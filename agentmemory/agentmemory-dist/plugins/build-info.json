@@ -1,0 +1,21 @@
+{
+  "version": "0.9.30",
+  "baseRevision": "831eb26ff2de1dded2a0df935abc301a488997ee",
+  "artifacts": [
+    {
+      "name": "agentmemory-codex-local",
+      "archive": "agentmemory-codex-local-0.9.30.zip",
+      "sha256": "356d28d595497776f2dffc42279d47df391020cb6f3d1441315509c17d93a172"
+    },
+    {
+      "name": "agentmemory-codex-review",
+      "archive": "agentmemory-codex-review-0.9.30.zip",
+      "sha256": "e0663831a6deb0f5496b152958d920d5c085d68a6296462a927492ea3108c6be"
+    },
+    {
+      "name": "agentmemory-codex-skills",
+      "archive": "agentmemory-codex-skills-0.9.30.zip",
+      "sha256": "8015396e169a74bff41003a11d64d54b202a339c7ec98c3e9ebe5453b329baf1"
+    }
+  ]
+}

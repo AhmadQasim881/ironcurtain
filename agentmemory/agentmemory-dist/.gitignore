@@ -1,0 +1,11 @@
+node_modules/
+data/
+data-*/
+agentmemory-debug/
+.gstack/
+.env
+.env.*
+!.env.example
+*.log
+*.db
+*.db-*

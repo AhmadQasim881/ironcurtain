@@ -1,0 +1,73 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HOME=$HOME /usr/bin/node \"$INSTALL_DIR/agentmemory-dist/hooks/session-start.mjs\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HOME=$HOME /usr/bin/node \"$INSTALL_DIR/agentmemory-dist/hooks/prompt-submit.mjs\"",
+            "timeout": 12
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|Read|Grep|Glob|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HOME=$HOME /usr/bin/node \"$INSTALL_DIR/agentmemory-dist/hooks/pre-tool-use.mjs\"",
+            "timeout": 12
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HOME=$HOME /usr/bin/node \"$INSTALL_DIR/agentmemory-dist/hooks/post-tool-use.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HOME=$HOME /usr/bin/node \"$INSTALL_DIR/agentmemory-dist/hooks/stop.mjs\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HOME=$HOME /usr/bin/node \"$INSTALL_DIR/agentmemory-dist/hooks/session-end.mjs\"",
+            "timeout": 12
+          }
+        ]
+      }
+    ]
+  }
+}

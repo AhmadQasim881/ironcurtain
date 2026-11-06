@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentmem"
+version = "0.4.0"
+description = "Persistent, chain-finding memory for autonomous agents (web bug-bounty, code review, and custom domains via profiles)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []                 # core runs on the standard library + SQLite
+license = { text = "MIT" }
+
+[project.optional-dependencies]
+# additive upgrades (the core does not need these)
+embeddings = ["sentence-transformers>=2.2"]
+graph = ["networkx>=3.0"]
+# MCP server for Claude Desktop / Claude Code (needs Python >= 3.10). The server
+# code supports both the v2 (MCPServer) and v1 (FastMCP) SDK via an import shim.
+mcp = ["mcp>=2,<3"]
+
+[project.scripts]
+agentmem-mcp = "agentmem.mcp_server:main"
+agentmem-research-mcp = "agentmem.research_mcp:main"
+
+[tool.setuptools.packages.find]
+include = ["agentmem*"]
+
+[tool.setuptools.package-data]
+agentmem = ["schema.sql", "schema_research.sql", "schema_firefox.sql"]

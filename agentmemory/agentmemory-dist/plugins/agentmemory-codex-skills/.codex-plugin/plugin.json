@@ -1,0 +1,41 @@
+{
+  "name": "agentmemory",
+  "version": "0.9.30",
+  "description": "Local persistent memory for coding agents. Recall decisions, resume sessions, learn from corrections, and manage memory through 17 skills that use the MCP tools of your own Agent Memory daemon.",
+  "author": {
+    "name": "Rohit Ghumare",
+    "url": "https://github.com/rohitg00"
+  },
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/rohitg00/agentmemory",
+  "repository": "https://github.com/rohitg00/agentmemory",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Agent Memory",
+    "shortDescription": "Memory across coding sessions",
+    "longDescription": "Recall past decisions, resume work, save useful context, and learn from corrections across your coding sessions using one local Agent Memory daemon. Includes search, session history, lessons, graph queries, memory maintenance, export, and deletion workflows. Requires Node.js 20+ and a running Agent Memory daemon. Basic keyword recall needs no model key. Embeddings and model-based features require configuration; external providers may receive selected data when enabled. This package contains the skills only. Install the Agent Memory daemon and wire its MCP server with `agentmemory connect codex` so the skills can call the memory tools. Designed for local Codex sessions.",
+    "developerName": "Rohit Ghumare",
+    "websiteURL": "https://www.agent-memory.dev",
+    "privacyPolicyURL": "https://www.agent-memory.dev/privacy",
+    "supportURL": "https://github.com/rohitg00/agentmemory/issues",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Local persistent memory",
+      "Session handoff",
+      "Lessons and recall",
+      "Memory management"
+    ],
+    "defaultPrompt": [
+      "Check my local Agent Memory connection and explain which features are enabled.",
+      "Recall decisions relevant to this repository, with the evidence for each.",
+      "Resume the latest session for this repository and show the recorded next step."
+    ],
+    "logo": "./assets/icon.svg",
+    "composerIcon": "./assets/icon.svg"
+  },
+  "extensions": {
+    "com.openai": {
+      "onboardingSkill": "./skills/agentmemory-config/SKILL.md"
+    }
+  }
+}

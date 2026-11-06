@@ -1,0 +1,24 @@
+[Unit]
+Description=agentmemory persistent memory daemon (iii-engine)
+Documentation=https://github.com/rohitg00/agentmemory
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$YOUR_USERNAME
+Group=$YOUR_USERNAME
+WorkingDirectory=$INSTALL_DIR/agentmemory-dist
+Environment=HOME=$HOME
+Environment=CI=1
+Environment=AGENTMEMORY_DATA_DIR=$HOME/.agentmemory-data
+ExecStart=/usr/bin/node $INSTALL_DIR/agentmemory-dist/cli.mjs
+ExecStop=/usr/bin/node $INSTALL_DIR/agentmemory-dist/cli.mjs stop
+Restart=always
+RestartSec=5
+TimeoutStartSec=120
+TimeoutStopSec=30
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

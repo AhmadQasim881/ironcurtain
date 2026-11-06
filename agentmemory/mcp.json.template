@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "agentmem-research": {
+      "type": "stdio",
+      "command": "$INSTALL_DIR/agentmem-research/.venv/bin/python",
+      "args": ["-m", "agentmem.research_mcp"],
+      "env": {
+        "AGENTMEM_DB": "$PROJECT_DIR/agentmem_research.db",
+        "AGENTMEM_ACTOR": "claude-code"
+      }
+    },
+    "agentmemory": {
+      "type": "stdio",
+      "command": "$NODE_BINARY",
+      "args": ["$INSTALL_DIR/agentmemory-dist/standalone.mjs"],
+      "env": {
+        "HOME": "$HOME",
+        "AGENTMEMORY_URL": "http://localhost:3111",
+        "AGENTMEMORY_TOOLS": "all",
+        "AGENTMEMORY_FORCE_PROXY": "1"
+      }
+    }
+  }
+}
