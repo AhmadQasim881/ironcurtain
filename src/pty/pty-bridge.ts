@@ -5,6 +5,17 @@
  *   node-pty child -> raw bytes -> @xterm/headless Terminal.write()
  *   @xterm/headless buffer -> readBuffer() -> MuxRenderer   (grid sink, mux)
  *   @xterm/headless buffer -> onData(chunk) -> WS stream    (stream sink, web-ui)
+ *   @xterm/headless replies (CPR, DA, DECRQM...) -> child   (answerTerminalQueries)
+ *
+ * Terminal queries. Programs ask their terminal for the cursor position
+ * (DSR 6, `ESC [ 6 n`), its device attributes (DA) or a mode's state
+ * (DECRQM) and wait for the answer; crossterm-based agents such as Codex
+ * stall or fail at start-up without one. Under the mux nothing else can
+ * answer: the host terminal never sees the query, because the mux re-renders
+ * cells rather than relaying bytes. With `answerTerminalQueries` the headless
+ * terminal's replies are written back to the child's own PTY, and only
+ * there: they never reach the host terminal. The web UI leaves it off,
+ * because the browser's xterm answers through the input path.
  *
  * Each PtyBridge instance owns:
  * - One node-pty child process (the `ironcurtain start --pty` invocation)
@@ -23,6 +34,8 @@ const { SerializeAddon } = serializeAddonPkg;
 import { getPtyRegistryDir } from '../config/paths.js';
 import { readActiveRegistrations } from '../escalation/session-registry.js';
 import type { PtySessionRegistration } from '../docker/pty-types.js';
+import { clampPtySize } from './pty-size.js';
+import { ironcurtainSubprocessEnv } from '../trusted-process/child-env.js';
 import * as logger from '../logger.js';
 
 export interface PtyBridge {
@@ -55,7 +68,9 @@ export interface PtyBridge {
   write(data: string): void;
 
   /**
-   * Resizes the child PTY and the headless terminal.
+   * Resizes the child PTY and the headless terminal. The size is clamped into
+   * the bounds in `src/pty/pty-size.ts` (cols 2..1000, rows 1..500): a larger
+   * request would make the headless terminal allocate gigabytes.
    */
   resize(cols: number, rows: number): void;
 
@@ -137,10 +152,24 @@ export interface PtyBridgeOptions {
   readonly model?: string;
   /** When true, pass `--capture-traces` to the child `ironcurtain start --pty`. */
   readonly captureTraces?: boolean;
+  /**
+   * Task text for a task-scoped session (`--task-scoped`): the child
+   * compiles (or reuses) the task scope from it before the session starts
+   * and escalates every call outside it. Never sent to the agent.
+   */
+  readonly taskScope?: string;
   /** Mux instance ID to propagate to child sessions via env var. */
   readonly muxId?: string;
   /** Mux process PID to propagate to child sessions via env var. */
   readonly muxPid?: number;
+  /**
+   * Write the headless terminal's replies to terminal queries (cursor
+   * position, device attributes, mode reports) back to the child's PTY.
+   * The mux sets it: nothing else answers there. The web UI leaves it unset
+   * (default false), because the browser's xterm answers through the input
+   * path and a second reply would reach the program twice.
+   */
+  readonly answerTerminalQueries?: boolean;
 }
 
 /**
@@ -150,7 +179,9 @@ export interface PtyBridgeOptions {
  * spawning a process. Order: prefix args (tsx loader/script path) → the
  * `start --pty --agent <agent>` base → the optional per-session selection
  * flags (`--resume`, `--workspace`, `--persona`, `--provider-profile`,
- * `--model`, `--capture-traces`). Each flag is appended only when set.
+ * `--model`, `--capture-traces`) → `--task-scoped -- <task>` last, so the
+ * task text after the `--` terminator is always a positional, whatever it
+ * starts with. Each flag is appended only when set.
  */
 export function buildSpawnArgs(options: PtyBridgeOptions): string[] {
   const spawnArgs = [...(options.prefixArgs ?? []), 'start', '--pty', '--agent', options.agent];
@@ -171,6 +202,9 @@ export function buildSpawnArgs(options: PtyBridgeOptions): string[] {
   }
   if (options.captureTraces) {
     spawnArgs.push('--capture-traces');
+  }
+  if (options.taskScope !== undefined && options.taskScope.trim() !== '') {
+    spawnArgs.push('--task-scoped', '--', options.taskScope);
   }
   return spawnArgs;
 }
@@ -199,9 +233,12 @@ const PTY_KILL_ERROR_LOG_INTERVAL_MS = 10_000;
 export async function createPtyBridge(options: PtyBridgeOptions): Promise<PtyBridge> {
   const nodePty = (await import('node-pty')) as typeof import('node-pty');
 
+  // Bound the size before it reaches the headless terminal or the child PTY;
+  // see src/pty/pty-size.ts for why an unbounded size is a memory hazard.
+  const initialSize = clampPtySize(options.cols, options.rows);
   const terminal = new Terminal({
-    cols: options.cols,
-    rows: options.rows,
+    cols: initialSize.cols,
+    rows: initialSize.rows,
     scrollback: SCROLLBACK_LINES,
     allowProposedApi: true,
   });
@@ -209,8 +246,12 @@ export async function createPtyBridge(options: PtyBridgeOptions): Promise<PtyBri
   terminal.loadAddon(serializeAddon);
 
   const spawnArgs = buildSpawnArgs(options);
-  // Create a copy of process.env so we don't mutate the shared object
-  const childEnv: Record<string, string> = { ...(process.env as Record<string, string>) };
+  // The child is IronCurtain itself and reads the same credentials and
+  // settings from the environment, so it inherits ours -- minus the
+  // code-injection variables (NODE_OPTIONS, NODE_PATH, LD_*, DYLD_*) and
+  // the variables that configure one MCP relay (trusted-process/child-env.ts).
+  // A fresh object, so nothing below mutates process.env.
+  const childEnv = ironcurtainSubprocessEnv(process.env);
   if (options.muxId) {
     childEnv.IRONCURTAIN_MUX_ID = options.muxId;
   }
@@ -219,8 +260,8 @@ export async function createPtyBridge(options: PtyBridgeOptions): Promise<PtyBri
   }
 
   const child = nodePty.spawn(options.ironcurtainBin, spawnArgs, {
-    cols: options.cols,
-    rows: options.rows,
+    cols: initialSize.cols,
+    rows: initialSize.rows,
     name: 'xterm-256color',
     env: childEnv,
   });
@@ -302,6 +343,15 @@ export async function createPtyBridge(options: PtyBridgeOptions): Promise<PtyBri
     });
   });
 
+  // The headless terminal's answers to queries in the child's output (see the
+  // module comment) go back to the child's own PTY, never to the host
+  // terminal. Its `onData` carries only such replies: nothing types into it.
+  if (options.answerTerminalQueries === true) {
+    terminal.onData((reply: string) => {
+      if (_alive) child.write(reply);
+    });
+  }
+
   const discoveryAbort = new AbortController();
 
   child.onExit(({ exitCode }: { exitCode: number }) => {
@@ -351,8 +401,13 @@ export async function createPtyBridge(options: PtyBridgeOptions): Promise<PtyBri
     },
 
     resize(cols: number, rows: number): void {
-      if (_alive) child.resize(cols, rows);
-      terminal.resize(cols, rows);
+      // Clamp here as well as at the RPC schema: every resize source (web UI,
+      // mux, tests) goes through this method, so this is the last line of
+      // defence against a size that would make the headless terminal allocate
+      // gigabytes or wrap node-pty's unsigned-short winsize.
+      const size = clampPtySize(cols, rows);
+      if (_alive) child.resize(size.cols, size.rows);
+      terminal.resize(size.cols, size.rows);
     },
 
     kill(): void {

@@ -1,19 +1,30 @@
 /**
- * SSE extraction transform stream for the MITM proxy.
+ * Token-stream extraction for the MITM proxy: the live view of an LLM
+ * response (web UI, `observe`, the workflow token counter, OpenRouter's
+ * authoritative cost).
  *
- * Sits in the response pipeline between the upstream LLM API and the
- * Docker container. All data passes through unmodified -- the extractor
- * only emits structured side-channel events via a callback.
+ * The extractor is a passive `ResponseObservationHub` consumer and never sits
+ * in the upstream-to-client pipe; the forwarded bytes are untouched and never
+ * wait on it. The hub decodes the response once (gzip, deflate, br), frames
+ * SSE once with split-UTF-8 handling (a StringDecoder), and isolates this
+ * consumer behind its own resource and exception limits. This module maps the
+ * frames, or a buffered non-streaming JSON body, to TokenStreamEvents.
  *
- * Handles Anthropic and OpenAI SSE formats. Unknown providers emit
- * raw events for every complete SSE line.
+ * Handles Anthropic and OpenAI SSE formats. Unknown providers emit a raw
+ * event for every SSE event.
  */
 
-import { Transform, type TransformCallback } from 'node:stream';
+import type { ResponseObservationConsumer } from './llm-observation/response-observation-hub.js';
+import type { SseEventFrame } from './llm-observation/sse-event-framer.js';
 import type { TokenStreamEvent, SseEventCallback, SseProvider } from './token-stream-types.js';
 
-/** Maximum length of a single SSE line buffer before truncation (1 MB). */
-export const MAX_SSE_LINE_LENGTH = 1_048_576;
+/**
+ * Max decoded bytes of a non-streaming JSON response buffered for token
+ * stream extraction. The response is still forwarded to the client unchanged;
+ * past the cap only the extraction is skipped. This protects the proxy from
+ * unbounded memory growth on very large completions.
+ */
+export const MAX_JSON_RESPONSE_CAPTURE_BYTES = 2 * 1024 * 1024; // 2 MB
 
 /** Safely extract a string from an unknown value. */
 function str(value: unknown, fallback = ''): string {
@@ -75,156 +86,56 @@ function extractOpenRouterUsage(usage: Record<string, unknown> | undefined): Ope
   };
 }
 
+function makeMessageEnd(
+  stopReason: string,
+  inputTokens: number,
+  outputTokens: number,
+  usage?: OpenRouterUsageFields,
+): TokenStreamEvent {
+  return {
+    kind: 'message_end',
+    stopReason,
+    inputTokens,
+    outputTokens,
+    // `usage` (from extractOpenRouterUsage) already contains ONLY the defined
+    // OpenRouter fields, so spreading it omits absent keys without re-guarding.
+    ...(usage ?? {}),
+    timestamp: Date.now(),
+  };
+}
+
 /**
- * A passthrough Transform stream that intercepts SSE data flowing
- * through the MITM proxy without modifying the forwarded bytes.
+ * Maps decoded SSE event frames of one response to TokenStreamEvents.
  *
- * Usage:
- *   upstreamRes.pipe(extractor).pipe(clientRes)
- *
- * The extractor reassembles SSE lines across chunk boundaries,
- * parses provider-specific event formats, and invokes the callback
- * with structured TokenStreamEvents.
- *
- * All data passes through unmodified. The extractor never drops,
- * delays, or modifies chunks. If parsing fails for any event,
- * a `raw` event is emitted and data continues to flow.
- *
- * ERROR CONTRACT: `_transform()` must NEVER throw or call
- * `callback(err)`. The entire body is wrapped in a try/catch
- * that always calls `callback(null, chunk)`. A parsing bug must
- * never interrupt the forwarding path to the Docker container.
+ * Framing (line endings, multi-line data, split UTF-8, size limits) is the
+ * hub's SseEventFramer's job; this class only interprets the payloads. If
+ * parsing fails for an event, a `raw` event is emitted instead. Listener
+ * errors are swallowed: one broken subscriber must not stop the stream.
  */
-export class SseExtractorTransform extends Transform {
-  private lineBuffer = '';
-  private currentEventType = '';
-  private readonly provider: SseProvider;
-  private readonly onEvent: SseEventCallback;
+export class TokenStreamSseParser {
+  constructor(
+    private readonly provider: SseProvider,
+    private readonly onEvent: SseEventCallback,
+  ) {}
 
-  constructor(provider: SseProvider, onEvent: SseEventCallback) {
-    super();
-    this.provider = provider;
-    this.onEvent = onEvent;
-  }
-
-  _transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback): void {
-    try {
-      const text = chunk.toString('utf-8');
-      this.processText(text);
-    } catch {
-      // Parsing errors must never propagate -- the forwarding path is sacred.
-    }
-    callback(null, chunk);
-  }
-
-  _flush(callback: TransformCallback): void {
-    try {
-      if (this.lineBuffer.length > 0) {
-        this.processLine(this.lineBuffer);
-        this.lineBuffer = '';
-      }
-    } catch {
-      // Same error contract as _transform.
-    }
-    callback();
-  }
-
-  private processText(text: string): void {
-    let pos = 0;
-    while (pos < text.length) {
-      const nextLf = text.indexOf('\n', pos);
-      const nextCr = text.indexOf('\r', pos);
-
-      // Find the nearest line ending (-1 means not found)
-      let lineEnd: number;
-      if (nextLf === -1 && nextCr === -1) {
-        // No more line endings -- buffer the rest
-        this.lineBuffer += text.slice(pos);
-        if (this.lineBuffer.length > MAX_SSE_LINE_LENGTH) {
-          this.emitSafe({
-            kind: 'raw',
-            eventType: 'truncated',
-            data: '',
-            timestamp: Date.now(),
-          });
-          this.lineBuffer = '';
-        }
-        return;
-      } else if (nextCr === -1) {
-        lineEnd = nextLf;
-      } else if (nextLf === -1) {
-        lineEnd = nextCr;
-      } else {
-        lineEnd = Math.min(nextLf, nextCr);
-      }
-
-      // Append the segment before the line ending and process
-      this.lineBuffer += text.slice(pos, lineEnd);
-      if (this.lineBuffer.length > MAX_SSE_LINE_LENGTH) {
-        this.emitSafe({
-          kind: 'raw',
-          eventType: 'truncated',
-          data: '',
-          timestamp: Date.now(),
-        });
-        this.lineBuffer = '';
-      } else {
-        this.processLine(this.lineBuffer);
-        this.lineBuffer = '';
-      }
-
-      // Advance past the line ending, consuming CRLF as a single break
-      pos = lineEnd + 1;
-      if (text[lineEnd] === '\r' && pos < text.length && text[pos] === '\n') {
-        pos++;
-      }
-    }
-  }
-
-  private processLine(line: string): void {
+  onFrame(frame: SseEventFrame): void {
     if (this.provider === 'unknown') {
-      this.processUnknownLine(line);
+      this.emitSafe({ kind: 'raw', eventType: 'unknown_provider', data: frame.dataUtf8, timestamp: Date.now() });
       return;
     }
-
-    if (line === '') {
-      // Empty line = SSE event boundary. Reset event type for next event.
-      this.currentEventType = '';
-      return;
+    if (this.provider === 'anthropic') {
+      this.parseAnthropicData(frame.dataUtf8, frame.eventType);
+    } else {
+      this.parseOpenaiData(frame.dataUtf8);
     }
-
-    if (line.startsWith('event:')) {
-      this.currentEventType = line.slice(6).trim();
-      return;
-    }
-
-    if (line.startsWith('data:')) {
-      const data = line.slice(5).trim();
-      if (this.provider === 'anthropic') {
-        this.parseAnthropicData(data);
-      } else {
-        this.parseOpenaiData(data);
-      }
-    }
-    // Ignore other SSE fields (id:, retry:, comments starting with :)
   }
 
-  private processUnknownLine(line: string): void {
-    if (line === '') return;
-    this.emitSafe({
-      kind: 'raw',
-      eventType: 'unknown_provider',
-      data: line,
-      timestamp: Date.now(),
-    });
-  }
-
-  private parseAnthropicData(data: string): void {
+  private parseAnthropicData(data: string, eventType: string): void {
     let parsed: unknown;
     try {
       parsed = JSON.parse(data) as unknown;
     } catch {
-      this.emitSafe({ kind: 'raw', eventType: this.currentEventType || 'parse_error', data, timestamp: Date.now() });
+      this.emitSafe({ kind: 'raw', eventType: eventType || 'parse_error', data, timestamp: Date.now() });
       return;
     }
 
@@ -267,12 +178,7 @@ export class SseExtractorTransform extends Transform {
       const delta = obj(root['delta']);
       const usage = obj(root['usage']);
       this.emitSafe(
-        this.makeMessageEnd(
-          str(delta?.['stop_reason']),
-          0,
-          num(usage?.['output_tokens']),
-          extractOpenRouterUsage(usage),
-        ),
+        makeMessageEnd(str(delta?.['stop_reason']), 0, num(usage?.['output_tokens']), extractOpenRouterUsage(usage)),
       );
       return;
     }
@@ -289,12 +195,12 @@ export class SseExtractorTransform extends Transform {
     }
 
     // Unknown Anthropic event type -- emit as raw.
-    this.emitSafe({ kind: 'raw', eventType: type || this.currentEventType || 'unknown', data, timestamp: now });
+    this.emitSafe({ kind: 'raw', eventType: type || eventType || 'unknown', data, timestamp: now });
   }
 
   private parseOpenaiData(data: string): void {
-    if (data === '[DONE]') {
-      this.emitSafe(this.makeMessageEnd('stop', 0, 0));
+    if (data.trim() === '[DONE]') {
+      this.emitSafe(makeMessageEnd('stop', 0, 0));
       return;
     }
 
@@ -317,7 +223,7 @@ export class SseExtractorTransform extends Transform {
     if (rootType === 'response.completed' || rootType === 'response.done') {
       const response = obj(root['response']);
       const status = str(response?.['status']) || 'stop';
-      this.emitSafe(this.makeMessageEnd(status, 0, 0, extractOpenRouterUsage(obj(response?.['usage']))));
+      this.emitSafe(makeMessageEnd(status, 0, 0, extractOpenRouterUsage(obj(response?.['usage']))));
       return;
     }
 
@@ -338,7 +244,7 @@ export class SseExtractorTransform extends Transform {
     if (!delta) {
       const finishReason = str(choice['finish_reason']) || undefined;
       if (finishReason) {
-        this.emitSafe(this.makeMessageEnd(finishReason, 0, 0, extractOpenRouterUsage(obj(root['usage']))));
+        this.emitSafe(makeMessageEnd(finishReason, 0, 0, extractOpenRouterUsage(obj(root['usage']))));
       }
       return;
     }
@@ -365,7 +271,7 @@ export class SseExtractorTransform extends Transform {
     // OpenRouter rides authoritative usage on this final chunk (§10.2).
     const finishReason = str(choice['finish_reason']) || undefined;
     if (finishReason) {
-      this.emitSafe(this.makeMessageEnd(finishReason, 0, 0, extractOpenRouterUsage(obj(root['usage']))));
+      this.emitSafe(makeMessageEnd(finishReason, 0, 0, extractOpenRouterUsage(obj(root['usage']))));
       return;
     }
 
@@ -373,30 +279,155 @@ export class SseExtractorTransform extends Transform {
     this.emitSafe({ kind: 'raw', eventType: 'openai_delta', data, timestamp: now });
   }
 
-  private makeMessageEnd(
-    stopReason: string,
-    inputTokens: number,
-    outputTokens: number,
-    usage?: OpenRouterUsageFields,
-  ): TokenStreamEvent {
-    return {
-      kind: 'message_end',
-      stopReason,
-      inputTokens,
-      outputTokens,
-      // `usage` (from extractOpenRouterUsage) already contains ONLY the defined
-      // OpenRouter fields, so spreading it omits absent keys without re-guarding.
-      ...(usage ?? {}),
-      timestamp: Date.now(),
-    };
-  }
-
   /** Invoke the callback, swallowing any listener errors. */
   private emitSafe(event: TokenStreamEvent): void {
-    try {
-      this.onEvent(event);
-    } catch {
-      // Listener errors must never propagate to the stream pipeline.
+    emitSafe(this.onEvent, event);
+  }
+}
+
+function emitSafe(onEvent: SseEventCallback, event: TokenStreamEvent): void {
+  try {
+    onEvent(event);
+  } catch {
+    // Listener errors must never propagate into observation.
+  }
+}
+
+/**
+ * Token stream events of a non-streaming JSON response body (decoded bytes).
+ * Emits message_start (model), text_delta (content), and message_end (usage,
+ * plus OpenRouter's authoritative `usage.cost` and cache reads). Returns no
+ * events for a body that is not a JSON object.
+ */
+export function tokenStreamEventsFromJson(body: Buffer): TokenStreamEvent[] {
+  let parsed: Record<string, unknown> | undefined;
+  try {
+    parsed = obj(JSON.parse(body.toString('utf-8')) as unknown);
+  } catch {
+    return []; // Not valid JSON -- nothing to extract
+  }
+  if (!parsed) return [];
+
+  const events: TokenStreamEvent[] = [];
+  const now = Date.now();
+
+  // Anthropic format: { model, content: [{type: 'text', text: '...'}], usage: {input_tokens, output_tokens}, stop_reason }
+  const model = typeof parsed['model'] === 'string' ? parsed['model'] : null;
+  if (model) events.push({ kind: 'message_start', model, timestamp: now });
+
+  // Extract text from content blocks (Anthropic) or choices (OpenAI)
+  for (const block of arr(parsed['content']) ?? []) {
+    const b = obj(block);
+    if (b?.['type'] === 'text' && typeof b['text'] === 'string') {
+      events.push({ kind: 'text_delta', text: b['text'], timestamp: now });
     }
   }
+  for (const choice of arr(parsed['choices']) ?? []) {
+    const message = obj(obj(choice)?.['message']);
+    if (typeof message?.['content'] === 'string') {
+      events.push({ kind: 'text_delta', text: message['content'], timestamp: now });
+    }
+  }
+
+  // Usage and stop reason. Anthropic: input_tokens/output_tokens; OpenAI: prompt_tokens/completion_tokens.
+  const usage = obj(parsed['usage']);
+  const stopReason = typeof parsed['stop_reason'] === 'string' ? parsed['stop_reason'] : 'stop';
+  const inputTokens = firstNumber(usage?.['input_tokens'], usage?.['prompt_tokens']) ?? 0;
+  const outputTokens = firstNumber(usage?.['output_tokens'], usage?.['completion_tokens']) ?? 0;
+  events.push(makeMessageEnd(stopReason, inputTokens, outputTokens, extractOpenRouterUsage(usage)));
+  return events;
+}
+
+/**
+ * Output of `createBoundedJsonResponseCapture` -- the stateful hooks used to
+ * drive a bounded capture over a chunked response stream.
+ */
+export interface BoundedJsonResponseCapture {
+  /** Feed a chunk into the capture buffer. Always safe to call. */
+  onData(chunk: Buffer): void;
+  /**
+   * Signal end-of-stream. The callback receives the concatenated buffer,
+   * or `null` if the capture overflowed and was discarded.
+   */
+  onEnd(onComplete: (body: Buffer | null) => void): void;
+}
+
+/**
+ * Create a size-bounded capture for a JSON response body.
+ *
+ * Up to `maxBytes` of data is accumulated into an internal chunk array.
+ * Once that threshold is crossed, any already-buffered chunks are released
+ * (so large responses do not pin memory) and further chunks are ignored.
+ */
+export function createBoundedJsonResponseCapture(
+  maxBytes: number = MAX_JSON_RESPONSE_CAPTURE_BYTES,
+): BoundedJsonResponseCapture {
+  let chunks: Buffer[] = [];
+  let capturedBytes = 0;
+
+  return {
+    onData(chunk: Buffer): void {
+      if (capturedBytes > maxBytes) return;
+      capturedBytes += chunk.length;
+      if (capturedBytes > maxBytes) {
+        chunks = [];
+        return;
+      }
+      chunks.push(chunk);
+    },
+    onEnd(onComplete: (body: Buffer | null) => void): void {
+      if (capturedBytes > maxBytes) {
+        onComplete(null);
+        return;
+      }
+      const body = Buffer.concat(chunks);
+      chunks = [];
+      onComplete(body);
+    },
+  };
+}
+
+export interface TokenStreamConsumerOptions {
+  /** Unique among the consumers of one hub. */
+  readonly id: string;
+  readonly provider: SseProvider;
+  /** True for an SSE response (frames); false for a buffered JSON body. */
+  readonly streaming: boolean;
+  /** Receives every extracted event; it is called from the hub's observation pump, never from forwarding. */
+  readonly onEvent: SseEventCallback;
+}
+
+/**
+ * The token stream's `ResponseObservationHub` consumer for one response.
+ *
+ * SSE: frames map to events as they arrive. Past this consumer's hub limits
+ * (decoded bytes, event count, framing) it keeps only usage-bearing events
+ * (usage scan), so the final `message_end` and its cost still arrive; a
+ * `raw`/`truncated` event marks where the live text stopped.
+ *
+ * JSON: decoded bytes are buffered up to MAX_JSON_RESPONSE_CAPTURE_BYTES (the
+ * hub detaches the consumer past it) and extracted when the body ends.
+ */
+export function createTokenStreamConsumer(options: TokenStreamConsumerOptions): ResponseObservationConsumer {
+  const { id, onEvent } = options;
+  if (options.streaming) {
+    const parser = new TokenStreamSseParser(options.provider, onEvent);
+    return {
+      id,
+      onSseEvent: (frame) => parser.onFrame(frame),
+      usageScanAfterLimits: true,
+      onDegrade: () => emitSafe(onEvent, { kind: 'raw', eventType: 'truncated', data: '', timestamp: Date.now() }),
+    };
+  }
+  const capture = createBoundedJsonResponseCapture(MAX_JSON_RESPONSE_CAPTURE_BYTES);
+  return {
+    id,
+    maxDecodedBytes: MAX_JSON_RESPONSE_CAPTURE_BYTES,
+    onDecodedChunk: (chunk) => capture.onData(chunk),
+    onEnd: () =>
+      capture.onEnd((body) => {
+        if (body === null) return; // overflowed -- skip extraction
+        for (const event of tokenStreamEventsFromJson(body)) emitSafe(onEvent, event);
+      }),
+  };
 }

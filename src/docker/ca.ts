@@ -1,6 +1,14 @@
 /** Host-owned IronCurtain MITM certificate-authority storage. */
 
-import { createHash, randomUUID } from 'node:crypto';
+import {
+  createHash,
+  createPrivateKey,
+  generateKeyPair,
+  generateKeyPairSync,
+  randomUUID,
+  sign as signWithPrivateKey,
+  type KeyObject,
+} from 'node:crypto';
 import {
   chmodSync,
   closeSync,
@@ -23,6 +31,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import * as tls from 'node:tls';
 import forge from 'node-forge';
 import * as logger from '../logger.js';
+import { classifyHostLiteral } from '../net/address-policy.js';
 import { acquireProcessLock, ProcessLockBusyError, type ProcessLockHandle } from '../docker-workload/process-lock.js';
 
 export interface CertificateAuthority {
@@ -67,6 +76,21 @@ const CA_VALIDITY_MS = 10 * 365 * 24 * 60 * 60 * 1000;
 const MIN_REMAINING_VALIDITY_MS = 24 * 60 * 60 * 1000;
 const LEAF_VALIDITY_MS = 24 * 60 * 60 * 1000;
 const LEAF_RENEWAL_MARGIN_MS = 60 * 60 * 1000;
+/**
+ * Process-wide bound on cached leaf TLS contexts, shared by every proxy in the
+ * process. Each context holds roughly 120 KiB, so the cache is a
+ * least-recently-used map rather than a plain one: a long-lived daemon that
+ * terminates TLS for many distinct hosts (a nested transport under
+ * `IRONCURTAIN_MITM_ALLOW_ALL_HOSTS` terminates every unknown host) stays
+ * bounded.
+ */
+export const LEAF_SECURE_CONTEXT_CACHE_MAX_ENTRIES = 256;
+/** Bound on cached issuers, each holding one leaf key pair (one per CA generation in practice). */
+const LEAF_ISSUER_CACHE_MAX_ENTRIES = 4;
+const LEAF_KEY_BITS = 2048;
+/** One lowercase DNS label: letters, digits, hyphen or underscore, no leading or trailing hyphen. */
+const LEAF_HOSTNAME_LABEL_PATTERN = /^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$/u;
+const MAX_LEAF_HOSTNAME_LENGTH = 253;
 const GENERATION_PATTERN = /^gen-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const CURRENT_TEMP_PATTERN = /^\.current\.json\.tmp-[0-9]+-[0-9a-f-]+$/u;
 const BASIC_CONSTRAINTS_OID = '2.5.29.19';
@@ -970,50 +994,268 @@ export function randomSerialNumber(): string {
   return first.toString(16).padStart(2, '0') + hex.slice(2);
 }
 
-/** Create the shared per-host leaf-certificate cache used by TLS-terminating proxies. */
-export function createLeafSecureContextCache(ca: CertificateAuthority): (hostname: string) => tls.SecureContext {
-  const caCertificate = forge.pki.certificateFromPem(ca.certPem);
-  const caKey = forge.pki.privateKeyFromPem(ca.keyPem);
+// ── Leaf certificate issuance (MITM-7) ─────────────────────────────────
+//
+// A TLS-terminating proxy serves one leaf per admitted host, on the event loop
+// it shares with every session in the daemon. A fresh 2048-bit key pair plus a
+// node-forge (JavaScript) RSA signature per leaf costs about 50 ms of blocked
+// loop, so issuance must stay cheap, bounded and out of the peer's control:
+//
+// - one leaf key pair per CA (generation) per process, generated off the event
+//   loop by `prepareLeafIssuance` (the synchronous path is only a fallback);
+// - node:crypto signs the forge-built TBSCertificate, so a miss costs one
+//   native signature (about 1 ms) rather than a key generation plus a
+//   JavaScript RSA sign;
+// - one process-wide least-recently-used cache, keyed by issuer and hostname,
+//   bounded at LEAF_SECURE_CONTEXT_CACHE_MAX_ENTRIES and shared by every proxy;
+// - callers mint only for the host they already admitted (the CONNECT host),
+//   never for a peer-chosen SNI name; `mitm-proxy.ts` rejects a mismatched SNI.
+
+/** The verified CA facts every leaf under one issuer needs, plus that issuer's shared leaf key pair. */
+interface LeafIssuer {
+  /** Identifies the issuing CA across proxies in this process: generation plus certificate digest. */
+  readonly fingerprint: string;
+  readonly caCertificate: forge.pki.Certificate;
+  /** The CA private key, parsed once by node:crypto; it never enters a JavaScript RSA implementation. */
+  readonly caKey: KeyObject;
+  readonly authorityKeyIdentifier: string;
+  keyPair?: LeafKeyPair;
+  pendingKeyPair?: Promise<LeafKeyPair>;
+}
+
+/** The leaf key pair shared by every host certificate this process issues under one issuer. */
+interface LeafKeyPair {
+  readonly privateKeyPem: string;
+  readonly publicKey: forge.pki.PublicKey;
+}
+
+interface LeafContextEntry {
+  readonly context: tls.SecureContext;
+  readonly expiresAt: number;
+}
+
+/**
+ * node-forge exposes `pki.getTBSCertificate` at runtime (its own `sign` uses
+ * it) but its typings omit it. Leaf issuance signs the DER TBSCertificate with
+ * node:crypto, so it needs the typed view.
+ */
+const x509 = forge.pki as typeof forge.pki & {
+  getTBSCertificate(certificate: forge.pki.Certificate): forge.asn1.Asn1;
+};
+
+// Process-wide least-recently-used caches shared by every TLS-terminating proxy
+// in the process: a daemon runs one proxy per bundle, all under the same CA
+// generation, which would otherwise each generate a key pair and mint the same
+// provider leaves.
+const leafIssuers = new Map<string, LeafIssuer>();
+const leafContexts = new Map<string, LeafContextEntry>();
+
+/** Number of cached leaf TLS contexts in this process (diagnostics and tests). */
+export function leafSecureContextCacheSize(): number {
+  return leafContexts.size;
+}
+
+/** Move `key` to the most-recently-used position and evict the oldest entries past `maxEntries`. */
+function touchLru<T>(cache: Map<string, T>, key: string, value: T, maxEntries: number): void {
+  cache.delete(key);
+  cache.set(key, value);
+  while (cache.size > maxEntries) {
+    const oldest = cache.keys().next();
+    if (oldest.done === true) break;
+    cache.delete(oldest.value);
+  }
+}
+
+/**
+ * The issuer for `ca`, verifying the authority first. The issuer state (and so
+ * the leaf key pair) is shared by every caller in the process that presents the
+ * same verified CA generation.
+ */
+function leafIssuerFor(ca: CertificateAuthority): LeafIssuer {
   if (verifyAuthority(ca.certPem, ca.keyPem) !== 'strict-v2') {
     throw new Error('IronCurtain leaf certificate issuance requires the strict-v2 CA profile');
   }
-  const cache = new Map<string, { readonly context: tls.SecureContext; readonly expiresAt: number }>();
+  const fingerprint = `${ca.generation}:${sha256(Buffer.from(ca.certPem))}`;
+  const cached = leafIssuers.get(fingerprint);
+  if (cached !== undefined) {
+    touchLru(leafIssuers, fingerprint, cached, LEAF_ISSUER_CACHE_MAX_ENTRIES);
+    return cached;
+  }
+  const caCertificate = forge.pki.certificateFromPem(ca.certPem);
+  const issuer: LeafIssuer = {
+    fingerprint,
+    caCertificate,
+    caKey: createPrivateKey(ca.keyPem),
+    authorityKeyIdentifier: caCertificate.generateSubjectKeyIdentifier().getBytes(),
+  };
+  touchLru(leafIssuers, fingerprint, issuer, LEAF_ISSUER_CACHE_MAX_ENTRIES);
+  return issuer;
+}
+
+function toLeafKeyPair(publicKeyPem: string, privateKeyPem: string): LeafKeyPair {
+  return { privateKeyPem, publicKey: forge.pki.publicKeyFromPem(publicKeyPem) };
+}
+
+const LEAF_KEY_PAIR_OPTIONS = {
+  modulusLength: LEAF_KEY_BITS,
+  publicKeyEncoding: { type: 'spki', format: 'pem' },
+  privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+} as const;
+
+/** The issuer's leaf key pair, generated synchronously only if `prepareLeafIssuance` has not produced it yet. */
+function leafKeyPairSync(issuer: LeafIssuer): LeafKeyPair {
+  if (issuer.keyPair === undefined) {
+    const generated = generateKeyPairSync('rsa', LEAF_KEY_PAIR_OPTIONS);
+    issuer.keyPair = toLeafKeyPair(generated.publicKey, generated.privateKey);
+  }
+  return issuer.keyPair;
+}
+
+/**
+ * Generate the issuer's leaf key pair on the libuv thread pool, once per
+ * issuer; concurrent callers share the one in-flight generation.
+ */
+function leafKeyPairAsync(issuer: LeafIssuer): Promise<LeafKeyPair> {
+  if (issuer.keyPair !== undefined) return Promise.resolve(issuer.keyPair);
+  issuer.pendingKeyPair ??= new Promise<LeafKeyPair>((resolveKeyPair, rejectKeyPair) => {
+    generateKeyPair('rsa', LEAF_KEY_PAIR_OPTIONS, (error, publicKey, privateKey) => {
+      if (error) rejectKeyPair(error);
+      else resolveKeyPair(toLeafKeyPair(publicKey, privateKey));
+    });
+  }).then(
+    (generated) => {
+      // A synchronous fallback may have won the race; keep whichever came first.
+      issuer.keyPair ??= generated;
+      return issuer.keyPair;
+    },
+    (error: unknown) => {
+      issuer.pendingKeyPair = undefined;
+      throw error;
+    },
+  );
+  return issuer.pendingKeyPair;
+}
+
+/**
+ * Prepare leaf issuance for `ca` off the event loop: verify the authority and
+ * generate the process's shared leaf key pair asynchronously. A proxy awaits
+ * this before it listens, so no handshake ever waits on a key generation.
+ * Idempotent and cheap once done; issuance still works without it (the first
+ * leaf then generates the key pair synchronously).
+ */
+export async function prepareLeafIssuance(ca: CertificateAuthority): Promise<void> {
+  await leafKeyPairAsync(leafIssuerFor(ca));
+}
+
+/**
+ * True for the syntax a leaf's DNS name must have: lowercase DNS syntax
+ * (letters, digits, hyphen, underscore; at most 253 characters). Leaves are
+ * minted only for names the proxy has already admitted (the CONNECT host), so
+ * anything else is refused rather than written into a certificate and a cache
+ * key. Text that reads as an IP literal is judged as an address instead (see
+ * `leafSubjectAltName`).
+ */
+export function isLeafHostname(hostname: string): boolean {
+  if (hostname.length === 0 || hostname.length > MAX_LEAF_HOSTNAME_LENGTH) return false;
+  return hostname.split('.').every((label) => LEAF_HOSTNAME_LABEL_PATTERN.test(label));
+}
+
+/** The one subjectAltName entry of a leaf: a DNS name (type 2) or an IP address (type 7). */
+type LeafSubjectAltName = { readonly type: 2; readonly value: string } | { readonly type: 7; readonly ip: string };
+
+/**
+ * The subjectAltName a leaf for `host` carries, or undefined when no leaf may
+ * be issued for it. An IP literal is accepted only in the canonical spelling
+ * the MITM proxy's CONNECT parser reports (a dotted quad, or RFC 5952 IPv6
+ * without brackets: an IP-literal provider host is admitted by that address)
+ * and is certified as an iPAddress, which is what a client that connects by
+ * address verifies. Any other host must be lowercase DNS syntax
+ * ({@link isLeafHostname}).
+ */
+function leafSubjectAltName(host: string): LeafSubjectAltName | undefined {
+  const literal = classifyHostLiteral(host);
+  if (literal.kind === 'ip') return literal.address === host ? { type: 7, ip: host } : undefined;
+  if (literal.kind === 'ip-like') return undefined;
+  return isLeafHostname(host) ? { type: 2, value: host } : undefined;
+}
+
+/**
+ * Build and sign one leaf for `hostname`. node-forge assembles the
+ * TBSCertificate; node:crypto produces the sha256WithRSAEncryption signature
+ * over its DER encoding, so no RSA private-key operation runs in JavaScript.
+ */
+function mintLeafCertificate(
+  issuer: LeafIssuer,
+  keyPair: LeafKeyPair,
+  hostname: string,
+  altName: LeafSubjectAltName,
+  now: number,
+): { readonly certPem: string; readonly expiresAt: number } {
+  const certificate = forge.pki.createCertificate();
+  certificate.publicKey = keyPair.publicKey;
+  certificate.serialNumber = randomSerialNumber();
+  const notBefore = Math.max(now, issuer.caCertificate.validity.notBefore.getTime());
+  const expiresAt = Math.min(now + LEAF_VALIDITY_MS, issuer.caCertificate.validity.notAfter.getTime());
+  if (expiresAt <= notBefore) {
+    throw new Error('IronCurtain CA validity does not contain a usable leaf certificate window');
+  }
+  certificate.validity.notBefore = new Date(notBefore);
+  certificate.validity.notAfter = new Date(expiresAt);
+  certificate.setSubject([{ name: 'commonName', value: hostname }]);
+  certificate.setIssuer(issuer.caCertificate.subject.attributes);
+  certificate.setExtensions([
+    { name: 'basicConstraints', cA: false, critical: true },
+    { name: 'subjectAltName', altNames: [altName] },
+    { name: 'keyUsage', digitalSignature: true, keyEncipherment: true, critical: true },
+    { name: 'extKeyUsage', serverAuth: true },
+    { name: 'subjectKeyIdentifier' },
+    { name: 'authorityKeyIdentifier', keyIdentifier: issuer.authorityKeyIdentifier },
+  ]);
+  const algorithmOid = forge.pki.oids.sha256WithRSAEncryption;
+  certificate.signatureOid = algorithmOid;
+  certificate.siginfo.algorithmOid = algorithmOid;
+  certificate.tbsCertificate = x509.getTBSCertificate(certificate);
+  const tbsDer = Buffer.from(forge.asn1.toDer(certificate.tbsCertificate).getBytes(), 'binary');
+  certificate.signature = signWithPrivateKey('sha256', tbsDer, issuer.caKey).toString('binary');
+  return { certPem: forge.pki.certificateToPem(certificate), expiresAt };
+}
+
+/**
+ * Create the per-host leaf lookup used by TLS-terminating proxies.
+ *
+ * Leaves are minted lazily, on first use of a hostname, and served from the
+ * process-wide least-recently-used cache keyed by issuer (CA generation) and
+ * hostname (see {@link LEAF_SECURE_CONTEXT_CACHE_MAX_ENTRIES}). Every leaf
+ * under one issuer shares a single RSA key pair and is signed natively, so a
+ * miss costs one signature. A leaf is renewed once it is within
+ * {@link LEAF_RENEWAL_MARGIN_MS} of expiry. Call {@link prepareLeafIssuance}
+ * first to keep the one-time key generation off the event loop.
+ *
+ * The lookup throws for a hostname that is neither lowercase DNS syntax
+ * ({@link isLeafHostname}) nor a canonical IP literal (which is certified as
+ * an iPAddress): callers pass the normalized host they already admitted,
+ * never a peer-chosen SNI name.
+ */
+export function createLeafSecureContextCache(ca: CertificateAuthority): (hostname: string) => tls.SecureContext {
+  const issuer = leafIssuerFor(ca);
 
   return (hostname) => {
-    const cached = cache.get(hostname);
-    if (cached !== undefined && cached.expiresAt - Date.now() > LEAF_RENEWAL_MARGIN_MS) return cached.context;
-
-    const keys = forge.pki.rsa.generateKeyPair(2048);
-    const certificate = forge.pki.createCertificate();
-    certificate.publicKey = keys.publicKey;
-    certificate.serialNumber = randomSerialNumber();
-    const now = Date.now();
-    const notBefore = Math.max(now, caCertificate.validity.notBefore.getTime());
-    const expiresAt = Math.min(now + LEAF_VALIDITY_MS, caCertificate.validity.notAfter.getTime());
-    if (expiresAt <= notBefore) {
-      throw new Error('IronCurtain CA validity does not contain a usable leaf certificate window');
+    const altName = leafSubjectAltName(hostname);
+    if (altName === undefined) {
+      throw new Error(`IronCurtain refuses to issue a leaf certificate for an invalid hostname: ${hostname}`);
     }
-    certificate.validity.notBefore = new Date(notBefore);
-    certificate.validity.notAfter = new Date(expiresAt);
-    certificate.setSubject([{ name: 'commonName', value: hostname }]);
-    certificate.setIssuer(caCertificate.subject.attributes);
-    certificate.setExtensions([
-      { name: 'basicConstraints', cA: false, critical: true },
-      { name: 'subjectAltName', altNames: [{ type: 2, value: hostname }] },
-      { name: 'keyUsage', digitalSignature: true, keyEncipherment: true, critical: true },
-      { name: 'extKeyUsage', serverAuth: true },
-      { name: 'subjectKeyIdentifier' },
-      {
-        name: 'authorityKeyIdentifier',
-        keyIdentifier: caCertificate.generateSubjectKeyIdentifier().getBytes(),
-      },
-    ]);
-    certificate.sign(caKey, forge.md.sha256.create());
-    const context = tls.createSecureContext({
-      key: forge.pki.privateKeyToPem(keys.privateKey),
-      cert: forge.pki.certificateToPem(certificate),
-    });
-    cache.set(hostname, { context, expiresAt });
+    const key = `${issuer.fingerprint}\n${hostname}`;
+    const now = Date.now();
+    const cached = leafContexts.get(key);
+    if (cached !== undefined && cached.expiresAt - now > LEAF_RENEWAL_MARGIN_MS) {
+      touchLru(leafContexts, key, cached, LEAF_SECURE_CONTEXT_CACHE_MAX_ENTRIES);
+      return cached.context;
+    }
+
+    const keyPair = leafKeyPairSync(issuer);
+    const { certPem, expiresAt } = mintLeafCertificate(issuer, keyPair, hostname, altName, now);
+    const context = tls.createSecureContext({ key: keyPair.privateKeyPem, cert: certPem });
+    touchLru(leafContexts, key, { context, expiresAt }, LEAF_SECURE_CONTEXT_CACHE_MAX_ENTRIES);
     return context;
   };
 }

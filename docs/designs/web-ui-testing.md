@@ -1,5 +1,7 @@
 # Web UI Testing Strategy
 
+**Status (2026-11-14):** Implemented: the mock WebSocket server (`npm run mock-server -w packages/web-ui`, `packages/web-ui/scripts/mock-ws-server.ts`) and the web UI unit tests.
+
 ## 1. Problem
 
 Testing the IronCurtain web UI currently requires starting the full daemon with Docker containers and/or LLM API keys. This makes development slow, expensive, and impossible in CI. We need to:

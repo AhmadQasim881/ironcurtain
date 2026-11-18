@@ -1,3 +1,5 @@
+import { testUserConfig } from '../helpers/user-config.js';
+import { USER_CONFIG_DEFAULTS } from '../../src/config/user-config.js';
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -16,7 +18,9 @@ import {
   type WorkflowLifecycleEvent,
 } from '../../src/workflow/orchestrator.js';
 import type { SessionOptions } from '../../src/session/types.js';
+import type { WorkflowId } from '../../src/workflow/types.js';
 import {
+  resolveActiveGate,
   approvedResponse,
   createDeps,
   MockSession,
@@ -24,6 +28,7 @@ import {
   waitForCompletion,
   waitForGate,
 } from './test-helpers.js';
+import type { AgentId } from '../../src/docker/agent-adapter.js';
 
 const IMAGE = 'ironcurtain-claude-code:latest';
 const TEST_HOME = `${REAL_TMP}/ironcurtain-evolve-human-surface-${process.pid}`;
@@ -64,13 +69,10 @@ function buildDockerSessionConfig(workspaceDir: string, generatedDir: string): I
     constitutionPath: join(generatedDir, 'constitution.md'),
     agentModelId: 'anthropic:claude-sonnet-4-6',
     escalationTimeoutSeconds: 300,
-    userConfig: {
+    userConfig: testUserConfig({
       agentModelId: 'anthropic:claude-sonnet-4-6',
       policyModelId: 'anthropic:claude-sonnet-4-6',
       anthropicApiKey: 'test-fake-key-no-network',
-      googleApiKey: '',
-      openaiApiKey: '',
-      escalationTimeoutSeconds: 300,
       resourceBudget: {
         maxTotalTokens: 1_000_000,
         maxSteps: 400,
@@ -78,25 +80,17 @@ function buildDockerSessionConfig(workspaceDir: string, generatedDir: string): I
         maxEstimatedCostUsd: 5.0,
         warnThresholdPercent: 80,
       },
-      autoCompact: {
-        enabled: false,
-        thresholdTokens: 80_000,
-        keepRecentMessages: 10,
-        summaryModelId: 'anthropic:claude-haiku-4-5',
-      },
-      autoApprove: { enabled: false, modelId: 'anthropic:claude-haiku-4-5' },
       auditRedaction: { enabled: false },
-      memory: { enabled: false, llmBaseUrl: undefined, llmApiKey: undefined },
       packageInstall: {
         enabled: true,
         quarantineDays: 2,
         allowedPackages: ['numpy', 'pyyaml'],
         deniedPackages: [],
       },
-      serverCredentials: {},
-      dockerResources: { memoryMb: null, cpus: null },
-    },
-  } as unknown as IronCurtainConfig;
+      dockerResources: { ...USER_CONFIG_DEFAULTS.dockerResources, memoryMb: null, cpus: null },
+      containerRuntime: 'docker',
+    }),
+  };
 }
 
 function writePreflightRunSpec(workspacePath: string): void {
@@ -125,7 +119,10 @@ function writePreflightRunSpec(workspacePath: string): void {
       command: evaluationCommand,
       script_path: '',
       timeout_secs: 30,
-      success_criteria: ['eval_score >= 1.0'],
+      // Unreachable on purpose: the deterministic stop_check ends the run on
+      // target_met, and the first valid round already scores 2, so a reachable
+      // target would stop it after one round. These runs end on max_rounds.
+      success_criteria: ['eval_score >= 99'],
     },
     budget: { max_rounds: ROUND_COUNT, patience: 2 },
     stop_conditions: ['max_rounds'],
@@ -259,6 +256,7 @@ describe.skipIf(!dockerReady)('evolve human-surface workflow with real Docker co
   let originalAuth: string | undefined;
   let originalApiKey: string | undefined;
   const liveBundles = new Set<DockerInfrastructure>();
+  const liveOrchestrators = new Set<WorkflowOrchestrator>();
 
   beforeAll(() => {
     originalHome = process.env.IRONCURTAIN_HOME;
@@ -271,11 +269,31 @@ describe.skipIf(!dockerReady)('evolve human-surface workflow with real Docker co
     cpSync(hostCaDir as string, join(TEST_HOME, 'ca'), { recursive: true });
   });
 
+  async function drainFixtures(): Promise<void> {
+    const orchestratorResults = await Promise.allSettled(
+      [...liveOrchestrators].map(async (orchestrator) => {
+        await orchestrator.shutdownAll();
+        liveOrchestrators.delete(orchestrator);
+      }),
+    );
+    const bundleResults = await Promise.allSettled(
+      [...liveBundles].map(async (bundle) => {
+        await destroyDockerInfrastructure(bundle);
+        liveBundles.delete(bundle);
+      }),
+    );
+    const failures = [...orchestratorResults, ...bundleResults].filter(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    );
+    if (failures.length > 0)
+      throw new AggregateError(
+        failures.map((result) => result.reason),
+        'Docker fixture cleanup failed',
+      );
+  }
+
   afterAll(async () => {
-    for (const bundle of liveBundles) {
-      await destroyDockerInfrastructure(bundle).catch(() => {});
-    }
-    liveBundles.clear();
+    await drainFixtures();
 
     if (originalHome === undefined) delete process.env.IRONCURTAIN_HOME;
     else process.env.IRONCURTAIN_HOME = originalHome;
@@ -285,19 +303,21 @@ describe.skipIf(!dockerReady)('evolve human-surface workflow with real Docker co
     else process.env.ANTHROPIC_API_KEY = originalApiKey;
 
     rmSync(TEST_HOME, { recursive: true, force: true });
-  });
+  }, 120_000);
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'evolve-human-surface-'));
   });
 
-  afterEach(() => {
+  // Stop workflow activity and containers before deleting their run files.
+  afterEach(async () => {
+    await drainFixtures();
     rmSync(tmpDir, { recursive: true, force: true });
-  });
+  }, 120_000);
 
   async function startScenario(scenario: Scenario): Promise<{
     orchestrator: WorkflowOrchestrator;
-    workflowId: string;
+    workflowId: WorkflowId;
     states: string[];
     workspaceDir: string;
     raiseGate: ReturnType<typeof vi.fn>;
@@ -319,7 +339,7 @@ describe.skipIf(!dockerReady)('evolve human-surface workflow with real Docker co
       mkdirSync(escalationDir, { recursive: true });
       const bundle = await createDockerInfrastructure(
         config,
-        { kind: 'docker', agent: 'claude-code' },
+        { kind: 'docker', agent: 'claude-code' as AgentId },
         bundleDir,
         input.workspacePath,
         escalationDir,
@@ -329,21 +349,27 @@ describe.skipIf(!dockerReady)('evolve human-surface workflow with real Docker co
         input.resolvedSkills,
         undefined,
         input.workflowScriptsDir,
+        { workflowRunDir: input.workflowRunDir },
       );
       liveBundles.add(bundle);
       return bundle;
     });
 
     const destroyInfra = vi.fn(async (bundle: DockerInfrastructure) => {
-      liveBundles.delete(bundle);
       await destroyDockerInfrastructure(bundle);
+      liveBundles.delete(bundle);
     });
 
+    // The orchestrator agent is not consulted after the round that meets the
+    // stop condition (the deterministic stop_check routes to final_summary), so
+    // the scripts hold only the verdicts it is actually asked for. In the
+    // final-force-revision scenario the fourth turn is the human's extension
+    // directive after final_review; stop_check ends that extra round as well.
     const scripts: Record<Scenario, string[]> = {
-      approve: ['design', 'design', 'design', 'complete'],
+      approve: ['design', 'design', 'design'],
       'preflight-abort': [],
-      'evaluator-force-revision': ['design', 'design', 'design', 'design', 'complete'],
-      'final-force-revision': ['design', 'design', 'design', 'complete', 'design', 'complete'],
+      'evaluator-force-revision': ['design', 'design', 'design', 'design'],
+      'final-force-revision': ['design', 'design', 'design', 'design'],
     };
 
     let provisionTurns = 0;
@@ -402,6 +428,7 @@ describe.skipIf(!dockerReady)('evolve human-surface workflow with real Docker co
       }),
     );
     const states: string[] = [];
+    liveOrchestrators.add(orchestrator);
     orchestrator.onEvent((event: WorkflowLifecycleEvent) => {
       if (event.kind === 'state_entered') states.push(event.state);
     });
@@ -417,13 +444,13 @@ describe.skipIf(!dockerReady)('evolve human-surface workflow with real Docker co
     expect(preflightGate.stateName).toBe('preflight_review');
     expect(preflightGate.acceptedEvents).toEqual(['APPROVE', 'FORCE_REVISION', 'ABORT']);
     expect([...preflightGate.presentedArtifacts.keys()].sort()).toEqual(['cognition_seed', 'run_spec']);
-    run.orchestrator.resolveGate(run.workflowId, { type: 'APPROVE' });
+    resolveActiveGate(run.orchestrator, run.workflowId, { type: 'APPROVE' });
 
     const gates = await waitForGate(run.raiseGate, 2, 180_000);
     const finalGate = gates[1];
     expect(finalGate.stateName).toBe('final_review');
     expect(finalGate.presentedArtifacts.has('final_report')).toBe(true);
-    run.orchestrator.resolveGate(run.workflowId, { type: 'APPROVE' });
+    resolveActiveGate(run.orchestrator, run.workflowId, { type: 'APPROVE' });
 
     await waitForCompletion(run.orchestrator, run.workflowId, 180_000);
     expect(run.orchestrator.getStatus(run.workflowId)?.phase).toBe('completed');
@@ -449,7 +476,7 @@ describe.skipIf(!dockerReady)('evolve human-surface workflow with real Docker co
     const run = await startScenario('preflight-abort');
     const [preflightGate] = await waitForGate(run.raiseGate, 1, 180_000);
     expect(preflightGate.stateName).toBe('preflight_review');
-    run.orchestrator.resolveGate(run.workflowId, { type: 'ABORT' });
+    resolveActiveGate(run.orchestrator, run.workflowId, { type: 'ABORT' });
 
     await waitForCompletion(run.orchestrator, run.workflowId, 180_000);
     expect(run.orchestrator.getStatus(run.workflowId)?.phase).toBe('aborted');
@@ -468,7 +495,7 @@ describe.skipIf(!dockerReady)('evolve human-surface workflow with real Docker co
     const run = await startScenario('evaluator-force-revision');
     const [preflightGate] = await waitForGate(run.raiseGate, 1, 180_000);
     expect(preflightGate.stateName).toBe('preflight_review');
-    run.orchestrator.resolveGate(run.workflowId, { type: 'APPROVE' });
+    resolveActiveGate(run.orchestrator, run.workflowId, { type: 'APPROVE' });
 
     const gatesAfterBlock = await waitForGate(run.raiseGate, 2, 180_000);
     const escalationGate = gatesAfterBlock[1];
@@ -480,18 +507,18 @@ describe.skipIf(!dockerReady)('evolve human-surface workflow with real Docker co
     // a per-lane gate.
     expect(escalationGate.summary).toContain('verdict: escalate');
     expect(escalationGate.summary).toContain('lane 0 blocked');
-    run.orchestrator.resolveGate(run.workflowId, {
+    resolveActiveGate(run.orchestrator, run.workflowId, {
       type: 'FORCE_REVISION',
       prompt: 'fix the candidate to define solve(xs)',
     });
 
     const gatesAfterRevision = await waitForGate(run.raiseGate, 3, 180_000);
     expect(gatesAfterRevision[2].stateName).toBe('preflight_review');
-    run.orchestrator.resolveGate(run.workflowId, { type: 'APPROVE' });
+    resolveActiveGate(run.orchestrator, run.workflowId, { type: 'APPROVE' });
 
     const gatesAtFinal = await waitForGate(run.raiseGate, 4, 180_000);
     expect(gatesAtFinal[3].stateName).toBe('final_review');
-    run.orchestrator.resolveGate(run.workflowId, { type: 'APPROVE' });
+    resolveActiveGate(run.orchestrator, run.workflowId, { type: 'APPROVE' });
 
     await waitForCompletion(run.orchestrator, run.workflowId, 180_000);
     expect(run.orchestrator.getStatus(run.workflowId)?.phase).toBe('completed');
@@ -514,15 +541,15 @@ describe.skipIf(!dockerReady)('evolve human-surface workflow with real Docker co
     const run = await startScenario('final-force-revision');
     const [preflightGate] = await waitForGate(run.raiseGate, 1, 180_000);
     expect(preflightGate.stateName).toBe('preflight_review');
-    run.orchestrator.resolveGate(run.workflowId, { type: 'APPROVE' });
+    resolveActiveGate(run.orchestrator, run.workflowId, { type: 'APPROVE' });
 
     const firstFinal = await waitForGate(run.raiseGate, 2, 180_000);
     expect(firstFinal[1].stateName).toBe('final_review');
-    run.orchestrator.resolveGate(run.workflowId, { type: 'FORCE_REVISION', prompt: 'run 1 more round' });
+    resolveActiveGate(run.orchestrator, run.workflowId, { type: 'FORCE_REVISION', prompt: 'run 1 more round' });
 
     const secondFinal = await waitForGate(run.raiseGate, 3, 180_000);
     expect(secondFinal[2].stateName).toBe('final_review');
-    run.orchestrator.resolveGate(run.workflowId, { type: 'APPROVE' });
+    resolveActiveGate(run.orchestrator, run.workflowId, { type: 'APPROVE' });
 
     await waitForCompletion(run.orchestrator, run.workflowId, 180_000);
     expect(run.orchestrator.getStatus(run.workflowId)?.phase).toBe('completed');

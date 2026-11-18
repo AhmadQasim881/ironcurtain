@@ -52,13 +52,24 @@ function readPersonaJson(name: string): Record<string, unknown> {
   return JSON.parse(readFileSync(resolve(personaDir(name), 'persona.json'), 'utf-8'));
 }
 
-/** Writes a compiled-policy.json fixture for stale-detection / detail tests. */
+/** sha256 of a persona's constitution.md content, as a compile records it. */
+function constitutionHashOf(fileContent: string): string {
+  return createHash('sha256').update(fileContent).digest('hex');
+}
+
+/**
+ * Writes a compiled-policy.json fixture for stale-detection / detail tests,
+ * with the metadata fields the runtime schema requires (resolvePersona reads
+ * the policy to check its breadth).
+ */
 function writeCompiledPolicy(name: string, opts: { rules?: unknown[]; constitutionHash?: string } = {}): void {
   const generatedDir = resolve(personaDir(name), 'generated');
   mkdirSync(generatedDir, { recursive: true });
   writeFileSync(
     resolve(generatedDir, 'compiled-policy.json'),
     JSON.stringify({
+      generatedAt: 'test',
+      inputHash: 'test',
       rules: opts.rules ?? [],
       ...(opts.constitutionHash ? { constitutionHash: opts.constitutionHash } : {}),
     }),
@@ -268,7 +279,7 @@ describe('deletePersona', () => {
 
   it('a soft-deleted persona is unresolvable by scanPersonas and resolvePersona', () => {
     createPersona({ name: 'p', description: 'd', constitution: 'x' }, 'cli');
-    writeCompiledPolicy('p', { rules: [] });
+    writeCompiledPolicy('p', { rules: [], constitutionHash: constitutionHashOf('x\n') });
     // Resolvable before delete.
     expect(scanPersonas().map((x) => x.name)).toContain('p');
     expect(() => resolvePersona('p')).not.toThrow();
@@ -367,7 +378,8 @@ describe('listPersonas', () => {
   it('returns alphabetically sorted name/description/compiled rows', () => {
     createPersona({ name: 'zebra', description: 'Z persona', constitution: 'x' }, 'cli');
     createPersona({ name: 'alpha', description: 'A persona' }, 'cli');
-    writeCompiledPolicy('alpha', { rules: [] });
+    // alpha's constitution.md is empty; its policy was compiled from that.
+    writeCompiledPolicy('alpha', { rules: [], constitutionHash: constitutionHashOf('') });
 
     const list = listPersonas();
     expect(list.map((p) => p.name)).toEqual(['alpha', 'zebra']);

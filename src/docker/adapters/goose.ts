@@ -1,5 +1,8 @@
 import { gatewayProfile, resolveChatClient, resolveGatewayCommandModel } from '../../config/gateway-client.js';
 import { gatewayProviders, gatewayCredential, gatewaySentinel } from '../gateway-runtime.js';
+import { mcpClientCommand } from '../mcp-client-command.js';
+import { assertAgentResponseOutputBound } from '../agent-response-output.js';
+import { stripTerminalSequences } from '../../terminal/display-sanitize.js';
 /**
  * Goose agent adapter for Docker Agent Mode.
  *
@@ -12,23 +15,41 @@ import { gatewayProviders, gatewayCredential, gatewaySentinel } from '../gateway
  * Key differences from Claude Code adapter:
  * - Config format is YAML (not JSON)
  * - System prompt is file-based (not inline CLI flag)
- * - No session continuity in batch mode (each turn is independent)
  * - Batch mode invokes `goose run --output-format json` so `extractResponse`
  *   can parse a structured envelope (incl. provider error surfacing); PTY
  *   mode still streams plain text to the user's terminal.
  * - Provider-specific credential detection (not Anthropic-only)
+ *
+ * Conversation continuity: both modes use named Goose sessions stored in the
+ * mounted session store (`goose-state` on the host, Goose's
+ * `~/.local/share/goose/sessions/` in the container). A batch turn names the
+ * session after the agent conversation id (`--name <id>`, plus `--resume`
+ * after the first turn); a PTY session names it after the IronCurtain session
+ * id (`IRONCURTAIN_SESSION_NAME`) and resumes it with `goose session --name
+ * <id> --resume`.
  */
 
 import { randomBytes } from 'node:crypto';
-import type { AgentAdapter, AgentConfigFile, AgentId, AgentResponse, OrientationContext } from '../agent-adapter.js';
+import type {
+  AgentAdapter,
+  AgentCommandOptions,
+  AgentConfigFile,
+  AgentId,
+  AgentResponse,
+  ConversationStateConfig,
+  OrientationContext,
+} from '../agent-adapter.js';
+import { resolveMaxAgentTurns } from '../agent-adapter.js';
 import type { DockerAuthKind, IronCurtainConfig } from '../../config/types.js';
 import type { ProviderConfig } from '../provider-config.js';
 import type { AuthMethod } from '../oauth-credentials.js';
 import type { ResolvedUserConfig, GooseProvider } from '../../config/user-config.js';
+import { isConversationName, PTY_RESUME_FLAGS_ENV, PTY_SESSION_NAME_ENV } from '../conversation-state.js';
 import { anthropicProvider, openaiProvider, googleProvider } from '../provider-config.js';
 import { buildSystemPrompt } from '../../session/prompts.js';
 import { CONTAINER_RUNTIME_CA_BUNDLE } from '../runtime-trust.js';
-import { resolveApiKeyForProvider } from '../../config/model-provider.js';
+import { GOOSE_CLI_VERSION } from '../agent-cli-version.js';
+import { PROVIDER_ENV_VARS, resolveApiKeyForProvider } from '../../config/model-provider.js';
 import {
   buildResizePtyScript,
   buildCheckPtySizeScript,
@@ -42,6 +63,17 @@ const GOOSE_IMAGE = 'ironcurtain-goose:latest';
 
 /** Default heredoc delimiter for shell commands. */
 const DEFAULT_HEREDOC_DELIMITER = 'IRONCURTAIN_EOF';
+
+/**
+ * Goose's session store inside the container (its XDG data dir). The image
+ * pre-creates it as `codespace` so the bind mount does not leave a
+ * root-owned `~/.local/share/goose` behind (docker/Dockerfile.goose).
+ */
+export const GOOSE_SESSIONS_CONTAINER_DIR = '/home/codespace/.local/share/goose/sessions/';
+
+/** Fallbacks matching `resolveUserConfig` for a partial session config. */
+const DEFAULT_GOOSE_PROVIDER: GooseProvider = 'anthropic';
+const DEFAULT_GOOSE_MODEL = 'claude-sonnet-4-20250514';
 
 // ─── Provider Helpers ────────────────────────────────────────
 
@@ -59,20 +91,65 @@ export function getProviderConfig(provider: GooseProvider): ProviderConfig {
   }
 }
 
+/**
+ * The session's Goose provider and model, read from the per-session config
+ * on every call. The registry keeps one adapter per process (a daemon serves
+ * many sessions, each loading config afresh), so capturing them when the
+ * adapter is created would apply the first session's choice to every later
+ * one. A partial config (tests, `--list-agents`) falls back to the defaults.
+ */
+export function resolveGooseSelection(config: {
+  readonly userConfig?: Partial<Pick<ResolvedUserConfig, 'gooseProvider' | 'gooseModel'>>;
+}): { readonly provider: GooseProvider; readonly model: string } {
+  return {
+    provider: config.userConfig?.gooseProvider ?? DEFAULT_GOOSE_PROVIDER,
+    model: config.userConfig?.gooseModel ?? DEFAULT_GOOSE_MODEL,
+  };
+}
+
 // ─── Response Parsing ────────────────────────────────────────
 
 /**
  * Strips ANSI escape codes from a string.
  */
 export function stripAnsi(text: string): string {
-  // Matches common ANSI escape sequences: CSI (ESC[), OSC (ESC]), and simple ESC sequences
-  // eslint-disable-next-line no-control-regex -- ANSI escape codes are control characters by definition
-  return text.replace(/\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][AB012]/g, '');
+  return stripTerminalSequences(text);
+}
+
+/**
+ * Parses the envelope, tolerating a line of CLI chrome before it: when the
+ * whole output is not JSON, parse from the first line that opens an object.
+ */
+function parseGooseEnvelope(stdout: string): unknown {
+  try {
+    return JSON.parse(stdout);
+  } catch {
+    // Fall through to the preamble-tolerant parse.
+  }
+  const start = stdout.search(/^\{/mu);
+  if (start <= 0) return undefined;
+  try {
+    return JSON.parse(stdout.slice(start));
+  } catch {
+    return undefined;
+  }
+}
+
+/** Text of a message's `text` content items. */
+function messageTexts(message: { readonly content?: unknown }): string[] {
+  if (!Array.isArray(message.content)) return [];
+  const texts: string[] = [];
+  for (const c of message.content) {
+    if (!c || typeof c !== 'object') continue;
+    const item = c as { type?: unknown; text?: unknown };
+    if (item.type === 'text' && typeof item.text === 'string') texts.push(item.text);
+  }
+  return texts;
 }
 
 /**
  * Parses Goose's `--output-format json` envelope and returns the
- * concatenated text of all assistant messages. Returns null if the
+ * concatenated text of this turn's assistant messages. Returns null if the
  * envelope is missing, malformed, or has no assistant text — the caller
  * falls back to the raw stripped output in that case.
  *
@@ -80,33 +157,30 @@ export function stripAnsi(text: string): string {
  * with intermediate tool calls produces multiple assistant messages
  * separated by tool-call/tool-result entries. Concatenating their text
  * preserves the model's narrative without surfacing the tool chrome.
+ *
+ * A resumed named session lists the whole conversation, so only the
+ * messages after the last user message with text (this turn's prompt; tool
+ * results carry no text item) belong to this turn.
  */
 export function extractAssistantText(stdout: string): string | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(stdout);
-  } catch {
-    return null;
-  }
-
+  assertAgentResponseOutputBound(stdout);
+  const parsed = parseGooseEnvelope(stdout);
   if (!parsed || typeof parsed !== 'object') return null;
   const messages = (parsed as { messages?: unknown }).messages;
   if (!Array.isArray(messages)) return null;
 
-  const segments: string[] = [];
-  for (const m of messages) {
-    if (!m || typeof m !== 'object') continue;
-    const msg = m as { role?: unknown; content?: unknown };
-    if (msg.role !== 'assistant') continue;
-    if (!Array.isArray(msg.content)) continue;
-    for (const c of msg.content) {
-      if (!c || typeof c !== 'object') continue;
-      const item = c as { type?: unknown; text?: unknown };
-      if (item.type === 'text' && typeof item.text === 'string') {
-        segments.push(item.text);
-      }
-    }
-  }
+  const typed = messages.filter(
+    (m): m is { readonly role?: unknown; readonly content?: unknown } => m !== null && typeof m === 'object',
+  );
+  let turnStart = 0;
+  typed.forEach((message, index) => {
+    if (message.role === 'user' && messageTexts(message).length > 0) turnStart = index + 1;
+  });
+
+  const segments = typed
+    .slice(turnStart)
+    .filter((message) => message.role === 'assistant')
+    .flatMap((message) => messageTexts(message));
 
   if (segments.length === 0) return null;
   return segments.join('\n\n').trim();
@@ -158,37 +232,63 @@ fi
 if [ -n "$IRONCURTAIN_INITIAL_COLS" ] && [ -n "$IRONCURTAIN_INITIAL_ROWS" ]; then
   stty cols "$IRONCURTAIN_INITIAL_COLS" rows "$IRONCURTAIN_INITIAL_ROWS" 2>/dev/null
 fi
+
+# The host names the session after the IronCurtain session id, so a resumed
+# PTY session finds it in the mounted session store.
+SESSION_ARGS=()
+if [ -n "$${PTY_SESSION_NAME_ENV}" ]; then
+  SESSION_ARGS=(--name "$${PTY_SESSION_NAME_ENV}")
+fi
+
+# shellcheck disable=SC2086
+if [ -n "$${PTY_RESUME_FLAGS_ENV}" ] && [ \${#SESSION_ARGS[@]} -gt 0 ]; then
+  # Continue the named session; if it cannot be resumed, start it fresh.
+  goose session "\${SESSION_ARGS[@]}" $${PTY_RESUME_FLAGS_ENV}
+  STATUS=$?
+  if [ $STATUS -eq 0 ]; then
+    exit 0
+  fi
+fi
+
 # Write system prompt to temp file for --instructions
 PROMPT_FILE=$(mktemp /tmp/goose-prompt-XXXXXX.md)
 trap 'rm -f "$PROMPT_FILE"' EXIT
 printf '%s' "$IRONCURTAIN_SYSTEM_PROMPT" > "$PROMPT_FILE"
-exec goose run -s -i "$PROMPT_FILE"
+exec goose run -s "\${SESSION_ARGS[@]}" -i "$PROMPT_FILE"
 `;
 }
 
 // ─── Adapter Factory ─────────────────────────────────────────
 
 /**
- * Creates a Goose agent adapter configured with the user's provider preferences.
- *
- * @param userConfig - Resolved user config. When undefined, uses defaults
- *   (anthropic provider, default model). This enables --list-agents to work
- *   without loading config.
+ * The Goose session name for a batch conversation: the agent conversation id
+ * itself, validated so it can only ever be a single `--name` value.
  */
-export function createGooseAdapter(userConfig?: ResolvedUserConfig): AgentAdapter {
-  const gooseProvider: GooseProvider = userConfig?.gooseProvider ?? 'anthropic';
-  const gooseModel: string = userConfig?.gooseModel ?? 'claude-sonnet-4-20250514';
+function gooseSessionName(conversationId: string): string {
+  if (!isConversationName(conversationId)) {
+    throw new Error(`Invalid Goose session name: ${JSON.stringify(conversationId)}`);
+  }
+  return conversationId;
+}
 
-  const credentialHelpText =
-    `No API key found for Goose provider "${gooseProvider}". ` +
-    'Set the appropriate API key in your environment ' +
-    '(ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY) ' +
-    'or via `ironcurtain config`.';
-
+/**
+ * Creates the Goose agent adapter. It takes no configuration: the provider
+ * and model come from the per-session config on every call
+ * ({@link resolveGooseSelection}), so `--list-agents` and the first-start
+ * wizard can register it before any config exists, and a daemon applies
+ * config edits to its next session without a restart.
+ */
+export function createGooseAdapter(): AgentAdapter {
   const adapter: AgentAdapter = {
     id: 'goose' as AgentId,
     displayName: 'Goose',
-    credentialHelpText,
+    credentialHelpText(config: IronCurtainConfig): string {
+      const { provider } = resolveGooseSelection(config);
+      return (
+        `No API key found for Goose provider "${provider}". ` +
+        `Set ${PROVIDER_ENV_VARS[provider]} in your environment or configure it via \`ironcurtain config\`.`
+      );
+    },
     // Path Goose's native skill discovery scans. No batch args or PTY env —
     // Goose auto-discovers from this fixed path.
     skills: { containerPath: '/home/codespace/.config/goose/skills' },
@@ -198,9 +298,13 @@ export function createGooseAdapter(userConfig?: ResolvedUserConfig): AgentAdapte
       return GOOSE_IMAGE;
     },
 
+    // Checked against the qualified range once per image build (best-effort:
+    // output without a version is only logged).
+    versionProbe: ['goose', '--version'],
+    cliVersion: GOOSE_CLI_VERSION,
+
     generateMcpConfig(socketPath: string): AgentConfigFile[] {
-      const isTcp = socketPath.includes(':');
-      const connectTarget = isTcp ? `TCP:${socketPath}` : `UNIX-CONNECT:${socketPath}`;
+      const transport = mcpClientCommand(socketPath);
 
       const yaml = [
         'GOOSE_TELEMETRY_ENABLED: false',
@@ -209,10 +313,12 @@ export function createGooseAdapter(userConfig?: ResolvedUserConfig): AgentAdapte
         '    name: IronCurtain Sandbox',
         '    type: stdio',
         '    enabled: true',
-        '    cmd: socat',
+        `    cmd: ${transport.command}`,
         '    args:',
-        '      - STDIO',
-        `      - ${connectTarget}`,
+        ...transport.args.map((arg) => `      - ${transport.tcp ? JSON.stringify(arg) : arg}`),
+        // Goose inherits the process environment for local stdio children.
+        // env_keys performs a secret lookup and rejects an absent token,
+        // which would break the retained tokenless host-only transport.
         '    timeout: 600',
         '',
       ].join('\n');
@@ -228,19 +334,16 @@ export function createGooseAdapter(userConfig?: ResolvedUserConfig): AgentAdapte
       ];
     },
 
+    // Each conversation is a named Goose session in the mounted session
+    // store: the first turn creates it (`--name <conversation id>`, system
+    // prompt plus message), later turns continue it (`--resume`, the message
+    // alone; the session already holds the orientation). Session arguments
+    // travel as positional parameters ("$@"), never inside the script text.
     // Client-owned model selection passes batch overrides via --model. Other
-    // routes retain the GOOSE_MODEL startup selection. Batch calls don't resume.
-    buildCommand(
-      message: string,
-      systemPrompt: string,
-      options: {
-        readonly sessionId: string;
-        readonly firstTurn: boolean;
-        readonly modelOverride?: string;
-        readonly providerProfile?: import('../../config/user-config.js').ResolvedProviderProfile;
-      },
-    ): readonly string[] {
-      const instructions = `${systemPrompt}\n\n---\n\nUser request:\n${message}`;
+    // routes retain the GOOSE_MODEL startup selection.
+    buildCommand(message: string, systemPrompt: string, options: AgentCommandOptions): readonly string[] {
+      const resume = !options.firstTurn;
+      const instructions = resume ? message : `${systemPrompt}\n\n---\n\nUser request:\n${message}`;
       const { delimiter } = escapeHeredoc(instructions);
       const modelOverride = options.modelOverride
         ? resolveGatewayCommandModel(options.providerProfile, options.modelOverride, 'goose')
@@ -252,9 +355,12 @@ export function createGooseAdapter(userConfig?: ResolvedUserConfig): AgentAdapte
         `PROMPT_FILE=$(mktemp /tmp/goose-prompt-XXXXXX.md) && ` +
           `trap 'rm -f "$PROMPT_FILE"' EXIT && ` +
           `cat > "$PROMPT_FILE" << '${delimiter}'\n${instructions}\n${delimiter}\n` +
-          `goose run --no-session --quiet --output-format json -i "$PROMPT_FILE"` +
-          (modelOverride ? ' "$@"' : ''),
-        ...(modelOverride ? ['ironcurtain-goose', '--model', modelOverride] : []),
+          `goose run --quiet --output-format json -i "$PROMPT_FILE" "$@"`,
+        'ironcurtain-goose',
+        '--name',
+        gooseSessionName(options.sessionId),
+        ...(resume ? ['--resume'] : []),
+        ...(modelOverride ? ['--model', modelOverride] : []),
       ];
     },
 
@@ -268,12 +374,19 @@ export function createGooseAdapter(userConfig?: ResolvedUserConfig): AgentAdapte
     getProviders(config: IronCurtainConfig, _authKind?: DockerAuthKind): readonly ProviderConfig[] {
       const gateway = gatewayProviders(config, 'chat', 'goose', ['gpt-4o-mini']);
       if (gateway) return gateway;
-      // Goose uses exactly one provider based on user config.
+      // Goose uses exactly one provider, the session's configured one.
       // The authKind parameter is ignored because Goose does not support OAuth.
-      return [getProviderConfig(gooseProvider)];
+      return [getProviderConfig(resolveGooseSelection(config).provider)];
     },
 
     buildEnv(config: IronCurtainConfig, fakeKeys: ReadonlyMap<string, string>): Record<string, string> {
+      const { provider: gooseProvider, model: gooseModel } = resolveGooseSelection(config);
+      // Goose reads its agentic-turn cap from the environment at container
+      // start, so the per-turn step budget is applied here rather than per
+      // `buildCommand` (defence in depth; see AgentAdapter.buildCommand).
+      // Omitted when the operator disabled the step limit.
+      const maxTurns = resolveMaxAgentTurns(config);
+      const maxTurnsEnv: Record<string, string> = maxTurns === undefined ? {} : { GOOSE_MAX_TURNS: String(maxTurns) };
       const profile = gatewayProfile(config.activeProviderProfile);
       if (profile) {
         const client = resolveChatClient(profile, gooseModel);
@@ -282,7 +395,7 @@ export function createGooseAdapter(userConfig?: ResolvedUserConfig): AgentAdapte
           GOOSE_MODEL: client.model,
           [client.credentialEnv]: gatewaySentinel(fakeKeys, client.route.host),
           GOOSE_MODE: 'auto',
-          GOOSE_MAX_TURNS: '200',
+          ...maxTurnsEnv,
           SSL_CERT_FILE: CONTAINER_RUNTIME_CA_BUNDLE,
           SSL_CERT_DIR: '/etc/ssl/certs',
         };
@@ -298,7 +411,7 @@ export function createGooseAdapter(userConfig?: ResolvedUserConfig): AgentAdapte
         GOOSE_PROVIDER: gooseProvider,
         GOOSE_MODEL: gooseModel,
         GOOSE_MODE: 'auto',
-        GOOSE_MAX_TURNS: '200',
+        ...maxTurnsEnv,
         // Defensive TLS cert env vars for Rust-based Goose.
         // Covers native-tls and rustls-native-certs backends.
         SSL_CERT_FILE: CONTAINER_RUNTIME_CA_BUNDLE,
@@ -347,7 +460,8 @@ export function createGooseAdapter(userConfig?: ResolvedUserConfig): AgentAdapte
      * in `../agent-adapter.ts` for the interface-level requirement on
      * adapters.
      */
-    extractResponse(exitCode: number, stdout: string): AgentResponse {
+    extractResponse(exitCode: number, stdout: string, stderr = ''): AgentResponse {
+      assertAgentResponseOutputBound(stdout, stderr);
       const clean = stripAnsi(stdout);
 
       if (exitCode !== 0) {
@@ -383,9 +497,21 @@ export function createGooseAdapter(userConfig?: ResolvedUserConfig): AgentAdapte
       // goose provider's API-key detection.
       const openRouter = gatewayCredential(config);
       if (openRouter) return openRouter;
-      const key = resolveApiKeyForProvider(gooseProvider, config.userConfig);
+      const key = resolveApiKeyForProvider(resolveGooseSelection(config).provider, config.userConfig);
       if (key) return { kind: 'apikey', key };
       return { kind: 'none' };
+    },
+
+    getConversationStateConfig(): ConversationStateConfig {
+      return {
+        hostDirName: 'goose-state',
+        containerMountPath: GOOSE_SESSIONS_CONTAINER_DIR,
+        // Goose creates its store on first use; nothing to seed.
+        seed: [],
+        // `goose session --name <IRONCURTAIN_SESSION_NAME> --resume` (start-goose.sh).
+        resumeFlags: ['--resume'],
+        transcriptLayout: 'goose-sessions',
+      };
     },
   };
 

@@ -1,18 +1,37 @@
 # Workflow-Scoped Docker Containers
 
+**Status (2026-11-14):** Implemented: Steps 1 to 5 and 7 shipped; Step 6 (`freshContainer`) was superseded by `containerScope` (`workflow-session-identity.md`).
+
 ## Implementation status
 
-**Steps 1-5 shipped** on branch `feat/session-borrow-path` (PR: *"workflow shared-container mode"*). Step 7 shipped as the opt-in snapshot-resume follow-up on `feat/workflow-container-snapshot-resume`; Step 6 remains follow-up work.
+Resumed workflow resources are validated against the run's own real
+`workflow-skills` and `workflow-scripts` roots before consumption. External
+imports copy those roots into the new local run using bounded no-follow file
+operations, and standalone resumes apply the same validation. Foreign runs
+must carry `definition.json`; their checkpoints cannot select an original
+package for definition reads or missing-stage recovery. Original-package
+recovery remains available only for this home's own workflow runs. The CLI
+`--trust` flag continues to authorize reviewed host commands, without changing
+these filesystem rules.
 
-| Step | §9 entry | Status |
-|------|----------|--------|
-| 1 | PolicyEngine + AuditLog centralization | shipped (master, `30e7510`) |
-| 2 | `DockerInfrastructure` bundle + `DockerAgentSession` ownership refactor | shipped (master, `be3bdce`) |
-| 3 | Audit rotation + policy reload plumbing in the coordinator | shipped (master, `2d961d4`) -- see deviation D1 (rotate API dropped) |
-| 4 | Session-side borrow path | shipped (branch, `963f793`) |
-| 5 | Engine-owned workflow infrastructure | shipped (branch, `d53b017` + `9918ad7` + follow-ups) |
-| 6 | Validation for `freshContainer` + `freshSession` | **pending** |
-| 7 | Resume reclamation | shipped (snapshot resume follow-up) |
+Imports refuse existing destination runs before writing. The runtime threads
+the actual run directory into infrastructure preparation: scripts are checked
+before dependency-manifest reads, before staging a mount, and again when the
+container mount plan is built. Workflow skill discovery pins its canonical
+root, and both run staging and bundle skill copying use bounded no-follow
+file operations. User-maintained skill layers retain their link semantics.
+
+**Steps 1-5 shipped** on branch `feat/session-borrow-path` (PR: _"workflow shared-container mode"_). Step 7 shipped as the opt-in snapshot-resume follow-up on `feat/workflow-container-snapshot-resume`. Step 6 was re-scoped (2026-11): `freshContainer` was retired in favor of `containerScope` (`workflow-session-identity.md`), and what Step 6 asked for is the validation of `containerScope` and `freshSession` in `src/workflow/validate.ts` (scope charset and placement, one scope per fan-out segment, no `freshSession: false` on concurrent lanes, one persona per shared scope unless `settings.allowMixedPersonas`). The topology sketches below that list a `memory` relay among a bundle's subprocesses predate WP-68: a shared-container workflow bundle never has a memory relay, and the sessions that borrow it run without memory (`per-persona-memory-optin.md`).
+
+| Step | §9 entry                                                                | Status                                                               |
+| ---- | ----------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| 1    | PolicyEngine + AuditLog centralization                                  | shipped (master, `30e7510`)                                          |
+| 2    | `DockerInfrastructure` bundle + `DockerAgentSession` ownership refactor | shipped (master, `be3bdce`)                                          |
+| 3    | Audit rotation + policy reload plumbing in the coordinator              | shipped (master, `2d961d4`) -- see deviation D1 (rotate API dropped) |
+| 4    | Session-side borrow path                                                | shipped (branch, `963f793`)                                          |
+| 5    | Engine-owned workflow infrastructure                                    | shipped (branch, `d53b017` + `9918ad7` + follow-ups)                 |
+| 6    | Validation for `freshContainer` + `freshSession`                        | superseded: `containerScope` + `freshSession` validation (see above) |
+| 7    | Resume reclamation                                                      | shipped (snapshot resume follow-up)                                  |
 
 Several concrete decisions diverged from this design during implementation. The most
 load-bearing ones (single `audit.jsonl` with a `persona` field; consolidated
@@ -99,7 +118,7 @@ the outer orchestrator flow; the container dies at that point.)
 ### `freshSession` today
 
 `AgentStateDefinition.freshSession` (`src/workflow/types.ts:134`) is a boolean
-controlling whether the same *agent* session is reused across re-entries into
+controlling whether the same _agent_ session is reused across re-entries into
 the same state. When `false`, `executeAgentState()` threads
 `resumeSessionId: context.sessionsByState[stateId]` into `SessionOptions`
 (`src/workflow/orchestrator.ts:784`). On the Docker side this triggers `claude
@@ -114,44 +133,44 @@ The earlier draft of this document assumed "the MCP proxy" was a single process
 with a single `PolicyEngine`, a single `AuditLog`, and one place to attach a
 control socket. That is not what the code does. The actual topology:
 
-* **Sandbox orchestration point.** `Sandbox.initialize()` at
+- **Sandbox orchestration point.** `Sandbox.initialize()` at
   `src/sandbox/index.ts:294` registers one entry in the UTCP `mcpServers` map
   **per backend MCP server** (`src/sandbox/index.ts:374-406`). Each entry's
   `command` + `args` points at `mcp-proxy-server.ts`; the per-entry `env`
   carries `SERVER_FILTER=<serverName>` so that subprocess connects to exactly
   one backend. An additional entry with `SERVER_FILTER=proxy` is registered
   when `MITM_CONTROL_ADDR` is set (virtual-only mode for domain management).
-* **N proxy subprocesses.** Every entry in that map becomes its own child
+- **N proxy subprocesses.** Every entry in that map becomes its own child
   process, spawned by UTCP / the MCP SDK's stdio transport. For a workflow
   with `filesystem`, `git`, `memory`, plus the virtual `proxy` entry, there
   are four `mcp-proxy-server.ts` processes running simultaneously under the
   Sandbox.
-* **Per-subprocess security primitives.** Each subprocess independently:
-  * reads the same `AUDIT_LOG_PATH`, `GENERATED_DIR`, `PROTECTED_PATHS`,
+- **Per-subprocess security primitives.** Each subprocess independently:
+  - reads the same `AUDIT_LOG_PATH`, `GENERATED_DIR`, `PROTECTED_PATHS`,
     `ALLOWED_DIRECTORY` env vars (`src/trusted-process/mcp-proxy-server.ts:467`);
-  * constructs its own `PolicyEngine` from the loaded artifacts
+  - constructs its own `PolicyEngine` from the loaded artifacts
     (`src/trusted-process/mcp-proxy-server.ts:1120-1128`);
-  * opens its own `AuditLog` appending to the shared file
+  - opens its own `AuditLog` appending to the shared file
     (`src/trusted-process/mcp-proxy-server.ts:1129`; `src/trusted-process/audit-log.ts:11-17`);
-  * creates its own `CallCircuitBreaker` (line 1130) and `ApprovalWhitelist`
+  - creates its own `CallCircuitBreaker` (line 1130) and `ApprovalWhitelist`
     (line 1400).
-* **In-process mode** (`src/trusted-process/index.ts`) is the exception: one
+- **In-process mode** (`src/trusted-process/index.ts`) is the exception: one
   `TrustedProcess` instance owns a single `PolicyEngine`, `AuditLog`,
   `MCPClientManager`, and `ApprovalWhitelist`. This is what the proxy-mode
   topology should look like but today does not.
 
 The implications:
 
-* There is no "the proxy" to attach a control socket to. A naive UDS at
+- There is no "the proxy" to attach a control socket to. A naive UDS at
   `mcp-proxy-control.sock` inside `main()` would be bound by whichever
   subprocess won the race, or by all of them if each picked a unique path --
   neither is useful.
-* A `loadPolicy` command would have to fan out to every subprocess and be
+- A `loadPolicy` command would have to fan out to every subprocess and be
   ack'd by every subprocess to guarantee no state ran under a stale engine.
   That is a multi-writer coordination problem with no clean solution (e.g.,
   what if the filesystem subprocess acks but the git subprocess crashes
   mid-reload?).
-* All N subprocesses today write into the same `AuditLog` file descriptor
+- All N subprocesses today write into the same `AuditLog` file descriptor
   from different processes. Node's `WriteStream` `{ flags: 'a' }` relies on
   POSIX `O_APPEND` atomicity, which holds for short writes (< `PIPE_BUF`,
   typically 4 KiB) but is not guaranteed for longer JSONL lines containing
@@ -274,21 +293,21 @@ From `mcp-proxy-server.ts` (currently in `main()` around lines 1086-1134,
 and within `handleCallTool` lines 686-1049) to the new coordinator in the
 Sandbox layer:
 
-* `loadGeneratedPolicy()` call + artifact parsing (lines 1104-1108).
-* `new PolicyEngine(...)` construction (line 1120).
-* `new AuditLog(auditLogPath, ...)` construction (line 1129).
-* `new CallCircuitBreaker()` construction (line 1130).
-* `createApprovalWhitelist()` (line 1400).
-* `ServerContextMap` (the local Map at the handler site, line 1387).
-* Auto-approver model construction (`createAutoApproveModel`, lines 1132
+- `loadGeneratedPolicy()` call + artifact parsing (lines 1104-1108).
+- `new PolicyEngine(...)` construction (line 1120).
+- `new AuditLog(auditLogPath, ...)` construction (line 1129).
+- `new CallCircuitBreaker()` construction (line 1130).
+- `createApprovalWhitelist()` (line 1400).
+- `ServerContextMap` (the local Map at the handler site, line 1387).
+- Auto-approver model construction (`createAutoApproveModel`, lines 1132
   and 393) including its dependency on `AUTO_APPROVE_MODEL_ID` /
   `AUTO_APPROVE_API_KEY` env vars.
-* Whitelist candidate and escalation logic -- the whole flow from
+- Whitelist candidate and escalation logic -- the whole flow from
   `policyEngine.evaluate()` through `waitForEscalationDecision()` to the
   audit write (`mcp-proxy-server.ts:795-960`).
-* Argument normalization (`prepareToolArgs`) and git enrichment (the
+- Argument normalization (`prepareToolArgs`) and git enrichment (the
   `toolInfo.serverName === 'git'` branch at `mcp-proxy-server.ts:759-785`).
-* **Schema-based argument validation** (`validateToolArguments` against
+- **Schema-based argument validation** (`validateToolArguments` against
   `inputSchema`, `mcp-proxy-server.ts:720`). This moves because it is
   coupled to two coordinator-owned concerns: (a) the "trusted servers"
   check (`policyEngine.isTrustedServer(...)`) skips validation for trusted
@@ -301,11 +320,11 @@ Sandbox layer:
   `isTrustedServer` back down and duplicating audit logic; moving it up
   keeps "all policy-gate outcomes are emitted from one place" invariant.
   The subprocess receives already-validated argument shapes.
-* **`ServerContext` post-success update** (`updateServerContext`,
+- **`ServerContext` post-success update** (`updateServerContext`,
   `mcp-proxy-server.ts:1034`). This fires after a successful tool response
   (e.g., it mirrors `git_set_working_dir` / `git_clone` into the map so
   later calls can enrich escalation prompts and fill in implicit `path`
-  args). In the coordinator, this is the *post-call* step that runs after
+  args). In the coordinator, this is the _post-call_ step that runs after
   the tool-router subprocess returns a successful result and before the
   coordinator returns to UTCP. See the ordering spec below.
 
@@ -319,10 +338,14 @@ handleToolCall(request):
      If missing AND not trusted → audit deny, return.
   2. If NOT trusted server: validateToolArguments(rawArgs, inputSchema).
      On failure → audit { policyDecision: deny, rule: "invalid-arguments" },
-     return.                                                          (B1.1)
+     return. Then deny any key the stored annotation does not classify
+     (audit, rule: "unannotated-arguments"), whatever the live schema
+     accepts.                                                         (B1.1)
   3. Normalize args: prepareToolArgs(...) produces {argsForTransport,
-     argsForPolicy}. Git-path enrichment branch runs here, reading
-     serverContextMap for git_set_working_dir / git_clone state.
+     argsForPolicy}, both carrying the same absolute canonical path for
+     path roles. Git-path enrichment branch runs here, reading
+     serverContextMap for the git_set_working_dir state (cleared by
+     git_clear_working_dir).
   4. policyEngine.evaluate(request{args: argsForPolicy}).
   5. Apply auto-approve / whitelist / circuit breaker / human escalation
      (serialized with respect to each other -- see B3 below).
@@ -349,30 +372,30 @@ handleToolCall(request):
 
 Ordering invariants:
 
-* Step 2 (validation) strictly precedes step 4 (policy evaluation) --
+- Step 2 (validation) strictly precedes step 4 (policy evaluation) --
   `prepareToolArgs` assumes a well-formed argument shape.
-* Step 6 (audit write for deny / pre-call failure) happens before any
+- Step 6 (audit write for deny / pre-call failure) happens before any
   early return; step 11 (audit write for success) happens after the
   MCP dispatch completes. This mirrors today's dual-write pattern and
   is the reason step 6 is described as "both before and after depending
   on decision" rather than strictly first.
-* Step 10 (server-context update) runs **only** on `result.isError ===
-  false`. A failed git call must not mutate the working-directory
+- Step 10 (server-context update) runs **only** on `result.isError ===
+false`. A failed git call must not mutate the working-directory
   cache.
 
 What stays in each `mcp-proxy-server` subprocess:
 
-* MCP client transport setup (stdio, `StdioClientTransport`).
-* OAuth credential injection and `TokenFileRefresher`
+- MCP client transport setup (stdio, `StdioClientTransport`).
+- OAuth credential injection and `TokenFileRefresher`
   (`mcp-proxy-server.ts:1165-1246`). These are keyed by server name and
   best-kept co-located with the outbound connection.
-* Sandbox-runtime (srt) wrapping of the backend command
+- Sandbox-runtime (srt) wrapping of the backend command
   (`wrapServerCommand`, `writeServerSettings` etc.).
-* `ListToolsRequestSchema` / `CallToolRequestSchema` handlers -- but the
+- `ListToolsRequestSchema` / `CallToolRequestSchema` handlers -- but the
   `CallTool` handler becomes a pure forward: receive the call, dispatch to
   the real backend client, return the raw result. No policy evaluation, no
   audit write, no schema validation, no server-context update.
-* **Virtual-only mode with `MITM_CONTROL_ADDR`.** The `SERVER_FILTER=proxy`
+- **Virtual-only mode with `MITM_CONTROL_ADDR`.** The `SERVER_FILTER=proxy`
   subprocess still hosts the `add_proxy_domain` /
   `remove_proxy_domain` / `list_proxy_domains` tools whose
   implementation calls the MITM control API via `ControlApiClient`
@@ -417,12 +440,12 @@ the manager and owns policy + audit.
 
 Concretely:
 
-* `MCPClientManager` grows a `callTool(serverName, toolName, args)` method
+- `MCPClientManager` grows a `callTool(serverName, toolName, args)` method
   if it does not already have one (it already supports `listTools`).
-* The Sandbox's `ToolCallCoordinator.handleToolCall(request)` runs the
+- The Sandbox's `ToolCallCoordinator.handleToolCall(request)` runs the
   full policy + audit logic, then calls `mcpManager.callTool(...)` when
   the decision is allow.
-* UTCP Code Mode's generated `execute_code` layer, which today routes tool
+- UTCP Code Mode's generated `execute_code` layer, which today routes tool
   calls to the subprocess via UTCP's MCP call-template, instead routes to
   the coordinator via an in-process UTCP communication protocol registered
   by IronCurtain. The coordinator routes out to the subprocess through
@@ -447,11 +470,8 @@ two-line mutation of two static registries, used by `@utcp/mcp` itself:
 
 ```typescript
 // From node_modules/@utcp/mcp/dist/index.js, register():
-CallTemplateSerializer.registerCallTemplate(
-  'mcp', new McpCallTemplateSerializer(), override
-);
-CommunicationProtocol.communicationProtocols['mcp'] =
-  new McpCommunicationProtocol();
+CallTemplateSerializer.registerCallTemplate('mcp', new McpCallTemplateSerializer(), override);
+CommunicationProtocol.communicationProtocols['mcp'] = new McpCommunicationProtocol();
 ```
 
 IronCurtain can mirror this pattern: define a new call template type
@@ -507,12 +527,12 @@ which the new protocol still produces.
 
 Concretely for `src/sandbox/index.ts:361-412`:
 
-* The per-backend `mcpServers` record-building loop (lines 361-406) is
+- The per-backend `mcpServers` record-building loop (lines 361-406) is
   deleted. Both the regular backend entries and the virtual-proxy
   `mcpServers['proxy']` entry (lines 394-406) go away from this
   callsite -- but the virtual-proxy subprocess itself is still spawned,
   just by the coordinator's `MCPClientManager` instead of by UTCP.
-* The `registerManual` call (line 408-412) changes to:
+- The `registerManual` call (line 408-412) changes to:
   ```typescript
   const registration = await this.client.registerManual({
     name: 'tools',
@@ -522,7 +542,7 @@ Concretely for `src/sandbox/index.ts:361-412`:
     config: { coordinator: this.coordinator },
   });
   ```
-* A one-time side-effect import (or explicit `register()` call) in
+- A one-time side-effect import (or explicit `register()` call) in
   `Sandbox.initialize()`, analogous to the `import '@utcp/mcp'` on
   `src/sandbox/index.ts:12`, installs the `'ironcurtain'` protocol into
   UTCP's static maps. It is safe to call `register()` multiple times
@@ -538,11 +558,11 @@ reusing the one that already works.
 
 The protocol is:
 
-* Subprocess -> coordinator: standard MCP responses (tool lists, tool
+- Subprocess -> coordinator: standard MCP responses (tool lists, tool
   results, errors).
-* Coordinator -> subprocess: standard MCP requests (`tools/list`,
+- Coordinator -> subprocess: standard MCP requests (`tools/list`,
   `tools/call`).
-* Policy decisions, audit entries, approval whitelist matches, circuit
+- Policy decisions, audit entries, approval whitelist matches, circuit
   breaker verdicts: **never cross the boundary**. They live entirely in
   the coordinator process. The subprocess has no `PolicyEngine` instance
   and no `AuditLog` instance.
@@ -552,7 +572,7 @@ ambiguity entirely. The subprocess's only responsibility is "dispatch MCP
 calls to the real backend and forward the result." That is narrow enough
 to make its failure modes easy to reason about (see §2.1.5).
 
-Note on the coordinator ↔ UTCP boundary: this is *not* MCP. UTCP calls
+Note on the coordinator ↔ UTCP boundary: this is _not_ MCP. UTCP calls
 `IronCurtainCommunicationProtocol.callTool` directly as a JavaScript
 method in the host process; the coordinator returns a plain result
 object. Only the coordinator ↔ subprocess boundary uses MCP over
@@ -563,7 +583,7 @@ downward) with the policy gate precisely in between.
 
 Both move to the coordinator. Rationale:
 
-* **CallCircuitBreaker.** Its job is to detect "same tool+args called
+- **CallCircuitBreaker.** Its job is to detect "same tool+args called
   repeatedly in a short window." Today, each subprocess has its own window
   on its own server's calls, so the threshold effectively applies
   per-server. That's fine in practice (a filesystem runaway doesn't
@@ -571,13 +591,13 @@ Both move to the coordinator. Rationale:
   centralization the breaker sees all calls and can apply a consistent
   threshold across the whole session. No behavioral regression expected;
   the threshold constants stay the same.
-* **ApprovalWhitelist.** Already session-scoped by design. The current
+- **ApprovalWhitelist.** Already session-scoped by design. The current
   per-subprocess split means a user approving a filesystem escalation
   cannot have that approval match a git escalation -- but today this does
   not come up because each whitelist pattern is keyed by `(server, tool,
-  args)` anyway. Centralizing is pure cleanup: one less duplicated
+args)` anyway. Centralizing is pure cleanup: one less duplicated
   in-memory store, one less place for subtle divergence.
-* **ServerContextMap.** Already needs to be consistent across
+- **ServerContextMap.** Already needs to be consistent across
   backend-server subprocesses when, e.g., `git_set_working_dir`'s
   effect is read by a later `git_status` call. Today those land in
   different in-process maps because the git subprocess is the only one
@@ -591,10 +611,10 @@ synchronous, so concurrent tool calls queue on the event loop. The
 coordinator's `handleToolCall` is `async`, with the following awaited
 interleaving points:
 
-* `await escalation` (human approval) -- the engine has already produced
+- `await escalation` (human approval) -- the engine has already produced
   a decision; the `await` is waiting for the human, not for the engine.
-* `await auditLog.log()` (if rotation is in progress -- see §4).
-* `await mcpManager.callTool(...)` (backend request out).
+- `await auditLog.log()` (if rotation is in progress -- see §4).
+- `await mcpManager.callTool(...)` (backend request out).
 
 `PolicyEngine.evaluate()` itself is stateless w.r.t. call inputs -- it
 reads `compiledPolicy`, `annotationMap`, `protectedPaths`, etc., all
@@ -612,7 +632,11 @@ will race under genuinely concurrent `handleToolCall` invocations:
 2. **`CallCircuitBreaker`** (`src/trusted-process/call-circuit-breaker.ts`) --
    sliding-window counter keyed by `(tool, argsHash)`. Each call
    mutates the window. Two concurrent calls to the same tool could
-   both see "under threshold" and both proceed past the limit.
+   both see "under threshold" and both proceed past the limit. (Since
+   WP-112 the window is also keyed by lane, one per agent connection to
+   the Code Mode proxy, so concurrent agents sharing the bundle do not
+   trip each other; an all-lanes window bounds their total at
+   `threshold × maxLanes`.)
 3. **`ServerContextMap`** (`src/trusted-process/server-context.ts`) --
    mutated on success (step 10 of `handleToolCall`, see
    `mcp-proxy-server.ts:1034`) and read during git-path enrichment
@@ -633,11 +657,11 @@ container.
 
 The coordinator carries two distinct mutexes:
 
-* **Policy mutex.** Serializes `loadPolicy` against all other
+- **Policy mutex.** Serializes `loadPolicy` against all other
   coordinator operations. Held only during the policy swap window
   (close audit stream, recompute paths, open new audit stream, replace
   `PolicyEngine` reference). Short-lived; does not cover tool calls.
-* **Tool-call mutex.** Serializes concurrent `handleToolCall`
+- **Tool-call mutex.** Serializes concurrent `handleToolCall`
   invocations against each other. Held for the full pre-call band
   through post-call band of one `handleToolCall` (steps 1-11 above).
   This is what protects `ApprovalWhitelist`, `CallCircuitBreaker`, and
@@ -649,7 +673,9 @@ The coordinator carries two distinct mutexes:
 for the tool-call mutex to be free (no tool call in flight), then
 takes the policy mutex, then does the swap. The tool-call mutex is
 therefore sufficient to rule out "a `handleToolCall` started under
-policy A and finished under policy B."
+policy A and finished under policy B." (As shipped, an escalation wait
+releases the tool-call mutex; `loadPolicy` and `close()` cancel such a
+parked call instead of waiting it out. See §10 D6.)
 
 **Performance implication.** Parallel tool calls from
 parallel-homogeneous states serialize through the coordinator. This
@@ -668,8 +694,8 @@ explicit and race-free.
 
 Two scoping options for the tool-call mutex; v1 chooses A:
 
-* **Option A (simpler, chosen for v1).** Hold the tool-call mutex
-  for the *entire* `handleToolCall` body including the awaited
+- **Option A (simpler, chosen for v1).** Hold the tool-call mutex
+  for the _entire_ `handleToolCall` body including the awaited
   backend dispatch. Conservatively safe; all three caches are read
   or written both before and after the MCP dispatch
   (`ServerContextMap` in particular is mutated post-success in step
@@ -678,7 +704,7 @@ Two scoping options for the tool-call mutex; v1 chooses A:
   therefore a filesystem; true in-flight parallelism is already
   unsafe for most mutating tools and would produce nondeterministic
   results regardless of the mutex.
-* **Option B (optimized, deferred).** Release the tool-call mutex
+- **Option B (optimized, deferred).** Release the tool-call mutex
   just before `await mcpManager.callTool(...)` and re-acquire it
   for the post-call band (`updateServerContext` + audit-success).
   This allows backend calls to overlap across parallel states.
@@ -694,13 +720,13 @@ call A might finish under persona X's policy while call B finishes
 under persona Y's policy, producing an incoherent audit record.
 Reject at one of two layers:
 
-* **Schema-level check (preferred).** `validateDefinition()` in
+- **Schema-level check (preferred).** `validateDefinition()` in
   `src/workflow/validate.ts` already iterates state definitions; add
   a cross-field check that any group of agent states sharing a
   `parallelKey` must also share a `persona` (falling back to the
   inherited persona if any state omits it). Reject at workflow-load
   time with a clear error pointing at the offending states.
-* **Coordinator error (fallback).** If the schema check is
+- **Coordinator error (fallback).** If the schema check is
   bypassed or a future runtime path constructs parallel states
   programmatically, `loadPolicy` detects a mismatched persona/version
   against the currently-running cycle and fails fast with a
@@ -712,7 +738,7 @@ loophole at runtime.
 
 ### 2.2 Workflow container
 
-The four layers that change below reference the *post-centralization*
+The four layers that change below reference the _post-centralization_
 architecture. Each assumes §2.1 has already landed.
 
 #### Engine (`src/workflow/orchestrator.ts`)
@@ -766,9 +792,9 @@ typed object. There is a paired factory and destroyer:
 interface DockerInfrastructure {
   readonly containerId: string;
   readonly containerName: string;
-  readonly sidecarContainerId?: string;    // TCP mode only (macOS)
-  readonly internalNetwork?: string;       // TCP mode only (macOS)
-  readonly proxy: DockerProxy;             // CodeModeProxy; owns the coordinator
+  readonly sidecarContainerId?: string; // TCP mode only (macOS)
+  readonly internalNetwork?: string; // TCP mode only (macOS)
+  readonly proxy: DockerProxy; // CodeModeProxy; owns the coordinator
   readonly mitmProxy: MitmProxy;
   readonly docker: DockerManager;
   readonly ca: CertificateAuthority;
@@ -809,7 +835,7 @@ A function by essentially this name already exists at
 - **Does not** start the container; `DockerAgentSession.initialize()` does
   that today.
 
-The refactor is *almost* a rename plus one new responsibility:
+The refactor is _almost_ a rename plus one new responsibility:
 
 1. **Rename** `prepareDockerInfrastructure` → `createDockerInfrastructure`
    and move the container creation (`docker create` + `docker start` with
@@ -889,7 +915,7 @@ return session;
 ```
 
 **Workflow mode (new, engine-owned):** `WorkflowOrchestrator` creates the
-infrastructure once per workflow run and hands the *same* bundle to every
+infrastructure once per workflow run and hands the _same_ bundle to every
 agent state's session. Each session borrows:
 
 ```typescript
@@ -923,7 +949,7 @@ The current `DockerAgentSessionDeps.preBuiltInfrastructure` field
   already runs the proxy + orientation setup via
   `prepareDockerInfrastructure()` before constructing the session, so the
   session's `initialize()` must skip those steps. After the refactor, the
-  infrastructure is *always* pre-built (because
+  infrastructure is _always_ pre-built (because
   `createDockerInfrastructure()` does everything), so the skip is
   unconditional. The field goes away.
 - A future third caller -- e.g., the daemon pre-building certain proxies
@@ -933,9 +959,9 @@ The current `DockerAgentSessionDeps.preBuiltInfrastructure` field
 
 ##### What each party owns
 
-| Party | Lifecycle | Resources |
-|-------|-----------|-----------|
-| `DockerAgentSession` | One state's execution | Escalation watcher, audit tailer, agent process started via `docker exec` |
+| Party                  | Lifecycle                                                     | Resources                                                                                                                                   |
+| ---------------------- | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DockerAgentSession`   | One state's execution                                         | Escalation watcher, audit tailer, agent process started via `docker exec`                                                                   |
 | `DockerInfrastructure` | Variable -- standalone: one session; workflow: whole workflow | Container, sidecar, internal network, MITM proxy, Code Mode proxy (+contained coordinator, `MCPClientManager`, subprocesses), CA, fake keys |
 
 The bundle is owned by exactly one party at a time: the session when
@@ -957,7 +983,7 @@ is in flight. Together these two mutexes make
 parallel-homogeneous-persona borrowing safe in v1.
 
 Parallel-heterogeneous-persona borrowing (two sessions simultaneously
-borrowing the same bundle under *different* personas) is rejected --
+borrowing the same bundle under _different_ personas) is rejected --
 schema check at workflow load time plus coordinator runtime guard,
 see §2.1 "Parallel heterogeneous personas remain rejected" and §7.
 
@@ -1133,7 +1159,7 @@ protocol and section 6 for orthogonality rules.
 
 - Add `freshContainer: z.boolean().optional()` to the agent state schema.
 - Add a cross-field check: reject any agent state where
-  `freshContainer === true` *and* `freshSession === false`. The combination
+  `freshContainer === true` _and_ `freshSession === false`. The combination
   is nonsensical -- you cannot resume a conversation in a fresh environment
   that does not yet have the prior process state. Emit a validation error
   naming both fields so workflow authors see exactly what to change.
@@ -1154,8 +1180,8 @@ protocol and section 6 for orthogonality rules.
   workflows.
 - Add private method `createWorkflowInfrastructure(instance)`: calls
   `createDockerInfrastructure({ workflowId: instance.id,
-  controlSocketPath: getWorkflowProxyControlSocketPath(instance.id),
-  ... })` and stashes the result on `instance.infra`. Called once from
+controlSocketPath: getWorkflowProxyControlSocketPath(instance.id),
+... })` and stashes the result on `instance.infra`. Called once from
   `start()` and from `resume()` if resume is configured with a Docker
   agent. The engine is now the owner of the bundle; sessions borrow via
   `ownsInfra=false`.
@@ -1173,7 +1199,7 @@ protocol and section 6 for orthogonality rules.
   transition-detection branch at line 655 (`stateValue !== previousState`).
   Implementation subtlety: the invoke fires as part of XState's reducer; the
   engine must issue the `loadPolicy` RPC synchronously from the subscription
-  and *block* the new state's first `sendMessage()` until the ack arrives.
+  and _block_ the new state's first `sendMessage()` until the ack arrives.
   The cleanest place to make that await is inside `executeAgentState()`
   itself (at the top, before `deps.createSession`), since that is where the
   agent work actually begins. `subscribeToActor` only needs to bump the
@@ -1187,7 +1213,7 @@ protocol and section 6 for orthogonality rules.
     `subscribeToActor`), so re-entries correctly increment.
   - Pass `workflowInfrastructure: instance.infra` in `SessionOptions`
     when present. The session will construct itself with
-    `ownsInfra=false`, so its `close()` will *not* destroy the bundle.
+    `ownsInfra=false`, so its `close()` will _not_ destroy the bundle.
   - Pre-step: if `stateConfig.freshContainer === true`, call
     `rebuildWorkflowInfrastructure(instance)` before cycling policy.
     This calls `destroyDockerInfrastructure(instance.infra)` followed
@@ -1243,7 +1269,7 @@ protocol and section 6 for orthogonality rules.
   - When unset (standalone): call `createDockerInfrastructure()` (new
     name for `prepareDockerInfrastructure()`, now including
     container creation), then construct `DockerAgentSession(infra,
-    /*ownsInfra=*/ true, ...)`. The factory's own error-recovery path
+/*ownsInfra=*/ true, ...)`. The factory's own error-recovery path
     falls through to `session.close()`, which -- because `ownsInfra=true`
     -- calls `destroyDockerInfrastructure()` and undoes the infrastructure
     setup for free. The `session = undefined` guard currently at
@@ -1355,7 +1381,7 @@ protocol and section 6 for orthogonality rules.
   today's `prepareDockerInfrastructure` semantics (modulo the new
   container-creation step).
 - **Add** `destroyDockerInfrastructure(infra: DockerInfrastructure):
-  Promise<void>`. Body is the seven steps currently in
+Promise<void>`. Body is the seven steps currently in
   `DockerAgentSession.close()`:
   ```typescript
   async function destroyDockerInfrastructure(infra: DockerInfrastructure) {
@@ -1449,7 +1475,16 @@ not by the entry. An example entry after this change is byte-identical to one
 from today:
 
 ```json
-{"timestamp":"2026-04-12T18:20:15.874Z","requestId":"1f8d...","serverName":"filesystem","toolName":"read_text_file","arguments":{"path":"/..."},"policyDecision":{"status":"allow","rule":"...","reason":"..."},"result":{"status":"success"},"durationMs":1}
+{
+  "timestamp": "2026-04-12T18:20:15.874Z",
+  "requestId": "1f8d...",
+  "serverName": "filesystem",
+  "toolName": "read_text_file",
+  "arguments": { "path": "/..." },
+  "policyDecision": { "status": "allow", "rule": "...", "reason": "..." },
+  "result": { "status": "success" },
+  "durationMs": 1
+}
 ```
 
 This keeps `AuditLog` and every downstream consumer (`AuditLogTailer`,
@@ -1500,7 +1535,7 @@ mid-parallel-group (see §8).
 - Request: `POST /__ironcurtain/policy/load`,
   `Content-Type: application/json`, body
   `{ "persona": "reviewer", "version": 3, "policyDir": "/abs/path",
-  "auditPath": "/abs/path/audit.reviewer.3.jsonl" }`.
+"auditPath": "/abs/path/audit.reviewer.3.jsonl" }`.
 - Response: 200 with `{ "ok": true, "loadedAt": "<ISO>" }` on success, 4xx
   on malformed input, 5xx with `{ "error": "..." }` on load failure.
 - Failure semantics: if the coordinator cannot load the new policy
@@ -1528,20 +1563,20 @@ mid-parallel-group (see §8).
 Three orthogonal dimensions. The table names what persists into the next
 agent invocation:
 
-| Dimension | What persists when "reuse" | What is fresh when "reset" |
-|-----------|---------------------------|----------------------------|
-| `freshSession: false` (existing) | Agent conversation history (`--continue`) | New session, agent bootstraps from artifacts |
+| Dimension                                                      | What persists when "reuse"                                               | What is fresh when "reset"                                              |
+| -------------------------------------------------------------- | ------------------------------------------------------------------------ | ----------------------------------------------------------------------- |
+| `freshSession: false` (existing)                               | Agent conversation history (`--continue`)                                | New session, agent bootstraps from artifacts                            |
 | Workflow container (NEW, default ON when workflow uses Docker) | Container FS: apt installs, compiled binaries, caches, working dir state | `freshContainer: true` rebuilds; workflow terminal rebuilds on next run |
-| Policy activation (NEW, always cycles per state) | N/A -- policy always reloads | New audit file, `PolicyEngine` reconstructed from persona's policy dir |
+| Policy activation (NEW, always cycles per state)               | N/A -- policy always reloads                                             | New audit file, `PolicyEngine` reconstructed from persona's policy dir  |
 
 ### Valid combinations
 
-| freshSession | freshContainer | Meaning | Valid? |
-|--------------|----------------|---------|--------|
-| `true` (default) | `false` (default) | New agent conversation, same container. Typical case. | Yes |
-| `false` | `false` | Resume conversation, same container. Ideal for iterative refinement (today's `harness_design` retries). | Yes |
-| `true` | `true` | New agent conversation, fresh container. "Hard reset" for the state. | Yes |
-| `false` | `true` | Resume conversation in a container whose process state is gone. The resumed session may reference files or state that no longer exist. | **Rejected at validation time.** |
+| freshSession     | freshContainer    | Meaning                                                                                                                                | Valid?                           |
+| ---------------- | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- |
+| `true` (default) | `false` (default) | New agent conversation, same container. Typical case.                                                                                  | Yes                              |
+| `false`          | `false`           | Resume conversation, same container. Ideal for iterative refinement (today's `harness_design` retries).                                | Yes                              |
+| `true`           | `true`            | New agent conversation, fresh container. "Hard reset" for the state.                                                                   | Yes                              |
+| `false`          | `true`            | Resume conversation in a container whose process state is gone. The resumed session may reference files or state that no longer exist. | **Rejected at validation time.** |
 
 The validator emits a clear error pointing at both fields. This is a static
 check, not a runtime check -- `validateDefinition()` should fail the workflow
@@ -1549,18 +1584,18 @@ before it ever starts.
 
 ### Ownership matrix
 
-| Resource | Owner |
-|----------|-------|
-| Workspace directory | WorkflowOrchestrator |
-| Checkpoint | WorkflowOrchestrator |
-| `DockerInfrastructure` bundle (container, sidecar, internal network, MITM proxy, Code Mode proxy + contained `ToolCallCoordinator` + `MCPClientManager` + subprocesses, CA, fake keys) | WorkflowOrchestrator (workflow mode); DockerAgentSession (standalone mode, via `ownsInfra=true`) |
-| Coordinator control socket | Same party that owns the `DockerInfrastructure` bundle (attached to the bundle's `CodeModeProxy`; exists only in workflow mode) |
-| `PolicyEngine` instance reference (mutable via `loadPolicy`) | `ToolCallCoordinator` |
-| `AuditLog` instance reference (rotated via `rotate()`) | `ToolCallCoordinator` |
-| Policy version counters | WorkflowOrchestrator |
-| Agent conversation state dir | DockerAgentSession (per-session subdirectory of the shared bind mount) |
-| Escalation watcher, audit tailer, agent process (`docker exec`) | DockerAgentSession (always; never part of the infrastructure bundle) |
-| XState actor, transition history, message log | WorkflowOrchestrator (unchanged) |
+| Resource                                                                                                                                                                               | Owner                                                                                                                           |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| Workspace directory                                                                                                                                                                    | WorkflowOrchestrator                                                                                                            |
+| Checkpoint                                                                                                                                                                             | WorkflowOrchestrator                                                                                                            |
+| `DockerInfrastructure` bundle (container, sidecar, internal network, MITM proxy, Code Mode proxy + contained `ToolCallCoordinator` + `MCPClientManager` + subprocesses, CA, fake keys) | WorkflowOrchestrator (workflow mode); DockerAgentSession (standalone mode, via `ownsInfra=true`)                                |
+| Coordinator control socket                                                                                                                                                             | Same party that owns the `DockerInfrastructure` bundle (attached to the bundle's `CodeModeProxy`; exists only in workflow mode) |
+| `PolicyEngine` instance reference (mutable via `loadPolicy`)                                                                                                                           | `ToolCallCoordinator`                                                                                                           |
+| `AuditLog` instance reference (rotated via `rotate()`)                                                                                                                                 | `ToolCallCoordinator`                                                                                                           |
+| Policy version counters                                                                                                                                                                | WorkflowOrchestrator                                                                                                            |
+| Agent conversation state dir                                                                                                                                                           | DockerAgentSession (per-session subdirectory of the shared bind mount)                                                          |
+| Escalation watcher, audit tailer, agent process (`docker exec`)                                                                                                                        | DockerAgentSession (always; never part of the infrastructure bundle)                                                            |
+| XState actor, transition history, message log                                                                                                                                          | WorkflowOrchestrator (unchanged)                                                                                                |
 
 The key shift from prior revisions: there is no per-resource ownership for
 workflow-level Docker handles. The bundle is atomic -- whoever creates it
@@ -1597,11 +1632,18 @@ the image digest.
 If the engine process dies while a state is executing (mid-`sendMessage`),
 the container, subprocesses, and proxies may survive or not:
 
-- The checkpoint reflects the state the workflow was in *before* the
+- The checkpoint reflects the state the workflow was in _before_ the
   currently-executing agent state began (XState persists on entry, not on
   exit). On resume, the engine replays the invoke via
   `replayInvokeForRestoredState()` (`src/workflow/orchestrator.ts:426`).
-  This already works today.
+  This already works today. Execution is therefore at-least-once: the
+  interrupted state runs again from its start, with the same inputs the
+  machine builds (`buildAgentInvokeInput` / `buildDeterministicInvokeInput`),
+  and a replayed agent's prompt opens with a resume notice telling it to
+  inspect the workspace for the earlier attempt's work and not to repeat
+  external actions (pushes, PR comments, messages) that may already have
+  happened (`RESUME_NOTICE` in `prompt-builder.ts`). Deterministic commands
+  get no such signal and must be idempotent.
 - The policy cycle runs again on resume (the engine does not know whether
   the pre-crash run cycled policy successfully, so it does so
   unconditionally). The version counter restarts at 1, so the audit file
@@ -1648,9 +1690,9 @@ In `src/workflow/validate.ts`:
   - For every agent state, if `state.freshContainer === true && state.freshSession === false`:
     emit an issue like
     `"State \"${stateId}\" has freshContainer: true with freshSession: false;
-    resuming a conversation in a fresh environment is nonsensical (the
-    resumed agent may reference files or installed binaries that the new
-    container does not have)."`
+resuming a conversation in a fresh environment is nonsensical (the
+resumed agent may reference files or installed binaries that the new
+container does not have)."`
   - Place the check alongside the existing `parallelKey`/non-agent check
     at `src/workflow/validate.ts:295` for consistency with the style of
     errors already emitted there.
@@ -1660,8 +1702,8 @@ In `src/workflow/validate.ts`:
   persona) must be identical. On mismatch, emit an issue naming the
   `parallelKey` value and the offending states, e.g.
   `"Parallel group \"fanout-1\" has mixed personas (reviewer, builder);
-  parallel states must share a persona because the policy engine is
-  single-tenant per coordinator."`. Rationale in §2.1 "Parallel
+parallel states must share a persona because the policy engine is
+single-tenant per coordinator."`. Rationale in §2.1 "Parallel
   heterogeneous personas remain rejected." The coordinator also
   enforces this at runtime (mismatched-persona `loadPolicy`), but the
   static check catches it at workflow-load time with a clear
@@ -1683,7 +1725,12 @@ through the single `ToolCallCoordinator`, which serializes them with
 the tool-call mutex described in §2.1's "Concurrency / thread-safety"
 subsection. `ApprovalWhitelist`, `CallCircuitBreaker`, and
 `ServerContextMap` are safe under that mutex; audit entries from
-interleaved callers land as contiguous JSONL records.
+interleaved callers land as contiguous JSONL records. Each agent
+process holds its own connection to the bundle's Code Mode proxy
+socket, and the proxy serves every connection with its own MCP
+`Server` (own JSON-RPC id space, never evicted by a newcomer) over that
+one coordinator -- see `src/docker/code-mode-proxy.ts` and the socket
+transports in `src/trusted-process/`.
 
 What remains out of scope for v1 is parallel **heterogeneous**
 personas -- two parallel states holding different personas and
@@ -1809,7 +1856,7 @@ it to work.
 Suggested implementation sequence (each step is independently shippable and
 does not break prior behavior):
 
-1. **PolicyEngine + AuditLog centralization.** *Status: shipped (`30e7510` feat: centralize PolicyEngine + AuditLog into ToolCallCoordinator).* Lift the policy, audit,
+1. **PolicyEngine + AuditLog centralization.** _Status: shipped (`30e7510` feat: centralize PolicyEngine + AuditLog into ToolCallCoordinator)._ Lift the policy, audit,
    circuit breaker, approval whitelist, auto-approver, and server-context
    primitives out of `mcp-proxy-server.ts` and into the new
    `ToolCallCoordinator` in the Sandbox / CodeModeProxy layer. The
@@ -1821,7 +1868,7 @@ does not break prior behavior):
    it first, soak it in regular single-session use for a release cycle
    before layering the workflow path on top.
 2. **`DockerInfrastructure` bundle + `DockerAgentSession` ownership
-   refactor.** *Status: shipped (`be3bdce` refactor: introduce DockerInfrastructure bundle with explicit lifecycle).* Concrete, landing in one incremental series that does
+   refactor.** _Status: shipped (`be3bdce` refactor: introduce DockerInfrastructure bundle with explicit lifecycle)._ Concrete, landing in one incremental series that does
    not break standalone mode at any point:
    1. Define the extended `DockerInfrastructure` interface in
       `src/docker/docker-infrastructure.ts` (add `containerId`,
@@ -1848,28 +1895,29 @@ does not break prior behavior):
    (create-then-own, destroy-on-close); no workflow caller exists yet.
    Validate by running the full interactive Docker test suite end to end
    before moving on.
-3. **Audit rotation + policy reload plumbing in the coordinator.** *Status: shipped (`2d961d4` feat: policy hot-swap via coordinator control socket). The `AuditLog.rotate()` API in the original proposal was dropped in favor of persona-tagged entries; see deviation D1.* Add
+
+3. **Audit rotation + policy reload plumbing in the coordinator.** _Status: shipped (`2d961d4` feat: policy hot-swap via coordinator control socket). The `AuditLog.rotate()` API in the original proposal was dropped in favor of persona-tagged entries; see deviation D1._ Add
    `AuditLog.rotate()`, the coordinator control socket, and the
    `loadPolicy` endpoint. Ship with no caller exercising it; verify by
    unit test.
-4. **Session-side borrow path.** *Status: shipped (`963f793` feat: session-side borrow path for workflow infrastructure).* Extend `SessionOptions` with
+4. **Session-side borrow path.** _Status: shipped (`963f793` feat: session-side borrow path for workflow infrastructure)._ Extend `SessionOptions` with
    `workflowInfrastructure?: DockerInfrastructure`. Route
    `createDockerSession()` through the "use caller-supplied bundle with
    `ownsInfra=false`" branch when set. Still no workflow caller; verify
    by unit test that a session wired to a manually-constructed bundle
    works end-to-end and leaves the bundle alive on `close()`.
-5. **Engine-owned workflow infrastructure.** *Status: shipped (`d53b017` feat(workflow): engine-owned DockerInfrastructure (Step 5 Round 1), `9918ad7` feat(workflow): policy hot-swap via persona-tagged audit (Step 5 Round 2), plus follow-ups `ff3ed77`, `73acb70`, `8551045`, `479f998`, `2a0a3b6`, `11c1c4d`, `5cc617f`, `46d7f0b`).* Wire up
+5. **Engine-owned workflow infrastructure.** _Status: shipped (`d53b017` feat(workflow): engine-owned DockerInfrastructure (Step 5 Round 1), `9918ad7` feat(workflow): policy hot-swap via persona-tagged audit (Step 5 Round 2), plus follow-ups `ff3ed77`, `73acb70`, `8551045`, `479f998`, `2a0a3b6`, `11c1c4d`, `5cc617f`, `46d7f0b`)._ Wire up
    `createWorkflowInfrastructure()` / `destroyWorkflowInfrastructure()`
    in the orchestrator, plumb `workflowInfrastructure` through
    `executeAgentState()`, and invoke `loadPolicy` at every state
    transition. This is the first user-visible behavior change; land it
    behind an opt-in flag (e.g., `settings.sharedContainer: true`) during
    the soak period if desired.
-6. **Validation for `freshContainer` + `freshSession`.** *Status: pending.* Land the
+6. **Validation for `freshContainer` + `freshSession`.** _Status: pending._ Land the
    validator check once at least one workflow wants to use
    `freshContainer`.
-7. **Resume reclamation.** *Status: shipped as opt-in snapshot resume on
-   `feat/workflow-container-snapshot-resume`.* Commit live per-scope containers
+7. **Resume reclamation.** _Status: shipped as opt-in snapshot resume on
+   `feat/workflow-container-snapshot-resume`._ Commit live per-scope containers
    at aborted terminal stops, store immutable image digests in checkpoints, use
    those digests as guarded `baseImageOverride` values on resume, and reclaim
    snapshots through supersede, completion, startup reconciliation, and age GC.
@@ -1902,6 +1950,21 @@ updates `currentPersona` on the coordinator and all entries continue to
 land in the same file. Consumers reconstruct per-persona / per-re-entry
 slices by scanning and grouping on the `persona` field plus entry order.
 
+Records per call (fail-closed audit). Every call that is allowed and
+acts on a backend (or runs as a virtual `proxy` tool) produces two
+records with the same `requestId`: a write-ahead record with
+`result.status: 'dispatching'` appended immediately before its first side
+effect (the backend call, or the roots update of an approved escalation
+that needs a new root), then the outcome record (`success` / `error`, or
+`denied` when roots verification fails after the update). Calls denied
+before anything reaches a backend still produce a single record. The
+pipeline checks `AuditLog.assertWritable()` before it
+evaluates a call, and the coordinator latches an `AUDIT_LOG_UNAVAILABLE`
+failure and refuses every later call at admission, so a run whose audit
+file becomes unwritable stops instead of acting unaudited. Consumers that
+want one record per call filter with `isDispatchingAuditEntry`
+(`src/types/audit.ts`), as `AuditLogTailer` does.
+
 Consequence for §§4, 5, 9: the audit-writer concurrency discussion
 (§4 "Audit writer concurrency (single-process semantics)") no longer
 has a rotation window to worry about -- the policy mutex still
@@ -1920,7 +1983,7 @@ The design implicitly assumed workflow artifacts would live under per-state
 session dirs (`~/.ironcurtain/sessions/{sessionId}/...`) plus a workflow
 parent (`~/.ironcurtain/workflow-runs/{workflowId}/`), with per-state UUID
 subdirectories for session-local output. The shipped layout consolidates
-*everything* for a workflow run under a single root:
+_everything_ for a workflow run under a single root:
 
 ```
 ~/.ironcurtain/workflow-runs/{workflowId}/
@@ -1958,7 +2021,7 @@ standalone / interactive sessions but not to workflow state sessions.
 the orchestrator would reach a rich accessor (`getCoordinator()`, or a
 `start({ controlSocketPath })` growing on `CodeModeProxy`). The shipped
 seam is narrower. `DockerProxy.getPolicySwapTarget()` returns a
-`PolicySwapTarget` interface whose *only* method is
+`PolicySwapTarget` interface whose _only_ method is
 `startControlServer(opts: ControlServerListenOptions): Promise<ControlServerAddress>`
 (see `src/docker/code-mode-proxy.ts`). The orchestrator cannot reach
 `PolicyEngine`, `AuditLog`, or the rest of the security kernel through
@@ -1979,7 +2042,7 @@ artifacts (`session.log`, `session-metadata.json`) live under
 `states/{stateSlug}/` (D2), and the logger stream must be explicitly
 retargeted on each re-entry so a single workflow run produces
 per-invocation log files rather than one appended file. This
-responsibility is split: the session owns the *claim* on its state
+responsibility is split: the session owns the _claim_ on its state
 slug (and guarantees unique `{stateId}.{visitCount}` values), and the
 infrastructure setup in `docker-infrastructure.ts` retargets the
 appropriate log sinks when constructing the per-state session on top
@@ -1991,6 +2054,13 @@ workflow itself terminates. Commits `479f998`
 (improve session handling for resumed conversations) carry the bulk
 of this work.
 
+Since WP-85 the logger is no longer retargeted: `logger.setup()`
+returns a claim that stacks on the others, the session binds its own
+work to it (`logger.runWithClaim`), and `close()` releases only that
+claim (`logger.release`), so a concurrent lane's log and the daemon's
+log carry on. See `src/logger.ts` and
+[workflow-session-identity.md §8](./workflow-session-identity.md).
+
 ### D5 -- Hardening: `validatePolicyDir` and related checks
 
 The design treated `policyDir` (and related paths reaching into the
@@ -1998,8 +2068,14 @@ coordinator over the control socket) as trusted input from the
 orchestrator. Implementation review added a defense-in-depth layer:
 `validatePolicyDir()` (re-exported from `src/config/validate-policy-dir.js`
 and called on the session side) enforces that any policy directory
-handed to a session / coordinator lives under the IronCurtain home or
-the package config dir. This closes a path-confusion hole that would
+handed to a session / coordinator is exactly one of the directories
+IronCurtain compiles policies into (`<home>/generated`,
+`<home>/personas/<name>/generated`, `<home>/jobs/<id>/generated`, a
+published task scope `<home>/task-policies/<key>`, or the package's
+bundled `generated/` and `generated-readonly/`), never another
+path in the home such as an agent-writable session sandbox, and that no
+other user can write it; the artifacts in it are read without following
+symlinks. This closes a path-confusion hole that would
 otherwise let a malformed workflow checkpoint or a compromised
 orchestrator state point the coordinator at arbitrary filesystem
 locations during `loadPolicy`. Commit `11c1c4d`
@@ -2032,28 +2108,226 @@ orchestrator always invoked agent states serially. The field was pure
 schema scaffolding for future work that was never built.
 
 Concretely removed:
-* `AgentStateDefinition.parallelKey?: string` field in
+
+- `AgentStateDefinition.parallelKey?: string` field in
   `src/workflow/types.ts`.
-* `AgentSlot.parallelKey?: string` on the public `WorkflowStatus` type
+- `AgentSlot.parallelKey?: string` on the public `WorkflowStatus` type
   (the `activeAgents` array was always empty anyway).
-* Zod schema field and the vacuous "parallelKey only on agent states"
+- Zod schema field and the vacuous "parallelKey only on agent states"
   semantic check in `src/workflow/validate.ts`.
-* Lint rule WF005 ("parallelKey + worktree without gitRepoPath") in
+- Lint rule WF005 ("parallelKey + worktree without gitRepoPath") in
   `src/workflow/lint.ts` and its test, along with the corresponding
   entry in `DiagnosticCode` (WF005 is retired and must not be reused).
 
 As a direct consequence, the earlier homogeneous-persona-per-scope
 check in `validateContainerScopes` was also removed: its only
 justification was concurrent tool calls from parallel same-scope
-states, which cannot occur under serial-only execution. States sharing
-a `containerScope` may now use different personas freely —
-`cyclePolicy(instance, persona, bundle)` hot-swaps the coordinator's
-active policy on each agent-state entry, so scope (container
-lifecycle) and persona (active policy) are orthogonal.
+states, which cannot occur under serial-only execution. States that
+run one at a time may share a `containerScope` and use different
+personas freely — `cyclePolicy(instance, persona, bundle)` hot-swaps
+the coordinator's active policy on each agent-state entry, so for
+serial states scope (container lifecycle) and persona (active policy)
+are orthogonal.
 
-`WorktreeInfo.parallelKey` in `src/workflow/worktree.ts` is unrelated
-and unchanged: it is an internal worktree-slot identifier (the git
-branch name), not the removed `AgentStateDefinition.parallelKey`.
+**A scope is one trust domain (WP-73, audit finding DINF-14).** That
+orthogonality only holds for the coordinator's policy. Nothing else is
+reset between serial states: processes an earlier state left running,
+the read-write `~/.claude` / `~/.codex` state mount, and `.claude/`
+hooks in the pre-trusted `/workspace` all carry over, and any process in
+the container can reach the scope's proxy socket, whose calls are
+evaluated and audited under whichever persona is loaded at that moment.
+A low-privilege persona could therefore act under a later persona's
+policy. `validateScopePersonaIsolation` (`src/workflow/validate.ts`)
+reinstates the homogeneous-persona-per-scope rule for shared-container
+workflows: agent states of one `containerScope` must share a persona
+unless `settings.allowMixedPersonas: true` declares the scope a single
+trust domain (effectively the union of its personas' policies). Authors
+who want the personas' containers apart give each persona its own scope;
+the workspace remains shared by every state in every mode, so files one
+state writes there (including agent-CLI project settings) still reach
+later states. The opt-in is rejected where no container is shared (a
+silent no-op), and it never lifts the fan-out rule below: concurrent lanes
+cannot share the single active policy whatever the trust domain. The bundled
+`test-email-summary` fixture, which exists to exercise a persona
+hot-swap inside one container, carries the opt-in explicitly. Starting
+and resuming a run apply the rule to its recorded `definition.json` copy;
+loading a past run only to display it (`workflow inspect`, the web UI's
+past runs and message logs) passes the display-only
+`allowMixedPersonaScopes`, beside WP-47's `allowUnacknowledgedHostStates`,
+so runs recorded before the rule stay visible.
+
+**Fan-out segments are the exception (WP-39).** Fan-out later made
+same-scope states concurrent: the N lanes of a `fanOut` segment run at
+the same time against the one coordinator of the segment's scope
+bundle, and that coordinator holds a single active policy. A lane
+entering a member of persona B would swap the policy out from under a
+peer lane still running a member of persona A, so tool calls would be
+evaluated and audited under the wrong persona. The homogeneity check
+therefore lives on again, scoped to where concurrency actually exists:
+`validateFanOutLaneConcurrency` (`src/workflow/validate.ts`) rejects a
+shared-container fan-out segment whose agent members use different
+personas whenever the state's effective lane count
+(`resolveFanOutWorkers`) exceeds 1, and a shared-container segment
+spanning more than one `containerScope` at any lane count. In any mode
+at >1 lane it also rejects `freshSession: false` and non-empty
+`outputs` on agent members (both would be shared across lanes). At
+runtime `preMintFanOutScopeBundle` (`src/workflow/orchestrator.ts`)
+refuses a mixed-persona or multi-scope segment with a
+`result_file_error` verdict before any lane starts and, for a
+homogeneous segment, cycles the single persona once before the child
+actors are created so every lane's own `cyclePolicy` call hits the
+`currentPersonaByBundle` short-circuit instead of racing a `loadPolicy`
+RPC. Per-state-container Docker mode and builtin mode are unaffected:
+there each session owns its coordinator.
+
+A drained lane can still outlive its batch: the drain stops the lane's
+actor at its next state boundary, but the agent turn already in flight
+keeps running in the container (a borrow-mode `session.close()` does
+not stop it) after the batch has returned. So every agent invocation in
+shared-container mode registers as a live turn on its bundle, with its
+persona, until its session has closed (`liveAgentTurnsByBundle`), and
+`cyclePolicy` waits for every live turn of another persona on the
+bundle to finish before it swaps the policy. A drained invocation is
+also detached through its invoke's abort signal: it starts no session
+or further turn and does not stamp the run as quota-exhausted or
+transiently failed.
+
+**Read-only scopes (WP-131).** The persona hot-swap only ever changes
+which compiled policy judges MCP calls; it cannot take away what the
+container itself allows, and structural sandbox containment allows every
+write inside the workspace under any persona. A reviewer or critic that
+reads untrusted code therefore had the coder's write access whatever its
+persona said. An agent state can now declare `workspaceAccess: read-only`
+(`AgentStateDefinition.workspaceAccess`, helpers in
+`src/workflow/workspace-access.ts`). Its session, or in shared-container
+mode its scope's bundle, is built with `IronCurtainConfig.readOnlyWorkspace`
+(`applyReadOnlyWorkspace`, `src/config/read-only-workspace.ts`):
+
+- `createSessionContainers` (and the PTY path, kept in sync) mounts
+  `/workspace` read-only, so the agent's own tools cannot change it, and
+  mounts the run's workflow dependency layers (`/opt/workflow-venv`,
+  `/opt/workflow-node_modules`) read-only too: every bundle of the run
+  shares them, and the read-write scopes execute what is installed there.
+  The host-mount privilege sweep skips read-only mounts.
+- Nested Docker is switched off for the session (`dockerWorkload`
+  disabled; `prepareDockerInfrastructure` refuses the combination), since
+  its daemon would mount the workspace read-write for the agent's
+  containers.
+- The coordinator builds every `PolicyEngine`, the first and each one
+  `loadPolicy` swaps in, with `readOnlyWorkspace`: a structural deny
+  (`structural-read-only-workspace`), ordered before sandbox containment
+  and the compiled rules, refuses every value of a mutation path role
+  (every path role but `read-path`) that does not resolve inside one of the
+  writable directories. Those are the state's (or the scope's) declared
+  `.workflow/<output>` directories, joined to the canonical sandbox, so a
+  symlink at or below them leads elsewhere and is refused. Every call that
+  would change a git repository is refused too, wherever its path points:
+  host git acts on the repository that contains the path, which from an
+  output directory is the workspace's own, so a `git reset --hard` or
+  `git stash` "in `.workflow/reviews`" would otherwise rewrite the code.
+- The agent writes its outputs with `filesystem.write_file` through
+  `execute_code` (its orientation and state prompt say so), and the
+  filesystem server is started for read-only sessions and scopes even when
+  no compiled rule names it. Before the session or bundle starts, the
+  orchestrator makes each output directory a real directory
+  (`prepareWritableOutputDirs`), moving aside a symlink an earlier
+  read-write state planted there.
+
+Because the mount belongs to the scope's one container, validation
+(`validateReadOnlyStates`) rejects a scope that mixes read-only and
+read-write agent states (give read-only states their own `containerScope`),
+read-only fan-out states, output names that are not plain relative paths,
+and a containerized `resultFile` in a read-only scope. At runtime a
+read-only state refuses a bundle that was not minted read-only
+(`DockerInfrastructure.readOnlyWorkspace`). Per-state-container Docker and
+builtin sessions get the same confinement through
+`SessionOptions.workflow.readOnlyWorkspace`. The bundled design-and-code
+`review` state runs read-only. Remote side effects (GitHub, mail) stay
+governed by the persona's policy.
+
+The rule sits beside the coordinator's other per-bundle settings rather
+than replacing them. A `--task-scoped` run's task scope is passed to every
+engine next to it (`PolicyEngine` takes both), so it still narrows the
+calls the rule leaves open, through every hot-swap. The coordinator's
+`workflow_commit` tool names no path and writes nothing into the
+workspace, so a read-only state commits its result like any other; its
+prompt forbids git commits, not that call.
+
+`WorktreeInfo.parallelKey` in the former `src/workflow/worktree.ts` was
+unrelated: it was an internal worktree-slot identifier (the git branch
+name), not the removed `AgentStateDefinition.parallelKey`. That module
+was never wired into the runtime and has since been deleted; the
+`worktree` and `settings.gitRepoPath` fields it would have served are
+ignored (lint WF017).
+
+### D6 -- Tool-call escalations: an in-process human route and cancellable waits
+
+The bundle coordinator was originally built from `loadConfig()` with
+neither an escalation directory nor a handler, so every call a persona
+policy escalated was denied on the spot ("no escalation handler"). Now:
+
+- **Human route.** `ensureBundleForScope` hands the infrastructure factory
+  an in-process `onEscalation` handler bound to the workflow
+  (`CreateWorkflowInfrastructureInput.onEscalation`), which
+  `createDockerInfrastructure` -> `createCodeModeProxy` ->
+  `Sandbox.initialize` passes to the coordinator. The factory also sets
+  `config.escalationDir` to the bundle's `escalations/` dir and switches the
+  auto-approver off (`withWorkflowEscalationRouting`): in a workflow the
+  approver's "user message" is the orchestrator prompt, which carries prior
+  agents' output. Per-state sessions (builtin, per-state containers) keep
+  their own coordinator and file-IPC escalation dir; the orchestrator
+  receives those through `SessionOptions.onEscalation` and the workflow
+  session factory sets `disableAutoApprove`. Both kinds are listed by
+  `WorkflowController.listToolCallEscalations`, announced as lifecycle events
+  (forwarded to the web event bus as `workflow.escalation_raised` /
+  `workflow.escalation_resolved`), logged as `tool_call_escalation` entries,
+  and settled by `resolveToolCallEscalation` (the standalone CLI's terminal
+  prompt, or `workflow escalation` / `workflows.resolveEscalation` through
+  the daemon; see `agent-driven-workflow-gates.md`).
+- **Bounded waits.** The wait is bounded by the configured
+  `escalationTimeoutSeconds` (`ToolCallCoordinatorOptions.escalationTimeoutMs`,
+  set by `buildCoordinator`); before, the in-process wait read an environment
+  variable only relays were given and always waited 300 s. An unanswered
+  escalation is denied and audited as `timed-out`, not as a human denial.
+- **Cancellable waits.** An escalation wait releases the tool-call mutex but
+  keeps its admission slot, so the quiesce in `close()` and `loadPolicy`
+  used to wait for it -- up to the full escalation timeout. The quiesce now
+  cancels every parked escalation first (each call is denied at once and
+  audited as `cancelled` under the persona it was evaluated under, its
+  request file removed), and a wait that starts while a quiesce is in
+  progress is cancelled before it parks. The "no mid-escalation swap"
+  guarantee is unchanged: the cancelled call settles before the engine is
+  swapped.
+- **Withdrawal when the script ends (WP-55).** Every tool call a Code Mode
+  script makes carries a signal that aborts when the script ends -- it
+  finished, failed, timed out, or its request was cancelled (`extra.signal`
+  in the code-mode proxy). The coordinator then withdraws the call's pending
+  escalation the same way (handler signal aborted, request file removed,
+  audited as `cancelled`), refuses to act on an approval that lands
+  afterwards (audited under `call-cancelled` with the approval kept), and
+  cancels a backend call in flight. An agent told "Script execution
+  timeout" can therefore no longer have the approved side effect run behind
+  its back.
+- **Withdrawal at turn end.** When the last live agent turn on a bundle ends
+  (`liveAgentTurnsByBundle`), the bundle's still-pending escalations are
+  withdrawn: the handler rejects with `EscalationWithdrawnError` and the
+  pipeline denies the call as `cancelled`. A late approval could otherwise run
+  the call's side effect during a later state of the same persona, where no
+  policy swap would cancel it. A workflow abort withdraws every pending
+  escalation the same way, in the tick that claims the terminal status, and
+  `resolveToolCallEscalation` refuses decisions once a run is terminal. An
+  escalation raised while no agent turn is live on the bundle (a process the
+  agent left running in the container, a deterministic state's in-container
+  command) is withdrawn at once and never offered to a human.
+- **Whitelist scope.** An approval can whitelist a pattern on the bundle
+  coordinator, which outlives the personas it serves. `loadPolicy` empties
+  the whitelist together with the engine swap, so a pattern a human approved
+  under one persona never discharges another persona's escalations.
+- **Human-only escalations.** The handler details carry the pipeline's
+  `humanOnly` flag (`InProcessEscalationDetails extends EscalationDetails`),
+  and a file-IPC request carries it too. The listed escalation keeps it, and
+  `resolveToolCallEscalation` drops any whitelist selection sent for such an
+  escalation: it is approved once, never whitelisted.
 
 ## 11. Revision history
 
@@ -2089,7 +2363,7 @@ blockers. v4 resolves each:
   `ControlApiClient`. Added a "Note on terminology" paragraph
   distinguishing the new coordinator control socket (§4) from the
   MITM control address and from `SESSION_LOG_PATH`; the subprocess
-  is free of the *coordinator* control channel but not of all
+  is free of the _coordinator_ control channel but not of all
   control-channel env vars.
 
 **B2 -- UTCP integration spike.**
@@ -2314,3 +2588,7 @@ per-state policy cycling, and audit file naming
 `audit.{persona}.{version}.jsonl`. Structurally assumed a single MCP
 proxy process with one `PolicyEngine` + one `AuditLog` -- an assumption
 corrected in v2.
+
+## Completion review update (2026-11-16)
+
+Session close callers join one teardown promise. Workflow sessions remain active until their final usage sample is counted; terminal checkpoints retain the metrics subscription through infrastructure teardown. A provisional `usageSettlementPending` checkpoint is saved before teardown or snapshot awaits and cleared only after settlement. Interrupted usage is partial and cannot support resume under token or cost ceilings.

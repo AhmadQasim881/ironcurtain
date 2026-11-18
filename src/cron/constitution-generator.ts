@@ -5,10 +5,11 @@
  *
  * The LLM explores MCP servers (read files, list dirs, check git,
  * query GitHub) to understand the task context, then produces a
- * structured constitution.
+ * structured constitution. For a job with a git repository, it reads a
+ * throwaway clone of that repository (see generateConstitution).
  */
 
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
@@ -17,6 +18,7 @@ import { parseJsonWithSchema } from '../pipeline/generate-with-repair.js';
 import { createSession } from '../session/index.js';
 import { getReadOnlyPolicyDir } from '../config/paths.js';
 import { HeadlessTransport } from './headless-transport.js';
+import { stripUrlCredentials, syncGitRepo } from './git-sync.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -44,14 +46,29 @@ export type GenerationContext = 'cron' | 'persona';
 export interface ConstitutionGeneratorOptions {
   /** The task description to generate a constitution for. */
   readonly taskDescription: string;
-  /** Path to the job workspace (for filesystem exploration). */
-  readonly workspacePath: string;
-  /** Optional git repo URI (included in context for the LLM). */
+  /**
+   * Workspace path shown to the LLM (the persona workspace). Unused when
+   * `gitRepo` is set, and optional for jobs: the LLM is then shown the
+   * session's own throwaway exploration directory.
+   */
+  readonly workspacePath?: string;
+  /**
+   * The job's git repository. When set, it is cloned into the generator
+   * session's throwaway exploration directory (its allowedDirectory) before
+   * the session starts, so the LLM reads the project itself; the clone is
+   * deleted with that directory afterwards.
+   */
   readonly gitRepo?: string;
   /** Progress callback for spinner updates. */
   readonly onProgress?: (message: string) => void;
   /** Generation context: 'cron' (default) or 'persona'. */
   readonly context?: GenerationContext;
+  /**
+   * Cancels the generation while the repository is being cloned (the git
+   * processes are killed and the clone deleted); a session is never started
+   * after it fired.
+   */
+  readonly signal?: AbortSignal;
 }
 
 // ---------------------------------------------------------------------------
@@ -63,6 +80,12 @@ export interface ConstitutionGeneratorOptions {
  * This is appended to the standard Code Mode system prompt via
  * SessionOptions.systemPromptAugmentation.
  *
+ * @param workspacePath - The directory the LLM explores. For a job it is
+ *   the session's throwaway exploration directory, which holds a clone of
+ *   `gitRepo` when one is given and is empty otherwise.
+ * @param gitRepo - The job's repository URL. The prompt names it without
+ *   the credentials a URL can embed (`stripUrlCredentials`), which only the
+ *   host-side clone uses.
  * @param context - Generation context: 'cron' for unattended jobs,
  *   'persona' for interactive sessions. Defaults to 'cron'.
  */
@@ -74,6 +97,7 @@ export function buildConstitutionGeneratorSystemPrompt(
 ): string {
   const contextLabel = context === 'persona' ? 'persona' : 'job';
   const taskLabel = context === 'persona' ? 'persona' : 'task';
+  const shownRepo = gitRepo === undefined ? undefined : stripUrlCredentials(gitRepo);
 
   const introLine =
     context === 'persona'
@@ -98,6 +122,12 @@ If the task description says the agent should do something (push to a remote,
 create PRs, write files), then **allow it** — do not escalate operations the
 task explicitly requires.`;
 
+  // A job's local project files exist only as the clone of its repository.
+  const repoExploration = gitRepo
+    ? `   - Check the project structure and key files (README, package.json) in the repository clone
+   - Check git remotes and branching patterns if the task involves git
+`
+    : '';
   const exploreStep =
     context === 'persona'
       ? `1. **Explore** (optional): If the description references a specific project or
@@ -105,10 +135,20 @@ task explicitly requires.`;
    persona is general-purpose (email, research, etc.), skip exploration and
    generate directly.`
       : `1. **Explore** (briefly): Use execute_code to call MCP tools for essential context:
-   - Check the project structure and key files (README, package.json)
-   - Check git remotes and branching patterns if the task involves git
-   - Check GitHub repo structure if the task involves GitHub
+${repoExploration}   - Check GitHub repo structure if the task involves GitHub
    Keep exploration focused — spend most effort on generation, not discovery.`;
+
+  const workspaceDescription =
+    context === 'persona'
+      ? `The ${contextLabel} workspace is at: ${workspacePath}
+${shownRepo ? `Git repository: ${shownRepo}` : 'No git repository configured.'}
+Use this path to explore project context.`
+      : shownRepo
+        ? `A temporary clone of the job's git repository is at: ${workspacePath}
+Git repository: ${shownRepo}
+Use this clone to explore project context. It is a throwaway copy, not where the job runs.`
+        : `No git repository configured: the job's workspace starts empty, so there are no
+project files to explore. Your scratch directory is: ${workspacePath}`;
 
   return `
 ## Constitution Generation Mode
@@ -126,9 +166,8 @@ ${taskDescription}
 
 ## Workspace (for exploration only)
 
-The ${contextLabel} workspace is at: ${workspacePath}
-${gitRepo ? `Git repository: ${gitRepo}` : 'No git repository configured.'}
-Use this path to explore project context. Do NOT reference this path in the constitution —
+${workspaceDescription}
+Do NOT reference this path in the constitution —
 workspace access is handled automatically by structural rules (see below).
 
 ## Critical Context: Structural Rules
@@ -231,10 +270,52 @@ export function parseConstitutionResponse(response: string): ConstitutionGenerat
 // Main Generation Function
 // ---------------------------------------------------------------------------
 
+function throwIfCancelled(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) throw new Error('constitution generation was cancelled');
+}
+
+/**
+ * Clones `gitRepo` into `workspaceDir` for exploration, through the same
+ * hardened sync the daemon uses for job workspaces (validated URI, a bare
+ * mirror and an IronCurtain-written `.git`), with the mirror next to the
+ * clone inside the throwaway `sandboxDir`.
+ *
+ * @throws {Error} with the sync's display-safe, credential-redacted reason
+ *   when the clone fails, or when `signal` cancelled it.
+ */
+async function cloneForExploration(
+  gitRepo: string,
+  sandboxDir: string,
+  workspaceDir: string,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  const result = await syncGitRepo({
+    uri: gitRepo,
+    workspaceDir,
+    mirrorDir: join(sandboxDir, 'mirror', 'repo.git'),
+    managedWorkspace: true,
+    signal,
+  });
+  throwIfCancelled(signal);
+  if (!result.ok) {
+    throw new Error(`could not clone the job's git repository for exploration: ${result.message}`);
+  }
+}
+
 /**
  * Generates a draft constitution by running an LLM through Code Mode
  * with a read-only policy. The LLM can explore MCP servers to
  * understand the task context before writing policy.
+ *
+ * The session's allowedDirectory is a throwaway exploration directory
+ * under the OS temp dir, never the real job workspace: a session gets
+ * structural read AND write access to its allowedDirectory, and the job
+ * workspace (under the IronCurtain home) is a protected path the session
+ * could not read anyway. When `gitRepo` is set, the repository is cloned
+ * into that directory first, so the LLM sees the project's files. The
+ * directory, clone included, is deleted when generation ends, whether it
+ * succeeded, failed or was cancelled, and also when the process exits
+ * while generation is still running.
  *
  * @returns The generated constitution and reasoning.
  */
@@ -242,29 +323,53 @@ export async function generateConstitution(
   options: ConstitutionGeneratorOptions,
 ): Promise<ConstitutionGenerationResult> {
   const readOnlyPolicyDir = getReadOnlyPolicyDir();
-  const augmentation = buildConstitutionGeneratorSystemPrompt(
-    options.taskDescription,
-    options.workspacePath,
-    options.gitRepo,
-    options.context ?? 'cron',
-  );
-
   const userMessage = buildConstitutionGenerationUserMessage(options.taskDescription);
-
-  options.onProgress?.('Starting Code Mode session with read-only policy...');
-
   const transport = new HeadlessTransport({ taskMessage: userMessage });
 
-  // Use a throwaway temp dir as the session sandbox so the sandbox fast-path
-  // auto-allows writes only in the temp dir, not the real job workspace.
-  // The job workspace path is still communicated to the LLM via the system
-  // prompt so it knows where to explore.
   const sandboxDir = mkdtempSync(join(tmpdir(), 'ironcurtain-constgen-'));
+  // The session's allowedDirectory. The clone's mirror stays outside it.
+  const explorationDir = join(sandboxDir, 'workspace');
+  const removeSandbox = (): void => rmSync(sandboxDir, { recursive: true, force: true, maxRetries: 3 });
+
+  // process.exit() skips the `finally` below, and the wizards' clack spinner
+  // calls it when Ctrl-C or Escape is pressed in a terminal (raw mode turns
+  // Ctrl-C into a keypress, so there is no SIGINT and no onCancel). The
+  // clone's git processes run in their own process group and would go on
+  // cloning into an orphaned directory, so an exit hook aborts them (runGit
+  // SIGKILLs the group synchronously on abort) and removes the directory.
+  const exiting = new AbortController();
+  const signal = options.signal === undefined ? exiting.signal : AbortSignal.any([options.signal, exiting.signal]);
+  const onExit = (): void => {
+    exiting.abort();
+    try {
+      removeSandbox();
+    } catch {
+      // The process is exiting: there is nobody left to report to.
+    }
+  };
+  process.once('exit', onExit);
 
   let session: Awaited<ReturnType<typeof createSession>> | undefined;
   try {
+    mkdirSync(explorationDir);
+    if (options.gitRepo !== undefined) {
+      options.onProgress?.(
+        'Cloning the job repository into a temporary directory (this can take a few minutes for a large repository)...',
+      );
+      await cloneForExploration(options.gitRepo, sandboxDir, explorationDir, signal);
+    }
+    throwIfCancelled(signal);
+
+    const augmentation = buildConstitutionGeneratorSystemPrompt(
+      options.taskDescription,
+      options.gitRepo === undefined ? (options.workspacePath ?? explorationDir) : explorationDir,
+      options.gitRepo,
+      options.context ?? 'cron',
+    );
+
+    options.onProgress?.('Starting Code Mode session with read-only policy...');
     session = await createSession({
-      workspacePath: sandboxDir,
+      workspacePath: explorationDir,
       policyDir: readOnlyPolicyDir,
       systemPromptAugmentation: augmentation,
       disableAutoApprove: true,
@@ -281,7 +386,12 @@ export async function generateConstitution(
     options.onProgress?.('Parsing generated constitution...');
     return parseConstitutionResponse(response);
   } finally {
-    if (session) await session.close();
-    rmSync(sandboxDir, { recursive: true, force: true });
+    try {
+      if (session) await session.close();
+    } finally {
+      // Also when close() throws: the clone must not outlive the generation.
+      process.removeListener('exit', onExit);
+      removeSandbox();
+    }
   }
 }

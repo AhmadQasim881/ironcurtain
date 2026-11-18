@@ -19,7 +19,8 @@ export type RegistryType = 'npm' | 'pypi' | 'debian' | 'cargo';
  * filtering for LLM APIs), RegistryConfig handles package-level
  * validation for software registries.
  *
- * No key injection is needed -- package registries are public.
+ * No key injection is needed -- package registries are public. The
+ * registry proxy also strips every credential the client sends.
  */
 export interface RegistryConfig {
   /** Registry hostname (e.g., 'registry.npmjs.org'). */
@@ -99,16 +100,19 @@ export interface PackageValidator {
 }
 
 /**
- * In-memory cache of allowed versions per package.
+ * In-memory cache of allowed artifacts per package.
  * Populated during metadata filtering, consulted during tarball downloads.
+ * The registry proxy bounds it (entries, total size, 1-hour TTL); eviction
+ * only means the next download revalidates from fresh metadata.
  *
  * Keyed by canonical package identifier: 'npm:express', 'npm:@types/node',
- * 'pypi:numpy'.
+ * 'cargo:serde'. PyPI is gated per distribution file, so its entries are
+ * 'pypi-file:numpy' and hold `files.pythonhosted.org` paths, not versions.
  */
 export type AllowedVersionCache = Map<
   string,
   {
-    /** Set of version strings that passed validation. */
+    /** Versions that passed validation, or for a 'pypi-file:' entry, the paths of the files that did. */
     readonly allowedVersions: ReadonlySet<string>;
     /** When this cache entry was populated. */
     readonly cachedAt: Date;
@@ -118,19 +122,51 @@ export type AllowedVersionCache = Map<
 /**
  * Audit log entry for package installation decisions.
  * Written to package-audit.jsonl in the session directory.
+ *
+ * The standard registry proxy writes one for every request it forwards or
+ * refuses. An entry records the method, host and path, never a header value.
  */
 export interface PackageAuditEntry {
   readonly timestamp: string;
   /** Package identity. */
   readonly registry: RegistryType;
-  readonly packageName: string;
+  /** The client's HTTP method: GET or HEAD, or the refused method on a `request-gate` refusal. */
+  readonly method: string;
+  /** The registry host the client addressed (the CONNECT host, or the host of apt's absolute URL). */
+  readonly host: string;
+  /**
+   * Package name, percent-decoded (e.g. `g++-12`, never `g%2b%2b-12`).
+   * Absent when no package identity was parsed: a `request-gate`,
+   * `request-path` or `pass-through` entry, or an artifact path the tarball
+   * backstop could not parse.
+   */
+  readonly packageName?: string;
   readonly packageVersion?: string;
   readonly packageScope?: string;
-  /** Decision made by the validator. */
+  /**
+   * PyPI only: the distribution file the decision applies to. PyPI is gated
+   * per file, by that file's own upload time, so one release can have both
+   * allowed and denied files.
+   */
+  readonly packageFile?: string;
+  /** Decision made by the validator, or the proxy's own allow/deny for a request that names no package. */
   readonly decision: 'allow' | 'deny';
   readonly reason: string;
-  /** Whether this was a metadata filter or tarball backstop decision. */
-  readonly source: 'metadata-filter' | 'tarball-backstop' | 'deb-backstop';
-  /** The HTTP request path that triggered this check. */
+  /**
+   * Which check produced the decision:
+   * - `metadata-filter`, `tarball-backstop`, `deb-backstop`: package validation.
+   *   A `metadata-filter` deny entry without a version records metadata that
+   *   could not be fetched or processed, or that lists no installable version.
+   * - `request-gate`: refused because the method is not GET or HEAD, or the
+   *   request declares a body.
+   * - `request-path`: refused because the path is not canonical, or matches no
+   *   route on the registry's allowlist.
+   * - `pass-through`: an allowlisted read-only route that names no package
+   *   (npm search, the PyPI JSON API, Debian `dists/` metadata, ...),
+   *   forwarded without credentials.
+   */
+  readonly source:
+    'metadata-filter' | 'tarball-backstop' | 'deb-backstop' | 'request-gate' | 'request-path' | 'pass-through';
+  /** The HTTP request path that triggered this check, exactly as the client sent it. */
   readonly requestPath: string;
 }

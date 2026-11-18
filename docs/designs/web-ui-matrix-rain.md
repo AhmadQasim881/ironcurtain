@@ -1,5 +1,7 @@
 # Web UI Matrix Rain — Login Page Cinematic
 
+**Status (2026-11-14):** Implemented (`packages/web-ui/src/lib/matrix-rain/`, used by the login page in `packages/web-ui/src/App.svelte`).
+
 ## 1. Overview
 
 Replace the plain gradient background on the web UI auth-token page with a Canvas 2D Matrix rain animation that

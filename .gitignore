@@ -17,6 +17,7 @@ dist/
 logs/
 *.jsonl
 !packages/web-ui/workflow-example-messages.jsonl
+!test/fixtures/**/*.jsonl
 
 # OS files
 .DS_Store
@@ -44,9 +45,6 @@ coverage/
 # Playwright
 e2e-results/
 playwright-report/
-
-# Generated docs (build.sh regenerates these)
-docs/vuln-discovery-onboarding/*.pdf
 
 # Local scratch / staged experiments — never committed
 donotcommit/

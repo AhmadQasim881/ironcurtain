@@ -25,6 +25,7 @@ import { tmpdir } from 'node:os';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   assembleDockerInfrastructure,
+  AGENT_OPEN_FILES_LIMIT,
   buildDockerDesktopTransportCreateLimits,
   buildDockerAgentTrustedCreateOptions,
   buildDockerWorkloadEgressMounts,
@@ -53,6 +54,8 @@ import {
   APPLE_VM_REGISTRY_EGRESS_PROXY_URL,
 } from '../../src/docker-workload/apple-vm-daemon.js';
 import { DESKTOP_RELAY_PROFILE } from '../../src/docker-workload/desktop-relay.js';
+import { resolveDockerWorkloadConfig } from '../../src/docker-workload/config.js';
+import { dockerDesktopVmCapacity } from '../../src/docker-workload/environment.js';
 import {
   DOCKER_BUILD_TRUST_APT_CONFIG_PATH,
   DOCKER_BUILD_TRUST_CA_BUNDLE_PATH,
@@ -163,7 +166,9 @@ function makeCore(docker: ContainerRuntime, handle: DockerWorkloadBundleHandle):
     useTcp: false,
     socketsDir,
     mitmAddr: { socketPath: '/tmp/test-mitm.sock' },
+    metricsProxyUrl: 'http://127.0.0.1:18080',
     authKind: 'apikey',
+    providerProfileId: 'native',
     setTokenSessionId: () => {},
     restageSkills: () => {},
     beginCaptureSession: () => {},
@@ -251,8 +256,10 @@ const registrySnapshot = () => ({ attempts: 0, totalBytes: 0, activeRequests: 0 
 const packageSnapshot = () => ({
   attempts: 0,
   clientAttempts: 0,
+  derivedAttempts: 0,
   activeClients: 0,
   activeDirect: 0,
+  activeDerived: 0,
   activeUpstreams: 0,
   transferredBytes: 0,
   rateTokens: 120,
@@ -419,13 +426,16 @@ describe('Docker-workload wiring — createSessionContainers (§8.2 step 1)', ()
 
 describe('Docker outer-agent inherited volume suppression', () => {
   it('shadows the image-declared Docker state volume without a nested workload', () => {
-    expect(buildDockerAgentTrustedCreateOptions('docker', [], undefined)).toEqual({
+    // The process and descriptor bounds ride along on every Docker agent (DINF-11).
+    expect(buildDockerAgentTrustedCreateOptions('docker', [], undefined, { pidsLimit: 4096 })).toEqual({
       tmpfs: ['/var/lib/docker:ro,nosuid,nodev,noexec,size=1m'],
+      pidsLimit: 4096,
+      ulimits: [{ name: 'nofile', soft: AGENT_OPEN_FILES_LIMIT, hard: AGENT_OPEN_FILES_LIMIT }],
     });
   });
 
   it('leaves Apple agent mounts unchanged', () => {
-    expect(buildDockerAgentTrustedCreateOptions('apple-container', [], undefined)).toBeUndefined();
+    expect(buildDockerAgentTrustedCreateOptions('apple-container', [], undefined, { pidsLimit: 4096 })).toBeUndefined();
   });
 });
 
@@ -991,12 +1001,18 @@ describe('Docker-workload wiring — outer resource envelope', () => {
   it('uses admitted workload CPU/memory instead of divergent ordinary defaults', () => {
     const resources = selectOuterContainerResources(
       {
-        dockerResources: { memoryMb: 7777, cpus: 7 },
+        dockerResources: { memoryMb: 7777, cpus: 7, pidsLimit: 4096 },
         dockerWorkload: {
           enabled: true,
           networkAccess: 'offline',
           acceptObservedDiskRisk: true,
-          resources: { memoryMb: 1536, cpus: 1.25, pids: { desired: 512, required: false }, diskMb: null },
+          resources: {
+            memoryMb: 1536,
+            cpus: 1.25,
+            daemonShare: 0.5,
+            pids: { desired: 4096, required: false },
+            diskMb: null,
+          },
         },
       },
       { cpus: 8, memoryMb: 16_384 },
@@ -1009,7 +1025,7 @@ describe('Docker-workload wiring — outer resource envelope', () => {
     expect(
       selectOuterContainerResources(
         {
-          dockerResources: { memoryMb: 2048, cpus: 1.5 },
+          dockerResources: { memoryMb: 2048, cpus: 1.5, pidsLimit: 4096 },
           dockerWorkload: { enabled: false },
         },
         { cpus: 8, memoryMb: 16_384 },
@@ -1019,32 +1035,59 @@ describe('Docker-workload wiring — outer resource envelope', () => {
 
   const relayMemoryMb = DESKTOP_RELAY_PROFILE.memoryBytes / (1024 * 1024);
   const relayCpus = DESKTOP_RELAY_PROFILE.nanoCpus / 1_000_000_000;
+  const millicpus = (cpus: number | undefined): number => Math.round((cpus ?? 0) * 1000);
+
+  function smallEnvelope(networkAccess: 'offline' | 'images' | 'packages', pidsDesired = 4096, daemonShare = 0.5) {
+    return {
+      dockerResources: { memoryMb: 7777, cpus: 7, pidsLimit: 4096 },
+      dockerWorkload: {
+        enabled: true,
+        networkAccess,
+        acceptObservedDiskRisk: true,
+        resources: {
+          memoryMb: 1536,
+          cpus: 1.25,
+          daemonShare,
+          pids: { desired: pidsDesired, required: false },
+          diskMb: null,
+        },
+      },
+    } as const;
+  }
 
   it.each([
-    { networkAccess: 'offline', relayCount: 0, sidecarPids: 352, agentMemoryMb: 960, agentCpus: 0.75 },
-    { networkAccess: 'images', relayCount: 1, sidecarPids: 320, agentMemoryMb: 896, agentCpus: 0.5 },
-    { networkAccess: 'packages', relayCount: 2, sidecarPids: 288, agentMemoryMb: 832, agentCpus: 0.25 },
+    {
+      networkAccess: 'offline',
+      relayCount: 0,
+      sidecarCpus: 0.625,
+      agentMemoryMb: 704,
+      agentCpus: 0.375,
+      agentPids: 2016,
+    },
+    { networkAccess: 'images', relayCount: 1, sidecarCpus: 0.5, agentMemoryMb: 640, agentCpus: 0.25, agentPids: 1984 },
+    {
+      networkAccess: 'packages',
+      relayCount: 2,
+      sidecarCpus: 0.25,
+      agentMemoryMb: 576,
+      agentCpus: 0.25,
+      agentPids: 1952,
+    },
   ] as const)(
     'partitions the Docker Desktop $networkAccess aggregate across every outer container',
-    ({ networkAccess, relayCount, sidecarPids, agentMemoryMb, agentCpus }) => {
+    ({ networkAccess, relayCount, sidecarCpus, agentMemoryMb, agentCpus, agentPids }) => {
       const partition = selectDockerDesktopResourcePartition(
-        {
-          dockerResources: { memoryMb: 7777, cpus: 7 },
-          dockerWorkload: {
-            enabled: true,
-            networkAccess,
-            acceptObservedDiskRisk: true,
-            resources: { memoryMb: 1536, cpus: 1.25, pids: { desired: 512, required: false }, diskMb: null },
-          },
-        },
+        smallEnvelope(networkAccess),
         { cpus: 8, memoryMb: 16_384 },
         true,
       );
 
+      // Half of the session goes to the daemon unless the agent's floor
+      // (512 MiB, 0.25 CPU) would be breached; the agent gets the remainder.
       expect(partition).toEqual({
-        sidecar: { memoryMb: 512, cpus: 0.25, pidsLimit: sidecarPids },
+        sidecar: { memoryMb: 768, cpus: sidecarCpus, pidsLimit: 2048 },
         transport: { memoryMb: relayMemoryMb, cpus: relayCpus, pidsLimit: DESKTOP_RELAY_PROFILE.pidsLimit },
-        agent: { memoryMb: agentMemoryMb, cpus: agentCpus, pidsLimit: 128 },
+        agent: { memoryMb: agentMemoryMb, cpus: agentCpus, pidsLimit: agentPids },
       });
       expect(
         partition.sidecar.memoryMb +
@@ -1053,31 +1096,160 @@ describe('Docker-workload wiring — outer resource envelope', () => {
           relayCount * relayMemoryMb,
       ).toBe(1536);
       expect(
-        partition.sidecar.cpus + partition.transport.cpus + (partition.agent.cpus ?? 0) + relayCount * relayCpus,
-      ).toBe(1.25);
+        millicpus(partition.sidecar.cpus) +
+          millicpus(partition.transport.cpus) +
+          millicpus(partition.agent.cpus) +
+          relayCount * millicpus(relayCpus),
+      ).toBe(1250);
       expect(
         partition.sidecar.pidsLimit +
           partition.transport.pidsLimit +
           partition.agent.pidsLimit +
           relayCount * DESKTOP_RELAY_PROFILE.pidsLimit,
-      ).toBe(512);
+      ).toBe(4096);
       expect(buildDockerDesktopTransportCreateLimits(partition)).toEqual({
         resources: { memoryMb: relayMemoryMb, cpus: relayCpus },
-        trustedCreateOptions: { pidsLimit: DESKTOP_RELAY_PROFILE.pidsLimit },
+        trustedCreateOptions: {
+          pidsLimit: DESKTOP_RELAY_PROFILE.pidsLimit,
+          ulimits: [
+            { name: 'nofile', soft: DESKTOP_RELAY_PROFILE.openFilesLimit, hard: DESKTOP_RELAY_PROFILE.openFilesLimit },
+          ],
+        },
       });
       expect(
         buildDockerAgentTrustedCreateOptions(
           'docker',
           [{ name: 'daemon-api', target: '/run/ironcurtain-docker', readonly: true, noCopy: true }],
           partition,
+          // The partition's agent share wins over the configured ceiling.
+          { pidsLimit: 4096 },
         ),
       ).toEqual({
         namedVolumeMounts: [{ name: 'daemon-api', target: '/run/ironcurtain-docker', readonly: true, noCopy: true }],
         tmpfs: ['/var/lib/docker:ro,nosuid,nodev,noexec,size=1m'],
-        pidsLimit: 128,
+        pidsLimit: agentPids,
+        ulimits: [{ name: 'nofile', soft: AGENT_OPEN_FILES_LIMIT, hard: AGENT_OPEN_FILES_LIMIT }],
       });
     },
   );
+
+  it('gives the nested daemon at least half of the default session envelope while the agent keeps its floor', () => {
+    const userConfig = {
+      dockerResources: { memoryMb: 8192, cpus: 4, pidsLimit: 4096 },
+      dockerWorkload: resolveDockerWorkloadConfig(
+        { enabled: true, networkAccess: 'images' },
+        { memoryMb: 8192, cpus: 4, pidsLimit: 4096 },
+      ),
+    };
+    const partition = selectDockerDesktopResourcePartition(userConfig, { cpus: 8, memoryMb: 32_000 }, true);
+
+    // The old fixed split gave every nested workload 512 MiB, 0.25 CPU and
+    // the PIDs left after a 128-task agent cap.
+    expect(partition.sidecar).toEqual({ memoryMb: 4096, cpus: 2, pidsLimit: 2048 });
+    expect(partition.sidecar.memoryMb).toBeGreaterThanOrEqual(8192 / 2);
+    expect(partition.sidecar.cpus).toBeGreaterThanOrEqual(4 / 2);
+    expect(partition.agent).toEqual({ memoryMb: 8192 - 128 - 4096, cpus: 1.5, pidsLimit: 4096 - 64 - 2048 });
+    expect(partition.agent.pidsLimit).toBeGreaterThan(128);
+  });
+
+  it('rounds the daemon share up, so an odd envelope still gives the daemon at least its share', () => {
+    const partition = selectDockerDesktopResourcePartition(
+      {
+        dockerResources: { memoryMb: 8191, cpus: 4.001, pidsLimit: 4095 },
+        dockerWorkload: resolveDockerWorkloadConfig(
+          { enabled: true, networkAccess: 'offline' },
+          { memoryMb: 8191, cpus: 4.001, pidsLimit: 4095 },
+        ),
+      },
+      { cpus: 8, memoryMb: 32_000 },
+      false,
+    );
+
+    expect(partition.sidecar).toEqual({ memoryMb: 4096, cpus: 2.001, pidsLimit: 2048 });
+    expect(partition.sidecar.memoryMb).toBeGreaterThanOrEqual(8191 / 2);
+    expect(partition.sidecar.cpus).toBeGreaterThanOrEqual(4.001 / 2);
+    expect(partition.sidecar.pidsLimit).toBeGreaterThanOrEqual(4095 / 2);
+    expect(partition.agent).toEqual({ memoryMb: 4095, cpus: 2, pidsLimit: 2047 });
+    // An exact product is not rounded up by binary noise: 0.55 of 6000 MiB and
+    // of 3 CPUs evaluate to 3300.0000000000005 and 1650.0000000000002.
+    const exact = selectDockerDesktopResourcePartition(
+      {
+        dockerResources: { memoryMb: 6000, cpus: 3, pidsLimit: 4096 },
+        dockerWorkload: resolveDockerWorkloadConfig(
+          { enabled: true, networkAccess: 'offline', resources: { daemonShare: 0.55 } },
+          { memoryMb: 6000, cpus: 3, pidsLimit: 4096 },
+        ),
+      },
+      { cpus: 8, memoryMb: 32_000 },
+      false,
+    );
+    expect(exact.sidecar).toEqual({ memoryMb: 3300, cpus: 1.65, pidsLimit: 2253 });
+    expect(exact.agent).toEqual({ memoryMb: 2700, cpus: 1.35, pidsLimit: 1843 });
+  });
+
+  it('applies a configured daemon share and never starves the agent below its floor', () => {
+    const generous = selectDockerDesktopResourcePartition(
+      {
+        dockerResources: { memoryMb: 8192, cpus: 4, pidsLimit: 4096 },
+        dockerWorkload: resolveDockerWorkloadConfig(
+          { enabled: true, networkAccess: 'offline', resources: { daemonShare: 0.75 } },
+          { memoryMb: 8192, cpus: 4, pidsLimit: 8192 },
+        ),
+      },
+      { cpus: 8, memoryMb: 32_000 },
+      false,
+    );
+    expect(generous.sidecar).toEqual({ memoryMb: 6144, cpus: 3, pidsLimit: 6144 });
+    expect(generous.agent).toEqual({ memoryMb: 2048, cpus: 1, pidsLimit: 2048 });
+
+    const starved = selectDockerDesktopResourcePartition(
+      smallEnvelope('offline', 512, 0.9),
+      { cpus: 8, memoryMb: 16_384 },
+      true,
+    );
+    expect(starved.agent).toEqual({ memoryMb: 512, cpus: 0.25, pidsLimit: 128 });
+    expect(starved.sidecar).toEqual({ memoryMb: 1536 - 64 - 512, cpus: 0.75, pidsLimit: 512 - 32 - 128 });
+  });
+
+  it('clamps the session envelope to the Docker Desktop VM reported by docker info, not the host', () => {
+    const vm = dockerDesktopVmCapacity({
+      profile: 'macos-desktop',
+      architecture: 'arm64',
+      egressTransport: 'tcp',
+      server: {
+        architecture: 'arm64',
+        operatingSystem: 'Docker Desktop',
+        osType: 'linux',
+        serverVersion: '29.4.1',
+        kernelVersion: '6.12',
+        cgroupVersion: '2',
+        securityOptions: [],
+        cpus: 4,
+        memoryBytes: 8_000_000_000,
+      },
+    });
+    expect(vm).toEqual({ cpus: 4, memoryMb: 8000 });
+    const partition = selectDockerDesktopResourcePartition(
+      {
+        dockerResources: { memoryMb: 8192, cpus: 4, pidsLimit: 4096 },
+        dockerWorkload: resolveDockerWorkloadConfig(
+          { enabled: true, networkAccess: 'offline' },
+          { memoryMb: 8192, cpus: 4, pidsLimit: 4096 },
+        ),
+      },
+      vm,
+      true,
+    );
+    // 75% of the VM's 8000 MB and one CPU short of its 4.
+    expect(partition.sidecar.memoryMb + partition.transport.memoryMb + (partition.agent.memoryMb ?? 0)).toBe(6000);
+    expect(
+      millicpus(partition.sidecar.cpus) + millicpus(partition.transport.cpus) + millicpus(partition.agent.cpus),
+    ).toBe(3000);
+    expect(partition.sidecar).toMatchObject({ memoryMb: 3000, cpus: 1.5 });
+    expect(
+      dockerDesktopVmCapacity({ profile: 'apple-container', architecture: 'arm64', egressTransport: 'unix' }),
+    ).toBe(undefined);
+  });
 
   it.each([
     { networkAccess: 'offline', minimumMemoryMb: 1088, minimumCpus: 0.75 },
@@ -1087,7 +1259,7 @@ describe('Docker-workload wiring — outer resource envelope', () => {
     expect(() =>
       selectDockerDesktopResourcePartition(
         {
-          dockerResources: { memoryMb: 7777, cpus: 7 },
+          dockerResources: { memoryMb: 7777, cpus: 7, pidsLimit: 4096 },
           dockerWorkload: {
             enabled: true,
             networkAccess: minimum.networkAccess,
@@ -1095,7 +1267,8 @@ describe('Docker-workload wiring — outer resource envelope', () => {
             resources: {
               memoryMb: minimum.minimumMemoryMb - 1,
               cpus: minimum.minimumCpus - 0.01,
-              pids: { desired: 512, required: false },
+              daemonShare: 0.5,
+              pids: { desired: 4096, required: false },
               diskMb: null,
             },
           },
@@ -1109,43 +1282,50 @@ describe('Docker-workload wiring — outer resource envelope', () => {
   });
 
   it.each([
-    { networkAccess: 'offline', sidecarPids: 384, agentMemoryMb: 1024, agentCpus: 1 },
-    { networkAccess: 'images', sidecarPids: 352, agentMemoryMb: 960, agentCpus: 0.75 },
-    { networkAccess: 'packages', sidecarPids: 320, agentMemoryMb: 896, agentCpus: 0.5 },
+    { networkAccess: 'offline', sidecarCpus: 0.625, agentMemoryMb: 768, agentCpus: 0.625, agentPids: 2048 },
+    { networkAccess: 'images', sidecarCpus: 0.625, agentMemoryMb: 704, agentCpus: 0.375, agentPids: 2016 },
+    { networkAccess: 'packages', sidecarCpus: 0.5, agentMemoryMb: 640, agentCpus: 0.25, agentPids: 1984 },
   ] as const)(
     'omits unused TCP transport reserves for WSL $networkAccess',
-    ({ networkAccess, sidecarPids, agentMemoryMb, agentCpus }) => {
+    ({ networkAccess, sidecarCpus, agentMemoryMb, agentCpus, agentPids }) => {
       const partition = selectDockerDesktopResourcePartition(
-        {
-          dockerResources: { memoryMb: 7777, cpus: 7 },
-          dockerWorkload: {
-            enabled: true,
-            networkAccess,
-            acceptObservedDiskRisk: true,
-            resources: { memoryMb: 1536, cpus: 1.25, pids: { desired: 512, required: false }, diskMb: null },
-          },
-        },
+        smallEnvelope(networkAccess),
         { cpus: 8, memoryMb: 16_384 },
         false,
       );
       expect(partition).toEqual({
-        sidecar: { memoryMb: 512, cpus: 0.25, pidsLimit: sidecarPids },
+        sidecar: { memoryMb: 768, cpus: sidecarCpus, pidsLimit: 2048 },
         transport: { memoryMb: 0, cpus: 0, pidsLimit: 0 },
-        agent: { memoryMb: agentMemoryMb, cpus: agentCpus, pidsLimit: 128 },
+        agent: { memoryMb: agentMemoryMb, cpus: agentCpus, pidsLimit: agentPids },
       });
     },
   );
 
-  it('builds the purpose-built Desktop daemon once and reuses its hash-labeled image', async () => {
+  it('builds the purpose-built Desktop daemon once and pins its hash-labeled immutable image', async () => {
+    const daemonImageId = `sha256:${'d'.repeat(64)}`;
     let storedHash: string | undefined;
     const buildImage = vi.fn(
       async (_tag: string, _dockerfile: string, _context: string, labels?: Record<string, string>) => {
         storedHash = labels?.['ironcurtain.build-hash'];
       },
     );
+    const inspectImage = vi.fn(async (reference: string) =>
+      storedHash === undefined
+        ? undefined
+        : {
+            id: daemonImageId,
+            repoTags: [reference],
+            labels: {
+              'ironcurtain.build-hash': storedHash,
+              'com.ironcurtain.docker-workload.image-role': 'nested-daemon',
+            },
+            created: '2026-11-11T00:00:00.000Z',
+          },
+    );
     const runtime = {
       getImageLabel: vi.fn(async () => storedHash),
       buildImage,
+      inspectImage,
     } as unknown as ContainerRuntime;
 
     const source = {
@@ -1153,8 +1333,10 @@ describe('Docker-workload wiring — outer resource envelope', () => {
       imageId: `sha256:${'a'.repeat(64)}`,
       reference: `docker@sha256:${'b'.repeat(64)}`,
     };
-    await expect(ensureDockerDesktopSidecarImage(runtime, source)).resolves.toBe('ironcurtain-nested-daemon:latest');
-    await expect(ensureDockerDesktopSidecarImage(runtime, source)).resolves.toBe('ironcurtain-nested-daemon:latest');
+    const first = await ensureDockerDesktopSidecarImage(runtime, source);
+    expect(first).toEqual({ imageId: daemonImageId, buildHash: storedHash });
+    await expect(ensureDockerDesktopSidecarImage(runtime, source)).resolves.toEqual(first);
+    expect(inspectImage).toHaveBeenCalledWith('ironcurtain-nested-daemon:latest');
 
     expect(buildImage).toHaveBeenCalledOnce();
     expect(buildImage).toHaveBeenCalledWith(
@@ -1167,5 +1349,37 @@ describe('Docker-workload wiring — outer resource envelope', () => {
     expect(buildImage.mock.calls[0]?.[1]).toMatch(/docker\/nested-daemon\/Dockerfile$/u);
     expect(buildImage.mock.calls[0]?.[2]).toMatch(/docker\/nested-daemon$/u);
     expect(storedHash).toMatch(/^[a-f0-9]{64}$/u);
+  });
+
+  it('refuses a daemon tag that does not resolve to the expected immutable build', async () => {
+    const source = {
+      architecture: 'amd64' as const,
+      imageId: `sha256:${'a'.repeat(64)}`,
+      reference: `docker@sha256:${'b'.repeat(64)}`,
+    };
+    // The cache check saw this recipe's hash, but by inspection the tag names
+    // another install's build: refuse instead of running a different daemon.
+    let expectedHash: string | undefined;
+    const runtime = {
+      getImageLabel: vi.fn(async () => expectedHash),
+      buildImage: vi.fn(
+        async (_tag: string, _dockerfile: string, _context: string, labels?: Record<string, string>) => {
+          expectedHash = labels?.['ironcurtain.build-hash'];
+        },
+      ),
+      inspectImage: vi.fn(async () => ({
+        id: `sha256:${'d'.repeat(64)}`,
+        repoTags: ['ironcurtain-nested-daemon:latest'],
+        labels: {
+          'ironcurtain.build-hash': 'f'.repeat(64),
+          'com.ironcurtain.docker-workload.image-role': 'nested-daemon',
+        },
+        created: '2026-11-11T00:00:00.000Z',
+      })),
+    } as unknown as ContainerRuntime;
+
+    await expect(ensureDockerDesktopSidecarImage(runtime, source)).rejects.toThrow(
+      /does not carry the expected build hash/u,
+    );
   });
 });

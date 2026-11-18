@@ -9,7 +9,7 @@ Opt-in Svelte 5 SPA served by the IronCurtain daemon via `--web-ui`. Communicate
 - **Tailwind CSS v3** with CSS custom properties for theming
 - **shadcn-svelte pattern** -- custom UI components in `src/lib/components/ui/` built with `clsx` + `tailwind-merge`
 - **phosphor-svelte** for icons (tree-shaken via `sveltePhosphorOptimize` Vite plugin)
-- **marked** + **DOMPurify** for safe markdown rendering
+- **marked** + **DOMPurify** for markdown rendering with a strict profile (`src/lib/markdown.ts`): raw HTML is shown as text, images become `[image: alt] url` text, and only `http:`, `https:` and `mailto:` links stay clickable (new tab). Every markdown view renders agent-written text (workflow artifacts at gates, transition messages, the message log, persona constitutions, workflow READMEs).
 
 ## Architecture & Design Principles
 
@@ -47,32 +47,47 @@ All WebSocket RPC calls go through named functions in `stores.svelte.ts` (e.g., 
 - `appState` is the single reactive store (Svelte 5 runes)
 - Event handling is in pure `event-handler.ts` via `AppStateLike` interface
 - Map mutations always create new Map instances for Svelte reactivity
+- Refresh domains fail independently. Failed RPCs retain held reviews and show an error until recovery; unreadable workflow details block approval while denial/abort remain available.
 
 ## Directory Structure
 
 ```
 src/
-  App.svelte              -- Root component: auth gate, sidebar nav, theme picker
+  App.svelte              -- Root component: auth gate, sidebar nav, theme picker, view switch
   main.ts                 -- Svelte mount point
   app.css                 -- Tailwind directives, theme variables, prose styles
   lib/
     utils.ts              -- cn() utility (clsx + tailwind-merge)
     stores.svelte.ts      -- AppState class (Svelte 5 runes), WS client wiring, RPC actions
+    event-handler.ts      -- Pure event reducer over the AppStateLike interface
     types.ts              -- Frontend DTO types mirroring daemon types
     ws-client.ts          -- Typed WebSocket client with auto-reconnect
-    markdown.ts           -- marked + DOMPurify rendering helper
+    markdown.ts           -- Strict marked + DOMPurify rendering (renderMarkdown, sanitizeMarkdownHtml)
+    unicode-display.ts    -- Pure segmentation of untrusted text into visible escapes (used by SafeText)
+    escalation-groups.ts  -- Groups pending escalations that share one whitelist pattern (`groupKey`)
+    pty-codec.ts          -- base64 <-> bytes for PTY frames
     components/
       ui/                 -- Reusable UI primitives (see below)
-      features/           -- Domain-specific components
-        escalation-card.svelte   -- Single escalation with approve/deny/whitelist
-        escalation-modal.svelte  -- Tabbed modal for pending escalations
-        session-sidebar.svelte   -- Session list with container launch options
-        terminal-console.svelte  -- xterm terminal for web-pty sessions
+      features/           -- Domain-specific components, among them:
+        escalation-card.svelte            -- Single escalation with approve/deny/whitelist
+        escalation-modal.svelte           -- Tabbed modal for pending escalations
+        escalation-review-context.svelte  -- Trusted/untrusted reviewer context of an escalation
+        escalation-group-confirm.svelte   -- Confirmation step for approving an escalation group
+        session-sidebar.svelte            -- Session list with container launch options
+        terminal-console.svelte           -- xterm terminal for web-pty sessions
+        gate-review-panel.svelte          -- Workflow human gate: artifacts, APPROVE/FORCE_REVISION/REPLAN/ABORT
+        workflow-escalation-panel.svelte  -- Tool-call escalations raised inside workflows
+        message-log-timeline.svelte, file-tree.svelte, file-viewer.svelte, state-machine-graph.svelte,
+        resource-budget-panel.svelte, statistics/ ...
   routes/
     Dashboard.svelte      -- Overview cards, active sessions table, upcoming jobs
+    Statistics.svelte     -- Observed LLM exchange statistics (series, distributions, models)
     Sessions.svelte       -- Thin coordinator: wires sidebar + terminal to store
-    Escalations.svelte    -- Pending escalation cards with approve/deny
+    Escalations.svelte    -- Pending escalation cards with approve/deny and group approval
     Jobs.svelte           -- Job table with run/enable/disable/recompile/remove
+    Workflows.svelte      -- Workflow runs and definitions; opens WorkflowDetail.svelte for one run
+    Personas.svelte       -- Personas: create/delete, constitution editing, policy compiles, memory and broad-policy opt-ins
+    Settings.svelte       -- Model provider profiles, statistics settings, resource limits
 ```
 
 ## UI Components (`src/lib/components/ui/`)
@@ -89,6 +104,12 @@ Each component lives in its own directory with an `index.ts` barrel export. All 
 | **Alert**        | `alert/`         | Variants: default, destructive. `dismissible` + `ondismiss` for closeable alerts.                                                   |
 | **DropdownMenu** | `dropdown-menu/` | DropdownMenu (container with backdrop) + DropdownMenuItem. `align` prop: bottom-left/right, top-left/right. Uses `trigger` snippet. |
 | **Spinner**      | `spinner/`       | Animated loading spinner. Sizes: xs, sm, md.                                                                                        |
+| **Modal**        | `modal/`         | Dialog with document-level Escape. `focusOnOpen` and `bind:dialog`, see below.                                                      |
+| **SafeText**     | `safe-text/`     | Untrusted text with invisible and direction-changing code points shown as `\u` escapes, see below.                                  |
+
+**Modal focus.** `focusOnOpen: 'dialog'` (default) moves focus into the dialog but never onto an action control: the first text field gets it, otherwise the dialog container. `'none'` keeps focus where it is, for modals that open without a user action (the escalation modal), so keystrokes meant for the terminal never reach the dialog. `bind:dialog` exposes the `role="dialog"` element.
+
+**SafeText.** Renders untrusted text with every invisible or direction-changing code point shown as a highlighted escape (U+202E appears as `\u202e`), using the pure segmentation in `$lib/unicode-display.ts`. Use it for agent-influenced values in approval views.
 
 ### Adding a New Component
 
@@ -164,13 +185,16 @@ npm test -w packages/web-ui       # Run the vitest unit suite
 npm run test:watch -w packages/web-ui  # Watch mode during development
 ```
 
-Tests cover:
+The suite (`vitest.config.ts` includes `src/**/*.test.ts`) has tests next to the components and routes they cover, plus shared ones in `src/lib/__tests__/`. Among them:
 
 - **`event-handler.test.ts`** -- All WebSocket event types, state mutations, edge cases
 - **`ws-client.test.ts`** -- Request correlation, event dispatch, reconnect, timeouts
 - **`stores-pty.test.ts`** -- PTY store actions + the buffering sink registry (frames that arrive before the terminal connects are held and drained in order; see "PTY terminal streaming" below)
+- **`stores-escalations.test.ts`**, **`stores-gates.test.ts`**, **`escalation-modal.test.ts`**, **`escalation-groups.test.ts`** -- escalation and gate state, the armed approval modal, group approval
+- **`markdown.test.ts`**, **`unicode-display.test.ts`** -- the strict markdown profile and visible escapes
+- **`routes/Sessions.reattach.test.ts`** -- PTY reattach after a reconnect (real store, mocked ws-client)
 
-Root `npm test` also runs the web-ui tests after the main test suite.
+Root `npm test` also runs the web-ui tests after the main test suite. `npm run check -w packages/web-ui` runs `svelte-check`; `lint` and `format:check` exist per package as well.
 
 ### Architecture for testability
 
@@ -220,6 +244,21 @@ A `web-pty` session (`source.kind === 'web-pty'`) renders a live xterm.js termin
 **Component (`features/terminal-console.svelte`).** Presentational: no store import (route wiring only). Creates the xterm terminal in **`onMount`, not `$effect`** — the route passes inline callback props whose identity changes on every parent re-render, and a reactive `$effect` re-runs on that churn, disposing and recreating the terminal and **dropping the one-shot replay** (the bug the E2E caught: reconnect to an idle session blanked). On mount it hands the route a live `{ write, reset }` handle via `onready`. Input is keyboard-only (mux parity: no `onBinary`/app-mouse forwarding; wheel = local scrollback; Ctrl+C stays SIGINT).
 
 **Buffering sink (`stores.svelte.ts`).** The one-shot replay can arrive _before_ the terminal has mounted (a fast daemon sends it the instant it receives `ptyAttach`). The per-label `BufferingPtySink` holds frames until the terminal connects, then drains them in order — a snapshot is never dropped. API: `registerPtySink(label)` (route, before attach) / `connectPtyTerminal(label, handle)` (from the component's `onready`) / `disconnectPtyTerminal` / `unregisterPtySink`; these two are order-independent (either creates the sink). `getPtySink(label)` returns the sink so the pure `event-handler.ts` can route `pty_output`/`pty_replay` to `.write` / `.reset`.
+
+**Reconnects.** The daemon drops a client's PTY subscription when its socket closes, so the Sessions route re-sends `sessions.ptyAttach` after every reconnect: its attach effect is keyed on `appState.connected` (not on `connectionGeneration`), and the replay snapshot repaints the terminal. The per-label sink/terminal binding is torn down only when the selection changes. A `role="status"` banner (`pty-reattach-banner`) shows the detached/reattaching/failed state, and `SessionDto.osSandboxWarning` renders as a `role="alert"` banner (`pty-os-sandbox-warning`). `sessions.ptyResize` accepts cols 2..1000 and rows 1..500 (`src/pty/pty-size.ts`; INVALID_PARAMS otherwise), and the mock server mirrors those bounds.
+
+**Complete browser reviews.** `src/web-ui/escalation-wire.ts` retains a complete review within 16 KiB, 2,048 traversal entries and depth 16, or emits an explicitly deny-only summary. All list/detail/push paths use this projection; server approval routes check the original pending record, including every member before group resolution. Summaries have no whitelist/group actions. The existing 8 MiB aggregate RPC cap remains; many bounded records may still yield a visible refresh error.
+
+**Escalations in PTY sessions.** `escalations.resolve` can fail with `ESCALATION_EXPIRED` when the proxy already timed the request out; the modal shows resolve errors inline. `session.ended` also drops that session's pending escalations client-side (the daemon expires them first with `escalation.expired`, and so does the mock server on `sessions.end`).
+
+**Armed approvals (`features/escalation-modal.svelte`).** The escalation modal opens with `focusOnOpen="none"`, so it never takes keyboard focus, and it has no bare-letter hotkeys: deciding is a click on Approve or Deny, or Ctrl/Cmd+Enter (approve) and Ctrl/Cmd+Backspace (deny) once focus is inside the dialog. Both work only while the escalation on screen is armed: visible for `ESCALATION_ARM_DELAY_MS` (750 ms). The delay restarts whenever a different escalation is shown, and nothing is armed while the page is hidden or the window unfocused. An escalation that does not name its server, tool and arguments can only be denied (`isApprovableEscalation` in `$lib/escalation-approval.ts`).
+
+## Workflows, gates and escalation groups
+
+- **Gates.** `pendingGates` is rebuilt from server state on reconnect, and `workflow.gate_raised` evicts the other gates of the same workflow. `resolveWorkflowGate(workflowId, gateId, event, prompt?)` declares the `web-ui` channel and, after a `GATE_MISMATCH` or `WORKFLOW_NOT_AT_GATE` refusal, re-reads the workflow's gate before rethrowing. `GateReviewPanel`'s `onResolve` is `(gateId, event, prompt?)`. Approve requires the full gate/event/content review to remain visible, focused and in place for `ESCALATION_ARM_DELAY_MS` (750 ms). Review/refresh changes, surrounding layout changes and measured action-row movement restart the delay; this includes scrolling and responsive layout changes. Presses begun unarmed, repeated keys and presses held across rearming cannot approve. Handlers reject duplicate pending submissions, and changed reviews clear feedback/abort drafts. Revision/replan and abort keep their existing feedback/confirmation steps and remain available while approval is unarmed.
+- **Artifacts and the message log.** `workflows.artifacts` returns a listing (`{path, size}[]` plus `truncated`) and `workflows.artifactFile` one file; the gate review panel opens the first file and loads the others on expand. Message-log entries are cut to 8,192 characters with `truncated` and `ref` (the full text comes from `workflows.messageLogEntry`), and the file tree notes when a directory listing stops at 2,000 entries. A `daemon.resync` event triggers a full refresh.
+- **Workflow escalations.** Tool-call escalations raised inside workflows arrive as `workflow.escalation_*` events, live in `appState.pendingWorkflowEscalations`, render in `workflow-escalation-panel.svelte`, and are decided through `resolveWorkflowEscalation`.
+- **Escalation groups.** Pending escalations sharing one whitelist pattern (`EscalationDto.groupKey`) can be approved together after a confirmation that lists every member (`approveEscalationGroup` → `escalations.approveGroup`; the daemon answers `ESCALATION_GROUP_CHANGED` unless the ids are still exactly the group). Human-only escalations never group.
 
 ## WebSocket Client
 

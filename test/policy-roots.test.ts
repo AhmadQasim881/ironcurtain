@@ -7,6 +7,9 @@ import {
   extractRequiredServers,
   toMcpRoots,
   directoryForPath,
+  pathForRootUri,
+  resolveApprovedPath,
+  rootUriForPath,
 } from '../src/trusted-process/policy-roots.js';
 import type { CompiledPolicyFile, CompiledRule } from '../src/pipeline/types.js';
 
@@ -205,6 +208,42 @@ describe('toMcpRoots', () => {
   it('returns empty array for empty input', () => {
     expect(toMcpRoots([])).toEqual([]);
   });
+
+  it('percent-encodes URL syntax so the server sees the exact directory', () => {
+    // A bare `file://${path}` turns `x#y` into a fragment: the server would
+    // install `/home/user/x` instead of the approved `/home/user/x#y`.
+    const [root] = toMcpRoots([{ path: '/home/user/x#y?z', name: 'odd' }]);
+    expect(root.uri).toBe('file:///home/user/x%23y%3Fz');
+    expect(pathForRootUri(root.uri)).toBe('/home/user/x#y?z');
+  });
+});
+
+describe('rootUriForPath / pathForRootUri', () => {
+  it('round-trips spaces, percent signs and non-ASCII names', () => {
+    for (const dir of ['/tmp/a b', '/tmp/100%', '/home/u/naïve', '/']) {
+      expect(pathForRootUri(rootUriForPath(dir))).toBe(dir);
+    }
+  });
+
+  it('returns undefined for URIs that are not local file URIs', () => {
+    expect(pathForRootUri('https://example.com/x')).toBeUndefined();
+    expect(pathForRootUri('file://remote-host/x')).toBeUndefined();
+    expect(pathForRootUri('not a uri')).toBeUndefined();
+  });
+});
+
+describe('resolveApprovedPath', () => {
+  it('resolves relative paths against the base directory, not the process cwd', () => {
+    expect(resolveApprovedPath('relative/file.txt', sandboxDir)).toBe(join(sandboxDir, 'relative/file.txt'));
+  });
+
+  it('returns undefined for a relative path without a base directory', () => {
+    expect(resolveApprovedPath('relative/file.txt')).toBeUndefined();
+  });
+
+  it('canonicalizes absolute paths through symlinks', () => {
+    expect(resolveApprovedPath(linkedFile, sandboxDir)).toBe(testFile);
+  });
 });
 
 describe('directoryForPath', () => {
@@ -216,8 +255,23 @@ describe('directoryForPath', () => {
     expect(directoryForPath(desktopDir + '/')).toBe(desktopDir);
   });
 
-  it('resolves relative paths before extracting directory', () => {
-    expect(directoryForPath('relative/file.txt')).toBe(resolve('relative'));
+  it('returns an existing directory itself, not its parent', () => {
+    // Approving a listing of desktopDir must not make all of tempDir a root.
+    expect(directoryForPath(desktopDir)).toBe(desktopDir);
+  });
+
+  it('returns the parent of a path that does not exist yet', () => {
+    expect(directoryForPath(join(desktopDir, 'new-dir'))).toBe(desktopDir);
+  });
+
+  it('resolves relative paths against the base directory', () => {
+    expect(directoryForPath('relative/file.txt', sandboxDir)).toBe(join(sandboxDir, 'relative'));
+    expect(directoryForPath('test-file.txt', sandboxDir)).toBe(sandboxDir);
+  });
+
+  it('never resolves a relative path against the process working directory', () => {
+    expect(directoryForPath('relative/file.txt')).toBeUndefined();
+    expect(directoryForPath('relative/file.txt', sandboxDir)).not.toBe(resolve('relative'));
   });
 
   it('handles deeply nested file paths', () => {
@@ -230,6 +284,10 @@ describe('directoryForPath', () => {
 
   it('resolves symlinks before extracting directory', () => {
     expect(directoryForPath(linkedFile)).toBe(sandboxDir);
+  });
+
+  it('resolves a symlinked directory to its target', () => {
+    expect(directoryForPath(sandboxLink)).toBe(sandboxDir);
   });
 });
 
@@ -266,6 +324,11 @@ describe('extractRequiredServers', () => {
     const servers = extractRequiredServers(policy);
     expect(servers.has('proxy')).toBe(false);
     expect(servers.has('filesystem')).toBe(true);
+  });
+
+  it('excludes the virtual network (MITM egress) server, which has no relay to spawn', () => {
+    const policy = makePolicyFile([makeServerRule('r1', ['git'], 'allow'), makeServerRule('r2', ['network'], 'allow')]);
+    expect(extractRequiredServers(policy)).toEqual(new Set(['git']));
   });
 
   it('returns an empty set when no rules carry an if.server entry', () => {

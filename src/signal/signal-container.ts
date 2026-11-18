@@ -1,205 +1,365 @@
-/**
- * Manages the signal-cli-rest-api Docker container.
- *
- * Unlike agent containers (per-session, ephemeral, --network=none),
- * the signal-cli container is a long-lived background service that
- * needs network access to communicate with Signal servers.
- *
- * Delegates to ContainerRuntime for all Docker CLI operations.
- */
-
-import { mkdirSync } from 'node:fs';
-import type { ContainerRuntime } from '../docker/types.js';
+/** Owns one authenticated Signal bridge and refuses containers from another home. */
+import { createHash } from 'node:crypto';
+import { closeSync, constants, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, realpathSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import type { ContainerRuntime, DockerContainerConfig } from '../docker/types.js';
+import { getIronCurtainHome, getOAuthDir } from '../config/paths.js';
+import { assertTrustedDirectoryChain } from '../hardened-fs.js';
 import { getSignalDataDir } from './signal-config.js';
+import { resolveSignalImage, SIGNAL_BRIDGE_AUTH_LABEL, SIGNAL_BRIDGE_AUTH_VERSION } from './signal-image.js';
+import { createSignalBridgeClient, type SignalBridgeClient } from './signal-bridge-client.js';
+import { loadOrCreateSignalBridgeCredentials } from './signal-bridge-credentials.js';
 import * as logger from '../logger.js';
 
-/** Container-internal path where signal-cli stores its data. */
 const SIGNAL_CLI_DATA_DIR = '/home/.local/share/signal-cli';
+const CREDENTIALS_TARGET = '/run/ironcurtain-signal-auth/credentials.json';
+const ENTRYPOINT = '/usr/local/bin/ironcurtain-signal-entrypoint';
+const AUTH_HEADER = 'X-IronCurtain-Signal-Auth';
+export const SIGNAL_BRIDGE_OWNER_LABEL = 'org.ironcurtain.signal-bridge-owner';
+export const SIGNAL_BRIDGE_CREDENTIAL_LABEL = 'org.ironcurtain.signal-bridge-credentials';
+const CAPABILITIES = ['CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'SETUID', 'SETGID', 'KILL'] as const;
 
-/** Configuration for the signal-cli Docker container. */
 export interface SignalContainerConfig {
-  /** Docker image name with tag. */
   readonly image: string;
-  /** Host port to bind the REST API to. */
   readonly port: number;
-  /** Host directory for signal-cli persistent data. */
   readonly dataDir: string;
-  /** Container name for identification. */
   readonly containerName: string;
 }
-
-/** Manages the signal-cli-rest-api Docker container. */
 export interface SignalContainerManager {
-  /** Ensures the container is running. Returns the REST API base URL. Idempotent. */
-  ensureRunning(): Promise<string>;
-
-  /** Polls GET /v1/health until the REST API responds. */
-  waitForHealthy(baseUrl: string, timeoutMs?: number): Promise<void>;
-
-  /** Stops and removes the container. */
+  ensureRunning(): Promise<SignalBridgeClient>;
+  waitForHealthy(client: SignalBridgeClient, timeoutMs?: number): Promise<void>;
   teardown(): Promise<void>;
-
-  /** Pulls the latest version of the configured Docker image. */
-  pullImage(): Promise<void>;
-
-  /** Returns true if the container exists (running or stopped). */
   exists(): Promise<boolean>;
-
-  /** Returns true if the container is currently running. */
   isRunning(): Promise<boolean>;
 }
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function record(value: unknown): Readonly<Record<string, unknown>> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Readonly<Record<string, unknown>>)
+    : {};
 }
-
-/**
- * Detects stale bind mounts by checking whether the container can see
- * the data/ subdirectory. After a host reboot (WSL2/Windows), Docker
- * may restart the container but the bind mount shows an empty or partial
- * view of the host directory.
- */
-async function hasStaleBindMount(docker: ContainerRuntime, containerName: string): Promise<boolean> {
+/** Existing owned data is narrowed to private modes, never chowned. */
+function privateDataDirectory(configured: string, create: boolean): string {
+  const euid = process.geteuid?.();
+  if (euid === undefined || euid === 0)
+    throw new Error('Signal requires a non-root host user with a verifiable identity');
+  const home = resolve(getIronCurtainHome());
+  const data = configured || getSignalDataDir();
+  if (!isAbsolute(data)) throw new Error('Signal data directory must be absolute and below the IronCurtain home');
+  const below = relative(home, resolve(data));
+  if (below === '' || below === '..' || below.startsWith(`..${sep}`) || isAbsolute(below))
+    throw new Error('Signal data directory must be below the IronCurtain home');
+  if (create) mkdirSync(home, { recursive: true, mode: 0o700 });
+  const canonicalHome = realpathSync(home);
+  if (lstatSync(canonicalHome).uid !== euid) throw new Error('Signal home must be owned by the current host user');
+  assertTrustedDirectoryChain(canonicalHome, {
+    root: canonicalHome,
+    rootDescription: 'the IronCurtain home',
+    label: 'Signal home',
+  });
+  let current = canonicalHome;
+  for (const component of below.split(sep)) {
+    current = join(current, component);
+    if (create) {
+      try {
+        mkdirSync(current, { mode: 0o700 });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
+    }
+    const descriptor = openSync(current, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    try {
+      const stats = fstatSync(descriptor);
+      if (!stats.isDirectory() || stats.uid !== euid)
+        throw new Error('Signal data directories must be owned by the current host user');
+      if (create) fchmodSync(descriptor, 0o700);
+      else if ((stats.mode & 0o777) !== 0o700) throw new Error('Signal data directory must have mode 0700');
+    } finally {
+      closeSync(descriptor);
+    }
+  }
+  return current;
+}
+function ownerFor(dataDir: string): string {
+  return createHash('sha256')
+    .update(`${realpathSync(getOAuthDir())}\0${dataDir}`)
+    .digest('hex');
+}
+function mountMatches(value: unknown, source: string, target: string, writable: boolean): boolean {
+  const mount = record(value);
+  return mount.Type === 'bind' && mount.Source === source && mount.Destination === target && mount.RW === writable;
+}
+function validateOwnership(
+  raw: Readonly<Record<string, unknown>>,
+  owner: string,
+  dataDir: string,
+  allowLegacy: boolean,
+): string {
+  const labels = record(record(raw.Config).Labels);
+  if (labels[SIGNAL_BRIDGE_OWNER_LABEL] !== undefined && labels[SIGNAL_BRIDGE_OWNER_LABEL] !== owner)
+    throw new Error('The named Signal container belongs to another IronCurtain home; it was left untouched');
+  if (!allowLegacy && labels[SIGNAL_BRIDGE_OWNER_LABEL] !== owner)
+    throw new Error('The named Signal container has no matching owner label; it was left untouched');
+  const mounts = Array.isArray(raw.Mounts) ? raw.Mounts : [];
+  const dataMounts = mounts.filter((mount) => record(mount).Destination === SIGNAL_CLI_DATA_DIR);
+  if (dataMounts.length !== 1 || !mountMatches(dataMounts[0], dataDir, SIGNAL_CLI_DATA_DIR, true))
+    throw new Error(
+      "The named Signal container does not mount this home's exact data directory; it was left untouched",
+    );
+  if (typeof raw.Id !== 'string' || !/^[a-f0-9]{64}$/u.test(raw.Id))
+    throw new Error('Signal container inspection did not provide an immutable container ID');
+  return raw.Id;
+}
+function exactStrings(value: unknown, expected: readonly string[]): boolean {
+  return (
+    Array.isArray(value) && value.length === expected.length && value.every((entry, index) => entry === expected[index])
+  );
+}
+function exactCapabilities(value: unknown): boolean {
+  if (!Array.isArray(value) || value.length !== CAPABILITIES.length) return false;
+  const normalized = value.map((capability: unknown) =>
+    typeof capability === 'string' ? capability.replace(/^CAP_/u, '') : undefined,
+  );
+  return (
+    new Set(normalized).size === CAPABILITIES.length &&
+    CAPABILITIES.every((capability) => normalized.includes(capability))
+  );
+}
+function matchesProfile(
+  raw: Readonly<Record<string, unknown>>,
+  profile: DockerContainerConfig,
+  fingerprint: string,
+): boolean {
+  const config = record(raw.Config),
+    host = record(raw.HostConfig),
+    labels = record(config.Labels);
+  const mounts = Array.isArray(raw.Mounts) ? raw.Mounts : [];
+  const bindings = record(host.PortBindings),
+    binding = bindings['8080/tcp'];
+  const expectedBinding = profile.ports?.length === 1 ? profile.ports[0] : undefined;
+  const expectedOwner = profile.labels?.[SIGNAL_BRIDGE_OWNER_LABEL];
+  if (expectedBinding === undefined || expectedOwner === undefined) return false;
+  const port = /^127\.0\.0\.1:(\d+):8080$/u.exec(expectedBinding)?.[1];
+  if (port === undefined) return false;
+  const networks = record(record(raw.NetworkSettings).Networks);
+  if (
+    raw.Image !== profile.image ||
+    config.Image !== profile.image ||
+    labels[SIGNAL_BRIDGE_OWNER_LABEL] !== expectedOwner ||
+    labels[SIGNAL_BRIDGE_AUTH_LABEL] !== SIGNAL_BRIDGE_AUTH_VERSION ||
+    labels[SIGNAL_BRIDGE_CREDENTIAL_LABEL] !== fingerprint ||
+    !exactStrings(config.Entrypoint, [ENTRYPOINT]) ||
+    !(config.Cmd === undefined || config.Cmd === null || exactStrings(config.Cmd, [])) ||
+    (profile.user !== undefined
+      ? config.User !== profile.user
+      : !['signal-api', '1000', '1000:1000'].includes(String(config.User))) ||
+    host.NetworkMode !== 'bridge' ||
+    Object.keys(networks).length !== 1 ||
+    !('bridge' in networks) ||
+    host.Privileged !== false ||
+    host.PublishAllPorts !== false ||
+    Object.keys(bindings).length !== 1 ||
+    !Array.isArray(binding) ||
+    binding.length !== 1 ||
+    record(binding[0]).HostIp !== '127.0.0.1' ||
+    record(binding[0]).HostPort !== port ||
+    mounts.length !== profile.mounts.length ||
+    profile.mounts.some(
+      (mount) => !mounts.some((observed) => mountMatches(observed, mount.source, mount.target, !mount.readonly)),
+    ) ||
+    !exactStrings(host.CapDrop, ['ALL']) ||
+    !exactCapabilities(host.CapAdd) ||
+    record(host.RestartPolicy).Name !== 'no' ||
+    !Array.isArray(host.SecurityOpt) ||
+    !host.SecurityOpt.some((option) => option === 'no-new-privileges' || option === 'no-new-privileges:true')
+  )
+    return false;
+  if (!Array.isArray(config.Env) || !config.Env.every((entry) => typeof entry === 'string')) return false;
+  const env = new Map<string, string>();
+  for (const entry of config.Env) {
+    const equals = entry.indexOf('=');
+    if (equals < 1 || env.has(entry.slice(0, equals))) return false;
+    env.set(entry.slice(0, equals), entry.slice(equals + 1));
+  }
+  if (env.has('AUTO_RECEIVE_SCHEDULE')) return false;
+  if (profile.user === undefined && (env.has('SIGNAL_BRIDGE_UID') || env.has('SIGNAL_BRIDGE_GID'))) return false;
+  return Object.entries(profile.env).every(([name, value]) => env.get(name) === value);
+}
+async function staleBindMount(docker: ContainerRuntime, id: string, dataDir: string): Promise<boolean> {
   try {
-    // Pass `execUser: null` to skip `--user codespace`: the
-    // bbernhard/signal-cli-rest-api image has no codespace account, and
-    // pinning it would cause `docker exec` to fail with a confusing
-    // "unable to find user codespace" error — which the catch below
-    // would swallow, silently returning false and breaking stale-mount
-    // detection on WSL/Windows reboots.
-    const result = await docker.exec(containerName, ['test', '-d', `${SIGNAL_CLI_DATA_DIR}/data`], 5_000, null);
-    return result.exitCode !== 0;
+    if (!lstatSync(join(dataDir, 'data')).isDirectory()) return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+  try {
+    return (await docker.exec(id, ['test', '-d', `${SIGNAL_CLI_DATA_DIR}/data`], 5_000, null)).exitCode !== 0;
   } catch {
-    return false; // Can't tell — assume OK
+    return true;
   }
 }
-
 export function createSignalContainerManager(
   docker: ContainerRuntime,
   config: SignalContainerConfig,
 ): SignalContainerManager {
-  const resolvedDataDir = config.dataDir || getSignalDataDir();
-
+  let activeClient: SignalBridgeClient | undefined;
+  let credentials: ReturnType<typeof loadOrCreateSignalBridgeCredentials> | undefined;
+  const origin = `https://127.0.0.1:${config.port}`;
+  async function inspect(name: string): Promise<Readonly<Record<string, unknown>>> {
+    if (docker.inspectContainerRaw === undefined)
+      throw new Error('Signal requires complete Docker container inspection support');
+    const raw = await docker.inspectContainerRaw(name);
+    if (raw === undefined)
+      throw new Error('Signal container could not be inspected; no existing container was changed');
+    return raw;
+  }
   return {
-    async ensureRunning(): Promise<string> {
-      const baseUrl = `http://127.0.0.1:${config.port}`;
-
-      // Check existing container first (fast path — avoids network round-trip to registry)
+    async ensureRunning(): Promise<SignalBridgeClient> {
+      activeClient?.close();
+      activeClient = undefined;
+      credentials = undefined;
+      if (docker.inspectContainerRaw === undefined)
+        throw new Error('Signal requires complete Docker container inspection support');
+      if (
+        !Number.isInteger(config.port) ||
+        config.port < 1024 ||
+        config.port > 65535 ||
+        !/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/u.test(config.containerName)
+      )
+        throw new Error('Invalid Signal bridge port or container name');
+      const dataDir = privateDataDirectory(config.dataDir, true);
+      credentials = loadOrCreateSignalBridgeCredentials();
+      const owner = ownerFor(dataDir),
+        linux = process.platform === 'linux';
+      const uid = process.geteuid?.(),
+        gid = process.getegid?.();
+      if (linux && (uid === undefined || gid === undefined || uid === 0 || gid === 0))
+        throw new Error('Signal requires positive non-root host UID and GID');
+      let existing: Readonly<Record<string, unknown>> | undefined;
+      let id: string | undefined;
       if (await docker.containerExists(config.containerName)) {
-        logger.info(`[Signal Container] Container ${config.containerName} exists, checking state...`);
-
-        if (await docker.isRunning(config.containerName)) {
-          // Verify the bind mount is healthy. After a host reboot (e.g. WSL2/Windows),
-          // Docker may auto-restart the container with a stale bind mount where the
-          // host directory contents are invisible inside the container.
-          if (await hasStaleBindMount(docker, config.containerName)) {
-            logger.info('[Signal Container] Stale bind mount detected, restarting container...');
-            await docker.stop(config.containerName);
-            await docker.start(config.containerName);
-          } else {
-            logger.info('[Signal Container] Already running');
-          }
-          return baseUrl;
-        }
-
-        // Container exists but is stopped — check for image update before starting
-        logger.info(`[Signal Container] Pulling image ${config.image}...`);
-        try {
-          await docker.pullImage(config.image);
-        } catch {
-          logger.info('[Signal Container] Pull failed (offline?) - using cached image');
-        }
-
-        const [containerId, imageId] = await Promise.all([
-          docker.getImageId(config.containerName),
-          docker.getImageId(config.image),
-        ]);
-        const outdated = containerId && imageId && containerId !== imageId;
-
-        if (outdated) {
-          logger.info('[Signal Container] Image outdated, recreating container...');
-          await docker.remove(config.containerName);
-          // Fall through to create below
-        } else {
-          logger.info('[Signal Container] Starting existing container...');
-          await docker.start(config.containerName);
-          return baseUrl;
-        }
-      } else {
-        // No existing container — pull latest image before creating
-        logger.info(`[Signal Container] Pulling image ${config.image}...`);
-        try {
-          await docker.pullImage(config.image);
-        } catch {
-          logger.info('[Signal Container] Pull failed (offline?) - using cached image');
+        existing = await inspect(config.containerName);
+        id = validateOwnership(existing, owner, dataDir, true);
+        // Image resolution can fail during an upgrade. Close an owned legacy
+        // listener first, so that failure cannot leave the old API exposed.
+        if (record(record(existing.Config).Labels)[SIGNAL_BRIDGE_AUTH_LABEL] !== SIGNAL_BRIDGE_AUTH_VERSION) {
+          logger.info('[Signal Container] Removing owned legacy bridge before image admission');
+          if (record(existing.State).Running === true) await docker.stop(id);
+          await docker.remove(id);
+          existing = undefined;
+          id = undefined;
         }
       }
-
-      // Create new container via ContainerRuntime.create()
-      logger.info('[Signal Container] Creating new container...');
-      mkdirSync(resolvedDataDir, { recursive: true });
-      await docker.create({
-        image: config.image,
+      const image = await resolveSignalImage(docker, config.image, {
+        info: (message) => logger.info(`[Signal Container] ${message}`),
+        warn: (message) => logger.warn(`[Signal Container] ${message}`),
+      });
+      const profile: DockerContainerConfig = {
+        image: image.id,
         name: config.containerName,
         network: 'bridge',
         ports: [`127.0.0.1:${config.port}:8080`],
-        // No restartPolicy — the daemon manages the container lifecycle.
-        // Docker's auto-restart after a host reboot produces stale bind mounts
-        // (host directory contents invisible inside the container).
-        // The signal-cli-rest-api entrypoint needs capabilities for:
-        //   CHOWN, FOWNER - jsonrpc2-helper creates FIFOs and sets permissions
-        //   DAC_OVERRIDE  - root writes config to UID-1000-owned volume
-        //   SETUID/SETGID - usermod/groupmod + setpriv to drop privileges
-        //   KILL          - supervisor manages signal-cli child process
-        capAdd: ['CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'SETUID', 'SETGID', 'KILL'],
+        entrypoint: ENTRYPOINT,
+        ...(linux ? { user: '0:0' } : {}),
+        capAdd: CAPABILITIES,
+        trustedCreateOptions: { securityOptions: ['no-new-privileges:true'] },
+        labels: {
+          [SIGNAL_BRIDGE_AUTH_LABEL]: SIGNAL_BRIDGE_AUTH_VERSION,
+          [SIGNAL_BRIDGE_OWNER_LABEL]: owner,
+          [SIGNAL_BRIDGE_CREDENTIAL_LABEL]: credentials.fingerprint,
+        },
         mounts: [
-          {
-            source: resolvedDataDir,
-            target: SIGNAL_CLI_DATA_DIR,
-            readonly: false,
-          },
+          { source: dataDir, target: SIGNAL_CLI_DATA_DIR, readonly: false },
+          { source: credentials.filePath, target: CREDENTIALS_TARGET, readonly: true },
         ],
         env: {
           MODE: 'json-rpc',
-          // Skip recursive chown on data dir - it's already owned by
-          // UID 1000 (matching the container's signal-api user).
+          PORT: '8080',
           SIGNAL_CLI_CHOWN_ON_STARTUP: 'false',
+          IRONCURTAIN_SIGNAL_CREDENTIALS_FILE: CREDENTIALS_TARGET,
+          ...(linux ? { SIGNAL_BRIDGE_UID: String(uid), SIGNAL_BRIDGE_GID: String(gid) } : {}),
         },
         command: [],
-      });
-      await docker.start(config.containerName);
-      return baseUrl;
-    },
-
-    async waitForHealthy(baseUrl: string, timeoutMs = 30_000): Promise<void> {
-      const start = Date.now();
-      let delay = 500;
-      while (Date.now() - start < timeoutMs) {
-        try {
-          const resp = await fetch(`${baseUrl}/v1/health`);
-          if (resp.status === 204) return;
-        } catch {
-          // Container starting up
-        }
-        await sleep(delay);
-        delay = Math.min(delay * 1.5, 3000);
+      };
+      if (existing !== undefined && id !== undefined) {
+        const raw = existing;
+        const running = record(raw.State).Running === true;
+        if (
+          !matchesProfile(raw, profile, credentials.fingerprint) ||
+          (running && (await staleBindMount(docker, id, dataDir)))
+        ) {
+          logger.info('[Signal Container] Recreating owned container with the authenticated bridge profile');
+          if (running) await docker.stop(id);
+          await docker.remove(id);
+          id = undefined;
+        } else if (!running) await docker.start(id);
       }
-      throw new Error(`signal-cli container did not become healthy within ${timeoutMs}ms`);
+      if (id === undefined) {
+        const created = await docker.create(profile);
+        const raw = await inspect(created);
+        id = validateOwnership(raw, owner, dataDir, false);
+        if (id !== created || !matchesProfile(raw, profile, credentials.fingerprint))
+          throw new Error(
+            'New Signal container does not match the required authenticated bridge profile; it was not started',
+          );
+        await docker.start(id);
+      }
+      activeClient = createSignalBridgeClient(origin, credentials.token, { ca: credentials.certPem });
+      return activeClient;
     },
-
+    async waitForHealthy(client, timeoutMs = 30_000): Promise<void> {
+      if (client !== activeClient || credentials === undefined)
+        throw new Error('Use the authenticated client returned by this Signal container manager');
+      if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 300_000)
+        throw new Error('Invalid Signal health timeout');
+      const token = `${credentials.token[0] === '0' ? '1' : '0'}${credentials.token.slice(1)}`;
+      const negative = createSignalBridgeClient(origin, token, { ca: credentials.certPem });
+      const deadline = AbortSignal.timeout(timeoutMs),
+        end = Date.now() + timeoutMs;
+      let delay = 500;
+      try {
+        while (Date.now() < end) {
+          try {
+            const response = await client.request('/v1/health', { signal: deadline });
+            if (response.status === 204) {
+              if (response.headers.get(AUTH_HEADER) !== SIGNAL_BRIDGE_AUTH_VERSION)
+                throw new Error('Signal bridge did not prove authenticated admission');
+              const refused = await negative.request('/v1/health', { signal: deadline });
+              if (refused.status !== 401 || refused.headers.get(AUTH_HEADER) !== SIGNAL_BRIDGE_AUTH_VERSION)
+                throw new Error('Signal bridge did not prove authenticated admission');
+              return;
+            }
+          } catch (error) {
+            if (
+              error instanceof Error &&
+              (error.message === 'Signal bridge did not prove authenticated admission' ||
+                error.message === 'Signal bridge client is closed')
+            )
+              throw error;
+          }
+          const remaining = end - Date.now();
+          if (remaining <= 0) break;
+          await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, Math.min(delay, remaining)));
+          delay = Math.min(delay * 1.5, 3000);
+        }
+        throw new Error(`Authenticated Signal bridge did not become healthy within ${timeoutMs}ms`);
+      } finally {
+        negative.close();
+      }
+    },
     async teardown(): Promise<void> {
-      await docker.stop(config.containerName);
-      await docker.remove(config.containerName);
+      activeClient?.close();
+      activeClient = undefined;
+      credentials = undefined;
+      if (!(await docker.containerExists(config.containerName))) return;
+      const dataDir = privateDataDirectory(config.dataDir, false);
+      const raw = await inspect(config.containerName);
+      const id = validateOwnership(raw, ownerFor(dataDir), dataDir, false);
+      if (record(raw.State).Running === true) await docker.stop(id);
+      await docker.remove(id);
     },
-
-    async pullImage(): Promise<void> {
-      await docker.pullImage(config.image);
-    },
-
     async exists(): Promise<boolean> {
       return docker.containerExists(config.containerName);
     },
-
     async isRunning(): Promise<boolean> {
       return docker.isRunning(config.containerName);
     },

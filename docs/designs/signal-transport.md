@@ -1,9 +1,29 @@
 # Signal Messaging Transport Design
 
+**Status (2026-11-16):** Partial — the authenticated Signal bridge, shared host client and private credential lifecycle are implemented (`src/signal/`, `docker/signal-bridge/`). Actual macOS Docker Desktop/Apple runtime and live Signal account qualification remain separate owner work. The current contract below supersedes the historical design record. An approval must name the code shown in its escalation banner (`approve <code>`).
+
 **Date:** 2026-02-24
-**Status:** Design
 **Author:** Feature Architect
 
+## Current transport contract
+
+The authoritative shipped contract is TLS plus bearer admission on every HTTP route and WebSocket upgrade. The derived router authenticates before Gin route logging, including health, OPTIONS, unknown routes and receive upgrades; redirects are disabled. Its internal JSON-RPC daemon and client use container loopback only. An unmodified upstream image is refused. A contract label is a compatibility declaration by an already trusted image publisher, not proof that a malicious image implements the contract.
+
+`src/signal/signal-bridge-client.ts` is the shared host client for setup, registration/linking, health, identity checks, send and receive. It accepts only a loopback HTTPS origin, explicitly trusts the private certificate, verifies server name `localhost`, supplies the bearer header and refuses redirects or plaintext fallback. WebSocket receive uses WSS with the same trust and admission. Secret values are never passed through Docker arguments, environment values, images or URL query strings.
+
+`loadOrCreateSignalBridgeCredentials()` keeps one exact-schema JSON bundle at `$IRONCURTAIN_HOME/oauth/signal-bridge/credentials.json` (default `~/.ironcurtain/oauth/signal-bridge/credentials.json`): `version: 1`, a random 64-hex token, the self-signed server certificate and its private key. The directory is 0700 and the file 0600, owned by the current user. The reader refuses links, foreign ownership, insecure modes, oversized files and corrupt schema/certificate/key data. Reads and renewal share a file lock; publication uses an atomic private write. RSA-2048/SHA-256 server certificates name both `localhost` and `127.0.0.1`. An expired certificate or one with less than one day remaining renews atomically. A SHA-256 fingerprint of the exact bundle bytes binds container reuse to those credentials. The bundle is mounted read-only.
+
+The default `SIGNAL_DEFAULT_IMAGE` is local `ironcurtain-signal-bridge:0.101-auth1`. Build it explicitly with `npm run build:signal-bridge`; it is not published or pullable and is never automatically pulled. The [recipe](../../docker/signal-bridge/README.md) pins official 0.101 source commit `74253a3a41c2cade40fd4a53cf3fb7a3fdf305dc`, verifies the 35-file source manifest before patching, pins runtime and Go 1.26.11 builder digests, and compiles the API and authentication plugin together. With no `--source-dir`, the build command downloads only the pinned manifest URLs and checks SHA-256; `--source-dir=/absolute/verified/context` uses an existing context. Docker can still download pinned base images and Go dependencies. Every accepted image must carry `org.ironcurtain.signal-bridge-auth=1`. For the local default `setup-signal --update-image` prints rebuild guidance; a compatible published custom image can be pulled, contract-checked and digest-pinned after confirmation. Configured tags are used only as already cached locally.
+
+Before reuse, the manager validates owner and exact data mount, immutable image ID, entrypoint, network/ports, mounts, credentials fingerprint and runtime security profile. Foreign-owned or mismatched-data containers are refused untouched. An owned legacy container lacking authentication contract `1` is stopped and removed by its inspected immutable ID before resolving a replacement image; a rejected or unavailable image therefore cannot leave that listener running. An already authenticated owned container may remain protected if a replacement is unavailable. The default name is shared across installations, so a collision with another home is refused rather than taken over. Linux uses the host numeric UID/GID and does not recursively chown data or credentials.
+
+The runtime retains `--cap-drop=ALL`, then CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID and KILL are added back for its entrypoint, with `no-new-privileges`. Restart policy is none as built (the bot or daemon starts it). Setup can restart it to load an account; the manager recreates an owned container when its authenticated profile, credentials, image or data-mount freshness changes. The bridge still holds the bot keys and is trusted for inbound messages and identity answers; Docker administrators and the owner remain trusted principals. Local synthetic validation does not qualify actual macOS Docker Desktop/Apple runtimes or a live Signal account.
+
+See [TRANSPORT.md](../../TRANSPORT.md) for current setup and update instructions.
+
+## Historical design record
+
+The numbered sections below preserve the earlier design, sample transcripts and pseudocode. Plain HTTP/WebSocket examples, generic upstream images and the old unrecorded default-digest workflow describe the pre-authentication design and are historical, not current implementation instructions. The current contract above and the linked user guide are authoritative for transport, credentials, image admission and migration.
 ## 1. Overview
 
 This document specifies a Signal messaging transport for IronCurtain, enabling users to interact with agent sessions from any device running the Signal app. The transport implements the existing `Transport` interface (`src/session/transport.ts`) and communicates with Signal's servers through a locally-managed `signal-cli-rest-api` Docker container.
@@ -95,15 +115,20 @@ User Signal App
 **Escalation flow:**
 
 ```
-PolicyEngine denies tool call -> session surfaces EscalationRequest
+PolicyEngine escalates tool call -> session surfaces EscalationRequest
   -> SignalSessionTransport.onEscalation()
-    -> SignalBotDaemon.sendSignalMessage()
-      -> POST /v2/send (escalation banner as formatted text)
-        -> User reads, replies "approve" or "deny"
-          -> WebSocket delivers reply to Daemon
-            -> Daemon routes reply to active session
+    -> SignalBotDaemon.surfaceEscalation(label, request)
+      -> code = HMAC(per-process key, escalationId), e.g. K7Q2
+      -> POST /v2/send (text_mode "normal"): header with code + instructions,
+         then the arguments (retried with backoff; undeliverable -> denied)
+        -> User reads, replies "approve K7Q2" or "deny K7Q2"
+          -> WebSocket (or the reconnect drain) delivers reply to Daemon
+            -> Daemon finds the pending escalation with that code,
+               refuses replies sent before it was raised
               -> session.resolveEscalation(id, decision)
 ```
+
+See "Escalation Banners and Replies" in section 5 for the rules.
 
 ## 3. Docker Container Management
 
@@ -246,7 +271,13 @@ Since `ports` and `restartPolicy` are optional and default to nothing, the agent
 
 ### Container Image
 
-The transport uses the community-maintained `bbernhard/signal-cli-rest-api` Docker image. The image version is configurable so users can pin to a known-good version or upgrade when signal-cli needs updating (Signal periodically changes its server protocol, breaking old versions).
+The transport uses the community-maintained `bbernhard/signal-cli-rest-api` Docker image. That container holds the bot's Signal keys and is the only source of inbound messages and of the identity check, so it can forge an "approve" reply: the image is part of the approval path and is pinned by digest (`src/signal/signal-image.ts`).
+
+- **Default.** `SIGNAL_DEFAULT_IMAGE` is `bbernhard/signal-cli-rest-api@<SIGNAL_IMAGE_PINNED_DIGEST>`, used by both `resolveSignalConfig()` and `loadUserConfig()`. While no reviewed digest is recorded in the build, `SIGNAL_IMAGE_PINNED_DIGEST` is the all-zero placeholder: the default image is then refused before any Docker call, with a message pointing at `ironcurtain setup-signal --update-image` (the setup wizard offers that step itself).
+- **`signal.container.image`** accepts `<repository>@sha256:<digest>` (what `--update-image` records) or a tag. A tag is used only as already present locally, with a warning; it is never pulled or updated automatically, and a missing one is refused with the same pointer.
+- **No automatic pulls.** `ensureRunning()` resolves the configured image first (`resolveSignalImage()`): a digest reference is pulled only when that image is missing locally (content-addressed, so the registry cannot hand back anything else), and the local image must carry the digest in its RepoDigests and have an immutable `sha256:` ID. If the existing container was created from another image ID (an older pin, or a tag an earlier version pulled on its own), it is removed and recreated from the resolved image ID. When the image is the same, the container is started or left running as before. Nothing else is pulled.
+- **Updating.** `ironcurtain setup-signal --update-image` pulls `<repository>:<tag>` (the tag the configured image names, else `latest`), shows the registry digest, image ID and build date next to the current setting, and on confirmation records `<repository>@<digest>` as `signal.container.image` (keeping `signal.container.port`). The bot or daemon recreates the container from it on its next start. Several or no registry digests for the pulled image are refused rather than guessed. Declining changes nothing: the pull moved the local tag, and a `signal.container.image` that names that tag would run whatever it names, so a declined (or cancelled, or unpinnable) candidate puts the tag back on the image it named before, or removes it when it named none (`discardSignalImageCandidate()`); when that fails, the command says so and how to recover. The setup wizard's pin step does the same.
+- **Staleness.** Signal changes its protocol from time to time, so a pinned image eventually stops working. Starting the bridge logs a reminder to run `--update-image` once the image is more than 90 days old (`SIGNAL_IMAGE_STALE_DAYS`).
 
 ### Volume Mount
 
@@ -267,7 +298,7 @@ A thin layer over `DockerManager` that adds signal-specific lifecycle semantics.
  * Stored in user config and used by the container manager.
  */
 export interface SignalContainerConfig {
-  /** Docker image name with tag. Default: 'bbernhard/signal-cli-rest-api:latest' */
+  /** Docker image, pinned by digest. Default: SIGNAL_DEFAULT_IMAGE (see "Container Image") */
   readonly image: string;
   /** Host port to bind the REST API to. Default: 18080 (avoids conflict with common :8080) */
   readonly port: number;
@@ -278,7 +309,7 @@ export interface SignalContainerConfig {
 }
 
 export const SIGNAL_CONTAINER_DEFAULTS: SignalContainerConfig = {
-  image: 'bbernhard/signal-cli-rest-api:latest',
+  image: SIGNAL_DEFAULT_IMAGE, // bbernhard/signal-cli-rest-api@sha256:...
   port: 18080,
   dataDir: '', // resolved at runtime to ~/.ironcurtain/signal-data/
   containerName: 'ironcurtain-signal',
@@ -289,7 +320,10 @@ export const SIGNAL_CONTAINER_DEFAULTS: SignalContainerConfig = {
  * Delegates to DockerManager for all Docker CLI operations.
  */
 export interface SignalContainerManager {
-  /** Ensures the container is running. Returns the REST API base URL. Idempotent. */
+  /**
+   * Ensures the container is running from the configured image. Returns the
+   * REST API base URL. Idempotent. Never pulls a tag (see "Container Image").
+   */
   ensureRunning(): Promise<string>;
 
   /** Polls GET /v1/health until the REST API responds. */
@@ -297,9 +331,6 @@ export interface SignalContainerManager {
 
   /** Stops and removes the container. */
   teardown(): Promise<void>;
-
-  /** Pulls the latest version of the configured Docker image. */
-  pullImage(): Promise<void>;
 
   /** Returns true if the container exists (running or stopped). */
   exists(): Promise<boolean>;
@@ -316,11 +347,11 @@ export interface SignalContainerManager {
 | Lifetime | Per-session | Persistent across sessions |
 | Network | `--network=none` | `bridge` (needs internet) |
 | Ports | None | `127.0.0.1:18080:8080` |
-| Capabilities | `--cap-drop=ALL` | `--cap-drop=ALL` (same) |
+| Capabilities | `--cap-drop=ALL` (as built, the capabilities sudo needs are added back unless `agentSudo` is false) | `--cap-drop=ALL` (as built, CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID and KILL are added back for its entrypoint) |
 | Created by | `DockerAgentSession.initialize()` | `ironcurtain setup-signal` or `SignalBotDaemon.start()` |
-| Stopped by | `session.close()` | `ironcurtain stop-signal` or explicit teardown |
+| Stopped by | `session.close()` | a stop-signal command or explicit teardown in this design; as built, nothing in IronCurtain stops it for good (no such command was built, and the bot and daemon leave it running when they exit; `setup-signal` restarts it to load an account, and starting the bot or daemon restarts it when its data mount went stale and recreates it when it was created from another image than the configured one; `docker stop ironcurtain-signal` stops it) |
 | Data persistence | Ephemeral sandbox | Host-mounted volume (registration keys) |
-| Restart policy | None | `unless-stopped` |
+| Restart policy | None | `unless-stopped` in this design; none as built (the bot or daemon starts it) |
 
 ### Docker Commands (equivalent)
 
@@ -341,9 +372,10 @@ docker create \
 
 Key choices:
 - `--cap-drop=ALL` -- same as agent containers. signal-cli only needs outbound TCP, which does not require elevated capabilities
-- `127.0.0.1:18080:8080` -- binds to localhost only, not all interfaces. Prevents remote access to the signal-cli REST API
+- `127.0.0.1:18080:8080` -- publishes on host loopback, shared by all local users. The REST bridge has no authentication; the native Linux bridge address can also expose its wildcard listener. This does not isolate the API from other host accounts.
 - `MODE=json-rpc` -- enables WebSocket message receiving, the most reliable real-time delivery mechanism
 - `--restart=unless-stopped` -- container survives host reboots but respects explicit `docker stop`
+- As built (`createSignalContainerManager` in `src/signal/signal-container.ts`), two of these choices changed: the signal-cli-rest-api entrypoint needs CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID and KILL, which are added back after `--cap-drop=ALL`; and there is no restart policy, because Docker's restart after a host reboot left stale bind mounts, so the bot or daemon starts the container (and restarts one whose data mount went stale)
 - Port 18080 -- avoids collision with development servers commonly running on 8080
 
 **Health check:**
@@ -355,6 +387,11 @@ curl -f http://127.0.0.1:18080/v1/health
 Returns 204 No Content when healthy.
 
 ### Implementation
+
+The sketch below predates image pinning: the implemented `ensureRunning()`
+resolves the configured image first, never pulls a tag, recreates a
+container created from another image, and has no restart policy (see
+"Container Image").
 
 ```typescript
 export function createSignalContainerManager(
@@ -477,8 +514,11 @@ $ ironcurtain setup-signal
 ◆  Checking Docker...
 │  ✓ Docker is available
 │
-◆  Pulling signal-cli-rest-api image...
-│  ✓ Image pulled: bbernhard/signal-cli-rest-api:latest
+◆  Starting signal-cli container...
+│  (when this build has no reviewed digest, or the configured tag is
+│   not present locally: pull bbernhard/signal-cli-rest-api:latest,
+│   show its digest, "Pin bbernhard/signal-cli-rest-api@sha256:... and
+│   use it?")
 │
 ◆  Starting signal-cli container...
 │  ✓ Container started on port 18080
@@ -882,7 +922,9 @@ async function verifyRecipientIdentity(
     throw new Error('No identity key found for recipient after message exchange.');
   }
 
-  // Use the most recent identity key
+  // Implemented as selectRecipientIdentity() (src/signal/recipient-identity.ts):
+  // the newest record for the number by `added`; its fingerprint is stored as
+  // recipientIdentityKey and its account UUID, when listed, as recipientUuid.
   const identity = identities[identities.length - 1];
   const identityFingerprint = identity.fingerprint;
 
@@ -909,6 +951,12 @@ Each identity entry includes:
 - `added` - timestamp when the key was first seen
 
 The fingerprint is what we store in config and compare at runtime. If it changes, the person controlling that phone number has changed (or re-installed Signal), and we must re-verify before accepting commands.
+
+**Which record.** The list can hold more than one record for a number (for example a second identity of the account), and a record without its number for a while. `selectRecipientIdentity()` decides, for setup and runtime alike: with a stored `recipientUuid` (the UUID signal-cli lists for the record whose key setup stored), the record listed under that UUID; without one, the newest record for the recipient's number by `added` (a millisecond timestamp or a date; the last listed when the times do not tell). Setup and `--re-trust` always select by number and store the chosen record's UUID with its key (re-trust removes a UUID the new record does not list).
+
+**Which sender.** Verifying the recorded account's record says nothing about who sent a message: after a SIM swap or number reassignment, messages from the recipient's number come from another account, whose key signal-cli stores under that account (and trusts on first use, without `untrustedIdentity`). So with a stored `recipientUuid`, every message whose envelope names another sender account (`sourceUuid`) locks the transport like a key change (`matchSenderAccount()` gives `other`). An envelope that names no account cannot be tied to the recorded one, and the record check cannot vouch for it (it verifies the recorded account, which still holds its old key after the number moved), so it is rejected without locking (`unnamed`). signal-cli normally names the sender account of every message it delivers, so this refuses only envelopes it could not attribute; a configuration without a stored UUID is not affected. Without a stored UUID the newest-record rule catches the same case, since the new account's record is the newest for the number.
+
+**Unlocking.** While locked, every message re-reads config.json; a new `recipientIdentityKey` or `recipientUuid` there (what `--re-trust` records) unlocks. The lock also drops the cached success of the last identity check, so the message that unlocks is checked against signal-cli with the reloaded values instead of riding a 5-minute window that vouched for the identity that just failed.
 
 ### Re-trust Flow
 
@@ -963,6 +1011,7 @@ This ensures an attacker who obtains the phone number cannot silently take over 
 | QR code scan timeout | Linking endpoint returns timeout | Regenerate QR code and retry |
 | Challenge code wrong | User enters wrong code 3 times | Abort setup. Suggest re-running setup. |
 | Identity key not available | GET /v1/identities returns empty | Retry after short delay. If still empty, warn and abort. |
+| signal-cli image not pinned | The build's default digest is the placeholder, or a configured tag is not present locally | Offer to pull the current image, show its digest and pin it; abort when declined. |
 
 ## 5. Signal Transport Implementation
 
@@ -1294,59 +1343,11 @@ export class SignalBotDaemon {
   }
 
   // --- Escalation handling ---
-
-  /**
-   * Checks if the message is an escalation reply.
-   * Accepts: approve, deny, /approve, /deny (case-insensitive).
-   *
-   * Race condition prevention: escalationResolving flag prevents
-   * concurrent replies. pendingEscalationId is cleared in .finally()
-   * after async resolution completes, not before.
-   */
-  private handleEscalationReply(text: string): boolean {
-    if (!this.pendingEscalationId || !this.activeSession) return false;
-
-    const normalized = text.trim().toLowerCase();
-    const isApprove = normalized === 'approve' || normalized === '/approve';
-    const isDeny = normalized === 'deny' || normalized === '/deny';
-    if (!isApprove && !isDeny) return false;
-
-    if (this.escalationResolving) {
-      this.sendSignalMessage('Escalation is being resolved, please wait...').catch(() => {});
-      return true;
-    }
-
-    const decision = isApprove ? 'approved' as const : 'denied' as const;
-    const escalationId = this.pendingEscalationId;
-    this.escalationResolving = true;
-
-    this.activeSession.resolveEscalation(escalationId, decision)
-      .then(() => {
-        return this.sendSignalMessage(`Escalation ${decision}.`);
-      })
-      .catch((err: unknown) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        this.sendSignalMessage(`Escalation error: ${msg}`).catch(() => {});
-      })
-      .finally(() => {
-        this.escalationResolving = false;
-        if (this.pendingEscalationId === escalationId) {
-          this.pendingEscalationId = null;
-        }
-      });
-
-    return true;
-  }
-
-  /** Called by SignalSessionTransport when the session surfaces an escalation. */
-  setPendingEscalation(escalationId: string): void {
-    this.pendingEscalationId = escalationId;
-  }
-
-  /** Called by SignalSessionTransport when an escalation expires. */
-  clearPendingEscalation(): void {
-    this.pendingEscalationId = null;
-  }
+  //
+  // Superseded: escalations are recorded and announced by
+  // surfaceEscalation(label, request), and replies must quote the banner's
+  // code ("approve K7Q2"). See "Escalation Banners and Replies" below for
+  // the banner, delivery and reply rules.
 
   // --- Control commands ---
 
@@ -1378,8 +1379,9 @@ export class SignalBotDaemon {
           '  /quit or /new - end current session\n' +
           '  /budget - show resource usage\n' +
           '  /help - show this message\n' +
-          '  approve or /approve - approve pending escalation\n' +
-          '  deny or /deny - deny pending escalation',
+          '  approve <code> - approve the escalation whose banner shows <code>\n' +
+          '  deny <code> - deny it ("deny" alone denies the only pending one)\n' +
+          '  details <code> - show more of its arguments',
         ).catch(() => {});
         return true;
 
@@ -1402,6 +1404,17 @@ export class SignalBotDaemon {
    * (handles the case where the user ran `--re-trust` externally).
    *
    * Returns true if the message should be rejected.
+   *
+   * Implemented differently in five ways (signal-bot-daemon.ts): the record
+   * is chosen by selectRecipientIdentity() (stored UUID, else the newest
+   * record for the number); with a stored UUID, an envelope from another
+   * sender account (sourceUuid) locks at once and one that names no account
+   * is rejected; no such record (or a record without a fingerprint, or an
+   * unreadable list) rejects the message without locking and without
+   * caching, like an API error; approve/deny replies pass `fresh` and skip
+   * the TTL, so a key change that arrives without the untrustedIdentity flag
+   * cannot ride a cached success; and a lock drops the cached success, while
+   * a new key or UUID on disk unlocks (see "Unlocking").
    */
   private async checkIdentityChanged(envelope: SignalEnvelope): Promise<boolean> {
     // If locked, attempt self-healing via config reload
@@ -1567,16 +1580,15 @@ export class SignalSessionTransport implements Transport {
 
   createEscalationHandler(): (request: EscalationRequest) => void {
     return (request) => {
-      this.daemon.setPendingEscalation(request.escalationId);
-      const banner = formatEscalationBanner(request);
-      this.daemon.sendSignalMessage(banner).catch(() => {});
+      // Records the escalation and sends its coded banner.
+      void this.daemon.surfaceEscalation(this.sessionLabel, request);
     };
   }
 
   createEscalationExpiredHandler(): () => void {
     return () => {
-      this.daemon.clearPendingEscalation();
-      this.daemon.sendSignalMessage('Escalation expired (timed out).').catch(() => {});
+      // Clears it and sends "[#N] Escalation K7Q2 expired (timed out)".
+      this.daemon.expireEscalation(this.sessionLabel);
     };
   }
 }
@@ -1676,32 +1688,144 @@ function splitMessage(text: string, maxLength: number): string[] {
 }
 ```
 
-### Escalation Banner Formatting
+### Escalation Banners and Replies
 
-Without inline buttons, escalations use a text-based banner with clear instructions:
+Signal has no buttons, so an approval is a typed reply, and nothing ties a
+typed reply to the banner it answers: it can be delayed on the phone, replayed
+by the reconnect drain, or arrive just after the escalation timed out and the
+agent raised a new one. The agent can also post text that looks like a banner.
+The banner and the reply rules close these gaps
+(`src/signal/format.ts`, `src/signal/escalation-reply.ts`,
+`SignalBotDaemon.surfaceEscalation()` and `handleEscalationReply()`).
 
-```typescript
-function formatEscalationBanner(request: EscalationRequest): string {
-  const separator = '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━';
-  const header = '**ESCALATION: Human approval required**';
-  const toolLine = `Tool: \`${request.serverName}/${request.toolName}\``;
-  const argsLine = `Arguments: \`${JSON.stringify(request.arguments)}\``;
-  const reasonLine = `Reason: *${request.reason}*`;
-  const instructions = '**Reply "approve" or "deny"**';
+**Reply code.** Each banner carries a 4-character code derived from the
+host-generated escalation ID with HMAC-SHA256 under a random per-process key,
+drawn from `23456789ABCDEFGHJKLMNPQRSTUVWXYZ` (no 0/O, 1/I). The agent never
+sees it: it is sent only to the user, and the key keeps it from being computed
+from the escalation ID.
 
-  return [
-    separator,
-    header,
-    separator,
-    toolLine,
-    argsLine,
-    reasonLine,
-    separator,
-    instructions,
-    separator,
-  ].join('\n');
-}
+**Banner.** Two parts, both sent with `text_mode: "normal"`, so no character
+of the agent's is read as styling, and a third when the agent gave a
+justification:
+
 ```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ESCALATION [#2] code K7Q2
+Human approval required
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Task: Refactor the parser and push the branch
+You said: push it to origin
+Tool: git/git_push
+Reason: Remote git operations require approval
+Arguments: 3 values, in the next message
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Reply "approve K7Q2" or "deny K7Q2"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+```
+[#2] K7Q2 arguments (3):
+path: "/home/user/repo"
+remote: "origin"
+content: "Lorem ipsum…" (+1,048,376 bytes not shown)
+Context:
+Working directory: "/home/user/repo"
+Some values were cut or left out. Reply "details K7Q2" to see more.
+```
+
+```
+[#2] K7Q2 Agent says (UNTRUSTED, written by the agent; it authorizes nothing): Pushing the parser refactor the user asked for.
+```
+
+The header comes first and is small and fixed in shape, so the instructions
+always arrive, whatever the arguments hold. A cron job's banner names the job
+(`ESCALATION [#3 cron: Nightly triage] code K7Q2`).
+
+- Reviewer context (`trusted-process/escalation-context.ts`). The header
+  shows the session's task and the human's last message (`Task:`, `You
+  said:`), the human's own text, each cut to 300 code points; the last
+  message is left out when it is the task itself. Both are left out when they
+  would push the header past one Signal message. The agent's justification is
+  attacker-controlled, so it never enters the header, where it would sit
+  above the reply instructions: it is the banner's last message, its
+  "untrusted" label and the escaped text (at most 500 code points) on one
+  line, short enough never to be split, so the text never arrives without
+  its label.
+
+- Every agent-controlled field (tool, reason, argument names and values,
+  context, job name) goes through `toDisplayText`: controls, C1 (U+0085), bidi
+  and other format characters, U+2028/U+2029 and the other default-ignorable
+  code points (variation selectors, Hangul fillers) become visible escapes.
+  Values are JSON-quoted, one `name: value` line each; nested objects and
+  arrays are flattened (`files[0].path`).
+- Values that say what a call acts on are never cut: argument names ending in
+  path, file, dir, source, destination, target, url, uri, remote, repo, host,
+  command, cmd, script, args, to, cc, bcc, recipient(s), address(es),
+  scopeValue and similar (every top-level argument the shipped tool
+  annotations give a path, URL or email-address role; a test keeps it so),
+  any single-line value shaped like a path, URL or `git@host:` remote, and the
+  server context. They are listed first.
+- Other values are cut to 200 code points with the omitted UTF-8 byte count,
+  within 1,200 characters for all of them; values that do not fit are counted
+  ("+N more values, B bytes, not shown"). `details <code>` sends up to 6,000
+  code points per value and 12,000 in all.
+- When the values that must be shown in full exceed 6,000 characters (or the
+  request has more than 200 values), the banner says the escalation cannot be
+  approved over Signal; it can still be denied there, and otherwise times out.
+
+**Delivery.** Each banner message is sent with a 20 s timeout and retried
+after 1 s, 2 s and 4 s. If one still fails, the escalation is denied, the
+failure is logged, and a short notice is attempted. Delivery (and retrying)
+stops as soon as the escalation is settled elsewhere, for example in the web
+UI; nothing is denied then, and no notice is sent. An approval is accepted
+only once every banner message was delivered ("still being delivered"
+otherwise), and only when it was sent after that (beyond the 10 s skew
+allowance below): a reply processed late, for example from the reconnect
+drain, may have been written before the arguments reached the phone.
+
+**Replies.** `approve`, `approve+`, `deny` and `details` are matched
+case-insensitively, with or without a slash; `/show` and `/pending` only with
+the slash (so "show tests" stays chat). None of them is ever forwarded to the
+agent, even when nothing is pending (`src/signal/escalation-reply.ts`):
+
+| Reply | Effect |
+|---|---|
+| `approve <code>` / `approve #N <code>` | Approves the pending escalation with that code (on session #N). |
+| `approve+ <code>` / `approve+ #N <code>` | Approves it and whitelists, for the session, the pattern its banner showed (the first whitelist candidate, `whitelistSelection: 0`); the confirmation repeats the pattern. Refused when the banner offered none. |
+| `approve`, `approve #N`, `approve+` | Refused: approvals need the code. Any other message that starts with `approve+` (`approve+ the plan`, `approve+K7Q2`) is refused too, never forwarded. |
+| `deny <code>`, `deny #N`, `deny` | Denies that escalation; bare `deny` only when exactly one is pending. |
+| `details <code>`, `/show <code>` | Sends the escalation in full: tool, reason, every value (up to 6,000 code points each), context, the whitelist pattern `approve+` would add, and the reply instructions. |
+| `/pending` | Lists the escalations pending over Signal: session, code, tool, age, and whether the banner is still being delivered, the escalation is deny-only or `approve+` is offered; plus a count of escalations other clients (the web UI) hold. |
+
+**Whitelisting.** When the proxy sends whitelist candidates, the header shows
+the first one, display-escaped and in full, after the reply line
+(`or "approve+ K7Q2" to approve and whitelist, for this session:` and the
+pattern on its own line). It is not offered for a human-only escalation, for
+one that can only be denied, or when the escaped pattern is longer than 600
+characters: `approve+` never whitelists more than the user read. The pattern
+is part of the header's one message: when the task and the human's last
+message would push the header past it, they are left out, never the pattern
+(every other header part is bounded, so the header without them always fits).
+The pending escalation recorded in the `SessionManager` keeps the candidates
+with the rest of the request, so the web UI lists the patterns too; it still
+carries no group key, so it never joins a web UI group approval. Replies that
+quote the pattern, `/show` and `/pending` are sent in normal text mode.
+
+A code that matches no pending escalation is refused ("already approved",
+"already expired (timed out)" for a recently settled one). Only escalations
+whose banner went out over Signal (Signal and cron sessions) are candidates;
+web sessions' escalations are decided in the web UI. A reply whose Signal
+server receive time (`serverReceivedTimestamp`, or the sender's timestamp when
+absent) is more than 10 s older than the escalation is refused with "Escalation
+changed since that reply was sent ... Re-confirm"; an approval without any
+timestamp is refused too. The same rules apply to messages drained after a
+WebSocket reconnect, since they go through the same handler.
+
+**Late approvals.** `Session.resolveEscalation()` throws `ESCALATION_EXPIRED`
+when the response was written after the proxy had already timed the request
+out, and `SessionManager.resolveSessionEscalation()` reports it as
+`{ resolved: false, reason: 'expired' }`, so the user is told the escalation
+had expired and the call was denied, never that it was approved.
 
 ## 6. Configuration Schema
 
@@ -1723,9 +1847,13 @@ export interface SignalConfig {
   /** The user's Signal identity key fingerprint, captured during onboarding.
    *  Used to detect identity changes (SIM swap, number reassignment). */
   recipientIdentityKey?: string;
+  /** The account UUID signal-cli lists for that key, captured with it. The
+   *  runtime check verifies the record under this UUID (see "Which record"). */
+  recipientUuid?: string;
   /** Container configuration overrides. */
   container?: {
-    /** Docker image. Default: 'bbernhard/signal-cli-rest-api:latest' */
+    /** Docker image: `<repository>@sha256:<digest>`, or a tag used only as present
+     *  locally. Default: SIGNAL_DEFAULT_IMAGE (pinned by digest). */
     image?: string;
     /** Host port for REST API. Default: 18080 */
     port?: number;
@@ -1828,8 +1956,9 @@ Signal has no defaults. It is not present until the user explicitly sets it up. 
     "botNumber": "+15551234567",
     "recipientNumber": "+15559876543",
     "recipientIdentityKey": "05a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1",
+    "recipientUuid": "8d2a4f1e-0c3b-4e5f-9a6b-7c8d9e0f1a2b",
     "container": {
-      "image": "bbernhard/signal-cli-rest-api:latest",
+      "image": "bbernhard/signal-cli-rest-api@sha256:<digest recorded by setup-signal --update-image>",
       "port": 18080
     }
   }
@@ -1840,7 +1969,7 @@ Signal has no defaults. It is not present until the user explicitly sets it up. 
 
 ```typescript
 const SIGNAL_DEFAULTS = {
-  image: 'bbernhard/signal-cli-rest-api:latest',
+  image: SIGNAL_DEFAULT_IMAGE, // bbernhard/signal-cli-rest-api@sha256:... (src/signal/signal-image.ts)
   port: 18080,
   dataDir: '', // resolved to ~/.ironcurtain/signal-data/
   containerName: 'ironcurtain-signal',
@@ -2107,13 +2236,16 @@ The file `config.json` was **successfully** written.
 | Failure | Detection | Recovery Strategy |
 |---------|-----------|-------------------|
 | **signal-cli container stops** | WebSocket `close` event | Exponential backoff reconnect (1s, 1.5s, 2.25s, ... up to 30s). After 10 failures, send nothing (container may be gone). |
-| **signal-cli protocol mismatch** | Send returns 400/500, "version too old" in response | Log error. Notify user on next successful connection: "signal-cli needs updating. Run: ironcurtain setup-signal --upgrade" |
+| **signal-cli protocol mismatch** | Send returns 400/500, "version too old" in response | Log error. The user updates the pinned image with `ironcurtain setup-signal --update-image` (pull, review the digest, pin); starting the bridge also warns once the image is over 90 days old. |
+| **signal-cli image not pinned** | `ensureRunning()` throws `SIGNAL_IMAGE_NOT_PINNED` (placeholder default digest, or a configured tag missing locally) | Signal does not start (the daemon continues in cron-only mode); the error names `ironcurtain setup-signal --update-image`. A pinned image that cannot be pulled, or a local image without the pinned digest, fails the same way. |
 | **WebSocket message parse error** | JSON.parse throws | Log and skip the malformed message. Do not crash. |
-| **REST API send failure** | fetch returns non-2xx | Retry once after 2s. If still failing, log and drop the message. Escalation banners get 3 retries (they are critical). |
+| **REST API send failure** | fetch returns non-2xx | Ordinary messages: log and drop. Escalation banner messages: 20 s timeout per attempt, 3 retries after 1 s, 2 s and 4 s; if still failing, the escalation is denied and logged (the user cannot decide on a banner they did not get). |
 | **Session.sendMessage() throws** | Promise rejection | Send error text to user via Signal. Do not crash the transport. |
 | **Unauthorized sender** | `sourceNumber` does not match configured `recipientNumber` | Silently ignore. Do not send any response (avoids revealing the bot exists to random numbers). |
-| **Identity key changed** | Envelope `untrustedIdentity` flag or fingerprint mismatch against stored `recipientIdentityKey` | Lock transport immediately. Reject all messages silently (do not alert attacker). Log warning to stderr with instructions to run `ironcurtain setup-signal --re-trust`. Requires challenge-response re-verification to unlock. |
+| **Identity key changed** | Envelope `untrustedIdentity` flag, an envelope `sourceUuid` other than the stored `recipientUuid`, or fingerprint mismatch against stored `recipientIdentityKey` | Lock transport immediately. Reject all messages silently (do not alert attacker). Log warning to stderr with instructions to run `ironcurtain setup-signal --re-trust`. Requires challenge-response re-verification to unlock. |
 | **Identity check API unavailable** | GET /v1/identities returns error | Fail closed: reject message and log error. An attacker who compromises the signal-cli container could disable the API to bypass identity verification. Consistent with default-deny posture. |
+| **Sender account not named** | With a stored `recipientUuid`, the envelope has no `sourceUuid` | Fail closed without locking: reject the message and log it. Nothing ties it to the recorded account, whose record the identity check verifies. |
+| **No identity record for the recipient** | The list has no record for the stored UUID (or, without one, for the number), or the record has no fingerprint | Fail closed like an API error: reject the message and log it, without locking (signal-cli may list a record without its number for a while) and without caching, so the next message checks again. A compromised container can still return the stored fingerprint; the image pin is the control for that. |
 | **Container port conflict** | Docker create fails | Clear error message during setup. Suggest alternative port. |
 | **Docker not available** | `docker info` fails | Clear error message. Do not attempt to continue. |
 | **Registration blocked by Signal** | Register endpoint returns 403/429 | Show error. Suggest: wait and retry, try different IP, use voice verification. |
@@ -2141,10 +2273,11 @@ When the signal-cli container itself is gone (not just the WebSocket):
 Unlike `ironcurtain start "task"` (which runs a single task with the CLI transport and exits), `ironcurtain bot` is a long-running process that:
 
 1. Loads the Signal config from `~/.ironcurtain/config.json`
-2. Resolves session mode (supports `--agent` flag for Docker mode)
-3. Creates a `SignalBotDaemon` with the container manager
-4. Starts the daemon, which manages WebSocket, sessions, and message routing
-5. Runs indefinitely until SIGTERM/SIGINT (Ctrl+C)
+2. Takes the Signal transport lock, `~/.ironcurtain/signal.lock` (`src/signal/signal-lock.ts`), or exits 1 naming the process that holds it: another bot, or a daemon that runs Signal. Two transports would both receive every message from the same signal-cli container and manage the same container. The daemon takes the same lock before its own Signal start and runs without Signal when it is held.
+3. Resolves session mode (supports `--agent` flag for Docker mode). A `PreflightError` is printed as its message and exits 1, after the bot gives back its log claim and the lock.
+4. Creates a `SignalBotDaemon` with the container manager
+5. Starts the daemon, which manages WebSocket, sessions, and message routing
+6. Runs indefinitely until SIGTERM/SIGINT (Ctrl+C), then releases the lock
 
 The daemon creates sessions on demand (first message starts a session) and destroys them when they end (`/quit`, `/new`, budget exhaustion). The user never needs to restart the bot to start a new conversation.
 
@@ -2177,6 +2310,10 @@ export async function runBot(options: BotOptions = {}): Promise<void> {
     process.exit(1);
   }
 
+  // The bot's own log. Process-wide: the bot's lines stay here while each
+  // session logs to its own file under a claim of its own.
+  const logClaim = logger.setup({ logFilePath: getDaemonLogPath('signal-bot'), processWide: true });
+
   const config = loadConfig();
 
   // Resolve session mode (same logic as `ironcurtain start`)
@@ -2201,7 +2338,9 @@ export async function runBot(options: BotOptions = {}): Promise<void> {
     if (shuttingDown) process.exit(1); // Second signal: force exit
     shuttingDown = true;
     await daemon.shutdown();
-    logger.teardown();
+    // The bot's own (process-wide) claim on signal-bot.log; each session
+    // took and gave back a claim of its own (see src/logger.ts).
+    logger.release(logClaim);
     process.exit(0);
   };
   process.on('SIGINT', shutdown);
@@ -2216,16 +2355,17 @@ export async function runBot(options: BotOptions = {}): Promise<void> {
 
 ### CLI Registration
 
-The `bot` subcommand is registered alongside `start`, `config`, `setup-signal`, etc. It accepts an optional `--agent` flag:
+The `bot` subcommand is registered alongside `start`, `config`, `setup-signal`, etc. `src/cli.ts` hands it exactly the arguments after `bot`, and `runBotCommand` parses them strictly (`parseBotArgs`): `-a`/`--agent` (as `-a X`, `--agent X` or `--agent=X`) and `-h`/`--help`. Any other option, an empty agent name or a positional argument is an error (exit 1): `bot` takes no subcommand and never starts the cron scheduler, which is `ironcurtain daemon` (see cron-mode.md, Section 8.1).
 
 ```typescript
 case 'bot': {
-  const agentName = values.agent as string | undefined;
-  const { runBot } = await import('./signal/bot-command.js');
-  await runBot({ agent: agentName });
+  const { runBotCommand } = await import('./signal/bot-command.js');
+  await runBotCommand(args);
   break;
 }
 ```
+
+`runBot` checks the Signal configuration first, then runs the V8 sandbox preflight (`ensureSandboxViable`, which `src/cli.ts` leaves to this command), so `bot --help`, an argument error and an unconfigured Signal transport never depend on isolated-vm loading.
 
 ## 10. Testing Strategy
 
@@ -2290,25 +2430,14 @@ describe('splitMessage', () => {
 });
 ```
 
-**Escalation banner tests:**
-
-```typescript
-describe('formatEscalationBanner', () => {
-  it('includes tool name and reason with Signal markup', () => {
-    const result = formatEscalationBanner({
-      escalationId: 'test-123',
-      toolName: 'write_file',
-      serverName: 'filesystem',
-      arguments: { path: '/etc/hosts' },
-      reason: 'Write outside sandbox',
-    });
-    expect(result).toContain('`filesystem/write_file`');
-    expect(result).toContain('*Write outside sandbox*');
-    expect(result).toContain('approve');
-    expect(result).toContain('deny');
-  });
-});
-```
+**Escalation banner tests** (`test/signal/format.test.ts`,
+`test/signal/escalation-reply.test.ts`): the header holds the code and the
+instructions; markup and line/bidi controls in any field are inert; a 1 MB
+argument yields a bounded banner; paths, URLs and commands are never cut;
+oversized must-show values make the escalation deny-only; replies parse as
+specified. `test/signal/signal-bot-daemon.test.ts` covers the reply rules
+end to end, including late, wrong-code, stale and drained replies, delivery
+retries and the auto-deny.
 
 **Signal envelope parsing tests:**
 
@@ -2480,7 +2609,7 @@ For pre-release validation with a real Signal account:
 1. [ ] `ironcurtain setup-signal` - register new number path
 2. [ ] `ironcurtain setup-signal` - link device path
 3. [ ] Send simple text message, receive response
-4. [ ] Send message triggering escalation, reply "approve"
+4. [ ] Send message triggering escalation, reply "approve <code>" (bare "approve" is refused)
 5. [ ] Send message triggering escalation, reply "deny"
 6. [ ] Send message triggering escalation, let it timeout
 7. [ ] Long agent response (triggers message splitting)
@@ -2591,15 +2720,15 @@ The `markdown-to-signal.ts` module has zero internal dependencies, making it tri
 
 5. **Signal username support** - Signal recently added usernames. The current design uses phone numbers exclusively. Usernames could be supported as an alternative identifier once signal-cli's API stabilizes around them.
 
-6. **Container image pinning with hash** - Currently uses a tag (`:latest` or specified version). For maximum reproducibility, we could pin to a specific image digest. Deferring because it adds friction to updates.
+6. **Container image pinning with hash** - Implemented: the default image is pinned by digest and never pulled by tag; updates go through `setup-signal --update-image` (see "Container Image" in section 3). The reviewed default digest itself is still to be recorded (`SIGNAL_IMAGE_PINNED_DIGEST`).
 
-7. **Automatic signal-cli updates** - A background job that checks for new signal-cli-rest-api images and notifies the user. Useful when Signal changes its protocol (which breaks old signal-cli versions).
+7. **Automatic signal-cli updates** - Deliberately not automatic: an update changes the component that vouches for every approval, so it stays an explicit, reviewed step (`--update-image`). Starting the bridge only warns when the pinned image is older than 90 days. A background check that merely notifies the user remains possible.
 
 8. **Matrix transport** - The second messaging transport, for users who want self-hosted infrastructure with button-capable clients.
 
 ### Known Limitations
 
-- **No inline buttons for escalation.** Signal has no bot API and no interactive elements. Users must type "approve" or "deny". This is less discoverable than Telegram's inline keyboards but acceptable for a security-focused tool.
+- **No inline buttons for escalation.** Signal has no bot API and no interactive elements. Users must type "approve <code>" (the code from the banner) or "deny". This is less discoverable than Telegram's inline keyboards but acceptable for a security-focused tool.
 
 - **Limited text formatting.** No syntax highlighting, no tables (beyond monospace approximation), no header sizing. Code-heavy agent output will look degraded compared to terminal rendering.
 
@@ -2609,4 +2738,8 @@ The `markdown-to-signal.ts` module has zero internal dependencies, making it tri
 
 - **Single-device constraint.** If signal-cli is registered as a primary device, using Signal on a phone with that number will de-register signal-cli. The linked-device option avoids this but has its own constraints (primary device must stay active).
 
-- **Protocol breakage.** Signal changes its server protocol periodically. When this happens, old signal-cli versions stop working. Users must update the Docker image. There is no automatic detection of this failure mode beyond the general "send failed" error path.
+- **Protocol breakage.** Signal changes its server protocol periodically. When this happens, old signal-cli versions stop working. Users must update the pinned image with `ironcurtain setup-signal --update-image`. There is no automatic detection of this failure mode beyond the general "send failed" error path and the warning for images over 90 days old.
+
+### RV-22: authenticated bridge implementation
+
+The current transport contract at the top of this document replaces the historical unauthenticated API and default-digest workflow. Source, credential and synthetic runtime checks are tracked separately from actual macOS Docker Desktop/Apple runtime and live Signal account qualification; those owner qualifications remain open.

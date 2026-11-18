@@ -124,11 +124,14 @@ export function hybridScoreFusion(
  * relativeScoreFusion, so the composite just needs to blend it with
  * recency, importance, and access pattern signals.
  *
+ * Ages are clamped at zero, so a future timestamp scores as "now": recency and access
+ * stay within [0, 1] instead of growing without bound for a future-dated row.
+ *
  * @param fusionMax - the maximum fusion score in this result set, used for normalization
  */
 export function computeCompositeScore(memory: ScoredMemory, now: number, fusionMax: number = 1): number {
-  const ageHours = (now - memory.created_at) / 3600000;
-  const accessAgeHours = (now - memory.last_accessed_at) / 3600000;
+  const ageHours = Math.max(0, now - memory.created_at) / 3600000;
+  const accessAgeHours = Math.max(0, now - memory.last_accessed_at) / 3600000;
 
   // Recency: exponential decay with ~30-day half-life
   const recencyScore = Math.exp(-0.001 * ageHours);

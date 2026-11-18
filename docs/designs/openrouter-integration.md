@@ -1,6 +1,9 @@
 # First-Class OpenRouter Support (Named Provider Profiles)
 
-**Status:** Design v3 — rescoped to provider profiles + per-session selection (v2 technical content preserved verbatim)
+**Status (2026-11-14):** Implemented: named provider profiles (`modelProviders.profiles`) with per-session selection (`src/config/openrouter.ts`, `src/docker/openrouter.ts`). Since then every OpenRouter POST also passes the OpenRouter request sanitizer after the rewriter (`mitm-request-filtering.md`).
+
+> **Corrections (2026-11):** a body the sanitizers cannot parse is refused with a local 400 (section 3, step 4); a request whose `model` is missing or not a string is refused with a local 400 rather than passing the rewriter unchanged (section 7.3, step 0, and the m7 row of section 12.1); and `count_tokens` requests are neither rewritten nor captured, but they are sanitized like `/v1/messages` (sections 7.4 and 9.4).
+
 **Date:** 2026-07-03
 **Supersedes (partially):** [`MODEL_ROUTING.md`](../../MODEL_ROUTING.md) LiteLLM recipe for the OpenRouter case (the generic base-URL mechanism stays; OpenRouter gets a dedicated, no-external-proxy path).
 
@@ -45,7 +48,7 @@ Docker Agent Mode runs an external CLI in a `--network=none` (Linux) / `--intern
 
 1. **CONNECT allowlist** — only hosts in the provider registry (`src/docker/provider-config.ts`) may be reached; unknown hosts get 403 (`mitm-proxy.ts:1482-1489`).
 2. **Endpoint allowlist** — `isEndpointAllowed()` matches method+path against the provider's `allowedEndpoints`; non-matches get 403 (`mitm-proxy.ts:884-890`).
-3. **Fake-key swap** — `validateAndSwapApiKey()` replaces the sentinel key (header `x-api-key` or `Authorization: Bearer`) with the real host-side key (`mitm-proxy.ts:2143-2172`). Real credentials never enter the container.
+3. **Fake-key swap** — the credential gate `applyProviderCredential()` (`src/docker/provider-credentials.ts`) replaces the sentinel key (header `x-api-key` or `Authorization: Bearer`) with the real host-side key and answers any other credential with a local 401. Real credentials never enter the container.
 4. **Body rewrite (optional)** — when `shouldRewriteBody()` is true, the JSON body is buffered, parsed, passed to `provider.config.requestRewriter(body, {method, path, agentKind})`, and the returned `modified` object is re-serialized upstream (`mitm-proxy.ts:1253-1269`). The rewriter may **add or remove** fields (currently only strips tools).
 5. **Upstream override (optional)** — when `provider.config.upstreamTarget` is set, the request is forwarded to `{hostname,port,pathPrefix,useTls}` instead of the canonical host, with the `Host` header rewritten and `pathPrefix` prepended (`mitm-proxy.ts:896-906,944-954`). Populated today from `ANTHROPIC_BASE_URL` etc. via `applyUpstreamOverrides()` (`docker-infrastructure.ts:1923-1951`).
 6. **SSE passthrough + taps** — the raw upstream bytes stream to the agent unchanged; `resolveSseProvider(host)` (`mitm-proxy.ts:340-348`) classifies the stream for **token-stream extraction**, while **trajectory capture** classifies independently via `providerForHost()`/`createReassembler()` (`trajectory-reassembler.ts:1002,1021`). These are two separate seams — both must become path-aware for OpenRouter (§11).
@@ -113,6 +116,8 @@ wire_api = "responses"
 
 `wire_api = "chat"` is a hard error since Feb 2026; Codex speaks **Responses only**. Some slugs reject certain tool schemas (known rough edge; out of our control — surfaced as a normal agent error).
 
+> **Transport note (WP-123).** The generated provider table also carries `name` and `supports_websockets = false`. The MITM refuses WebSocket upgrades on provider hosts, so every Codex route is bound to HTTP (POST + SSE). The `native` route is no longer table-free: it selects `[model_providers.ironcurtain-chatgpt]`, a copy of Codex's built-in ChatGPT provider with WebSockets off, since the built-in `openai` provider cannot be redefined. It still carries no OpenRouter keys.
+
 > **Implementation note (§9.2 file layout).** `src/docker/adapters/codex.ts` `generateMcpConfig()` builds `codex-config.toml` as a `string[]` joined by `\n`, and `docker/entrypoint-codex.sh:19` copies it to `$CODEX_HOME/config.toml`. When OpenRouter is on, the generator must PREPEND the two root keys (`model = <slug>`, `model_provider = "openrouter"`) before the FIRST existing `[table]` line (today the first table is `[projects."/workspace"]`), and APPEND the `[model_providers.openrouter]` block. A real TOML parser reading the result must see `model` and `model_provider` as top-level keys. **The §12.3 test MUST parse the generated string with a real TOML parser** (no TOML parser is currently a dependency — add `smol-toml` as a `devDependency`) and assert top-level `model_provider === 'openrouter'` and `model === <expected slug>`, precisely to catch the "keys captured by a preceding table" failure.
 
 ### 4.7 Goose (native OpenRouter provider)
@@ -168,7 +173,7 @@ wire_api = "responses"
 ### E. Cost accounting — **prefer OpenRouter's authoritative `usage.cost`; add a GLM matcher as fallback**
 
 **Decision.** Two-part (v0 scope narrowed per D6):
-1. Add a `z-ai` / `glm` matcher to `MODEL_PRICING` (`resource-budget-tracker.ts:78`) so estimation is sane even without response cost.
+1. Add a `z-ai` / `glm` matcher to the host pricing table (now `OTHER_PROVIDER_PRICING` in `src/llm-metrics/pricing.ts`, which `ResourceBudgetTracker` uses) so estimation is sane even without response cost.
 2. For the **Anthropic-skin SSE path only** (Claude Code), prefer the **authoritative `usage.cost`**. In Docker mode, per-turn cost flows from the adapter's self-reported `costUsd` (`docker-agent-session.ts:307-310`) — which is **wrong** for GLM (Claude Code reports Anthropic-model cost). Extend the Anthropic-skin SSE usage extractor (in `sse-extractor.ts`, NOT `mitm-proxy.ts`) to surface `cost` / `cached_tokens` on the token-stream bus, and have the Docker session **sum** those per-request costs and prefer the cumulative sum over the CLI's self-report when the active profile is openrouter-type and the sum > 0. **Goose/Codex (chat/responses) use the static matcher in v0** — the OpenAI-shape SSE extractor emits raw events only today.
 
 **Rationale.** The response `cost` is ground truth and free (always present). The static matcher is a cheap guard for the estimation path, for Code Mode, and for Goose/Codex in v0. See §10 for the precise plumbing and the fallback ordering.
@@ -538,7 +543,7 @@ The oracle (§12.2 test 3) asserts stability under same conversation+model, and 
 
 ### 8.3 Auth-header conversion (all agents)
 
-The agent sends `Authorization: Bearer sk-or-v1-ironcurtain-<random>`. `validateAndSwapApiKey` (bearer branch, `mitm-proxy.ts:2161-2170`) matches the sentinel and rewrites to `Authorization: Bearer sk-or-v1-<realkey>`. No `x-api-key` involved.
+The agent sends `Authorization: Bearer sk-or-v1-ironcurtain-<random>`. `applyProviderCredential` (`src/docker/provider-credentials.ts`) matches the sentinel and rewrites to `Authorization: Bearer sk-or-v1-<realkey>`. No `x-api-key` involved.
 
 ### 8.4 No-op case (active profile is `native`)
 
@@ -554,6 +559,8 @@ All three adapters read the session's resolved **active profile** — but **NOT*
 - Adapters that need the profile receive it by reading `config.activeProviderProfile` from the `IronCurtainConfig` they are already handed in `buildEnv(config, fakeKeys)` / `getProviders(...)` / `generateMcpConfig(...)`. The concrete signature changes are in §9's per-agent sections and §7.5; see the resolution ordering in §9.7 (Resolution).
 
 **FORBIDDEN:** binding the active profile at adapter-factory or registry time (e.g. threading it through `createClaudeCodeAdapter`/`createCodexAdapter`/`createGooseAdapter` and closing over it). The process-global, first-registration-wins registry (`agent-registry.ts:11-17,41-59`) shared across the multi-session daemon/signal/web-UI hosts makes any factory-time binding a cross-session leak. The profile MUST reach the adapter through the per-session stamped `config`, never through a captured factory argument.
+
+**Since applied to every session-specific value:** the factories and `registerBuiltinAdapters()` now take no configuration at all. Besides the profile, Claude Code's agent model (`config.agentModelId` in `buildEnv`, the `agentModelId` option of `buildCommand`) and Goose's `gooseProvider` / `gooseModel` (read from `config.userConfig` in `getProviders`, `buildEnv`, `detectCredential` and `credentialHelpText(config)`) are read per call, so the first-start wizard's config-less registration and a daemon's first session no longer fix later sessions' choices.
 
 **Signature changes (the profile must reach functions that currently lack a `config`/profile input).** `buildEnv(config, fakeKeys)` already receives the per-session `config` (`agent-adapter.ts:280`) and simply reads `config.activeProviderProfile`. Two adapter methods do NOT take `config` today and must be threaded it (config-threading chosen over any factory-captured value, per the forbid above):
 
@@ -584,7 +591,7 @@ References below to `openrouter.<field>` mean `config.activeProviderProfile.<fie
 
 ### 9.2 Codex (`adapters/codex.ts`)
 
-- **Factory signature change (m3).** `createCodexAdapter()` currently takes no args (`codex.ts:79`) and `agent-registry.ts:56` calls it as `createCodexAdapter()`. Change to `createCodexAdapter(userConfig?: ResolvedUserConfig)` (matching `createClaudeCodeAdapter`/`createGooseAdapter`) and update the registry call to `createCodexAdapter(userConfig)`. This is in-scope for G5.
+- **Factory signature change (m3).** `createCodexAdapter()` currently takes no args (`codex.ts:79`) and `agent-registry.ts:56` calls it as `createCodexAdapter()`. Change to `createCodexAdapter(userConfig?: ResolvedUserConfig)` (matching `createClaudeCodeAdapter`/`createGooseAdapter`) and update the registry call to `createCodexAdapter(userConfig)`. This is in-scope for G5. (Later reverted for all three factories: none takes configuration now; see the note after the FORBIDDEN rule in §9.)
 - **Mapped slug (D2).** Codex has **no native model field in IronCurtain config** (no `codexModel`). It therefore must **never passthrough an unmapped OpenAI id**. The Codex slug is:
   `codexSlug = perAgent.codex ?? resolveMappedModel(DEFAULT_GLM_SLUG, modelMap) ?? DEFAULT_GLM_SLUG`. Applying `modelMap` to the default probe keeps `config.toml`'s `model` consistent with the model the MITM rewriter actually serves — the rewriter (D1) re-globs whatever Codex sends, so an omitted map step made `config.toml` disagree with the wire model whenever a glob matched the GLM default (Codex then budgeted its context window for a model it wasn't routed to). A non-matching map still falls back to `DEFAULT_GLM_SLUG`, so Codex never passthroughs an unmapped id. (Corrected from the original `perAgent.codex ?? DEFAULT_GLM_SLUG`, which excluded `modelMap` and introduced that drift.)
 - `getProviders()` → `[makeOpenRouterProvider('responses', rewriter)]` (drop `codexChatGptProvider` / `codexAuthProvider`).
@@ -677,11 +684,13 @@ An unknown `providerProfileName` (not a key of the resolved `profiles` record) t
 
 ## 10. Cost accounting
 
-1. **Static matcher.** Add to `MODEL_PRICING` (`resource-budget-tracker.ts:78`, before broad matches):
+1. **Static matcher.** Add to the host pricing table (now `OTHER_PROVIDER_PRICING` in `src/llm-metrics/pricing.ts`, before broad matches; entries there are built with `plainRates(input, output, cacheRead)`):
    `{ match: 'glm-5.2', pricing: { inputPerMillion: 0.6, outputPerMillion: 2.2, cacheReadPerMillion: 0.11 } }` and a broader `{ match: 'z-ai/', ... }` guard. (Approximate; adjust to current OpenRouter GLM pricing — the table is explicitly "approximate by design".)
 2. **Authoritative cost (v0 scope — D6).** The authoritative `usage.cost` extraction is specified for the **Anthropic-skin SSE path only** (Claude Code, `/api/v1/messages`). The SSE usage parsing lives in **`src/docker/sse-extractor.ts`** (`SseExtractorTransform`, the Anthropic path around `sse-extractor.ts:230,319`) — **not** in `mitm-proxy.ts` (the `mitm-proxy.ts:491` `extractFromJsonResponse` handles only the **non-streaming JSON** response). Extend the Anthropic-skin SSE usage extraction to read `usage.cost` and `usage.prompt_tokens_details.cached_tokens` and publish them on the token-stream bus as fields on the existing usage event (emitted on the `message_end`-equivalent event). **Goose (chat) and Codex (responses) fall back to the static matcher in v0** — the OpenAI-shape SSE extractor emits raw events only today and is not extended here (documented limitation, not a bug).
 
-   **Accumulation semantics.** The Docker session **sums** the per-request `usage.cost` values observed on token-stream `message_end` events attributed to its session id, and **prefers that cumulative sum** over the CLI's self-reported `costUsd` (`docker-agent-session.ts:307-310`, which sets `this.cumulativeCostUsd = response.costUsd`) **when the active profile is openrouter-type AND the observed sum > 0**. Fallback order: **authoritative cumulative sum → CLI `costUsd` → static estimate**. (This is a named session-level test in §12.3 and part of G6 validation.)
+   *Current state:* the token-stream extractor is a passive observation-hub consumer, not a Transform in the pipe (see `token-stream-extraction.md`). It decodes gzip/deflate/br responses before parsing (so a compressed OpenRouter response no longer loses its cost), reads `usage.cost` and the three cached-token spellings on all three skins, and extracts them from non-streaming JSON bodies too (`tokenStreamEventsFromJson`). With statistics enabled the same cost also reaches LLM metrics through `OpenRouterGatewayAdapter` as a `gateway_reported` cost.
+
+   **Accumulation semantics.** The Docker session **sums** the per-request `usage.cost` values observed on token-stream `message_end` events attributed to its session id, and **prefers that cumulative sum** over the CLI's self-reported `costUsd` **when the active profile is openrouter-type AND the observed sum > 0**. Since host-side pricing (MET-3), both are fallbacks: host-observed cost (gateway-reported or list-price per exchange) wins when every observed exchange carried one, and a session with no cost at all reports `costSource: 'unknown'` instead of $0.00. Fallback order: **complete host-observed cost → authoritative cumulative sum → valid CLI `costUsd` → partial host sum (lower bound) → unknown**. (This is a named session-level test in §12.3 and part of G6 validation.) The order is for display; budget decisions read only host-observed cost (`hostObservedCostUsd`: the larger of the per-exchange sum and the authoritative sum), never the CLI's report.
 
 Document in `MODEL_ROUTING.md` that with first-class OpenRouter the cost is now accurate for Claude Code (unlike the LiteLLM base-URL path, where the cap bills at the requested model id); Goose/Codex use the static estimate in v0.
 

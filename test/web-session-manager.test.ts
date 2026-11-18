@@ -9,6 +9,7 @@ import { SessionManager } from '../src/session/session-manager.js';
 import type { PendingEscalationData, SessionSource } from '../src/session/session-manager.js';
 import type { Session, SessionInfo } from '../src/session/types.js';
 import type { Transport } from '../src/session/transport.js';
+import { EscalationExpiredError } from '../src/types/errors.js';
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -22,7 +23,7 @@ function stubSession(overrides?: Partial<Session>): Session {
     getHistory: vi.fn().mockReturnValue([]),
     getDiagnosticLog: vi.fn().mockReturnValue([]),
     resolveEscalation: vi.fn().mockResolvedValue(undefined),
-    getPendingEscalation: vi.fn(),
+    getPendingEscalations: vi.fn(() => []),
     getBudgetStatus: vi.fn(),
     close: vi.fn().mockResolvedValue(undefined),
     ...overrides,
@@ -86,22 +87,42 @@ describe('SessionManager web UI additions', () => {
       mgr.setPendingEscalation(label, data);
 
       const managed = mgr.get(label)!;
-      expect(managed.pendingEscalation).toEqual(data);
-      expect(managed.pendingEscalation!.toolName).toBe('write_file');
-      expect(managed.pendingEscalation!.serverName).toBe('filesystem');
+      expect(managed.pendingEscalations.get('esc-full')).toEqual(data);
+      expect(managed.pendingEscalations.get('esc-full')!.toolName).toBe('write_file');
+      expect(managed.pendingEscalations.get('esc-full')!.serverName).toBe('filesystem');
     });
 
-    it('backward compat: stores string escalation ID', () => {
+    it('keeps an earlier pending escalation when another is recorded', () => {
+      const mgr = new SessionManager();
+      const label = mgr.register(stubSession(), stubTransport(), webSource);
+
+      mgr.setPendingEscalation(label, makeEscalationData('esc-1', label));
+      mgr.setPendingEscalation(label, makeEscalationData('esc-2', label));
+
+      expect([...mgr.get(label)!.pendingEscalations.keys()]).toEqual(['esc-1', 'esc-2']);
+    });
+
+    it('records a Signal session escalation with its full data, never a blank placeholder', () => {
       const mgr = new SessionManager();
       const label = mgr.register(stubSession(), stubTransport(), signalSource);
 
-      mgr.setPendingEscalation(label, 'esc-string');
+      mgr.recordEscalation(label, {
+        escalationId: 'esc-signal',
+        serverName: 'filesystem',
+        toolName: 'write_file',
+        arguments: { path: '/tmp/test.txt' },
+        reason: 'Write outside sandbox',
+      });
 
       const managed = mgr.get(label)!;
-      expect(managed.pendingEscalation!.escalationId).toBe('esc-string');
-      // Should fill in defaults for other fields
-      expect(managed.pendingEscalation!.toolName).toBe('');
-      expect(managed.pendingEscalation!.serverName).toBe('');
+      expect(managed.pendingEscalations.get('esc-signal')).toMatchObject({
+        escalationId: 'esc-signal',
+        sessionLabel: label,
+        toolName: 'write_file',
+        serverName: 'filesystem',
+        arguments: { path: '/tmp/test.txt' },
+        reason: 'Write outside sandbox',
+      });
     });
   });
 
@@ -131,7 +152,7 @@ describe('SessionManager web UI additions', () => {
       const label = mgr.register(stubSession(), stubTransport(), webSource);
       mgr.setPendingEscalation(label, makeEscalationData('esc-c', label));
 
-      mgr.clearPendingEscalation(label);
+      mgr.clearPendingEscalation(label, 'esc-c');
       expect(mgr.findByEscalation('esc-c')).toBeUndefined();
     });
   });
@@ -148,7 +169,7 @@ describe('SessionManager web UI additions', () => {
       expect(result).toEqual({ resolved: true });
       expect(session.resolveEscalation).toHaveBeenCalledWith('esc-resolve', 'approved', undefined);
       // Escalation should be cleared after resolution
-      expect(mgr.get(label)!.pendingEscalation).toBeNull();
+      expect(mgr.get(label)!.pendingEscalations.size).toBe(0);
     });
 
     it('passes whitelistSelection option through', async () => {
@@ -190,7 +211,23 @@ describe('SessionManager web UI additions', () => {
       void firstAttempt;
     });
 
-    it('clears escalationResolving flag even when session.resolveEscalation throws', async () => {
+    it('reports a response that came after the proxy timeout as expired, not resolved', async () => {
+      const session = stubSession({
+        resolveEscalation: vi.fn().mockRejectedValue(new EscalationExpiredError('esc-late')),
+      });
+      const mgr = new SessionManager();
+      const label = mgr.register(session, stubTransport(), signalSource);
+      mgr.setPendingEscalation(label, makeEscalationData('esc-late', label));
+
+      const result = await mgr.resolveSessionEscalation('esc-late', 'approved');
+
+      expect(result).toEqual({ resolved: false, reason: 'expired' });
+      const managed = mgr.get(label)!;
+      expect(managed.pendingEscalations.size).toBe(0);
+      expect(managed.escalationsResolving.size).toBe(0);
+    });
+
+    it('clears the resolving mark even when session.resolveEscalation throws', async () => {
       const session = stubSession({
         resolveEscalation: vi.fn().mockRejectedValue(new Error('boom')),
       });
@@ -200,11 +237,11 @@ describe('SessionManager web UI additions', () => {
 
       await expect(mgr.resolveSessionEscalation('esc-error', 'denied')).rejects.toThrow('boom');
 
-      // escalationResolving should be reset
+      // The resolving mark should be reset
       const managed = mgr.get(label)!;
-      expect(managed.escalationResolving).toBe(false);
-      // pendingEscalation should also be cleared
-      expect(managed.pendingEscalation).toBeNull();
+      expect(managed.escalationsResolving.size).toBe(0);
+      // The pending escalation should also be cleared
+      expect(managed.pendingEscalations.size).toBe(0);
     });
   });
 });

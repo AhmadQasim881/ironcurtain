@@ -10,9 +10,10 @@
  */
 
 import { BaseTransport, type BaseTransportOptions } from '../session/base-transport.js';
+import { isStartupNotice, type SessionNotice, type StartupNotice } from '../session/startup-notices.js';
 import type { Session, DiagnosticEvent, EscalationRequest } from '../session/types.js';
+import { formatSessionNoticesMessage } from './format.js';
 import type { SignalBotDaemon } from './signal-bot-daemon.js';
-import { formatEscalationBanner } from './format.js';
 import * as logger from '../logger.js';
 
 export interface SignalSessionTransportOptions extends BaseTransportOptions {
@@ -26,6 +27,14 @@ export class SignalSessionTransport extends BaseTransport {
 
   /** Session label assigned by the daemon after construction. */
   sessionLabel = 0;
+
+  /**
+   * Start-up notices (`isStartupNotice`) emitted while the session was being
+   * created, before it had a label. The daemon sends them once, right after
+   * announcing the session ({@link takeStartupNotices}); null from then on,
+   * when a notice is sent as it comes.
+   */
+  private pendingStartupNotices: StartupNotice[] | null = [];
 
   constructor(options: SignalSessionTransportOptions) {
     super(options);
@@ -70,6 +79,11 @@ export class SignalSessionTransport extends BaseTransport {
   createDiagnosticHandler(): (event: DiagnosticEvent) => void {
     return (event) => {
       const label = this.sessionLabel;
+      if (isStartupNotice(event)) {
+        if (this.pendingStartupNotices !== null) this.pendingStartupNotices.push(event);
+        else this.sendNotices([event]);
+        return;
+      }
       switch (event.kind) {
         case 'tool_call':
           // Don't send every tool call - too noisy for messaging
@@ -80,10 +94,36 @@ export class SignalSessionTransport extends BaseTransport {
         case 'budget_exhausted':
           this.daemon.sendSignalMessage(`[#${label}] [Budget exhausted] ${event.message}`).catch(() => {});
           break;
+        case 'host_privileged_files':
+          // After a turn or at session end, when the label is known.
+          this.sendNotices([event]);
+          break;
       }
     };
   }
 
+  /**
+   * Hands over the start-up notices held since the session was created, for
+   * the daemon to send once after announcing the session. Any later one is
+   * sent as it comes.
+   */
+  takeStartupNotices(): readonly StartupNotice[] {
+    const notices = this.pendingStartupNotices ?? [];
+    this.pendingStartupNotices = null;
+    return notices;
+  }
+
+  /** Notices quote server-provided text and agent-chosen paths: plain text, never styled. */
+  private sendNotices(notices: readonly SessionNotice[]): void {
+    this.daemon
+      .sendSignalMessage(formatSessionNoticesMessage(this.sessionLabel, notices), { textMode: 'normal' })
+      .catch(() => {});
+  }
+
+  /**
+   * Hands each escalation to the daemon, which records it and sends the
+   * coded banner the user must quote to approve it.
+   */
   createEscalationHandler(): (request: EscalationRequest) => void {
     return (request) => {
       const label = this.sessionLabel;
@@ -91,17 +131,14 @@ export class SignalSessionTransport extends BaseTransport {
         `[Signal Transport] Escalation fired on session #${label} ` +
           `(tool=${request.serverName}/${request.toolName}, id=${request.escalationId})`,
       );
-      this.daemon.setPendingEscalation(label, request.escalationId);
-      const banner = formatEscalationBanner(request, label);
-      this.daemon.sendSignalMessage(banner).catch(() => {});
+      void this.daemon.surfaceEscalation(label, request);
     };
   }
 
-  createEscalationExpiredHandler(): () => void {
-    return () => {
-      const label = this.sessionLabel;
-      this.daemon.clearPendingEscalation(label);
-      this.daemon.sendSignalMessage(`[#${label}] Escalation expired (timed out).`).catch(() => {});
+  /** Hands each expiry to the daemon, which drops that escalation and tells the user. */
+  createEscalationExpiredHandler(): (escalationId: string) => void {
+    return (escalationId) => {
+      this.daemon.expireEscalation(this.sessionLabel, escalationId);
     };
   }
 }

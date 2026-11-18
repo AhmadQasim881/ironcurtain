@@ -4,13 +4,16 @@ import { z } from 'zod';
 
 import { LlmMetricsRepositoryUnavailableError } from '../../llm-metrics/persistence/repository.js';
 import {
+  isStatisticsLimitError,
   isValidStatisticsTimeZone,
-  MAX_STATISTICS_AGGREGATION_ROWS,
+  MAX_STATISTICS_DIMENSION_VALUES,
   MAX_STATISTICS_DISTRIBUTION_BINS,
   MAX_STATISTICS_FILTER_VALUES,
+  MAX_STATISTICS_GROUP_BY,
+  MAX_STATISTICS_MEASURES,
+  MAX_STATISTICS_PAGE_SIZE,
   MAX_STATISTICS_TOP_GROUPS,
   STATISTICS_BUCKET_SIZES_MS,
-  STATISTICS_CALENDAR_BUCKET_UNITS,
   STATISTICS_DIMENSIONS,
   STATISTICS_DISTRIBUTION_MEASURES,
   STATISTICS_IDENTIFIER_PATTERN,
@@ -19,6 +22,7 @@ import {
   STATISTICS_PROVIDER_IDENTIFIER_PATTERN,
   STATISTICS_TIME_ZONE_MAX_LENGTH,
 } from '../../llm-metrics/query-contract.js';
+import { statisticsCapabilityLimits } from '../../llm-metrics/query-service.js';
 import type { WorkflowDispatchContext } from './workflow-dispatch.js';
 import { validateParams } from './types.js';
 import { InvalidParamsError, MethodNotFoundError, RpcError } from '../web-ui-types.js';
@@ -79,8 +83,8 @@ const rangeSchema = z
 
 const summarySchema = rangeSchema
   .extend({
-    measures: z.array(measureSchema).min(1).max(20),
-    groupBy: z.array(dimensionSchema).max(3).optional(),
+    measures: z.array(measureSchema).min(1).max(MAX_STATISTICS_MEASURES),
+    groupBy: z.array(dimensionSchema).max(MAX_STATISTICS_GROUP_BY).optional(),
     topGroups: z.number().int().positive().max(MAX_STATISTICS_TOP_GROUPS).optional(),
   })
   .superRefine((value, context) => {
@@ -131,6 +135,11 @@ async function mapQueryError<T>(operation: () => Promise<T>): Promise<T> {
     if (error instanceof LlmMetricsRepositoryUnavailableError) {
       throw new RpcError('STATISTICS_UNAVAILABLE', 'LLM statistics are temporarily unavailable');
     }
+    // A well-formed query over a limit: tell the client which limit, so it can
+    // suggest a shorter range instead of reporting invalid parameters.
+    if (isStatisticsLimitError(error)) {
+      throw new RpcError('STATISTICS_LIMIT', error.message, { limit: error.limit, maximum: error.maximum });
+    }
     throw new InvalidParamsError(error instanceof Error ? error.message : 'Invalid statistics query');
   }
 }
@@ -145,14 +154,8 @@ export async function statisticsDispatch(
     if (!ctx.statisticsReader) {
       return {
         available: false,
-        dtoVersion: 2,
-        formulaVersion: 1,
         schemaVersion: null,
-        maxPageSize: 500,
-        maxScannedRows: MAX_STATISTICS_AGGREGATION_ROWS,
-        maxGroups: 500,
-        allowedBucketSizesMs: [...STATISTICS_BUCKET_SIZES_MS],
-        allowedCalendarBucketUnits: [...STATISTICS_CALENDAR_BUCKET_UNITS],
+        ...statisticsCapabilityLimits(),
         health: {
           state: 'disabled',
           schemaVersion: null,
@@ -190,7 +193,7 @@ export async function statisticsDispatch(
     case 'statistics.exchanges': {
       const query = validateParams(
         rangeSchema.extend({
-          limit: z.number().int().positive().max(500).optional(),
+          limit: z.number().int().positive().max(MAX_STATISTICS_PAGE_SIZE).optional(),
           cursor: z.string().max(1024).optional(),
         }),
         params,
@@ -199,7 +202,10 @@ export async function statisticsDispatch(
     }
     case 'statistics.dimensions': {
       const query = validateParams(
-        rangeSchema.extend({ dimension: dimensionSchema, limit: z.number().int().positive().max(500).optional() }),
+        rangeSchema.extend({
+          dimension: dimensionSchema,
+          limit: z.number().int().positive().max(MAX_STATISTICS_DIMENSION_VALUES).optional(),
+        }),
         params,
       );
       return mapQueryError(() => reader.dimensions(query));

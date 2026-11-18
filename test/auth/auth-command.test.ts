@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -12,7 +12,7 @@ import { runAuthCommand } from '../../src/auth/auth-command.js';
 // ---------------------------------------------------------------------------
 
 /** Captures stdout and stderr writes, suppresses process.exit. */
-async function captureOutput(fn: () => Promise<void>): Promise<string> {
+async function captureOutput(fn: () => Promise<void>, exitCalls: unknown[] = []): Promise<string> {
   const writes: string[] = [];
   const origWrite = process.stdout.write;
   const origErrWrite = process.stderr.write;
@@ -31,7 +31,9 @@ async function captureOutput(fn: () => Promise<void>): Promise<string> {
   }) as typeof console.error;
 
   const origExit = process.exit;
-  process.exit = (() => {}) as typeof process.exit;
+  process.exit = ((code?: unknown) => {
+    exitCalls.push(code);
+  }) as typeof process.exit;
 
   try {
     await fn();
@@ -123,6 +125,59 @@ describe('auth import credential import', () => {
     expect(output).toContain('console.cloud.google.com');
     expect(output).toContain('Desktop app');
   });
+
+  // Regression: the file used to be copied over the stored credentials first
+  // and validated afterwards, so a wrong file destroyed working credentials.
+  it.each([
+    ['not JSON', '{ this is not json'],
+    ['without a client_id', JSON.stringify({ installed: { client_secret: 'GOCSPX-x' } })],
+    ['without a client_secret', JSON.stringify({ client_id: 'id-only' })],
+  ])('refuses a credentials file that is %s and keeps the existing credentials', async (_label, content) => {
+    const provider = getOAuthProvider('google');
+    const destFile = resolve(tempDir, 'oauth', provider.credentialsFilename);
+    mkdirSync(resolve(tempDir, 'oauth'), { recursive: true });
+    const working = JSON.stringify({ installed: { client_id: 'working-id', client_secret: 'working-secret' } });
+    writeFileSync(destFile, working, { mode: 0o600 });
+    const sourceFile = resolve(sourceDir, 'wrong.json');
+    writeFileSync(sourceFile, content);
+
+    const exitCalls: unknown[] = [];
+    const output = await captureOutput(() => runAuthCommand(['import', 'google', sourceFile]), exitCalls);
+
+    expect(readFileSync(destFile, 'utf-8')).toBe(working);
+    expect(exitCalls).toEqual([1]);
+    expect(output).toContain('Invalid credentials file');
+    expect(output).toContain('Nothing was imported');
+    expect(output).not.toContain('Credentials saved');
+  });
+
+  it('refuses a source that is not a regular file', async () => {
+    const exitCalls: unknown[] = [];
+    const output = await captureOutput(() => runAuthCommand(['import', 'google', sourceDir]), exitCalls);
+
+    expect(exitCalls).toEqual([1]);
+    expect(output).toContain('is not a regular file');
+    expect(existsSync(resolve(tempDir, 'oauth', getOAuthProvider('google').credentialsFilename))).toBe(false);
+  });
+
+  it('replaces existing credentials atomically with an owner-only file', async () => {
+    const provider = getOAuthProvider('google');
+    const oauthDir = resolve(tempDir, 'oauth');
+    mkdirSync(oauthDir, { recursive: true });
+    writeFileSync(resolve(oauthDir, provider.credentialsFilename), '{"client_id":"old","client_secret":"old"}', {
+      mode: 0o644,
+    });
+    const sourceFile = resolve(sourceDir, 'creds.json');
+    writeFileSync(sourceFile, JSON.stringify({ client_id: 'new-id', client_secret: 'new-secret' }), { mode: 0o644 });
+
+    await captureOutput(() => runAuthCommand(['import', 'google', sourceFile]));
+
+    const destFile = resolve(oauthDir, provider.credentialsFilename);
+    expect(loadClientCredentials(provider)).toEqual({ clientId: 'new-id', clientSecret: 'new-secret' });
+    expect(statSync(destFile).mode & 0o777).toBe(0o600);
+    // No temporary file is left behind next to it.
+    expect(readdirSync(oauthDir)).toEqual([provider.credentialsFilename]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -204,7 +259,8 @@ describe('auth-command', () => {
   // Revoke
   // -----------------------------------------------------------------------
 
-  it('revokes a stored token and deletes the file', async () => {
+  /** Writes a stored Google token and returns its path. */
+  function writeStoredToken(): string {
     const tokenPath = resolve(tempDir, 'oauth', 'google.json');
     writeFileSync(
       tokenPath,
@@ -215,12 +271,31 @@ describe('auth-command', () => {
         scopes: ['test'],
       }),
     );
-    expect(existsSync(tokenPath)).toBe(true);
+    return tokenPath;
+  }
 
-    const output = await captureOutput(() => runAuthCommand(['revoke', 'google']));
+  /** Runs `auth revoke google` against a stubbed revocation endpoint. */
+  async function revokeWith(fetchImpl: () => Promise<Response>): Promise<{ output: string; exitCode: unknown }> {
+    const origFetch = globalThis.fetch;
+    const savedExitCode = process.exitCode;
+    globalThis.fetch = vi.fn(fetchImpl);
+    try {
+      const output = await captureOutput(() => runAuthCommand(['revoke', 'google']));
+      return { output, exitCode: process.exitCode };
+    } finally {
+      globalThis.fetch = origFetch;
+      process.exitCode = savedExitCode;
+    }
+  }
+
+  it('revokes a stored token and deletes the file once the provider confirms it', async () => {
+    const tokenPath = writeStoredToken();
+
+    const { output, exitCode } = await revokeWith(() => Promise.resolve(new Response('', { status: 200 })));
 
     expect(existsSync(tokenPath)).toBe(false);
     expect(output).toContain('Token revoked');
+    expect(exitCode).not.toBe(1);
   });
 
   it('handles revoke when no token exists', async () => {
@@ -229,33 +304,39 @@ describe('auth-command', () => {
     expect(output).toContain('No stored token found');
   });
 
-  it('warns on failed server-side revocation but still deletes local token', async () => {
-    // Write a valid token so revokeTokenRemotely can read it
-    const tokenPath = resolve(tempDir, 'oauth', 'google.json');
-    writeFileSync(
-      tokenPath,
-      JSON.stringify({
-        accessToken: 'fake-access',
-        refreshToken: 'fake-refresh',
-        expiresAt: Date.now() + 3600000,
-        scopes: ['test'],
-      }),
+  // Regression: a failed revocation used to delete the only local copy of a
+  // token that was still valid at Google, and report "Token revoked".
+  it.each([
+    ['a network error', () => Promise.reject(new Error('network error'))],
+    ['a server error', () => Promise.resolve(new Response('backend unavailable', { status: 503 }))],
+    ['another client error', () => Promise.resolve(new Response('{"error":"invalid_request"}', { status: 400 }))],
+  ])('keeps the local token when revocation fails with %s', async (_label, fetchImpl) => {
+    const tokenPath = writeStoredToken();
+
+    const { output, exitCode } = await revokeWith(fetchImpl);
+
+    expect(existsSync(tokenPath)).toBe(true);
+    expect(output).toContain('Warning');
+    expect(output).toContain('NOT revoked');
+    expect(output).toContain('https://myaccount.google.com/permissions');
+    expect(output).not.toContain('Token revoked');
+    expect(exitCode).toBe(1);
+  });
+
+  it('deletes the local token when the provider reports it is already invalid (400 invalid_token)', async () => {
+    const tokenPath = writeStoredToken();
+
+    const { output, exitCode } = await revokeWith(() =>
+      Promise.resolve(
+        new Response(JSON.stringify({ error: 'invalid_token', error_description: 'Token expired or revoked' }), {
+          status: 400,
+        }),
+      ),
     );
 
-    // The revocation URL for Google points to a real endpoint that will fail
-    // with our fake token, but the local file should still be deleted.
-    // Mock fetch to simulate a network error.
-    const origFetch = globalThis.fetch;
-    globalThis.fetch = vi.fn().mockRejectedValue(new Error('network error'));
-    try {
-      const output = await captureOutput(() => runAuthCommand(['revoke', 'google']));
-
-      expect(existsSync(tokenPath)).toBe(false);
-      expect(output).toContain('Warning');
-      expect(output).toContain('Token revoked');
-    } finally {
-      globalThis.fetch = origFetch;
-    }
+    expect(existsSync(tokenPath)).toBe(false);
+    expect(output).toContain('no longer valid');
+    expect(exitCode).not.toBe(1);
   });
 
   // -----------------------------------------------------------------------

@@ -5,11 +5,16 @@ import { tmpdir } from 'node:os';
 import { resolveSessionMode, PreflightError } from '../src/session/preflight.js';
 import { checkDockerAvailable, type DockerAvailability, type ProbeExecFileFn } from '../src/docker/docker-probe.js';
 import type { IronCurtainConfig } from '../src/config/types.js';
-import type { ResolvedProviderProfile } from '../src/config/user-config.js';
+import type { ResolvedProviderProfile, ResolvedUserConfig } from '../src/config/user-config.js';
 import type { AgentId } from '../src/docker/agent-adapter.js';
-import type { CredentialSources } from '../src/docker/oauth-credentials.js';
+import {
+  preflightCredentialSources,
+  readOnlyCredentialSources,
+  type CredentialSources,
+} from '../src/docker/oauth-credentials.js';
 
 import { TEST_SANDBOX_DIR, REAL_TMP } from './fixtures/test-policy.js';
+import { testUserConfig } from './helpers/user-config.js';
 
 /** No OAuth credentials — forces API key path. */
 const noOAuthSources: CredentialSources = {
@@ -32,6 +37,8 @@ function createTestConfig(
     anthropicApiKey?: string;
     preferredMode?: 'container' | 'builtin';
     agentModelId?: string;
+    /** Further user-config fields, applied last. */
+    userConfig?: Partial<ResolvedUserConfig>;
   } = {},
 ): IronCurtainConfig {
   const agentModelId = overrides.agentModelId ?? 'anthropic:claude-sonnet-4-6';
@@ -46,47 +53,24 @@ function createTestConfig(
     constitutionPath: `${REAL_TMP}/test-constitution.md`,
     agentModelId,
     escalationTimeoutSeconds: 300,
-    userConfig: {
+    userConfig: testUserConfig({
       agentModelId,
-      policyModelId: 'anthropic:claude-sonnet-4-6',
-      prefilterModelId: 'anthropic:claude-haiku-4-5',
       anthropicApiKey: overrides.anthropicApiKey ?? 'test-api-key',
-      googleApiKey: '',
-      openaiApiKey: '',
-      anthropicBaseUrl: '',
-      openaiBaseUrl: '',
-      googleBaseUrl: '',
       // Native-default registry: no OpenRouter routing, so preflight falls
       // through to agent-native credential detection (G13 §9.7).
       modelProviders: { default: 'native', profiles: { native: { type: 'native' } } },
-      escalationTimeoutSeconds: 300,
-      resourceBudget: {
-        maxTotalTokens: 1_000_000,
-        maxSteps: 200,
-        maxSessionSeconds: 1800,
-        maxEstimatedCostUsd: 5.0,
-        warnThresholdPercent: 80,
-      },
-      autoCompact: {
-        enabled: false,
-        thresholdTokens: 80_000,
-        keepRecentMessages: 10,
-        summaryModelId: 'anthropic:claude-haiku-4-5',
-      },
-      autoApprove: { enabled: false, modelId: 'anthropic:claude-haiku-4-5' },
-      auditRedaction: { enabled: true },
-      memory: { enabled: true, autoSave: true, llmBaseUrl: undefined, llmApiKey: undefined },
-      webSearch: { provider: null, brave: null, tavily: null, serpapi: null },
-      serverCredentials: {},
-      signal: null,
-      gooseProvider: 'anthropic',
-      gooseModel: 'claude-sonnet-4-20250514',
-      preferredDockerAgent: 'claude-code',
+      memory: { enabled: true, autoSave: true, llmBaseUrl: undefined, llmApiKey: undefined, offlineModels: false },
       preferredMode: overrides.preferredMode ?? 'container',
       packageInstall: { enabled: true, quarantineDays: 2, allowedPackages: [], deniedPackages: [] },
-      dockerResources: { memoryMb: 8192, cpus: 4 },
-    },
+      dockerResources: { memoryMb: 8192, cpus: 4, pidsLimit: 4096 },
+      ...overrides.userConfig,
+    }),
   };
+}
+
+/** `config` with some user-config fields replaced (the resolved user config is read-only). */
+function withUserConfig(config: IronCurtainConfig, overrides: Partial<ResolvedUserConfig>): IronCurtainConfig {
+  return { ...config, userConfig: { ...config.userConfig, ...overrides } };
 }
 
 /**
@@ -202,9 +186,43 @@ describe('resolveSessionMode', () => {
       expect(result.reason).toBe('Explicit --agent selection (OAuth)');
     });
 
+    it('refreshes an expired Claude login only after the selected runtime is available', async () => {
+      const expired = { accessToken: 'fixture-access', refreshToken: 'fixture-refresh', expiresAt: 1 };
+      const files = [{ credentials: expired, filePath: '/fixture/claude.json' }];
+      const passiveRead = vi.spyOn(readOnlyCredentialSources, 'loadFromFilesWithSource').mockReturnValue(files);
+      const activeRead = vi.spyOn(preflightCredentialSources, 'loadFromFilesWithSource').mockReturnValue(files);
+      const refresh = vi.spyOn(preflightCredentialSources, 'refreshToken').mockResolvedValue({
+        ...expired,
+        expiresAt: Date.now() + 3_600_000,
+      });
+      const save = vi.spyOn(preflightCredentialSources, 'saveToFile').mockReturnValue(undefined);
+      try {
+        const config = createTestConfig({ anthropicApiKey: '' });
+        await expect(resolveSessionMode({ config, isDockerAvailable: dockerUnavailable })).rejects.toThrow(
+          /container runtime is not available/,
+        );
+        expect(refresh).not.toHaveBeenCalled();
+        const result = await resolveSessionMode({ config, isDockerAvailable: dockerAvailable });
+        expect(result.mode).toMatchObject({ agent: 'claude-code', authKind: 'oauth' });
+        expect(refresh).toHaveBeenCalledOnce();
+        expect(save).toHaveBeenCalledOnce();
+      } finally {
+        passiveRead.mockRestore();
+        activeRead.mockRestore();
+        refresh.mockRestore();
+        save.mockRestore();
+      }
+    });
+
     it('selects codex with Codex ChatGPT OAuth and no OpenAI API key', async () => {
       const tmp = mkdtempSync(join(tmpdir(), 'ironcurtain-codex-preflight-'));
       const oldCodexHome = process.env.CODEX_HOME;
+      const readClaude = vi.spyOn(preflightCredentialSources, 'loadFromFilesWithSource').mockReturnValue([
+        {
+          credentials: { accessToken: 'fixture', refreshToken: 'fixture', expiresAt: Date.now() + 3_600_000 },
+          filePath: '/fixture/claude.json',
+        },
+      ]);
       try {
         process.env.CODEX_HOME = tmp;
         writeFileSync(
@@ -212,18 +230,18 @@ describe('resolveSessionMode', () => {
           JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: 'codex-token' } }),
         );
 
-        const config = createTestConfig({ anthropicApiKey: '' });
-        config.userConfig.openaiApiKey = '';
+        const config = createTestConfig({ anthropicApiKey: '', userConfig: { openaiApiKey: '' } });
         const result = await resolveSessionMode({
           config,
           requestedAgent: 'codex' as AgentId,
           isDockerAvailable: dockerAvailable,
-          credentialSources: noOAuthSources,
         });
 
         expect(result.mode).toEqual({ kind: 'docker', agent: 'codex', authKind: 'oauth' });
         expect(result.reason).toBe('Explicit --agent selection (OAuth)');
+        expect(readClaude).not.toHaveBeenCalled();
       } finally {
+        readClaude.mockRestore();
         if (oldCodexHome === undefined) delete process.env.CODEX_HOME;
         else process.env.CODEX_HOME = oldCodexHome;
         rmSync(tmp, { recursive: true, force: true });
@@ -252,9 +270,10 @@ describe('resolveSessionMode', () => {
     });
 
     it('--agent goose surfaces the OAuth-not-usable-with-goose addendum on OAuth-only', async () => {
-      const config = createTestConfig({ anthropicApiKey: '' });
-      config.userConfig.preferredDockerAgent = 'goose';
-      config.userConfig.gooseProvider = 'anthropic';
+      const config = createTestConfig({
+        anthropicApiKey: '',
+        userConfig: { preferredDockerAgent: 'goose', gooseProvider: 'anthropic' },
+      });
 
       const promise = resolveSessionMode({
         config,
@@ -292,9 +311,7 @@ describe('resolveSessionMode', () => {
       });
 
       it('selects Docker (goose) when preferredDockerAgent=goose and goose provider key is set', async () => {
-        const config = createTestConfig();
-        config.userConfig.preferredDockerAgent = 'goose';
-        config.userConfig.gooseProvider = 'anthropic';
+        const config = createTestConfig({ userConfig: { preferredDockerAgent: 'goose', gooseProvider: 'anthropic' } });
 
         const result = await resolveSessionMode({
           config,
@@ -315,8 +332,7 @@ describe('resolveSessionMode', () => {
             join(tmp, 'auth.json'),
             JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: 'codex-token' } }),
           );
-          const config = createTestConfig({ anthropicApiKey: '' });
-          config.userConfig.preferredDockerAgent = 'codex';
+          const config = createTestConfig({ anthropicApiKey: '', userConfig: { preferredDockerAgent: 'codex' } });
 
           const result = await resolveSessionMode({
             config,
@@ -334,9 +350,10 @@ describe('resolveSessionMode', () => {
       });
 
       it('throws with goose+OAuth-only and includes the goose-OAuth-not-usable addendum', async () => {
-        const config = createTestConfig({ anthropicApiKey: '' });
-        config.userConfig.preferredDockerAgent = 'goose';
-        config.userConfig.gooseProvider = 'anthropic';
+        const config = createTestConfig({
+          anthropicApiKey: '',
+          userConfig: { preferredDockerAgent: 'goose', gooseProvider: 'anthropic' },
+        });
 
         const promise = resolveSessionMode({
           config,
@@ -474,20 +491,48 @@ describe('resolveSessionMode', () => {
         expect(result.reason).toBe('Explicit --agent builtin');
       });
 
-      it('--agent builtin succeeds even with preferredMode = builtin and no API key', async () => {
-        // resolveExplicit('builtin', ...) intentionally does not check the API
-        // key — the agent loop fails later on the actual API call.
+      it('--agent builtin fails fast without an API key for the agent model, like preferredMode = builtin', async () => {
+        // The explicit path used to skip the key check, so the session started
+        // and its first turn failed on the API call. It now refuses up front
+        // with an explicit-flag message, before any Docker or OAuth probe.
         const dockerSpy = vi.fn().mockResolvedValue({ available: true });
+        const loadFromFile = vi.fn(() => null);
+        const loadFromKeychain = vi.fn(() => null);
+        for (const preferredMode of ['builtin', 'container'] as const) {
+          const promise = resolveSessionMode({
+            config: createTestConfig({ anthropicApiKey: '', preferredMode }),
+            requestedAgent: 'builtin' as AgentId,
+            isDockerAvailable: dockerSpy,
+            credentialSources: { loadFromFile, loadFromKeychain },
+          });
+
+          await expect(promise).rejects.toThrow(PreflightError);
+          await expect(promise).rejects.toThrow(/--agent builtin requires an API key, but no ANTHROPIC_API_KEY/);
+          await expect(promise).rejects.not.toThrow(/preferredMode is/);
+        }
+        expect(dockerSpy).not.toHaveBeenCalled();
+        expect(loadFromFile).not.toHaveBeenCalled();
+        expect(loadFromKeychain).not.toHaveBeenCalled();
+      });
+
+      it('--agent builtin checks the configured agent provider, not Anthropic', async () => {
+        const config = createTestConfig({ anthropicApiKey: '', agentModelId: 'openai:gpt-4o' });
         const result = await resolveSessionMode({
-          config: createTestConfig({ anthropicApiKey: '', preferredMode: 'builtin' }),
+          config: withUserConfig(config, { openaiApiKey: 'sk-openai-test' }),
           requestedAgent: 'builtin' as AgentId,
-          isDockerAvailable: dockerSpy,
+          isDockerAvailable: dockerUnavailable,
           credentialSources: noOAuthSources,
         });
-
         expect(result.mode).toEqual({ kind: 'builtin' });
-        expect(result.reason).toBe('Explicit --agent builtin');
-        expect(dockerSpy).not.toHaveBeenCalled();
+
+        await expect(
+          resolveSessionMode({
+            config: withUserConfig(config, { openaiApiKey: '' }),
+            requestedAgent: 'builtin' as AgentId,
+            isDockerAvailable: dockerUnavailable,
+            credentialSources: noOAuthSources,
+          }),
+        ).rejects.toThrow(/no OPENAI_API_KEY/);
       });
 
       it('--agent claude-code with unavailable container runtime throws the explicit-mode message', async () => {
@@ -502,6 +547,84 @@ describe('resolveSessionMode', () => {
         // The explicit-mode message attributes the failure to the flag the user typed.
         await expect(promise).rejects.toThrow(/--agent claude-code requires container mode/);
       });
+    });
+  });
+
+  it.each([undefined, 'goose' as AgentId])(
+    'names the Google host key for native Goose (agent %s)',
+    async (requestedAgent) => {
+      const promise = resolveSessionMode({
+        config: createTestConfig({ userConfig: { preferredDockerAgent: 'goose', gooseProvider: 'google' } }),
+        requestedAgent,
+        isDockerAvailable: dockerAvailable,
+        credentialSources: noOAuthSources,
+      });
+      await expect(promise).rejects.toThrow(/Set GOOGLE_GENERATIVE_AI_API_KEY/);
+    },
+  );
+
+  describe('host-model role warnings', () => {
+    /** An OpenAI-only user: the agent runs on OpenAI, the role defaults stay on Anthropic. */
+    function openAiOnlyConfig(preferredMode: 'container' | 'builtin'): IronCurtainConfig {
+      const config = createTestConfig({ anthropicApiKey: '', preferredMode, agentModelId: 'openai:gpt-4o' });
+      return withUserConfig(config, {
+        openaiApiKey: 'sk-openai-test',
+        autoCompact: { ...config.userConfig.autoCompact, enabled: true },
+      });
+    }
+
+    it('an OpenAI-only builtin user with autoCompact gets a warning, not a refusal', async () => {
+      const result = await resolveSessionMode({
+        config: openAiOnlyConfig('builtin'),
+        isDockerAvailable: dockerUnavailable,
+        credentialSources: noOAuthSources,
+      });
+
+      expect(result.mode).toEqual({ kind: 'builtin' });
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings?.[0]).toMatch(/summary model "anthropic:claude-haiku-4-5" has no credentials/);
+      expect(result.warnings?.[0]).toMatch(/no ANTHROPIC_API_KEY is configured/);
+      expect(result.warnings?.[0]).toMatch(/summarizes with the agent model "openai:gpt-4o"/);
+    });
+
+    it('warns that auto-approve is off when its model has no key, in either mode', async () => {
+      const openAiOnly = openAiOnlyConfig('builtin');
+      const builtin = withUserConfig(openAiOnly, {
+        autoCompact: { ...openAiOnly.userConfig.autoCompact, enabled: false },
+        autoApprove: { enabled: true, modelId: 'anthropic:claude-haiku-4-5' },
+      });
+      const builtinResult = await resolveSessionMode({
+        config: builtin,
+        requestedAgent: 'builtin' as AgentId,
+        isDockerAvailable: dockerUnavailable,
+        credentialSources: noOAuthSources,
+      });
+      expect(builtinResult.warnings).toEqual([expect.stringMatching(/^Auto-approve is off for this session/)]);
+
+      const container = withUserConfig(createTestConfig({ anthropicApiKey: '' }), {
+        autoApprove: { enabled: true, modelId: 'anthropic:claude-haiku-4-5' },
+      });
+      const containerResult = await resolveSessionMode({
+        config: container,
+        isDockerAvailable: dockerAvailable,
+        credentialSources: oauthOnlySources,
+      });
+      expect(containerResult.mode).toEqual({ kind: 'docker', agent: 'claude-code', authKind: 'oauth' });
+      expect(containerResult.warnings).toEqual([expect.stringMatching(/^Auto-approve is off for this session/)]);
+    });
+
+    it('has no warnings when every role the session uses has credentials', async () => {
+      const base = createTestConfig({ preferredMode: 'builtin' });
+      const config = withUserConfig(base, {
+        autoCompact: { ...base.userConfig.autoCompact, enabled: true },
+        autoApprove: { enabled: true, modelId: 'anthropic:claude-haiku-4-5' },
+      });
+      const result = await resolveSessionMode({
+        config,
+        isDockerAvailable: dockerUnavailable,
+        credentialSources: noOAuthSources,
+      });
+      expect(result.warnings).toBeUndefined();
     });
   });
 
@@ -549,6 +672,7 @@ describe('resolveSessionMode', () => {
       });
 
       await expect(promise).rejects.toThrow(PreflightError);
+      await expect(promise).rejects.toThrow(/Set OPENROUTER_API_KEY/);
     });
 
     it('surfaces the authoritative unknown-profile error for an unknown name, before credential detection', async () => {

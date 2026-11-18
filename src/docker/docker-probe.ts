@@ -50,6 +50,13 @@ export interface DockerServerFacts {
   readonly kernelVersion: string;
   readonly cgroupVersion: string;
   readonly securityOptions: readonly string[];
+  /**
+   * Logical CPUs (`NCPU`) and total memory in bytes (`MemTotal`) of the
+   * machine the daemon runs on: the Docker Desktop VM, not the host. Absent
+   * when the daemon did not report a positive value.
+   */
+  readonly cpus?: number;
+  readonly memoryBytes?: number;
 }
 
 export type DockerAvailability =
@@ -74,6 +81,8 @@ export function parseDockerServerFacts(value: unknown): DockerServerFacts {
   if (!Array.isArray(info.SecurityOptions) || !info.SecurityOptions.every((item) => typeof item === 'string')) {
     throw new Error('Docker info omitted security options');
   }
+  const cpus = positiveSafeInteger(info.NCPU);
+  const memoryBytes = positiveSafeInteger(info.MemTotal);
   return {
     architecture,
     operatingSystem: requiredString('OperatingSystem'),
@@ -82,7 +91,41 @@ export function parseDockerServerFacts(value: unknown): DockerServerFacts {
     kernelVersion: requiredString('KernelVersion'),
     cgroupVersion: requiredString('CgroupVersion'),
     securityOptions: info.SecurityOptions,
+    ...(cpus === undefined ? {} : { cpus }),
+    ...(memoryBytes === undefined ? {} : { memoryBytes }),
   };
+}
+
+function positiveSafeInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+/**
+ * How container root relates to host root on a Docker daemon, read from
+ * `docker info` SecurityOptions:
+ *
+ *   - `rootless`      -- `name=rootless`: the daemon itself runs unprivileged;
+ *                        container UID 0 is the host user.
+ *   - `userns-remap`  -- `name=userns`: the daemon maps container UIDs into a
+ *                        subordinate range.
+ *   - `host-root`     -- neither: container UID 0 is real host UID 0 on every
+ *                        bind mount. Agent containers keep passwordless sudo
+ *                        by default, so a compromised agent can leave
+ *                        root-owned setuid files in the workspace (audit
+ *                        finding DINF-3).
+ *
+ * Both isolated modes currently break the Linux UID-remap entrypoint, so this
+ * classification drives warnings (session log and `ironcurtain doctor`) and
+ * the host-side setuid/root-owned scan of agent-writable mounts
+ * (`host-mount-privilege-scan.ts`), not admission.
+ */
+export type DockerUserNamespaceMode = 'rootless' | 'userns-remap' | 'host-root';
+
+export function classifyDockerUserNamespace(securityOptions: readonly string[]): DockerUserNamespaceMode {
+  const names = securityOptions.map((option) => option.split(',')[0]?.trim() ?? '');
+  if (names.includes('name=rootless')) return 'rootless';
+  if (names.includes('name=userns')) return 'userns-remap';
+  return 'host-root';
 }
 
 function describeProbeFailure(err: unknown, fallback: string): string {

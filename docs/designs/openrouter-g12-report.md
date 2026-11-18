@@ -1,5 +1,7 @@
 # OpenRouter Integration — G12 Completion Report
 
+**Status (2026-11-14):** Historical: the completion report (2026-07-03) of the OpenRouter work against the gates of `openrouter-integration.md`.
+
 **Branch:** `feature/openrouter-profiles` · **Spec:** [`openrouter-integration.md`](openrouter-integration.md) (Design v3, gates G1–G13) · **Date:** 2026-07-03
 
 ## Gate verdicts

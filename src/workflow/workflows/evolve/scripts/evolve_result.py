@@ -100,6 +100,8 @@ def _clear_current_round(run_dir: Path, lane: int | None = None) -> None:
     # stop_signals.json is cleared here so a human "run N more rounds" extension
     # past an early stop does not re-route `complete` on a stale stop_reason from
     # the round that triggered the stop (the human directive resets after one turn).
+    # stop_check.json goes with it: the round-boundary verdict belongs to the
+    # round that just ended and is rewritten after the next one records.
     current_dir = _current_dir(run_dir, lane)
     names = [
         "step_name",
@@ -111,7 +113,7 @@ def _clear_current_round(run_dir: Path, lane: int | None = None) -> None:
         "cognition_item.json",
     ]
     if lane is None:
-        names.append("stop_signals.json")
+        names.extend(["stop_signals.json", "stop_check.json"])
     for name in names:
         (current_dir / name).unlink(missing_ok=True)
 
@@ -1412,6 +1414,45 @@ def compute_stop_signals(args: argparse.Namespace) -> int:
     return 0
 
 
+def stop_check(args: argparse.Namespace) -> int:
+    # Deterministic round-boundary stop decision, routed on by the workflow so
+    # the orchestrator agent can neither skip a stop nor extend the run past
+    # one (a human's FORCE_REVISION at final_review still buys exactly one more
+    # round, because the agent is consulted again only after that gate). The
+    # signals are recomputed over the durable nodes.json and run_spec.yaml
+    # rather than read back, and the canonical current/stop_signals.json is
+    # rewritten with them, so the agents that read it see the same decision.
+    # A crash exits non-zero and the workflow routes that to `failed`: an
+    # undecidable stop never continues the search. A run spec without a positive
+    # budget.max_rounds (deleted, emptied or zeroed after preflight validated it)
+    # is undecidable too: _compute_stop_signals would read it as "no round
+    # limit" and keep the search going until the visit backstop.
+    run_dir = _run_dir(args)
+    result_file = Path(args.result_file)
+    spec_path = run_dir / "run_spec.yaml"
+    if not spec_path.is_file():
+        raise SystemExit(f"evolve_result stop_check: {spec_path} is missing; the round budget cannot be enforced")
+    budget = _load_structured(spec_path).get("budget")
+    if not isinstance(budget, dict) or _safe_int(budget.get("max_rounds")) <= 0:
+        raise SystemExit(
+            f"evolve_result stop_check: {spec_path} has no positive budget.max_rounds; "
+            "the round budget cannot be enforced"
+        )
+    signals = _write_stop_signals(run_dir, None)
+    stop_reason = signals.get("stop_reason")
+    payload: dict[str, Any] = {
+        "stop_reason": stop_reason,
+        "stop_signals_path": str(_stop_signals_path(run_dir, None)),
+        "done_rounds": signals.get("done_rounds"),
+        "max_rounds": signals.get("max_rounds"),
+    }
+    if "target_parse_warning" in signals:
+        payload["target_parse_warning"] = signals["target_parse_warning"]
+    verdict = "stop" if stop_reason is not None else "continue"
+    _write_json(result_file, {"verdict": verdict, "payload": payload, "passed": True})
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1490,6 +1531,11 @@ def build_parser() -> argparse.ArgumentParser:
     stop_signals_parser.add_argument("--run-dir", required=True)
     stop_signals_parser.add_argument("--result-file", required=True)
     stop_signals_parser.set_defaults(func=compute_stop_signals)
+
+    stop_check_parser = subparsers.add_parser("stop_check")
+    stop_check_parser.add_argument("--run-dir", required=True)
+    stop_check_parser.add_argument("--result-file", required=True)
+    stop_check_parser.set_defaults(func=stop_check)
 
     return parser
 

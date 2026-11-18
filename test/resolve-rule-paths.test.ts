@@ -1,12 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { CompiledRule } from '../src/pipeline/types.js';
 
-// Mock node:fs so we control realpathSync behavior without touching disk
+// Mock node:fs so we control realpathSync behavior without touching disk.
+// resolveRealPath calls realpathSync.native on macOS; route it to the same mock
+// so the expectations below hold on every platform.
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
+  const realpathSync = vi.fn();
   return {
     ...actual,
-    realpathSync: vi.fn(),
+    realpathSync: Object.assign(realpathSync, { native: (p: string) => realpathSync(p) }),
   };
 });
 
@@ -51,7 +54,9 @@ describe('resolveRulePaths', () => {
   });
 
   it('falls back to path.resolve when realpathSync throws (path does not exist)', () => {
-    mockedRealpathSync.mockImplementation(() => {
+    // Only the root exists: the missing components are re-attached verbatim.
+    mockedRealpathSync.mockImplementation((p) => {
+      if (p === '/') return '/';
       throw new Error('ENOENT');
     });
 
@@ -59,6 +64,16 @@ describe('resolveRulePaths', () => {
     const result = resolveRulePaths(rules);
 
     expect(result[0].if.paths!.within).toBe(resolve('/nonexistent/dir'));
+  });
+
+  it('fails closed when not even the filesystem root resolves', () => {
+    mockedRealpathSync.mockImplementation(() => {
+      throw new Error('EIO');
+    });
+
+    expect(() => resolveRulePaths([makeRule('/nonexistent/dir')])).toThrow(
+      expect.objectContaining({ code: 'PATH_UNRESOLVABLE' }),
+    );
   });
 
   it('returns the original rule object when resolved path is unchanged', () => {

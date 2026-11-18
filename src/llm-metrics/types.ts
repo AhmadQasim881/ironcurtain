@@ -19,6 +19,41 @@ export type OutputTokenSemantics = 'includes_thinking' | 'excludes_thinking' | '
 export type TokenMeasurementAccuracy =
   'reported_exact' | 'provider_estimate' | 'derived_exact' | 'derived_from_estimate' | 'unknown';
 
+/**
+ * Kind of one provider-itemized billing attempt inside a single exchange
+ * (Anthropic `usage.iterations`). `other` keeps an unrecognized future kind
+ * countable without retaining its raw name.
+ */
+export type UsageIterationKind = 'compaction' | 'message' | 'advisor_message' | 'fallback_message' | 'other';
+
+/**
+ * One billing attempt of an exchange. Each attempt bills at the rates of its
+ * own model, so the model is kept per attempt. Counts follow the exchange's
+ * protocol semantics (for Anthropic, `inputTokensUncached` excludes cache).
+ */
+export interface UsageIteration {
+  readonly kind: UsageIterationKind;
+  /** Bounded identifier; null when the provider names no model for the attempt. */
+  readonly model: string | null;
+  readonly inputTokensUncached: number | null;
+  readonly cacheReadInputTokens: number | null;
+  readonly cacheWriteInputTokens: number | null;
+  readonly outputTokens: number | null;
+}
+
+/**
+ * Where an exchange's cost comes from: the gateway's own report (OpenRouter
+ * `usage.cost`), or the host's estimate at first-party list prices for a
+ * verified official provider origin (`cost-estimate.ts`). Null: no cost.
+ */
+export type LlmCostSource = 'gateway_reported' | 'list_price';
+
+/** Provider-billed server-tool request counts (allowlisted kinds only). */
+export interface ServerToolRequests {
+  readonly webSearchRequests: number | null;
+  readonly webFetchRequests: number | null;
+}
+
 export interface NormalizedUsage {
   readonly inputTokensReported: number | null;
   readonly inputTokensTotal: number | null;
@@ -41,12 +76,36 @@ export interface NormalizedUsage {
 
   readonly providerTotalTokens: number | null;
   readonly canonicalTotalTokens: number | null;
+  /** Cost the gateway reported (OpenRouter `usage.cost`); never a host estimate. */
   readonly costUsd: number | null;
+  /**
+   * Host-side estimate at first-party list prices, set only for a verified
+   * official direct origin and a model the price table lists (and then only
+   * when the gateway reported no cost). The exchange's cost is
+   * `costUsd ?? estimatedCostUsd` (see `exchangeCostUsd`).
+   */
+  readonly estimatedCostUsd?: number | null;
+  readonly costSource?: LlmCostSource | null;
+  /** `PRICING_VERSION` of the table behind `estimatedCostUsd`. */
+  readonly pricingVersion?: string | null;
 
   readonly usageSource: string | null;
   readonly usageCompleteness: UsageCompleteness;
   readonly usageSemanticsVersion: 1;
   readonly qualityFlags: readonly string[];
+
+  /*
+   * Optional breakdowns, present only when the protocol itemizes them. They
+   * are pricing inputs and never add to the totals above, which already
+   * include them.
+   */
+  /** Cache writes with a 5-minute TTL; a subset of cacheWriteInputTokens. */
+  readonly cacheWrite5mInputTokens?: number | null;
+  /** Cache writes with a 1-hour TTL; a subset of cacheWriteInputTokens. */
+  readonly cacheWrite1hInputTokens?: number | null;
+  readonly serverToolRequests?: ServerToolRequests;
+  /** Per-attempt breakdown; the totals above are its sums, never sums plus top-level usage. */
+  readonly iterations?: readonly UsageIteration[];
 }
 
 export type IdentitySource =
@@ -123,6 +182,8 @@ export interface LlmProtocolObservation {
   readonly providerRequestId: string | null;
   readonly providerResponseId: string | null;
   readonly actualServiceTier: string | null;
+  /** The speed the provider reports it served (Anthropic `usage.speed`), when it reports one. */
+  readonly actualSpeedMode?: 'standard' | 'fast' | null;
   readonly usage: NormalizedUsage;
   readonly outcome: LlmOutcome;
   readonly protocolTerminal: boolean;
@@ -153,10 +214,24 @@ export interface LlmProtocolAccumulator {
   snapshot(): LlmProtocolObservation;
 }
 
+/** Route-level usage contract facts an accumulator cannot learn from the protocol alone. */
+export interface LlmProtocolAccumulatorOptions {
+  /**
+   * The route omits (or sends null for) zero-valued cache counters instead
+   * of reporting 0, as OpenRouter's Anthropic-compatible Messages skin does.
+   * Once the final usage report has arrived (`message_delta`, or a JSON
+   * body), a cache counter still absent counts as 0 with an
+   * `absent_usage_assumed_zero:<field>` quality flag. Before that report a
+   * counter may simply not be reported yet, so it stays unknown, as it does
+   * without this option. An invalid counter is never assumed to be zero.
+   */
+  readonly absentCacheCountsAreZero?: boolean;
+}
+
 export interface LlmProtocolAdapter {
   readonly id: LlmProtocolId;
   inspectRequest(value: unknown, context?: ProtocolRequestContext): LlmRequestFacts;
-  createAccumulator(): LlmProtocolAccumulator;
+  createAccumulator(options?: LlmProtocolAccumulatorOptions): LlmProtocolAccumulator;
 }
 
 export interface GatewayRouteAttempt {
@@ -173,6 +248,13 @@ export interface GatewayObservation {
   readonly servedProvider: SourcedIdentity;
   readonly generationId: string | null;
   readonly costUsd: number | null;
+  /**
+   * True only for a verified official provider origin (a direct route to the
+   * provider's own API), where the provider's first-party list prices apply
+   * to the served model. Only such exchanges get a host list-price estimate;
+   * opaque, gateway and unverified routes never do.
+   */
+  readonly officialListPricing?: boolean;
   readonly routeAttempts: readonly GatewayRouteAttempt[];
   readonly qualityFlags: readonly string[];
 }
@@ -189,6 +271,8 @@ export interface LlmGatewayAccumulator {
 
 export interface LlmGatewayAdapter {
   readonly id: string;
+  /** The gateway's known usage-reporting contract, passed to the protocol accumulator. */
+  readonly protocolAccumulatorOptions?: LlmProtocolAccumulatorOptions;
   createAccumulator(): LlmGatewayAccumulator;
 }
 

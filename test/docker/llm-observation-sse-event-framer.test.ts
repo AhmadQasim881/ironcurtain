@@ -3,6 +3,7 @@ import {
   SseEventFramer,
   SseFramingError,
   type SseEventFrame,
+  type SseEventFramerLimits,
 } from '../../src/docker/llm-observation/sse-event-framer.js';
 
 function frameChunks(chunks: readonly Buffer[]): SseEventFrame[] {
@@ -60,5 +61,64 @@ describe('SseEventFramer', () => {
 
   it('does not emit events without data fields', () => {
     expect(frameChunks([Buffer.from('event: empty\n\nid: x\n\n')])).toEqual([]);
+  });
+});
+
+describe('SseEventFramer lenient mode', () => {
+  function lenientFrames(
+    chunks: readonly Buffer[],
+    limits: Partial<SseEventFramerLimits>,
+  ): { frames: string[]; exceeded: string[]; dropped: number } {
+    const frames: string[] = [];
+    const exceeded: string[] = [];
+    const framer = new SseEventFramer({ limits, onLimit: (limit) => exceeded.push(limit.reason) });
+    for (const chunk of chunks) framer.feed(chunk, (frame) => frames.push(frame.dataUtf8));
+    framer.finish((frame) => frames.push(frame.dataUtf8));
+    expect(framer.degraded).toBe(exceeded.length > 0);
+    return { frames, exceeded, dropped: framer.droppedEvents };
+  }
+
+  it('reports the first exceeded limit once and keeps framing past the stream and event-count limits', () => {
+    const wire = Buffer.from('data: one\n\ndata: two\n\ndata: three\n\n');
+    expect(lenientFrames([wire], { maxEvents: 1 })).toEqual({
+      frames: ['one', 'two', 'three'],
+      exceeded: ['event-count-limit'],
+      dropped: 0,
+    });
+    expect(lenientFrames([Buffer.from('data: one\n\n'), Buffer.from('data: two\n\n')], { maxStreamBytes: 8 })).toEqual({
+      frames: ['one', 'two'],
+      exceeded: ['stream-limit'],
+      dropped: 0,
+    });
+  });
+
+  it('drops an oversized line or event whole without retaining it, then resumes at the next event', () => {
+    const longLine = Buffer.from(`event: big\ndata: ${'x'.repeat(64)}\ndata: tail\n\ndata: next\n\n`);
+    expect(lenientFrames([longLine], { maxLineBytes: 16 })).toEqual({
+      frames: ['next'],
+      exceeded: ['line-limit'],
+      dropped: 1,
+    });
+    const longEvent = Buffer.from('data: abc\ndata: def\n\ndata: ok\n\n');
+    expect(lenientFrames([longEvent], { maxEventBytes: 5 })).toEqual({
+      frames: ['ok'],
+      exceeded: ['event-limit'],
+      dropped: 1,
+    });
+  });
+
+  it('drops the same oversized event at every byte split', () => {
+    const wire = Buffer.from(`data: ${'y'.repeat(40)}\r\n\r\ndata: usage\r\n\r\n`);
+    const expected = lenientFrames([wire], { maxLineBytes: 16 });
+    expect(expected.frames).toEqual(['usage']);
+    for (let split = 0; split <= wire.length; split++) {
+      expect(lenientFrames([wire.subarray(0, split), wire.subarray(split)], { maxLineBytes: 16 })).toEqual(expected);
+    }
+  });
+
+  it('keeps strict mode for callers without an onLimit handler', () => {
+    expect(() =>
+      new SseEventFramer({ limits: { maxEvents: 1 } }).feed(Buffer.from('data: a\n\ndata: b\n\n'), () => {}),
+    ).toThrow(SseFramingError);
   });
 });

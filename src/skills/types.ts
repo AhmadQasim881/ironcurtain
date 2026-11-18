@@ -27,7 +27,11 @@ export interface ResolvedSkill {
  *   so the runtime wrapper does NOT log this — only consumers that
  *   walked a known skills tree (e.g., a workflow package) should
  *   surface it as a warning.
- * - `unreadable`: `readFileSync` failed (permission error, etc.).
+ * - `unreadable`: the entry or its SKILL.md could not be read safely: a
+ *   permission or I/O error, a FIFO, socket, device or directory where
+ *   SKILL.md belongs (refused without blocking), or, for workflow skills,
+ *   a symlinked skill directory or SKILL.md, or one resolving outside the
+ *   skills root.
  * - `malformed-frontmatter`: the `---` fence is missing, or the YAML
  *   between fences failed to parse, or the parsed value isn't an object.
  * - `missing-required-fields`: frontmatter parsed but `name` or

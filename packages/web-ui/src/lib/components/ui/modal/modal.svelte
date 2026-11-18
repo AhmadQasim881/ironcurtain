@@ -1,12 +1,36 @@
+<script module lang="ts">
+  /**
+   * Open modals, oldest first. Only the most recently opened one reacts to a
+   * document-level Escape (see handleDocumentKeydown), so stacked dialogs
+   * close one at a time.
+   */
+  const openModals: symbol[] = [];
+
+  /**
+   * Text-entry fields `focusOnOpen: 'dialog'` may focus. Everything else that
+   * is focusable (buttons, links, checkboxes, radios, selects) acts on a key.
+   */
+  const TEXT_FIELD_SELECTOR = [
+    'textarea',
+    'input:not([type])',
+    ...['text', 'search', 'email', 'url', 'tel', 'password', 'number'].map((type) => `input[type="${type}"]`),
+  ]
+    .map((selector) => `${selector}:not([disabled]):not([readonly])`)
+    .join(', ');
+</script>
+
 <script lang="ts">
   import { cn } from '$lib/utils.js';
   import type { Snippet } from 'svelte';
+  import type { ModalFocusOnOpen } from './index.js';
 
   let {
     open,
     onclose,
     onkeydown: externalKeydown,
     title,
+    focusOnOpen = 'dialog',
+    dialog = $bindable(undefined),
     class: className,
     children,
   }: {
@@ -14,17 +38,35 @@
     onclose: () => void;
     onkeydown?: (e: KeyboardEvent) => void;
     title?: string;
+    /**
+     * Where keyboard focus goes when the modal opens.
+     * - `'dialog'` (default): into the dialog, but never onto an action
+     *   control -- a button, link, checkbox or select focused automatically
+     *   would act on an Enter or Space the user was already typing. The first
+     *   text field gets focus if there is one, otherwise the dialog container
+     *   itself; Tab then moves on from there.
+     * - `'none'`: focus stays where it is. For modals that open without a
+     *   user action (the escalation modal): keystrokes meant for the page,
+     *   such as the terminal, keep going there and none reaches the dialog
+     *   until the user clicks into it. Escape anywhere still dismisses it.
+     */
+    focusOnOpen?: ModalFocusOnOpen;
+    /**
+     * The `role="dialog"` element while open (`bind:dialog`), for owners that
+     * need to observe interaction anywhere inside the dialog.
+     */
+    dialog?: HTMLDivElement | undefined;
     class?: string;
     children?: Snippet;
   } = $props();
 
-  let dialogEl: HTMLDivElement | undefined = $state(undefined);
   let previousActiveElement: Element | null = null;
+  const stackId = Symbol('modal');
 
   function getFocusableElements(): HTMLElement[] {
-    if (!dialogEl) return [];
+    if (!dialog) return [];
     return Array.from(
-      dialogEl.querySelectorAll<HTMLElement>(
+      dialog.querySelectorAll<HTMLElement>(
         'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"]):not([disabled])',
       ),
     );
@@ -35,7 +77,7 @@
     const focusable = getFocusableElements();
     if (focusable.length === 0) {
       e.preventDefault();
-      dialogEl?.focus();
+      dialog?.focus();
       return;
     }
 
@@ -43,7 +85,9 @@
     const last = focusable[focusable.length - 1];
 
     if (e.shiftKey) {
-      if (document.activeElement === first) {
+      // Also from the dialog container itself, where focusOnOpen 'dialog'
+      // puts focus: the browser would otherwise move it out to the page.
+      if (document.activeElement === first || document.activeElement === dialog) {
         e.preventDefault();
         last.focus();
       }
@@ -65,23 +109,48 @@
     externalKeydown?.(e);
   }
 
+  /**
+   * Escape pressed while focus is outside the dialog (`focusOnOpen: 'none'`,
+   * or focus never moved in). Registered in the capture phase on the document
+   * so it runs before the focused element (e.g. xterm's textarea) can swallow
+   * it, and the event is consumed so a dismissal never doubles as terminal
+   * input. Escape with focus inside the dialog is handled by handleKeydown.
+   */
+  function handleDocumentKeydown(e: KeyboardEvent): void {
+    if (e.key !== 'Escape') return;
+    if (openModals[openModals.length - 1] !== stackId) return;
+    if (dialog && e.target instanceof Node && dialog.contains(e.target)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    onclose();
+  }
+
   function handleBackdropClick(): void {
     onclose();
   }
 
   $effect(() => {
+    if (!open) return;
+    openModals.push(stackId);
+    document.addEventListener('keydown', handleDocumentKeydown, true);
+    return () => {
+      document.removeEventListener('keydown', handleDocumentKeydown, true);
+      const index = openModals.indexOf(stackId);
+      if (index !== -1) openModals.splice(index, 1);
+    };
+  });
+
+  $effect(() => {
     if (open) {
       previousActiveElement = document.activeElement;
-      // Focus the dialog after it renders
+      if (focusOnOpen === 'none') return;
+      // After the dialog renders: its first text field, else the container.
+      // Never an action control (see focusOnOpen).
       requestAnimationFrame(() => {
-        const focusable = getFocusableElements();
-        if (focusable.length > 0) {
-          focusable[0].focus();
-        } else {
-          dialogEl?.focus();
-        }
+        const field = dialog?.querySelector<HTMLElement>(TEXT_FIELD_SELECTOR);
+        (field ?? dialog)?.focus();
       });
-    } else if (previousActiveElement && previousActiveElement instanceof HTMLElement) {
+    } else if (previousActiveElement instanceof HTMLElement) {
       previousActiveElement.focus();
       previousActiveElement = null;
     }
@@ -99,7 +168,7 @@
 
     <!-- Dialog -->
     <div
-      bind:this={dialogEl}
+      bind:this={dialog}
       role="dialog"
       aria-modal="true"
       aria-labelledby={title ? titleId : undefined}

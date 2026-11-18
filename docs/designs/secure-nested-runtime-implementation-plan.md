@@ -1,7 +1,9 @@
 # Secure Nested Docker Runtime Implementation Plan
 
+**Status (2026-11-14):** Partial. The broader nested-Docker runtime design: the admitted developer profiles shipped (see `linux-nested-docker-implementation-plan.md`), while the outcome gates G0 to G10 below remain the target. Preview or stable qualification, a native Linux profile (deferred, WP-127) and IronCurtain-in-IronCurtain (reserved) are not done.
+
 **Date:** 2026-07-19
-**Status:** Phase 0A is implemented and self-tested. A later Docker Desktop H3 probe resolved the
+**Implementation history:** Phase 0A is implemented and self-tested. A later Docker Desktop H3 probe resolved the
 earlier inner-procfs stop with a reviewed, sidecar-only mount-mask exception and passed staged image
 load, ordinary run/exec, bind and named-volume mounts, offline BuildKit RUN, internal target/scanner
 exchange, egress negatives, and exact cleanup. Independent Apple evidence supports guest
@@ -100,7 +102,8 @@ never inferred from those historical sections.
 and hermetic two-MITM/path gate are specified by
 [`ironcurtain-in-ironcurtain-hermetic-slice.md`](./ironcurtain-in-ironcurtain-hermetic-slice.md). Endpoint
 transport is topology-selected: native Linux Docker uses UDS and must not inherit Docker Desktop's TCP
-host-gateway relay merely because both backends implement Docker.
+host-gateway relay merely because both backends implement Docker. As of 2026-11-11 that slice is reserved
+and not scheduled; its foundations ship unwired.
 **Scope:** Docker-capable IronCurtain bundles on macOS Docker Desktop, macOS Apple `container`, and Linux Docker
 **Supersedes:** The broker-first design formerly in this file and the runtime recommendation in [`docs/brainstorm/ironcurtain-in-ironcurtain.md`](../brainstorm/ironcurtain-in-ironcurtain.md)
 
@@ -315,10 +318,12 @@ Native Linux remains unproved until Phase 2-LX runs on a real Linux host. Docker
 
 Use the same sibling-sidecar and identical-path model. Docker named volumes inside the Desktop VM carry the API and exchange roots; do not rely on macOS VirtioFS to carry daemon sockets.
 
+The daemon image is pinned like the relay and agent images: preparation resolves the shared tag once to an immutable image ID that carries the recipe's `ironcurtain.build-hash` (Dockerfile, entrypoint, and the `runtime-shim/main.go` runc wrapper) and the daemon role label, and the sidecar is created from that exact ID after the label is verified on it again, so another IronCurtain version retagging the shared tag cannot swap the daemon build. Host staging below the IronCurtain home (daemon identity files, the Apple lease staging root, the selected-agent cache) resolves the home once at admission and uses canonical paths for the private-directory checks and bind-mount sources, so a home reached through a symlink works while every component below it must still be a real owner-owned directory.
+
 Qualification has two explicit topologies:
 
 - **DD-STRICT:** agent and daemon use top-level `network=none`. It proves rootless boot, API/path/image/build/internal-network/resource/cleanup primitives without a provider path.
-- **DD-PROXY:** only after DD-STRICT passes, attach agent/daemon and one trusted fixed relay to a dedicated outer network. Baseline preflight requires Docker Engine 28+ and verified `--internal` with both `com.docker.network.bridge.gateway_mode_ipv4=isolated` and `gateway_mode_ipv6=isolated`. Absence is a compatibility blocker. Any future alternative network boundary is a separately designed and named backend, never a DD-PROXY fallback. Fully expanded create arguments and effective network inspect are evidence.
+- **DD-PROXY:** only after DD-STRICT passes, attach agent/daemon and one trusted fixed relay to a dedicated outer network. Baseline preflight requires Docker Engine 28+ and verified `--internal` with both `com.docker.network.bridge.gateway_mode_ipv4=isolated` and `gateway_mode_ipv6=isolated`. Absence is a compatibility blocker. Any future alternative network boundary is a separately designed and named backend, never a DD-PROXY fallback. Fully expanded create arguments and effective network inspect are evidence. Admission enforces the engine half of this preflight before any image, lease, relay, or sidecar work: for `images` and `packages` network access the `docker info` ServerVersion must be 28 or later on both Docker Desktop profiles (macOS and WSL2), while `offline` creates no relay network and keeps working on older releases. On macOS, admission also requires the reported OperatingSystem to identify Docker Desktop and cgroup v2, so OrbStack, Colima, Rancher Desktop, Podman machine, or a remote engine behind a local socket is refused with a specific message instead of failing late.
 
 DD-PROXY has no bridge gateway address, default bridge, host gateway route, or host publication. The relay exposes only the fixed outer HTTP proxy service. After attaching it, rerun separate DNS, direct-connect, gateway, `host.docker.internal`, IPv4, IPv6, LAN, metadata, runtime, and unrelated-service negatives from agent, daemon, build, and nested children; a pre-attach pass is not evidence for the proxy topology.
 
@@ -430,7 +435,9 @@ Host/SNI, and exposes no caller-selected CONNECT operation. HTTPS passthrough is
 re-originated through that transport; nested WSS passthrough is explicitly unsupported. A hermetic
 test proves inner-sentinel -> outer-sentinel -> real-credential substitution and proves that outer
 proxy loss returns 502 without direct fallback. This is foundation evidence, not backend
-qualification.
+qualification. No production path selects nested mode yet; the inner-IronCurtain bootstrap that
+would select the fixed parent is reserved
+([implementation status](./ironcurtain-in-ironcurtain-hermetic-slice.md#implementation-status)).
 
 ### 6.3 Build-egress split
 
@@ -477,10 +484,20 @@ delegates only the same frozen registry listener, not any broader egress authori
 - push, delete, catalog/tag enumeration, and all non-pull registry operations are rejected;
 - fetched image references and final destinations are recorded as provenance but remain untrusted bundle state — mediated request authority and provenance are the claims, not content integrity or trust.
 
-The current production vertical slice implements the authority path but does not yet attach a durable
-host provenance sink to successful pulls. That persistence is a remaining pre-preview gate; until it
-lands, qualification may claim the mediated request/redirect controls above but not durable pull
-provenance evidence.
+The production vertical slice attaches a durable host provenance sink to registry pulls. Every
+manifest or blob request that completes through the bundle's registry-egress listener appends one
+validated JSON line to `registry-pull-provenance.jsonl` in the lease's host-only `evidence/`
+directory: lease, generation, and bundle identity; the reviewed origin (`<origin>:cdn` after a
+followed redirect to an unlisted CDN, which is how Docker Hub serves blobs); the final HTTPS
+destination host and port; the HTTP status of the terminal response (a refused or missing pull is
+recorded with its 4xx status, never as delivered content); operation and method (`HEAD` is how a
+client resolves a tag); repository and reference; the requested digest of a by-digest pull; the
+registry-reported `Docker-Content-Digest`; and the bytes streamed. The lease owns the file
+(owner-only, single-link, opened without following links and only ever appended), teardown deletes
+only the state root so the log outlives the session, and the log is bounded per lease: past its cap
+one truncation marker is appended and later pulls are dropped. A failed append is logged and never
+interrupts the completed transfer. The recorded digests are what the registry reported: durable pull
+provenance evidence, not host attestation of the pulled bytes.
 
 Hashing bundle-image artifacts is transport-integrity and qualification machinery, not a
 workload-registry or host-isolation control: the bundle can already build or import arbitrary bytes, a
@@ -581,11 +598,20 @@ Expose one configured bundle budget with a coordinator-chosen reserve rather tha
 | Desktop/Linux sidecar | outer cgroup after proof      | outer cgroup after proof      | outer cgroup after ancestry/migration proof | hard quota if claimed; otherwise preview-observed policy only        |
 | Apple per-session VM  | hypervisor after stress proof | hypervisor after stress proof | `unsupported`/advisory inside VM            | hard VM/state cap if claimed; otherwise preview-observed policy only |
 
+**Desktop partition (implemented, 2026-11).** The bundle total is the numeric ordinary `dockerResources` envelope (`memoryMb`, `cpus`, and `pidsLimit`, default 8192 MiB, 4 CPUs, 4096 PIDs), clamped to the Docker Desktop VM's capacity (`docker info` `NCPU` and `MemTotal`, the same 75%-memory / one-CPU-headroom clamp ordinary containers get against the host) when the daemon reports it. The session transport and every enabled fixed relay are fixed reserves charged first. The nested daemon, which runs dockerd, BuildKit and every inner container, then receives at least `dockerWorkload.resources.daemonShare` of the total memory, CPU and PIDs (default 0.5, accepted 0.1 to 0.9; rounded up to a whole MiB, millicpu and PID), never less than its own floor (512 MiB, 0.25 CPU, 256 PIDs) and never so much that the agent drops below its floor (512 MiB, 0.25 CPU, 128 PIDs); the agent receives the exact remainder. CPU shares are whole millicpus so Docker's `--cpus` parser and the effective `NanoCpus` comparison agree. An envelope that cannot cover every floor and reserve is refused before provisioning. The earlier fixed split (512 MiB, 0.25 CPU and the PIDs left of a fixed 512 after a 128-task agent cap, for all nested work) starved builds and Compose stacks.
+
 Apple fork pressure is bundle availability/recovery, not host PID security. Bounded tests prove host and an unrelated VM remain responsive, VM memory stays bounded, timeout triggers exact VM deletion, and bundle heartbeat/API/relay cease. A policy requiring hard PID enforcement rejects Apple. No inner cgroup, daemon metric, or limit upgrades an authoritative status.
 
-For any `vfs` or `disk=observed` candidate, the host watchdog/supervisor starts and proves healthy before daemon sidecar or Apple VM creation. It survives coordinator death and startup-reconciles its host-only lease; teardown stops it only after exact state removal and two empty inventories. Loss, stale sample, measurement error, target identity/scope change, or supervisor error fails closed and revokes/deletes in the frozen order.
+For any `vfs` or `disk=observed` candidate, the host watchdog/supervisor starts and proves healthy before daemon sidecar or Apple VM creation. It survives coordinator death and startup-reconciles its host-only lease; when its lease becomes an `incident` (a failed coordinator teardown, a failed trip revocation, or its own failed cleanup of a silent coordinator) it stays up and retries the same serialized exact recovery with backoff (5 s doubling to 5 minutes, at most 8 attempts) before leaving the lease to reconciliation; teardown stops it only after exact state removal and two empty inventories. Loss, a sample that stays in flight past the stale bound, measurement error, target identity/scope change, or supervisor error fails closed and revokes/deletes in the frozen order. Staleness is measured on each observer's own monotonic clock; wall-clock values are persisted evidence only. A late watchdog iteration (host sleep, a paused VM, a clock step) is not evidence about the bundle: the next tick judges a fresh sample, and a sample deadline that fired a full interval late gets one fresh attempt before it can trip. The coordinator launches the supervisor entrypoint that sits beside its own running module (the `.ts` source under tsx, the compiled `.js` in a build), so a source run never waits out the startup deadline for an absent `dist/` or runs a stale build. It passes the child only its module-loader Node options (never inspector, eval, watch, or test flags), checks that the entrypoint exists before spawning, ends the startup wait as soon as the child exits (reporting its exit code), and points the child's stderr at an owner-only per-launch log in the lease directory that receives only bounded fatal records.
 
 0F freezes the measurement target and scope, included state classes, sampling interval, soft evidence threshold, hard safety threshold, host-reserve floor, maximum overshoot, stale timeout, error behavior, and stop/kill/delete order. The bundle cannot mount or mutate any of them. Bounded tests prove coverage of every state class, sampling/kill latency, and overshoot without crossing host reserve. If bounded coverage is unavailable, observed-disk preview is prohibited. The watchdog remains explicitly not a hard quota.
+
+**Measured storage (correction, 2026-11).** The first frozen policy measured `daemon`, `api`, `exchange`, and `staging` directories under the host state root. Nothing mounts or writes them: the nested daemon's data lives inside the container runtime, so only the host reserve could ever trip, and on WSL2 not even that. Policy version 2 replaces those classes with per-runtime coverage in `config/docker-workload/resource-watchdog-policy.json`, and admission refuses a runtime the frozen template does not cover before creating any lease state:
+
+- **Apple.** At create, the coordinator binds each ledgered VM's runtime-owned rootfs image (`<app root>/containers/<id>/rootfs.ext4`) to the container ID by path and inode in the lease. At activation it records the image's allocated bytes as a baseline, and the agent is not released while any live VM is unbound. Each sample is one `lstat` per VM: allocated blocks above the baseline are charged against the soft and hard thresholds, so the trusted bootstrap image load is not billed and sparse logical size is not counted. A substituted inode fails closed.
+- **Docker Desktop.** Every sample reads the Desktop VM disk with `statfs` (`stat -f` run as uid 0 in the nested-daemon sidecar's own mount namespace, at a mount point whose parents are the read-only image rootfs) against a frozen `runtimeReserveBytes` floor for the disk every container of every session shares. On a slower frozen cadence, or as soon as the VM disk has grown by the overshoot bound since the last sizing, the outer Engine sizes the daemon volume (`docker system df --verbose`), and that size is charged against the thresholds. No `du` walk runs inside the 5 s sample, and nothing needs a quota or `SYS_ADMIN`. Both Docker readings run in the background with their own timeouts and fail closed once a reading has not completed for its staleness bound of supervisor-monotonic time. The volume size is the Engine's apparent size: an accounting bound for ordinary pulls and builds. A bundle that games apparent size still meets the VM-disk floor.
+
+**Revocation independent of durable writes.** A trip publishes a best-effort `revoking` status, then stops and removes the generation's exact containers and volumes (the same identity and label rules as the ledgered pass, and the same exact single-object inspects, so stopping the bundle never waits on an inventory of every container on the host) without any durable write. Only after that does it free a preallocated per-lease reserve file, so a bundle still filling the disk cannot consume it, and run the ledgered cleanup, which adopts the supervisor's already-held sampling claim instead of writing a new lock record. Status publication after attestation is best-effort, building the record included, and persisted details are bounded (head and tail kept, control characters removed), so no status failure can precede revocation; on a failure path, a status the disk refuses travels with the reported failure instead of replacing it. A supervisor that cannot take its lifecycle claim (for example ENOSPC on the lock candidate) fails closed through the same path instead of exiting, and a supervisor-initiated stale-coordinator cleanup stops containers before its first lease write. On APFS a local snapshot can delay reclaiming the freed reserve; the write-free step does not depend on it.
 
 **Withdrawn (2026-07-30, see §16.11):** this section previously required freezing a checked-in
 `performance-budget.json` of duration and state-growth ceilings before 0C, hash-bound into release
@@ -619,7 +645,9 @@ An agent cannot supply create arguments for the outer daemon component.
 
 Crash reconciliation starts before any new Docker-workload lease is admitted and scans every nonclosed lease. An `incident` is durable evidence that exact cleanup was not proven, not a permanently terminal state. Admission immediately retries each well-formed incident through its recorded runtime, bound watchdog policy, and the same serialized exact-cleanup path used by normal teardown. Recovery transitions `incident -> revoking -> closed`; it retains the original incident record verbatim, while the closed lease's cleanup proof and inventory timestamps prove that the historical incident was resolved. A crash after the transition to `revoking` resumes the same cleanup on the next pass. A failed retry returns to `incident` without replacing the first failure and continues to fence admission; corrupt or unverifiable records also remain fenced. Each lease receives at most one bounded attempt per reconciliation pass. Because all nonclosed leases are scanned to avoid starving later cleanup, a pass containing several unavailable runtimes may take the sum of their individual bounds.
 
-Reconciliation opens each lease through its recorded runtime kind, even if automatic backend selection changed; an unavailable recorded runtime fences rather than proving absence through the wrong inventory. A present but unreadable/symlinked/unsupported lease marker also fences admission. Labels are discovery indexes only: deletion requires recorded exact outer IDs plus lease generation and state roots. A lease is stale after coordinator death/restart or a bounded missed host-owned heartbeat; the heartbeat is not writable from the bundle. Admission and per-lease locks atomically publish a complete owner record bound to PID start identity and a random token, and reclaim/release only the exact observed file instance. A nested heartbeat fixture proves daemon/descendant activity stops after exact outer deletion. Fault tests cover coordinator `SIGKILL`, restart reconciliation, incident retry and retry-crash resumption, backend-selection change, corrupt lease markers, lock publication/reuse races, multiple concurrent live leases, and unrelated/foreign object preservation. The recovery budget begins when cleanup ownership is requested. Cooperative checkpoints prevent a new runtime, deletion, inventory, or grace-sleep phase from starting after it expires; an already-running runtime call or synchronous exact state deletion is allowed to finish before the lease returns to `incident`. A strict wall-clock deadline would require cancellable runtime and filesystem operations that prove no mutation continues after cancellation, and is not claimed. This does not need a per-operation WAL or exact inner container inventory.
+**Admission concurrency and operator surface (implemented, 2026-11).** Recovery runs before, and outside, the global admission critical section: each lease is recovered under its own lifecycle claim, and an admission that finds another owner (a concurrent admission's recovery, the watchdog) holding that claim waits for it, bounded by the recovery bound, then re-judges the lease. The critical section covers only fence detection, judged from one snapshot, and lease creation, so a new lease is still never created beside an unresolved one. Admissions in one process queue in order; across processes an admission polls the admission lock every 200 ms for up to 60 s, naming the holder, before failing as busy. A fenced refusal names each lease and its incident and the remediation commands. `ironcurtain docker-workload status` lists every lease (state, incident, resources, runtime and endpoint) from a read-only snapshot; `reconcile` runs one bounded pass; `clear <lease-id>` shows, and with `--force` performs, the retirement of a fenced lease: it first tries ordinary exact recovery, and otherwise removes every container, volume and network carrying the lease's generation label on its recorded runtime (listed, like the owned inventories of exact cleanup, through daemon-side label filters and rechecked), requires two empty generation-label inventories separated by the lease's frozen gap, removes the lease's host-only state, and, still under the lease's lifecycle claim, moves its record to `docker-workload/cleared/`. An unreachable runtime refuses the clear, and so does a state root that is no longer the exact directory the lease recorded (the same identity check exact cleanup applies, since removing the state paths beneath a symlink would follow it). A record that cannot be parsed carries no trustworthy liveness: it is refused while it is still being rewritten (within the stale bound) or while the coordinator process it names still runs, and otherwise cleared through the generation it still names, or, when it names none, only when the selected runtime holds no generation-labelled object that a readable lease of the home does not account for. The daemon runs one background pass at startup when any lease is stale or an incident, and `ironcurtain doctor` reports fenced leases with these commands.
+
+Reconciliation opens each lease through its recorded runtime kind, even if automatic backend selection changed; an unavailable recorded runtime fences rather than proving absence through the wrong inventory. A present but unreadable/symlinked/unsupported lease marker also fences admission. Labels are discovery indexes only: deletion requires recorded exact outer IDs plus lease generation and state roots. Owned inventories use daemon-side label filters for the lease's ownership labels, and presence checks inspect the exact observed ID (or, before observation, the exact precommitted name, still refusing a same-named object without the generation label), so teardown cost does not grow with the number of unrelated objects on the host. Incident records bound error-derived detail to a head and a tail with control characters removed, and recording a failure never replaces the failure being recorded. A lease is stale after coordinator death/restart or a bounded missed host-owned heartbeat; the heartbeat is not writable from the bundle. A live observer counts a missed heartbeat from when it last saw `coordinator.heartbeatAt` change on its own monotonic clock, and an observer that was itself late on either clock gives the peer one fresh window instead of the blame. Version-3 leases record the coordinator's process-start identity. Startup reconciliation, which has only one snapshot, never waits on a dead or reused coordinator PID: once its heartbeat looks stale the lease is recovered at once, while a recent heartbeat still fences as before. A live, identity-matched coordinator whose heartbeat only looks stale (or is dated more than one heartbeat interval in the future after a backward step) is watched for one bounded stale window before it can be recovered, and a pass watching several such coordinators may take the sum of their windows. Admission and per-lease locks atomically publish a complete owner record bound to PID start identity and a random token, and reclaim/release only the exact observed file instance. A nested heartbeat fixture proves daemon/descendant activity stops after exact outer deletion. Fault tests cover coordinator `SIGKILL`, restart reconciliation, incident retry and retry-crash resumption, backend-selection change, corrupt lease markers, lock publication/reuse races, multiple concurrent live leases, and unrelated/foreign object preservation. The recovery budget begins when cleanup ownership is requested. Cooperative checkpoints prevent a new runtime, deletion, inventory, or grace-sleep phase from starting after it expires; an already-running runtime call or synchronous exact state deletion is allowed to finish before the lease returns to `incident`. A strict wall-clock deadline would require cancellable runtime and filesystem operations that prove no mutation continues after cancellation, and is not claimed. This does not need a per-operation WAL or exact inner container inventory.
 
 ### 8.4 Audit
 
@@ -1048,7 +1076,12 @@ that cleanup owner.
 The reviewed cleanup-claim/handoff protocol now serializes exact runtime I/O among coordinator teardown,
 watchdog trips, and crash reconciliation, including in-flight watchdog sampling. The active coordinator
 monitors the bound watchdog and invokes the same serialized teardown when status is missing, stale,
-unbound, or non-ready; reconciliation fencing alone is not treated as cleanup proof.
+unbound, or non-ready; reconciliation fencing alone is not treated as cleanup proof. Stale means no status
+change for a full window of the coordinator's own monotonic clock that the monitor actually watched. Gates
+before daemon create, after a long create, and at activation must instead see a change within that window,
+so a late observer never grants itself freshness. After a long create the coordinator waits up to one window
+for a newer sample that passes this gate, even when a sample published while the create waited for the
+lifecycle claim is already newer than its baseline.
 
 **Exit:** deterministic contracts cover creation/rollback/kill/reconcile; feature-off equivalence holds; untrusted config cannot set outer daemon arguments; exact-ID teardown and state-root cleanup pass fault tests.
 
@@ -1131,24 +1164,36 @@ Each requires its own threat model and gates.
   [`src/docker/oci-image-archive-canonicalizer.ts`](../../src/docker/oci-image-archive-canonicalizer.ts) —
   streaming verification and canonical selected-current transport; archive integrity protects host
   tooling and transport consistency, not bundle trust.
-- `src/docker-workload/resource-watchdog.ts` — host-only observed-disk/state measurement, reserve thresholds, revocation, and overshoot evidence.
+- `src/docker/resource-watchdog.ts` and `src/docker-workload/observed-storage.ts` — observed-disk state machine, runtime-storage measurement (Apple rootfs-image blocks; Docker Desktop VM-disk `statfs` and Engine volume size), host and runtime reserve thresholds, revocation, and overshoot evidence.
 - `src/docker-workload/desktop-relay.ts` — fixed-target hardened DD-PROXY relay lifecycle/config/health evidence.
 - `src/docker-workload/build-egress-policy.ts` and `src/docker/build-egress-proxy.ts` — deleted obsolete
   current-Dockerfile source/path policy and TLS-MITM listener seam; Git history retains the experiment.
 - `src/docker/registry-egress-policy.ts` — frozen workload-registry manifest resolution and pull-protocol authorization for the outer MITM registry path (§6.4).
 - `src/docker/outbound-transport.ts` — direct and fixed-parent destination-bound transport primitives.
-  The fixed-parent primitive is tested but is not yet selected by the inner-IronCurtain product bootstrap.
+  The direct transport keeps one keep-alive pool per address policy, so a socket opened for a trusted
+  private provider gateway never serves a public-only request for the same name and port.
+  The fixed-parent primitive is tested but not yet wired: no production path selects it, and the
+  inner-IronCurtain bootstrap that would is reserved
+  ([implementation status](./ironcurtain-in-ironcurtain-hermetic-slice.md#implementation-status)).
+  Its address classifiers, IP-literal screen, local/metadata hostname check and guarded resolver live in
+  the shared leaf `src/net/address-policy.ts` and are re-exported for existing callers.
+- `src/docker/linux-dependency-abi.ts` — strict Linux dependency ABI manifest, volume naming, and
+  disposable `isolated-vm`/`node-pty` native-load probe for an ABI-keyed dependency volume. Tested but not
+  yet wired: nothing outside its test calls it.
 - `src/docker/mediated-egress.ts` — the registry credential-free forwarder (backpressured streaming,
   per-request byte/time ceilings, session ledger, internal redirect-following, fail-closed rejection),
   deliberately separate from the credential-injecting provider path.
 - `src/docker/egress-forwarding.ts` — independently tested registry request/response shaping
-  (`buildRequestUrl`/`toOutgoingHeaders`/`sanitizeResponseHeaders`).
+  (`buildRequestUrl`/`toOutgoingHeaders`/`sanitizeResponseHeaders`); the MITM's provider path also
+  relays every provider response through `sanitizeResponseHeaders`.
 - [`docker/nested-daemon/`](../../docker/nested-daemon/) — purpose-built rootless daemon source used by
   the Docker Desktop sidecar and available as a template for future Linux work. It clears inherited
   volumes/ports and pins the private UDS runtime, identity, and toolchain; it is not used by current Apple
   production admission.
 - `test/docker-workload/profile-ceiling.test.ts` — exact checked-in Docker Desktop profile-ceiling contract,
-  promoted from the historical verifier.
+  promoted from the historical verifier. Besides the tagged P2 additions it checks the untagged rules
+  against the reviewed Moby default (the ceiling's `source.canonicalSha256`) and that the forbidden
+  syscalls appear only in rules gated on capabilities the sidecar does not add (WP-101).
 - `test/docker/registry-egress-live.integration.test.ts` — opt-in compatibility check against anonymous
   Docker Hub and GHCR pulls through the production egress guard; Git history retains the exploratory tools.
 - `scripts/qualify-backend.ts` and package release commands — current-tree backend suites with zero-skip enforcement and optional generated diagnostic reports; no frozen contract or commit binding.
@@ -1157,7 +1202,7 @@ Each requires its own threat model and gates.
   it is not packaged or available as admission authority.
 - `config/docker-workload/registry-egress-manifest.json` — reviewed public-registry origins, pull-protocol rules, and ceilings for workload-image pulls.
 - `test/docker-workload/` — boundary, target/scanner, fault, feature-off, and platform acceptance tests.
-- `src/hardened-fs.ts` and `src/zod-helpers.ts` — shared TCB leaves for hardened host-file reads, immutable-JSON load, atomic stable-JSON writes, and canonical-path guards (`hardened-fs`), plus header/identifier and duplicate-detection schema fragments (`zod-helpers`).
+- `src/hardened-fs.ts` and `src/zod-helpers.ts` — shared TCB leaves for hardened host-file reads, immutable-JSON load, atomic stable-JSON writes, and canonical-path guards (`hardened-fs`), plus header/identifier and duplicate-detection schema fragments (`zod-helpers`). `hardened-fs` also holds the no-follow, non-blocking, size-capped primitives for agent-writable paths (`readUntrustedRegularFile`, `writeFileNoFollowAtomic`, `appendRegularFileNoFollow`). Package-shipped frozen assets (the `config/docker-workload/` manifests and the build-trust wrapper) are read with `readPackageAsset` / `loadPackageAssetJson` instead of the strict host-state mode test: the file and every directory up to the package root must be owned by root, the current user or the package owner, never world-writable, and group-writable only for the owner's user-private group, so an install made under umask 002 is accepted while one another local user can change is refused.
 
 Names are provisional; module ownership and security boundaries are normative.
 
@@ -1192,8 +1237,10 @@ conservatively to `images`; fresh CLI/web enablement writes `networkAccess: pack
 is developer-only, uses selected-current-agent resolve-once transport, has ephemeral daemon state, no
 host-port publication, advisory PIDs, and watchdog-observed disk. `containerRuntime` may remain `auto` or
 select `apple-container` or `docker` explicitly; admission still requires the selected backend to be
-available and its effective profile to pass. Numeric ordinary `dockerResources` memory/CPU values feed
-the aggregate bundle envelope; unlimited (`null`) ordinary values retain safe nested fallbacks. Legacy
+available and its effective profile to pass. Numeric ordinary `dockerResources` memory/CPU/PID values feed
+the aggregate bundle envelope; unlimited (`null`) ordinary values retain safe nested fallbacks. The
+optional `dockerWorkload.resources.daemonShare` (default 0.5) splits that envelope on Docker Desktop;
+it chooses a proportion, not a second envelope. Legacy
 nested resource override fields are rejected instead of creating a second operator-controlled resource
 envelope. CPU and memory are clamped to the host/VM envelope.
 
@@ -1363,7 +1410,9 @@ then-blocked workload path. The corrections are normative:
   unreadable lease marker fences admission; neither can be converted into an absence proof.
 - **One process lock protects both admission and lease updates.** It atomically publishes a complete
   owner record, binds PID to an OS process-start identity plus a random token, and verifies the exact file
-  instance before reclaim or release. Fresh malformed records are busy, not stale.
+  instance before reclaim or release. Fresh malformed records are busy, not stale. Admission waits for a
+  live holder (an in-process queue, then bounded polling of the cross-process lock) instead of failing at
+  once, and holds it only for fence detection and lease creation.
 - **Response hop semantics are complete.** Egress relays remove both the static hop-by-hop set and every
   field nominated by an upstream `Connection` header.
 

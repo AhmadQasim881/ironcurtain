@@ -1,5 +1,7 @@
 # Explicit Agent Mode (no silent fallback)
 
+**Status (2026-11-14):** Implemented: `preferredMode` with no silent fallback (`src/session/preflight.ts`). The value this design calls `docker` shipped as `container` (default); `docker` is still accepted as a legacy alias.
+
 ## Motivation
 
 Bishop Fox testers Aaron and Ben spent significant time debugging the wrong session mode because IronCurtain silently fell back from Docker to the builtin V8 sandbox when Docker detection failed. PR #213 already eliminated transient Docker-probe flakiness (10s per-attempt timeout, up to 2 retries). The remaining behavioral fix is to stop the silent fallback itself: builtin must be a deliberate choice, not a degraded default.
@@ -208,7 +210,7 @@ This is purely additive — the rest of the message is unchanged.
 
 | Scenario | Outcome |
 | --- | --- |
-| `--agent builtin` + `preferredMode: 'docker'` | CLI wins. `resolveExplicit('builtin', ...)` returns builtin without checking Docker or the API key (current behavior). Documented in the test plan to lock the gap in. |
+| `--agent builtin` + `preferredMode: 'docker'` | CLI wins. `resolveExplicit('builtin', ...)` returns builtin without checking Docker, but it does check the agent model's API key, exactly like the builtin `preferredMode` branch (`requireBuiltinAgentKey`), and fails with an `--agent builtin requires an API key` message before any probe. (Originally the explicit path skipped the key check and the first turn failed instead; WP-85 closed that gap.) |
 | `--agent claude-code` + `preferredMode: 'builtin'` | CLI wins. `resolveExplicit('claude-code', ...)` checks Docker and errors with the existing message if unavailable. |
 | `preferredMode: 'docker'` + `preferredDockerAgent: 'goose'` + only Anthropic OAuth credentials | `detectCredentials('goose', ...)` looks at the goose provider's API key, finds none, returns `null` → `credentialErrorMessageForPreferredMode('goose', config, credentialSources)` fires. The message names goose's provider explicitly and appends the "OAuth not usable with goose" line because Anthropic OAuth was detected. |
 | `preferredMode: 'builtin'` + only OAuth (no `ANTHROPIC_API_KEY`) | New explicit check at the top of the builtin branch errors with `builtinNeedsApiKeyMessage()` before any Docker probe. Fast failure — no 10s docker probe wasted. |
@@ -263,7 +265,7 @@ In `test/preflight.test.ts`, replace the auto-detect block with a `resolveDefaul
 - `preferredMode: 'builtin'` + OAuth only → throws PreflightError matching `no ANTHROPIC_API_KEY`.
 - `preferredMode: 'builtin'` + nothing configured → same PreflightError as OAuth-only.
 - `--agent builtin` + `preferredMode: 'docker'` → mode builtin (CLI overrides config).
-- `--agent builtin` + `preferredMode: 'builtin'` + no API key → mode builtin returned successfully (the API-key check is intentionally skipped on the explicit path; agent loop fails later on the actual API call). This test exists to lock the asymmetry in — anyone "tightening" `resolveExplicit` to mirror the default path's API-key check should have to delete this test on purpose.
+- `--agent builtin` + no API key (either `preferredMode`) → throws PreflightError matching `--agent builtin requires an API key`, without probing Docker or OAuth. (This replaced an earlier lock-in test of the opposite behaviour: the explicit path used to skip the check, and the session then failed on its first API call.)
 - `--agent claude-code` + `preferredMode: 'builtin'` + Docker unavailable → throws (existing explicit-mode message — assert it still uses `credentialErrorMessageForExplicit`'s `--agent claude-code requires...` wording).
 
 Add one assertion-level test for `userConfigSchema`: rejects `preferredMode: 'auto'` with a clear message.
@@ -296,5 +298,5 @@ For `src/doctor/`, add tests covering `checkPreferredMode`:
 - Changing `--agent` semantics. The flag continues to override config and to skip auto-selection logic entirely.
 - Migrating existing config files. The user-base accepts churn; missing `preferredMode` resolves to the `'docker'` default automatically via `mergeWithDefaults`, which is the same as the prior auto-detect behavior on a Docker-up host.
 - Cross-cutting changes to `ironcurtain doctor` exit codes beyond the targeted change in `checkPreferredMode`. Other checks' `warn`/`fail` semantics are unchanged.
-- Tightening the `--agent builtin` explicit path to require an API key. Today `resolveExplicit('builtin', ...)` succeeds without an API-key check and the agent loop fails later on the actual API call; the test plan locks this gap in deliberately so a future "symmetry" refactor doesn't silently regress it. If that asymmetry needs to go, it's a separate design.
+- ~~Tightening the `--agent builtin` explicit path to require an API key.~~ Done in WP-85: both builtin paths require the agent model's key. The other host-side models a session uses (auto-compaction's summary model, auto-approve's model, the memory server's LLM) only produce warnings (`PreflightResult.warnings`); sessions fall back to the agent's model for summaries and turn auto-approve off when its model has no key (`src/session/host-model-roles.ts`).
 - Removing `preferredDockerAgent` or merging it into `preferredMode`. The agent dimension (which Docker agent) is orthogonal to the mode dimension (Docker vs builtin); collapsing them into a single `preferredAgent: 'docker-claude-code' | 'docker-goose' | 'builtin'` would re-introduce the ambiguity this design is meant to remove.

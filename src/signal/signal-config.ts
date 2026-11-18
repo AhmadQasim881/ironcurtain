@@ -9,6 +9,8 @@
 
 import { resolve } from 'node:path';
 import { getIronCurtainHome } from '../config/paths.js';
+import { SIGNAL_DEFAULT_IMAGE } from './signal-image.js';
+
 /** Signal transport configuration as stored in the config file. */
 export interface SignalConfig {
   /** The bot's registered Signal phone number (e.g., '+15551234567'). */
@@ -20,11 +22,25 @@ export interface SignalConfig {
    * Used to detect identity changes (SIM swap, number reassignment).
    */
   recipientIdentityKey?: string;
+  /**
+   * The account UUID (ACI) signal-cli lists for that key, captured with it.
+   * When present, the runtime identity check verifies the record listed
+   * under this UUID instead of the newest record for the number, and a
+   * message whose envelope names another sender account locks the
+   * transport (see `recipient-identity.ts`).
+   */
+  recipientUuid?: string;
   /** Container configuration overrides. */
   container?: {
-    /** Docker image. Default: 'bbernhard/signal-cli-rest-api:latest' */
+    /**
+     * Authenticated TLS bridge image. Default: the explicitly built local
+     * SIGNAL_DEFAULT_IMAGE. Published images must carry the authentication contract. Accepts `<repository>@sha256:<digest>` (recorded by
+     * `ironcurtain setup-signal --update-image`) or a tag; a tag is used
+     * only as already present locally and is never pulled or updated
+     * automatically (see `signal-image.ts`).
+     */
     image?: string;
-    /** Host port for REST API. Default: 18080 */
+    /** Host loopback port for the authenticated HTTPS API. Default: 18080 */
     port?: number;
   };
   /** Maximum number of concurrent sessions. Default: 3 */
@@ -36,6 +52,8 @@ export interface ResolvedSignalConfig {
   readonly botNumber: string;
   readonly recipientNumber: string;
   readonly recipientIdentityKey: string;
+  /** See {@link SignalConfig.recipientUuid}. */
+  readonly recipientUuid?: string;
   readonly container: {
     readonly image: string;
     readonly port: number;
@@ -46,7 +64,7 @@ export interface ResolvedSignalConfig {
 }
 
 export const SIGNAL_DEFAULTS = {
-  image: 'bbernhard/signal-cli-rest-api:latest',
+  image: SIGNAL_DEFAULT_IMAGE,
   port: 18080,
   containerName: 'ironcurtain-signal',
   maxConcurrentSessions: 3,
@@ -93,6 +111,7 @@ export function resolveSignalConfig(config: HasSignalConfig): ResolvedSignalConf
     botNumber: raw.botNumber,
     recipientNumber: raw.recipientNumber,
     recipientIdentityKey: raw.recipientIdentityKey,
+    ...(raw.recipientUuid ? { recipientUuid: raw.recipientUuid } : {}),
     container: {
       image: raw.container?.image ?? SIGNAL_DEFAULTS.image,
       port: raw.container?.port ?? SIGNAL_DEFAULTS.port,

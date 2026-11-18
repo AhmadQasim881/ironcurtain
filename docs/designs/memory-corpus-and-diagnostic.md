@@ -1,8 +1,6 @@
 # Memory corpus build + representativeness diagnostic
 
-**Status:** Results doc for the `feat/memory-ingest` branch. Pairs with the
-[`memory-ingest` tool design](./memory-ingest-tool.md) and the
-[representative-eval-set proposal](./memory-eval-representative-set.md).
+**Status (2026-11-14):** Historical: results record of the `feat/memory-ingest` branch. Pairs with the [`memory-ingest` tool design](./memory-ingest-tool.md) and the [representative-eval-set proposal](./memory-eval-representative-set.md).
 
 ## Why this exists
 

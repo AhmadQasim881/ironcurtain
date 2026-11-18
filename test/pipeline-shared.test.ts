@@ -6,6 +6,7 @@
  *   - loadExistingArtifact: JSON read with primary-then-fallback resolution
  *   - writeArtifact: JSON write with directory creation
  *   - loadToolAnnotationsFile: reads + resolves stored tool annotations
+ *   - createPipelineLlm / createPipelineModels: model construction (providers mocked)
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -19,7 +20,10 @@ import {
   loadToolAnnotationsFile,
   createPipelineLlm,
 } from '../src/pipeline/pipeline-shared.js';
+import { createPipelineModels } from '../src/pipeline/pipeline-runner.js';
+import { AnthropicCacheStrategy, NoOpCacheStrategy } from '../src/session/prompt-cache.js';
 import type { StoredToolAnnotationsFile, ToolAnnotationsFile } from '../src/pipeline/types.js';
+import { objectSchema } from './fixtures/test-policy.js';
 
 // Mock the AI SDK providers so createPipelineLlm builds a model without
 // network access or a real API key (mirrors model-provider.test.ts).
@@ -250,7 +254,7 @@ function makeStoredAnnotations(): StoredToolAnnotationsFile {
             toolName: 'read_file',
             serverName: 'filesystem',
             comment: 'Reads a file',
-
+            inputSchema: objectSchema({ path: 'string' }, ['path']),
             args: {
               path: ['read-path'],
             },
@@ -259,7 +263,7 @@ function makeStoredAnnotations(): StoredToolAnnotationsFile {
             toolName: 'write_file',
             serverName: 'filesystem',
             comment: 'Writes a file',
-
+            inputSchema: objectSchema({ path: 'string', content: 'string' }, ['path', 'content']),
             args: {
               path: ['write-path'],
               content: ['none'],
@@ -283,7 +287,7 @@ function makeStoredAnnotationsWithConditional(): StoredToolAnnotationsFile {
             toolName: 'clone',
             serverName: 'git',
             comment: 'Clones a repo',
-
+            inputSchema: objectSchema({ url: 'string', local: 'boolean' }, ['url']),
             args: {
               url: {
                 default: ['git-remote-url'],
@@ -294,6 +298,9 @@ function makeStoredAnnotationsWithConditional(): StoredToolAnnotationsFile {
                   },
                 ],
               },
+              // A condition must name an argument of the same tool (the
+              // annotator's rule, enforced by the runtime schema too).
+              local: ['none'],
             },
           },
         ],
@@ -322,7 +329,9 @@ describe('loadToolAnnotationsFile', () => {
 
     const result = loadToolAnnotationsFile(dir);
     expect(result).toBeDefined();
-    const expected: ToolAnnotationsFile = {
+    // Only role specs are flattened (none here); the other fields, the input
+    // schema included, pass through unchanged.
+    const expected: ToolAnnotationsFile & StoredToolAnnotationsFile = {
       generatedAt: '2026-03-08T00:00:00.000Z',
       servers: {
         filesystem: {
@@ -332,14 +341,14 @@ describe('loadToolAnnotationsFile', () => {
               toolName: 'read_file',
               serverName: 'filesystem',
               comment: 'Reads a file',
-
+              inputSchema: objectSchema({ path: 'string' }, ['path']),
               args: { path: ['read-path'] },
             },
             {
               toolName: 'write_file',
               serverName: 'filesystem',
               comment: 'Writes a file',
-
+              inputSchema: objectSchema({ path: 'string', content: 'string' }, ['path', 'content']),
               args: { path: ['write-path'], content: ['none'] },
             },
           ],
@@ -381,11 +390,31 @@ describe('loadToolAnnotationsFile', () => {
     expect(result!.servers['filesystem'].inputHash).toBe('abc123');
   });
 
-  it('returns undefined when the JSON is corrupt', () => {
+  // A damaged annotations file used to read as "absent", which let a corrupt
+  // user file silently fall back to other annotations. It now fails closed.
+  it('throws a coded error when the JSON is corrupt', () => {
     const dir = tempDir('annotations-corrupt');
     writeFileSync(resolve(dir, 'tool-annotations.json'), '{not valid json');
-    const result = loadToolAnnotationsFile(dir);
-    expect(result).toBeUndefined();
+    expect(() => loadToolAnnotationsFile(dir)).toThrow(
+      expect.objectContaining({ code: 'TOOL_ANNOTATIONS_INVALID' }) as Error,
+    );
+  });
+
+  it('throws rather than falling back when a corrupt primary has a valid fallback', () => {
+    const primary = tempDir('annotations-corrupt-primary');
+    const fallback = tempDir('annotations-valid-fallback');
+    writeFileSync(resolve(primary, 'tool-annotations.json'), '{not valid json');
+    writeFileSync(resolve(fallback, 'tool-annotations.json'), JSON.stringify(makeStoredAnnotations()));
+    expect(() => loadToolAnnotationsFile(primary, fallback)).toThrow(/not valid JSON/);
+  });
+
+  it('layers the primary file per server over the fallback', () => {
+    const primary = tempDir('annotations-overlay-primary');
+    const fallback = tempDir('annotations-overlay-fallback');
+    writeFileSync(resolve(primary, 'tool-annotations.json'), JSON.stringify(makeStoredAnnotationsWithConditional()));
+    writeFileSync(resolve(fallback, 'tool-annotations.json'), JSON.stringify(makeStoredAnnotations()));
+    const result = loadToolAnnotationsFile(primary, fallback);
+    expect(Object.keys(result?.servers ?? {}).sort()).toEqual(['filesystem', 'git']);
   });
 });
 
@@ -432,5 +461,50 @@ describe('createPipelineLlm log path', () => {
     for (const bad of ['', '.', '..', '../escape.jsonl', 'sub/dir.jsonl', 'a\\b.jsonl']) {
       await expect(createPipelineLlm(dir, 'unknown', bad)).rejects.toThrow(/bare filename/);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// createPipelineModels — the optional separate verifier model (PIP-12)
+// ---------------------------------------------------------------------------
+
+describe('createPipelineModels verifier model', () => {
+  const saved = { home: process.env.IRONCURTAIN_HOME, key: process.env['ANTHROPIC_API_KEY'] };
+
+  beforeEach(() => {
+    process.env.IRONCURTAIN_HOME = tempDir('home');
+    process.env['ANTHROPIC_API_KEY'] = 'sk-test';
+  });
+
+  afterEach(() => {
+    if (saved.home === undefined) delete process.env.IRONCURTAIN_HOME;
+    else process.env.IRONCURTAIN_HOME = saved.home;
+    if (saved.key === undefined) delete process.env['ANTHROPIC_API_KEY'];
+    else process.env['ANTHROPIC_API_KEY'] = saved.key;
+  });
+
+  function writeUserConfig(config: Record<string, unknown>): void {
+    writeFileSync(resolve(TEST_ROOT, 'home', 'config.json'), JSON.stringify(config));
+  }
+
+  it('builds one for a policyVerifierModelId other than the policy model, with its own cache strategy', async () => {
+    writeUserConfig({ policyModelId: 'anthropic:claude-sonnet-4-6', policyVerifierModelId: 'openai:gpt-5' });
+    const models = await createPipelineModels(tempDir('logs-separate'));
+    expect(models.policyModelId).toBe('anthropic:claude-sonnet-4-6');
+    expect(models.verifier?.modelId).toBe('openai:gpt-5');
+    expect(models.verifier?.baseLlm).toMatchObject({ modelId: 'gpt-5', provider: 'openai' });
+    expect(models.verifier?.cacheStrategy).toBeInstanceOf(NoOpCacheStrategy);
+    expect(models.cacheStrategy).toBeInstanceOf(AnthropicCacheStrategy);
+  });
+
+  it('builds none when it is unset or names the policy model', async () => {
+    writeUserConfig({ policyModelId: 'anthropic:claude-sonnet-4-6' });
+    expect((await createPipelineModels(tempDir('logs-unset'))).verifier).toBeUndefined();
+
+    writeUserConfig({
+      policyModelId: 'anthropic:claude-sonnet-4-6',
+      policyVerifierModelId: 'anthropic:claude-sonnet-4-6',
+    });
+    expect((await createPipelineModels(tempDir('logs-same'))).verifier).toBeUndefined();
   });
 });

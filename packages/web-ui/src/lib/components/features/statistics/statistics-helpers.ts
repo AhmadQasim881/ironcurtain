@@ -5,22 +5,54 @@ import type {
   StatisticsTimeBucketDto,
 } from '$lib/types.js';
 
-export type StatisticsIdentityMode = 'routed' | 'served';
+/**
+ * How the chart and rail group observations: by provider and model (as
+ * routed, or as served), by persona, or by workflow run.
+ */
+export type StatisticsIdentityMode = 'routed' | 'served' | 'persona' | 'workflow';
 
 /** Resolved once per module load; calendar math is local-time by contract. */
 export const localTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 
-const IDENTITY_DIMENSIONS: Readonly<
-  Record<StatisticsIdentityMode, readonly [LlmStatisticsDimension, LlmStatisticsDimension]>
-> = {
+const IDENTITY_DIMENSIONS: Readonly<Record<StatisticsIdentityMode, readonly LlmStatisticsDimension[]>> = {
   routed: ['logicalProvider', 'forwardedModel'],
   served: ['servedProvider', 'servedModel'],
+  persona: ['personaId'],
+  workflow: ['workflowRunId'],
 };
 
-export function statisticsIdentityDimensions(
-  mode: StatisticsIdentityMode,
-): readonly [LlmStatisticsDimension, LlmStatisticsDimension] {
+export function statisticsIdentityDimensions(mode: StatisticsIdentityMode): readonly LlmStatisticsDimension[] {
   return IDENTITY_DIMENSIONS[mode];
+}
+
+/** True when the grouping is provider/model identity rather than attribution. */
+export function isModelIdentityMode(mode: StatisticsIdentityMode): boolean {
+  return mode === 'routed' || mode === 'served';
+}
+
+/** Short noun for the groups a mode produces, for headings and empty states. */
+export function statisticsGroupNoun(mode: StatisticsIdentityMode): string {
+  switch (mode) {
+    case 'routed':
+    case 'served':
+      return 'provider/model';
+    case 'persona':
+      return 'persona';
+    case 'workflow':
+      return 'workflow run';
+  }
+}
+
+/**
+ * User-facing text for a failed statistics request. Over-limit queries
+ * (`STATISTICS_LIMIT`) get guidance instead of the raw message.
+ */
+export function statisticsErrorMessage(reason: unknown): string {
+  if (reason !== null && typeof reason === 'object' && 'code' in reason && reason.code === 'STATISTICS_LIMIT') {
+    const detail = reason instanceof Error && reason.message !== '' ? ` (${reason.message})` : '';
+    return `This view asks for more than one statistics query may summarize${detail}. Choose a shorter time range.`;
+  }
+  return reason instanceof Error ? reason.message : String(reason);
 }
 
 export interface StatisticsTrendPoint {
@@ -195,6 +227,19 @@ export function findMeasure(
   return summaries.find((summary) => summary.measure === measure);
 }
 
+/** The display name of one dimension value: its resolved label, else the stored value. */
+function dimensionText(summary: StatisticsMetricSummaryDto, dimension: LlmStatisticsDimension): string | null {
+  const label = summary.labels?.[dimension];
+  if (label !== undefined) return label;
+  const value = summary.dimensions[dimension];
+  return typeof value === 'string' ? value : null;
+}
+
+/**
+ * Display identity of one group. `provider` is the secondary line and
+ * `model` the primary one (for persona and workflow groups: the kind and the
+ * name). The key uses stored values, so a label change never merges groups.
+ */
 function identity(
   summary: StatisticsMetricSummaryDto,
   mode: StatisticsIdentityMode,
@@ -203,13 +248,19 @@ function identity(
   model: string;
   key: string;
 } {
+  if (mode === 'persona' || mode === 'workflow') {
+    const [dimension] = statisticsIdentityDimensions(mode);
+    const stored = dimension === undefined ? null : summary.dimensions[dimension];
+    const name = dimension === undefined ? null : dimensionText(summary, dimension);
+    const provider = mode === 'persona' ? 'Persona' : 'Workflow run';
+    const model = name ?? (mode === 'persona' ? 'No persona' : 'Not in a workflow');
+    return { provider, model, key: `${mode}\u0000${typeof stored === 'string' ? stored : ''}` };
+  }
   const [providerDimension, modelDimension] = statisticsIdentityDimensions(mode);
-  const rawProvider = summary.dimensions[providerDimension];
-  const rawModel = summary.dimensions[modelDimension];
-  const provider =
-    typeof rawProvider === 'string' ? rawProvider : mode === 'served' ? 'Provider not exposed' : 'Unknown provider';
-  const model =
-    typeof rawModel === 'string' ? rawModel : mode === 'served' ? 'Model not exposed' : 'Model not reported';
+  const rawProvider = providerDimension === undefined ? null : dimensionText(summary, providerDimension);
+  const rawModel = modelDimension === undefined ? null : dimensionText(summary, modelDimension);
+  const provider = rawProvider ?? (mode === 'served' ? 'Provider not exposed' : 'Unknown provider');
+  const model = rawModel ?? (mode === 'served' ? 'Model not exposed' : 'Model not reported');
   return { provider, model, key: `${provider}\u0000${model}` };
 }
 

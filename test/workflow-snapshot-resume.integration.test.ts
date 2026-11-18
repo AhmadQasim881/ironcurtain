@@ -1,17 +1,21 @@
 import { execFile as execFileCb } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { cpSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { REAL_TMP, testCompiledPolicy, testToolAnnotations } from './fixtures/test-policy.js';
-import { isDockerAvailable, isDockerImageAvailable } from './helpers/docker-available.js';
+import { isDockerAvailable } from './helpers/docker-available.js';
 import type { IronCurtainConfig } from '../src/config/types.js';
+import { USER_CONFIG_DEFAULTS } from '../src/config/user-config.js';
+import { testUserConfig } from './helpers/user-config.js';
 import { createDockerManager } from '../src/docker/docker-manager.js';
 import {
   createDockerInfrastructure,
   destroyDockerInfrastructure,
   type DockerInfrastructure,
+  type AgentImageResolution,
 } from '../src/docker/docker-infrastructure.js';
 import { FileCheckpointStore } from '../src/workflow/checkpoint.js';
 import { sweepContainerSnapshots } from '../src/workflow/container-snapshots.js';
@@ -22,10 +26,16 @@ import {
 } from '../src/workflow/orchestrator.js';
 import type { WorkflowCheckpoint, WorkflowDefinition, WorkflowId } from '../src/workflow/types.js';
 import { createDeps, waitForCompletion, writeDefinitionFile } from './workflow/test-helpers.js';
+import type { AgentId } from '../src/docker/agent-adapter.js';
+import { createClaudeCodeAdapter } from '../src/docker/adapters/claude-code.js';
+import { registerAgent } from '../src/docker/agent-registry.js';
 
 const execFileAsync = promisify(execFileCb);
 
-const IMAGE = 'ironcurtain-claude-code:latest';
+const FIXTURE_AGENT = `snapshot-fixture-${process.pid}` as AgentId;
+const FIXTURE_IMAGE_TAG = `ironcurtain-snapshot-fixture:${process.pid}`;
+// The measured small-fixture round trips take about47s per case on Linux.
+const SNAPSHOT_CASE_TIMEOUT_MS = 180_000;
 const TEST_HOME = `${REAL_TMP}/ironcurtain-workflow-snapshot-${process.pid}`;
 const RESULT_FILE = '.workflow/snapshot-result.json';
 const SETUP_SCRIPT = [
@@ -69,8 +79,7 @@ function findHostCaDir(): string | null {
 }
 
 const hostCaDir = findHostCaDir();
-const dockerReady =
-  process.env.INTEGRATION_TEST === '1' && isDockerAvailable() && isDockerImageAvailable(IMAGE) && hostCaDir !== null;
+const dockerReady = process.env.INTEGRATION_TEST === '1' && isDockerAvailable() && hostCaDir !== null;
 
 function buildDockerSessionConfig(workspaceDir: string, generatedDir: string): IronCurtainConfig {
   return {
@@ -82,50 +91,20 @@ function buildDockerSessionConfig(workspaceDir: string, generatedDir: string): I
     constitutionPath: join(generatedDir, 'constitution.md'),
     agentModelId: 'anthropic:claude-sonnet-4-6',
     escalationTimeoutSeconds: 300,
-    userConfig: {
-      agentModelId: 'anthropic:claude-sonnet-4-6',
-      policyModelId: 'anthropic:claude-sonnet-4-6',
-      prefilterModelId: 'anthropic:claude-haiku-4-5',
+    userConfig: testUserConfig({
       anthropicApiKey: 'test-fake-key-no-network',
-      googleApiKey: '',
-      openaiApiKey: '',
-      anthropicBaseUrl: '',
-      openaiBaseUrl: '',
-      googleBaseUrl: '',
-      escalationTimeoutSeconds: 300,
-      resourceBudget: {
-        maxTotalTokens: 1_000_000,
-        maxSteps: 200,
-        maxSessionSeconds: 1800,
-        maxEstimatedCostUsd: 5.0,
-        warnThresholdPercent: 80,
-      },
-      autoCompact: {
-        enabled: false,
-        thresholdTokens: 80_000,
-        keepRecentMessages: 10,
-        summaryModelId: 'anthropic:claude-haiku-4-5',
-      },
-      autoApprove: { enabled: false, modelId: 'anthropic:claude-haiku-4-5' },
       auditRedaction: { enabled: false },
-      memory: { enabled: false, autoSave: false, llmBaseUrl: undefined, llmApiKey: undefined },
-      webSearch: { provider: null, brave: null, tavily: null, serpapi: null },
-      serverCredentials: {},
-      signal: null,
-      gooseProvider: 'anthropic',
-      gooseModel: 'claude-sonnet-4-20250514',
-      preferredDockerAgent: 'claude-code',
-      preferredMode: 'docker',
+      preferredMode: 'container',
       packageInstall: {
         enabled: true,
         quarantineDays: 2,
         allowedPackages: [],
         deniedPackages: [],
       },
-      dockerResources: { memoryMb: null, cpus: null },
-      snapshot: { enabled: true, maxAgeDays: 7, sweepIntervalHours: 24 },
-    },
-  } as IronCurtainConfig;
+      dockerResources: { memoryMb: null, cpus: null, pidsLimit: USER_CONFIG_DEFAULTS.dockerResources.pidsLimit },
+      snapshot: { enabled: true, maxAgeDays: 7, sweepIntervalHours: 24, maxBytes: null },
+    }),
+  };
 }
 
 function snapshotWorkflowDefinition(name: string): WorkflowDefinition {
@@ -197,9 +176,11 @@ describe.skipIf(!dockerReady)('workflow container snapshot and resume with real 
   let originalAuth: string | undefined;
   let originalApiKey: string | undefined;
   const liveBundles = new Set<DockerInfrastructure>();
+  const liveOrchestrators = new Set<WorkflowOrchestrator>();
   const trackedDigests = new Set<string>();
+  let fixtureImage: AgentImageResolution;
 
-  beforeAll(() => {
+  beforeAll(async () => {
     originalHome = process.env.IRONCURTAIN_HOME;
     originalAuth = process.env.IRONCURTAIN_DOCKER_AUTH;
     originalApiKey = process.env.ANTHROPIC_API_KEY;
@@ -208,17 +189,88 @@ describe.skipIf(!dockerReady)('workflow container snapshot and resume with real 
     process.env.ANTHROPIC_API_KEY = 'test-fake-key-no-network';
     mkdirSync(TEST_HOME, { recursive: true });
     cpSync(hostCaDir as string, join(TEST_HOME, 'ca'), { recursive: true });
-  });
+    const context = mkdtempSync(join(tmpdir(), 'workflow-snapshot-image-'));
+    const dockerConfig = mkdtempSync(join(tmpdir(), 'workflow-snapshot-docker-config-'));
+    const previousDockerConfig = process.env.DOCKER_CONFIG;
+    process.env.DOCKER_CONFIG = dockerConfig;
+    try {
+      copyFileSync(resolve('test/fixtures/workflow-snapshot/Dockerfile'), resolve(context, 'Dockerfile'));
+      for (const file of ['entrypoint-uid-remap.sh', 'entrypoint-claude-code.sh']) {
+        copyFileSync(resolve('docker', file), resolve(context, file));
+      }
+      const hash = createHash('sha256').update(`snapshot-fixture-owner:${process.pid}\n`);
+      for (const file of ['Dockerfile', 'entrypoint-uid-remap.sh', 'entrypoint-claude-code.sh']) {
+        hash.update(`file:${file}\n`).update(readFileSync(resolve(context, file)));
+      }
+      const buildHash = hash.digest('hex');
+      const docker = createDockerManager();
+      await docker.buildImage(FIXTURE_IMAGE_TAG, resolve(context, 'Dockerfile'), context, {
+        'ironcurtain.build-hash': buildHash,
+        'ironcurtain.test.fixture': 'workflow-snapshot',
+        'ironcurtain.test.owner': String(process.pid),
+      });
+      const image = await docker.inspectImage(FIXTURE_IMAGE_TAG);
+      if (!image || image.labels['ironcurtain.build-hash'] !== buildHash)
+        throw new Error('Fixture build identity mismatch');
+      fixtureImage = {
+        mode: 'build-if-stale',
+        logicalName: image.id,
+        imageRef: image.id,
+        immutableImageId: image.id,
+        buildHash,
+      };
+      registerAgent({
+        ...createClaudeCodeAdapter(),
+        id: FIXTURE_AGENT,
+        displayName: 'Snapshot shell fixture (no agent CLI)',
+        getImage: async () => image.id,
+        versionProbe: undefined,
+        cliVersion: undefined,
+      });
+      console.log(
+        'snapshot fixture image proof',
+        JSON.stringify({ tag: FIXTURE_IMAGE_TAG, imageId: image.id, buildHash }),
+      );
+    } finally {
+      if (previousDockerConfig === undefined) delete process.env.DOCKER_CONFIG;
+      else process.env.DOCKER_CONFIG = previousDockerConfig;
+      rmSync(dockerConfig, { recursive: true, force: true });
+      rmSync(context, { recursive: true, force: true });
+    }
+  }, 300_000);
+
+  async function drainFixtures(): Promise<void> {
+    const orchestratorResults = await Promise.allSettled(
+      [...liveOrchestrators].map(async (orchestrator) => {
+        await orchestrator.shutdownAll();
+        liveOrchestrators.delete(orchestrator);
+      }),
+    );
+    const bundleResults = await Promise.allSettled(
+      [...liveBundles].map(async (bundle) => {
+        await destroyDockerInfrastructure(bundle);
+        liveBundles.delete(bundle);
+      }),
+    );
+    const failures = [...orchestratorResults, ...bundleResults].filter(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    );
+    if (failures.length > 0)
+      throw new AggregateError(
+        failures.map((result) => result.reason),
+        'Snapshot fixture cleanup failed',
+      );
+  }
 
   afterAll(async () => {
-    for (const bundle of liveBundles) {
-      await destroyDockerInfrastructure(bundle).catch(() => {});
-    }
-    liveBundles.clear();
+    await drainFixtures();
 
     const docker = createDockerManager();
-    await Promise.allSettled([...trackedDigests].map((digest) => docker.removeImage(digest)));
+    await Promise.all([...trackedDigests].map((digest) => docker.removeImage(digest)));
+    for (const digest of trackedDigests) expect(await docker.imageExists(digest)).toBe(false);
     trackedDigests.clear();
+    if (await docker.imageExists(FIXTURE_IMAGE_TAG)) await docker.removeImage(FIXTURE_IMAGE_TAG);
+    expect(await docker.imageExists(FIXTURE_IMAGE_TAG)).toBe(false);
 
     if (originalHome === undefined) delete process.env.IRONCURTAIN_HOME;
     else process.env.IRONCURTAIN_HOME = originalHome;
@@ -228,19 +280,17 @@ describe.skipIf(!dockerReady)('workflow container snapshot and resume with real 
     else process.env.ANTHROPIC_API_KEY = originalApiKey;
 
     rmSync(TEST_HOME, { recursive: true, force: true });
-  });
+  }, 660_000);
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'workflow-snapshot-resume-'));
   });
 
   afterEach(async () => {
-    for (const bundle of liveBundles) {
-      await destroyDockerInfrastructure(bundle).catch(() => {});
-    }
-    liveBundles.clear();
+    // Drain pending commits before deleting the checkpoint and lock tree.
+    await drainFixtures();
     rmSync(tmpDir, { recursive: true, force: true });
-  });
+  }, 660_000);
 
   function createHarness(label: string): {
     readonly baseDir: string;
@@ -280,7 +330,7 @@ describe.skipIf(!dockerReady)('workflow container snapshot and resume with real 
       mkdirSync(escalationDir, { recursive: true });
       const bundle = await createDockerInfrastructure(
         config,
-        { kind: 'docker', agent: 'claude-code' },
+        { kind: 'docker', agent: FIXTURE_AGENT },
         bundleDir,
         input.workspacePath,
         escalationDir,
@@ -290,7 +340,13 @@ describe.skipIf(!dockerReady)('workflow container snapshot and resume with real 
         input.resolvedSkills,
         undefined,
         input.workflowScriptsDir,
-        input.baseImageOverride ? { baseImageOverride: input.baseImageOverride } : undefined,
+        {
+          workflowRunDir: input.workflowRunDir,
+          preparedImageResolution: fixtureImage,
+          ...(input.baseImageOverride
+            ? { baseImageOverride: input.baseImageOverride, baseImageAgentBuildHash: input.baseImageAgentBuildHash }
+            : {}),
+        },
       );
       liveBundles.add(bundle);
       const { stdout } = await execFileAsync('docker', ['inspect', '-f', '{{.Config.Image}}', bundle.containerId], {
@@ -305,8 +361,8 @@ describe.skipIf(!dockerReady)('workflow container snapshot and resume with real 
     });
 
     const destroyInfra = vi.fn(async (bundle: DockerInfrastructure) => {
-      liveBundles.delete(bundle);
       await destroyDockerInfrastructure(bundle);
+      liveBundles.delete(bundle);
     });
     const createSession = vi.fn(async () => {
       throw new Error('snapshot integration workflow should not create agent sessions');
@@ -321,6 +377,7 @@ describe.skipIf(!dockerReady)('workflow container snapshot and resume with real 
           destroyWorkflowInfrastructure: destroyInfra,
         }),
       );
+      liveOrchestrators.add(orchestrator);
       orchestrator.onEvent((event: WorkflowLifecycleEvent) => {
         if (event.kind === 'completed') {
           const checkpoint = checkpointStore.load(event.workflowId);
@@ -347,6 +404,7 @@ describe.skipIf(!dockerReady)('workflow container snapshot and resume with real 
         trackedDigests.add(snapshot.image);
       }
       await orchestrator.shutdownAll();
+      liveOrchestrators.delete(orchestrator);
     };
 
     return {
@@ -383,86 +441,96 @@ describe.skipIf(!dockerReady)('workflow container snapshot and resume with real 
     return image;
   }
 
-  it('captures, restores, isolates identities, and garbage-collects snapshot images', async () => {
-    const docker = createDockerManager();
-    const runA = createHarness('A');
-    const runB = createHarness('B');
+  it(
+    'captures, restores, isolates identities, and garbage-collects snapshot images',
+    async () => {
+      const docker = createDockerManager();
+      const runA = createHarness('A');
+      const runB = createHarness('B');
 
-    const [workflowA, workflowB] = await Promise.all([runA.startRun(), runB.startRun()]);
-    const digestA1 = await snapshotDigest(runA, workflowA);
-    const digestB1 = await snapshotDigest(runB, workflowB);
-    expect(digestA1).toMatch(/^sha256:/);
-    expect(digestB1).toMatch(/^sha256:/);
-    expect(digestA1).not.toBe(digestB1);
-    expect(await docker.imageExists(digestA1)).toBe(true);
-    expect(await docker.imageExists(digestB1)).toBe(true);
+      const [workflowA, workflowB] = await Promise.all([runA.startRun(), runB.startRun()]);
+      const digestA1 = await snapshotDigest(runA, workflowA);
+      const digestB1 = await snapshotDigest(runB, workflowB);
+      expect(digestA1).toMatch(/^sha256:/);
+      expect(digestB1).toMatch(/^sha256:/);
+      expect(digestA1).not.toBe(digestB1);
+      expect(await docker.imageExists(digestA1)).toBe(true);
+      expect(await docker.imageExists(digestB1)).toBe(true);
 
-    writeFileSync(resolve(runA.workspaceDir, 'force-abort'), 'again');
-    await runA.resumeRun(workflowA);
-    const digestA2 = await snapshotDigest(runA, workflowA);
-    expect(digestA2).not.toBe(digestA1);
-    expect(digestA2).not.toBe(digestB1);
-    await waitForImageState(digestA1, false);
-    expect(await docker.imageExists(digestA2)).toBe(true);
+      writeFileSync(resolve(runA.workspaceDir, 'force-abort'), 'again');
+      await runA.resumeRun(workflowA);
+      const digestA2 = await snapshotDigest(runA, workflowA);
+      expect(digestA2).not.toBe(digestA1);
+      expect(digestA2).not.toBe(digestB1);
+      await waitForImageState(digestA1, false);
+      expect(await docker.imageExists(digestA2)).toBe(true);
 
-    await runA.resumeRun(workflowA);
-    const digestA3 = await snapshotDigest(runA, workflowA);
-    expect(digestA3).not.toBe(digestA2);
-    expect(digestA3).not.toBe(digestB1);
-    await waitForImageState(digestA2, false);
-    expect(await docker.imageExists(digestA3)).toBe(true);
+      await runA.resumeRun(workflowA);
+      const digestA3 = await snapshotDigest(runA, workflowA);
+      expect(digestA3).not.toBe(digestA2);
+      expect(digestA3).not.toBe(digestB1);
+      await waitForImageState(digestA2, false);
+      expect(await docker.imageExists(digestA3)).toBe(true);
 
-    const resumeRecordsA = runA.createRecords.filter((record) => record.baseImageOverride !== undefined);
-    expect(resumeRecordsA.map((record) => record.baseImageOverride)).not.toContain(digestB1);
-    expect(resumeRecordsA.every((record) => record.baseImageOverride?.startsWith('sha256:'))).toBe(true);
-    expect(resumeRecordsA.every((record) => record.containerImage.startsWith('sha256:'))).toBe(true);
+      const resumeRecordsA = runA.createRecords.filter((record) => record.baseImageOverride !== undefined);
+      expect(resumeRecordsA.map((record) => record.baseImageOverride)).not.toContain(digestB1);
+      expect(resumeRecordsA.every((record) => record.baseImageOverride?.startsWith('sha256:'))).toBe(true);
+      expect(resumeRecordsA.every((record) => record.containerImage.startsWith('sha256:'))).toBe(true);
+      expect(resumeRecordsA.every((record) => record.containerImage === record.baseImageOverride)).toBe(true);
 
-    rmSync(resolve(runA.workspaceDir, 'force-abort'), { force: true });
-    await runA.resumeRun(workflowA);
-    await waitForCheckpoint(
-      runA.checkpointStore,
-      workflowA,
-      (checkpoint) => checkpoint.finalStatus?.phase === 'completed',
-    );
-    expect(readFileSync(resolve(runA.workspaceDir, 'setup-count'), 'utf-8')).toBe('1');
-    expect(readFileSync(resolve(runA.workspaceDir, 'restored-marker.txt'), 'utf-8')).toBe('snapshot-marker');
-    await waitForImageState(digestA3, false);
-  }, 360_000);
+      rmSync(resolve(runA.workspaceDir, 'force-abort'), { force: true });
+      await runA.resumeRun(workflowA);
+      await waitForCheckpoint(
+        runA.checkpointStore,
+        workflowA,
+        (checkpoint) => checkpoint.finalStatus?.phase === 'completed',
+      );
+      expect(readFileSync(resolve(runA.workspaceDir, 'setup-count'), 'utf-8')).toBe('1');
+      expect(readFileSync(resolve(runA.workspaceDir, 'restored-marker.txt'), 'utf-8')).toBe('snapshot-marker');
+      await waitForImageState(digestA3, false);
+    },
+    SNAPSHOT_CASE_TIMEOUT_MS,
+  );
 
-  it('degrades gracefully when a snapshot image is missing and age-GCs referenced snapshots', async () => {
-    const docker = createDockerManager();
-    const missingRun = createHarness('missing');
-    const workflowMissing = await missingRun.startRun();
-    const missingDigest = await snapshotDigest(missingRun, workflowMissing);
-    expect(await docker.removeImage(missingDigest)).toBe(true);
-    await missingRun.resumeRun(workflowMissing);
-    const missingCheckpoint = missingRun.checkpointStore.load(workflowMissing);
-    expect(missingCheckpoint?.finalStatus?.phase).toBe('aborted');
-    expect(missingCheckpoint?.machineState).toBe('driver');
-    const missingResume = missingRun.createRecords.find((record) => record.baseImageOverride === missingDigest);
-    expect(missingResume?.containerImage).toBe(IMAGE);
+  it(
+    'degrades gracefully when a snapshot image is missing and age-GCs referenced snapshots',
+    async () => {
+      const docker = createDockerManager();
+      const missingRun = createHarness('missing');
+      const workflowMissing = await missingRun.startRun();
+      const missingDigest = await snapshotDigest(missingRun, workflowMissing);
+      expect(await docker.removeImage(missingDigest)).toBe(true);
+      await missingRun.resumeRun(workflowMissing);
+      const missingCheckpoint = missingRun.checkpointStore.load(workflowMissing);
+      expect(missingCheckpoint?.finalStatus?.phase).toBe('aborted');
+      expect(missingCheckpoint?.machineState).toBe('driver');
+      const missingResume = missingRun.createRecords.find((record) => record.baseImageOverride === missingDigest);
+      // A fresh fallback comes from the immutable prepared fixture image.
+      expect(missingResume?.containerImage).toBe(fixtureImage.immutableImageId);
 
-    const agedRun = createHarness('aged');
-    const workflowAged = await agedRun.startRun();
-    const agedDigest = await snapshotDigest(agedRun, workflowAged);
-    const gcResult = await sweepContainerSnapshots({
-      baseDir: agedRun.baseDir,
-      checkpointStore: agedRun.checkpointStore,
-      docker,
-      now: new Date(Date.now() + 10 * 60 * 1000),
-      userConfig: {
-        ...buildDockerSessionConfig(agedRun.workspaceDir, resolve(TEST_HOME, 'generated-aged')).userConfig,
-        snapshot: { enabled: true, maxAgeDays: 0.000001, sweepIntervalHours: 24 },
-      },
-    });
-    expect(gcResult.agedImages).toContain(agedDigest);
-    expect(agedRun.checkpointStore.load(workflowAged)?.containerSnapshots?.primary.image).toBe(agedDigest);
-    expect(await docker.imageExists(agedDigest)).toBe(false);
+      const agedRun = createHarness('aged');
+      const workflowAged = await agedRun.startRun();
+      const agedDigest = await snapshotDigest(agedRun, workflowAged);
+      const gcResult = await sweepContainerSnapshots({
+        baseDir: agedRun.baseDir,
+        checkpointStore: agedRun.checkpointStore,
+        docker,
+        now: new Date(Date.now() + 10 * 60 * 1000),
+        userConfig: {
+          ...buildDockerSessionConfig(agedRun.workspaceDir, resolve(TEST_HOME, 'generated-aged')).userConfig,
+          snapshot: { enabled: true, maxAgeDays: 0.000001, sweepIntervalHours: 24, maxBytes: null },
+        },
+      });
+      expect(gcResult.agedImages).toContain(agedDigest);
+      expect(agedRun.checkpointStore.load(workflowAged)?.containerSnapshots?.primary.image).toBe(agedDigest);
+      expect(await docker.imageExists(agedDigest)).toBe(false);
 
-    await agedRun.resumeRun(workflowAged);
-    const agedCheckpoint = agedRun.checkpointStore.load(workflowAged);
-    expect(agedCheckpoint?.finalStatus?.phase).toBe('aborted');
-    const agedResume = agedRun.createRecords.find((record) => record.baseImageOverride === agedDigest);
-    expect(agedResume?.containerImage).toBe(IMAGE);
-  }, 360_000);
+      await agedRun.resumeRun(workflowAged);
+      const agedCheckpoint = agedRun.checkpointStore.load(workflowAged);
+      expect(agedCheckpoint?.finalStatus?.phase).toBe('aborted');
+      const agedResume = agedRun.createRecords.find((record) => record.baseImageOverride === agedDigest);
+      expect(agedResume?.containerImage).toBe(fixtureImage.immutableImageId);
+    },
+    SNAPSHOT_CASE_TIMEOUT_MS,
+  );
 });

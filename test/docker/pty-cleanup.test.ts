@@ -1,17 +1,20 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as logger from '../../src/logger.js';
 
 const state = vi.hoisted<{
   infrastructure: unknown;
+  /** Replaces the scripted `infrastructure` result of prepareDockerInfrastructure when set. */
+  prepare: (() => Promise<unknown>) | undefined;
   destroyArguments: unknown;
   destroyError: unknown;
   removeBundleRuntimeRoot: ReturnType<typeof vi.fn>;
   updateSessionMetadata: ReturnType<typeof vi.fn>;
 }>(() => ({
   infrastructure: undefined,
+  prepare: undefined,
   destroyArguments: undefined,
   destroyError: undefined,
   removeBundleRuntimeRoot: vi.fn(),
@@ -30,14 +33,19 @@ vi.mock('ora', () => ({
 }));
 
 vi.mock('../../src/session/index.js', () => ({
-  buildSessionConfig: (config: unknown, sessionId: string) => ({
-    config,
-    sandboxDir: `/tmp/${sessionId}/sandbox`,
-    escalationDir: `/tmp/${sessionId}/escalations`,
-    systemPromptAugmentation: '',
-    resolvedSkills: [],
-    memoryEnabled: false,
-  }),
+  // Like the real one, creates the session directory (the session claims it).
+  buildSessionConfig: (config: unknown, sessionId: string) => {
+    mkdirSync(`${process.env.IRONCURTAIN_HOME}/sessions/${sessionId}`, { recursive: true });
+    return {
+      config,
+      sandboxDir: `/tmp/${sessionId}/sandbox`,
+      escalationDir: `/tmp/${sessionId}/escalations`,
+      systemPromptAugmentation: '',
+      resolvedSkills: [],
+      memoryEnabled: false,
+      hostModelNotices: [],
+    };
+  },
 }));
 
 vi.mock('../../src/session/session-metadata.js', () => ({
@@ -47,7 +55,7 @@ vi.mock('../../src/session/session-metadata.js', () => ({
 vi.mock('../../src/docker/claude-md-seed.js', () => ({ buildDockerClaudeMd: () => '' }));
 
 vi.mock('../../src/docker/docker-infrastructure.js', () => ({
-  prepareDockerInfrastructure: async () => state.infrastructure,
+  prepareDockerInfrastructure: async () => (state.prepare ? state.prepare() : state.infrastructure),
   activateNestedDockerWorkload: vi.fn(),
   attachDockerDesktopAgentEgressNetwork: vi.fn(),
   resolveNestedDockerAgentWiring: () => ({ appleNestedDaemon: undefined, env: {}, namedVolumeMounts: [] }),
@@ -93,13 +101,33 @@ vi.mock('../../src/docker/container-lifecycle.js', () => ({
 }));
 
 import { runPtySession } from '../../src/docker/pty-session.js';
+import { InternalNetworkConnectivityError } from '../../src/docker/docker-resource-lifecycle.js';
+import type { AgentId } from '../../src/docker/agent-adapter.js';
 
 describe('PTY early-initialization cleanup ownership', () => {
   const directories: string[] = [];
+  let home: string;
+  let originalHome: string | undefined;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'pty-cleanup-home-'));
+    directories.push(home);
+    originalHome = process.env.IRONCURTAIN_HOME;
+    process.env.IRONCURTAIN_HOME = home;
+  });
+
+  /** Whether any session directory still holds its claim (resume.lock). */
+  function anySessionClaimed(): boolean {
+    const sessionsDir = join(home, 'sessions');
+    return readdirSync(sessionsDir).some((id) => existsSync(join(sessionsDir, id, 'resume.lock')));
+  }
 
   afterEach(() => {
+    if (originalHome !== undefined) process.env.IRONCURTAIN_HOME = originalHome;
+    else delete process.env.IRONCURTAIN_HOME;
     for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
     state.infrastructure = undefined;
+    state.prepare = undefined;
     state.destroyArguments = undefined;
     state.destroyError = undefined;
     state.removeBundleRuntimeRoot.mockReset();
@@ -143,7 +171,7 @@ describe('PTY early-initialization cleanup ownership', () => {
             dockerWorkload: { enabled: true },
           },
         } as never,
-        mode: { kind: 'docker', agent: 'claude-code' },
+        mode: { kind: 'docker', agent: 'claude-code' as AgentId },
         workspacePath: directory,
       }),
     ).rejects.toThrow(/scripted capture begin failure/u);
@@ -166,6 +194,8 @@ describe('PTY early-initialization cleanup ownership', () => {
       }),
     );
     expect(errorSpy).toHaveBeenCalledWith('PTY setup failed: scripted capture begin failure');
+    // The fresh session's claim on its directory is given back with the rest.
+    expect(anySessionClaimed()).toBe(false);
     errorSpy.mockRestore();
   });
 
@@ -189,7 +219,7 @@ describe('PTY early-initialization cleanup ownership', () => {
     await expect(
       runPtySession({
         config: { userConfig: { modelProviders: { default: 'native' } } } as never,
-        mode: { kind: 'docker', agent: 'claude-code' },
+        mode: { kind: 'docker', agent: 'claude-code' as AgentId },
         workspacePath: directory,
       }),
     ).rejects.toThrow(/scripted runtime verification failure/u);
@@ -197,5 +227,48 @@ describe('PTY early-initialization cleanup ownership', () => {
     expect(mitmStop).toHaveBeenCalledOnce();
     expect(proxyStop).toHaveBeenCalledOnce();
     expect(state.removeBundleRuntimeRoot).toHaveBeenCalledOnce();
+    expect(anySessionClaimed()).toBe(false);
+  });
+
+  it('claims the directory of every retried attempt and gives all of them back when the session ends', async () => {
+    // A rejected internal network makes runPtySession start the session again
+    // under a new ID; each attempt claims the directory it created, and every
+    // claim is held until the session has ended.
+    const errorSpy = vi.spyOn(logger, 'error').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const directory = mkdtempSync(join(tmpdir(), 'pty-cleanup-'));
+    directories.push(directory);
+    const sessionsDir = join(home, 'sessions');
+    const claimed = (): string[] =>
+      readdirSync(sessionsDir).filter((id) => existsSync(join(sessionsDir, id, 'resume.lock')));
+    const claimedPerAttempt: string[][] = [];
+    state.prepare = () => {
+      claimedPerAttempt.push(claimed());
+      return Promise.reject(
+        claimedPerAttempt.length === 1
+          ? new InternalNetworkConnectivityError('scripted unusable internal network', '10.200.0.0/24')
+          : new Error('scripted failure of the retried attempt'),
+      );
+    };
+
+    await expect(
+      runPtySession({
+        config: { userConfig: { modelProviders: { default: 'native' } } } as never,
+        mode: { kind: 'docker', agent: 'claude-code' as AgentId },
+        workspacePath: directory,
+      }),
+    ).rejects.toThrow(/scripted failure of the retried attempt/u);
+
+    expect(claimedPerAttempt).toHaveLength(2);
+    const [first, second] = claimedPerAttempt;
+    expect(first).toHaveLength(1);
+    expect(second).toHaveLength(2);
+    expect(second).toEqual(expect.arrayContaining(first));
+    expect(readdirSync(sessionsDir)).toHaveLength(2);
+    expect(anySessionClaimed()).toBe(false);
+    // The rejected network was logged as such before the retry.
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('retrying with another allocation (1/4)'));
+    errorSpy.mockRestore();
+    warnSpy.mockRestore();
   });
 });

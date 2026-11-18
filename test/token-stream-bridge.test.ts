@@ -547,6 +547,49 @@ describe('TokenStreamBridge', () => {
   });
 
   // -----------------------------------------------------------------------
+  // Backpressure (WEB-4): a stalled client misses batches, the rest do not
+  // -----------------------------------------------------------------------
+
+  describe('backpressure', () => {
+    function stalledWs(): WsWebSocket {
+      return { readyState: 1, bufferedAmount: 5 * 1024 * 1024 } as unknown as WsWebSocket;
+    }
+
+    it('leaves a client with a saturated send buffer out of the batch but keeps the others', () => {
+      const bridge = new TokenStreamBridge(sender);
+      const stalled = stalledWs();
+      const healthy = mockWs();
+      const sid = sessionId('sess-1');
+
+      bridge.addClient(stalled, 1, sid);
+      bridge.addClient(healthy, 1, sid);
+
+      bus.push(sid, textDelta('hello'));
+      vi.advanceTimersByTime(50);
+
+      expect(sender.calls).toHaveLength(1);
+      expect(sender.calls[0].clients.has(healthy)).toBe(true);
+      expect(sender.calls[0].clients.has(stalled)).toBe(false);
+      // The subscription itself is kept: the client receives again once drained.
+      expect(bridge.hasSubscription(stalled, 1)).toBe(true);
+    });
+
+    it('drops the batch entirely when every subscriber is backpressured', () => {
+      const bridge = new TokenStreamBridge(sender);
+      const sid = sessionId('sess-1');
+
+      bridge.addClient(stalledWs(), 1, sid);
+      bridge.registerSession(1, sid);
+      bridge.addGlobalClient(stalledWs());
+
+      bus.push(sid, textDelta('nobody can take this'));
+      vi.advanceTimersByTime(50);
+
+      expect(sender.calls).toHaveLength(0);
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // close (full bridge shutdown)
   // -----------------------------------------------------------------------
 

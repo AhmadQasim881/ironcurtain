@@ -31,7 +31,9 @@ function createMockState(): AppStateLike & { outputs: Map<number, OutputLine[]> 
     jobs: [],
     workflows: new Map(),
     pendingGates: new Map(),
+    pendingWorkflowEscalations: new Map(),
     personaCompiles: new Map(),
+    sessionNotices: new Map(),
     outputs,
     addOutput(label: number, line: OutputLine) {
       let existing = outputs.get(label) ?? [];
@@ -64,6 +66,7 @@ function createMockEffects(getPtySink: (label: number) => PtySink | undefined = 
     refreshWorkflowHistory: vi.fn(),
     refreshPersonas: vi.fn(),
     refreshConfig: vi.fn(),
+    resync: vi.fn(),
     assignDisplayNumber: vi.fn(() => ++displayNumberCounter),
     getPtySink: vi.fn(getPtySink),
   };
@@ -120,6 +123,83 @@ describe('handleEvent', () => {
     expect(state.outputs.has(1)).toBe(false);
   });
 
+  // FU-10 (08-07): the session view shows the notices a session reports.
+  describe('session.diagnostic', () => {
+    const unavailable = { kind: 'mcp_server_unavailable', serverName: 'github', reason: 'relay exited' };
+
+    it('retains a host-file warning after session teardown until the user dismisses it', () => {
+      const state = createMockState();
+      state.sessions.set(1, mockSession(1));
+      const notice = {
+        kind: 'host_privileged_files',
+        when: 'session end',
+        rootOwned: 1,
+        stripped: 0,
+        unstripped: 0,
+        unlisted: 0,
+        paths: ['/workspace/example'],
+        incomplete: false,
+        hint: 'Inspect the example file.',
+      };
+      handleEvent(state, createMockEffects(), 'session.diagnostic', { label: 1, event: notice });
+      handleEvent(state, createMockEffects(), 'session.ended', { label: 1 });
+
+      expect(state.retainedHostNotices).toEqual([expect.objectContaining({ label: 1, notice })]);
+      // A notice delivered after the session disappears still needs a visible home.
+      handleEvent(state, createMockEffects(), 'session.diagnostic', { label: 1, event: notice });
+      expect(state.retainedHostNotices).toHaveLength(1);
+    });
+
+    it("adds a start-up notice to the session's notices, once", () => {
+      const state = createMockState();
+      state.sessions.set(1, mockSession(1));
+
+      expect(handleEvent(state, createMockEffects(), 'session.diagnostic', { label: 1, event: unavailable })).toBe(
+        true,
+      );
+      handleEvent(state, createMockEffects(), 'session.diagnostic', { label: 1, event: unavailable });
+
+      expect(state.sessionNotices.get(1)?.map((entry) => entry.notice)).toEqual([unavailable]);
+      expect(state.sessionNotices.get(1)?.[0].dismissed).toBe(false);
+    });
+
+    it('ignores diagnostics that are not notices, and notices of a session the client does not list', () => {
+      const state = createMockState();
+      state.sessions.set(1, mockSession(1));
+
+      handleEvent(state, createMockEffects(), 'session.diagnostic', {
+        label: 1,
+        event: { kind: 'tool_call', toolName: 't', preview: 'p' },
+      });
+      handleEvent(state, createMockEffects(), 'session.diagnostic', { label: 9, event: unavailable });
+
+      expect(state.sessionNotices.size).toBe(0);
+    });
+
+    it("drops a session's notices when it ends", () => {
+      const state = createMockState();
+      state.sessions.set(1, mockSession(1));
+      handleEvent(state, createMockEffects(), 'session.diagnostic', { label: 1, event: unavailable });
+
+      handleEvent(state, createMockEffects(), 'session.ended', { label: 1 });
+
+      expect(state.sessionNotices.has(1)).toBe(false);
+    });
+
+    it("keeps a session's notices across its updates, and drops them when its label names another session", () => {
+      const state = createMockState();
+      state.sessions.set(1, mockSession(1));
+      handleEvent(state, createMockEffects(), 'session.diagnostic', { label: 1, event: unavailable });
+
+      handleEvent(state, createMockEffects(), 'session.updated', mockSession(1, { status: 'processing' }));
+      expect(state.sessionNotices.get(1)?.map((entry) => entry.notice)).toEqual([unavailable]);
+
+      // A restarted daemon numbers its sessions from 1 again.
+      handleEvent(state, createMockEffects(), 'session.created', mockSession(1, { createdAt: '2026-11-15T09:00:00Z' }));
+      expect(state.sessionNotices.has(1)).toBe(false);
+    });
+  });
+
   it('does not clear selection when a different session ends', () => {
     const state = createMockState();
     state.sessions.set(1, mockSession(1));
@@ -129,6 +209,59 @@ describe('handleEvent', () => {
     handleEvent(state, createMockEffects(), 'session.ended', { label: 1 });
 
     expect(state.selectedSessionLabel).toBe(2);
+  });
+
+  // WEB-10: a card must not outlive its session (the PTY exit path used to
+  // clear its pending map silently, leaving the card + badge until a reload).
+  it("drops the ended session's pending escalations on session.ended, keeping other sessions' cards", () => {
+    const state = createMockState();
+    state.sessions.set(1, mockSession(1, { source: { kind: 'web-pty' } }));
+    state.sessions.set(2, mockSession(2, { source: { kind: 'web-pty' } }));
+    const effects = createMockEffects();
+    const makeEsc = (escalationId: string, sessionLabel: number): EscalationDto => ({
+      escalationId,
+      sessionLabel,
+      sessionSource: { kind: 'web-pty' },
+      toolName: 'write_file',
+      serverName: 'filesystem',
+      arguments: { path: '/etc/hosts' },
+      reason: 'Protected path',
+      receivedAt: '2026-01-01T00:00:00Z',
+    });
+    handleEvent(state, effects, 'escalation.created', makeEsc('esc-s1-a', 1));
+    handleEvent(state, effects, 'escalation.created', makeEsc('esc-s1-b', 1));
+    handleEvent(state, effects, 'escalation.created', makeEsc('esc-s2', 2));
+    const before = state.pendingEscalations;
+
+    handleEvent(state, effects, 'session.ended', { label: 1, reason: 'pty_exited' });
+
+    expect(state.pendingEscalations.has('esc-s1-a')).toBe(false);
+    expect(state.pendingEscalations.has('esc-s1-b')).toBe(false);
+    expect(state.pendingEscalations.has('esc-s2')).toBe(true);
+    expect(state.pendingEscalations).not.toBe(before); // new Map so Svelte sees the change
+  });
+
+  it('leaves the pendingEscalations map untouched when the ended session had none', () => {
+    const state = createMockState();
+    state.sessions.set(1, mockSession(1));
+    state.sessions.set(2, mockSession(2));
+    const effects = createMockEffects();
+    handleEvent(state, effects, 'escalation.created', {
+      escalationId: 'esc-other',
+      sessionLabel: 2,
+      sessionSource: { kind: 'web' },
+      toolName: 'write_file',
+      serverName: 'filesystem',
+      arguments: {},
+      reason: 'r',
+      receivedAt: '2026-01-01T00:00:00Z',
+    } satisfies EscalationDto);
+    const before = state.pendingEscalations;
+
+    handleEvent(state, effects, 'session.ended', { label: 1 });
+
+    expect(state.pendingEscalations).toBe(before);
+    expect(state.pendingEscalations.has('esc-other')).toBe(true);
   });
 
   it('transitions session to processing and adds thinking line on session.thinking', () => {
@@ -378,6 +511,15 @@ describe('handleEvent', () => {
     expect(effects.refreshConfig).toHaveBeenCalledOnce();
   });
 
+  it('requests a full state refetch for daemon.resync (events were skipped under backpressure)', () => {
+    const state = createMockState();
+    const effects = createMockEffects();
+    const handled = handleEvent(state, effects, 'daemon.resync', { reason: 'backpressure' });
+    expect(handled).toBe(true);
+    expect(effects.resync).toHaveBeenCalledOnce();
+    expect(effects.refreshJobs).not.toHaveBeenCalled();
+  });
+
   it('returns false for unknown events', () => {
     const state = createMockState();
     const handled = handleEvent(state, createMockEffects(), 'unknown.event', {});
@@ -516,6 +658,52 @@ describe('handleEvent', () => {
       expect(state.pendingGates.size).toBe(1);
       expect(state.pendingGates.get('wf-1-plan_review')?.stateName).toBe('plan_review');
       expect(state.workflows.get('wf-1')?.phase).toBe('waiting_human');
+    });
+
+    it('replaces a stale gate for the same workflow on workflow.gate_raised', () => {
+      // Every raise has its own id. If the dismissal of the earlier raise was
+      // missed (disconnect), the new raise must evict it: a workflow waits at
+      // one gate at a time, and a stale entry would be selectable for review.
+      const state = createMockState();
+      state.pendingGates = new Map([
+        [
+          'wf-1-plan_review-1-aaaa',
+          {
+            gateId: 'wf-1-plan_review-1-aaaa',
+            workflowId: 'wf-1',
+            stateName: 'plan_review',
+            acceptedEvents: ['APPROVE'],
+            presentedArtifacts: [],
+            summary: 'Visit 1',
+          },
+        ],
+        [
+          'wf-2-review-1-cccc',
+          {
+            gateId: 'wf-2-review-1-cccc',
+            workflowId: 'wf-2',
+            stateName: 'review',
+            acceptedEvents: ['APPROVE'],
+            presentedArtifacts: [],
+            summary: 'Other workflow',
+          },
+        ],
+      ]);
+
+      handleEvent(state, createMockEffects(), 'workflow.gate_raised', {
+        workflowId: 'wf-1',
+        gate: {
+          gateId: 'wf-1-plan_review-2-bbbb',
+          workflowId: 'wf-1',
+          stateName: 'plan_review',
+          acceptedEvents: ['APPROVE', 'FORCE_REVISION'],
+          presentedArtifacts: ['plan'],
+          summary: 'Visit 2',
+        },
+      });
+
+      expect([...state.pendingGates.keys()].sort()).toEqual(['wf-1-plan_review-2-bbbb', 'wf-2-review-1-cccc']);
+      expect(state.pendingGates.get('wf-1-plan_review-2-bbbb')?.summary).toBe('Visit 2');
     });
 
     it('removes gate on workflow.gate_dismissed', () => {
@@ -877,10 +1065,10 @@ describe('handleEvent', () => {
       const state = createMockState();
       handleEvent(state, createMockEffects(), 'workflow.started', {
         workflowId: 'wf-task',
-        name: 'vuln-discovery',
-        taskDescription: 'Investigate the auth bypass report',
+        name: 'design-and-code',
+        taskDescription: 'Add calendar import support',
       });
-      expect(state.workflows.get('wf-task')?.taskDescription).toBe('Investigate the auth bypass report');
+      expect(state.workflows.get('wf-task')?.taskDescription).toBe('Add calendar import support');
     });
 
     it('captures error string from workflow.failed onto the summary', () => {

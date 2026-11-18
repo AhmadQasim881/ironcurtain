@@ -1,4 +1,5 @@
 import { buildCodexModelCatalog } from './codex-model-catalog.js';
+import { mcpClientCommand, MCP_TCP_TOKEN_ENV } from '../mcp-client-command.js';
 import { gatewayProfile, resolveResponsesClient, resolveGatewayCommandModel } from '../../config/gateway-client.js';
 import { gatewayProviders, gatewayCredential, gatewaySentinel } from '../gateway-runtime.js';
 /**
@@ -7,23 +8,35 @@ import { gatewayProviders, gatewayCredential, gatewaySentinel } from '../gateway
  * Runs OpenAI Codex CLI non-interactively through the same container,
  * MCP proxy, and MITM fake-token path as other Docker agents. The adapter
  * uses Codex's ChatGPT OAuth/access-token flow, not OPENAI_API_KEY.
+ *
+ * Conversation continuity: Codex mints its own thread id (reported by the
+ * `thread.started` event of `exec --json`) rather than accepting ours. The
+ * first turn of a conversation runs `codex exec <prompt>`; `extractResponse`
+ * reports the thread as `agentThreadId`, the session records it against its
+ * agent conversation id, and later turns run `codex exec resume <thread>
+ * <message>`. Never `--last`: workflow states that share a container share
+ * `~/.codex`. A PTY resume runs `codex resume <thread>` for the most recently
+ * active rollout of that session's own state directory.
  */
 
 import type {
   AgentAdapter,
+  AgentCommandOptions,
   AgentConfigFile,
   AgentId,
   AgentResponse,
   ConversationStateConfig,
   OrientationContext,
+  TransientFailureKind,
 } from '../agent-adapter.js';
 import type { DockerAuthKind, IronCurtainConfig } from '../../config/types.js';
 import type { ProviderConfig } from '../provider-config.js';
 import type { AuthMethod } from '../oauth-credentials.js';
-import type { ResolvedUserConfig } from '../../config/user-config.js';
+import { normalizeCodexThreadId, PTY_RESUME_ID_ENV } from '../conversation-state.js';
 import { buildSystemPrompt } from '../../session/prompts.js';
 import { codexAuthProvider, codexChatGptProvider } from '../provider-config.js';
 import { CONTAINER_RUNTIME_CA_BUNDLE, CONTAINER_RUNTIME_CA_CERT } from '../runtime-trust.js';
+import { CODEX_CLI_VERSION } from '../agent-cli-version.js';
 import { loadCodexOAuthCredentials } from '../oauth-credentials.js';
 import { parseModelId } from '../../config/model-id.js';
 import {
@@ -36,6 +49,23 @@ import {
 } from './shared-scripts.js';
 
 const CODEX_IMAGE = 'ironcurtain-codex:latest';
+
+/**
+ * Codex CLI version installed by `docker/Dockerfile.codex` (`ARG CODEX_VERSION`,
+ * recorded as {@link CODEX_CLI_VERSION}). The native provider binding sends it
+ * as the built-in provider's `version` header; a test ties the two together,
+ * so bump them together.
+ */
+export const CODEX_CLIENT_VERSION = CODEX_CLI_VERSION.pinned;
+
+/**
+ * Provider id of the native ChatGPT binding. Codex refuses a config that
+ * redefines one of its built-in providers ("model_providers contains reserved
+ * built-in provider IDs: `lmstudio`, `ollama`, `openai`"), so the binding that
+ * stands in for the built-in `openai` provider needs an id of its own.
+ */
+export const CODEX_NATIVE_PROVIDER_ID = 'ironcurtain-chatgpt';
+
 const CODEX_FAKE_ID_TOKEN =
   'eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.' +
   'eyJlbWFpbCI6Imlyb25jdXJ0YWluQGV4YW1wbGUuaW52YWxpZCIsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X3BsYW5fdHlwZSI6InBybyIsImNoYXRncHRfdXNlcl9pZCI6Imlyb25jdXJ0YWluLXVzZXIiLCJjaGF0Z3B0X2FjY291bnRfaWQiOiJpcm9uY3VydGFpbi1hY2NvdW50IiwiY2hhdGdwdF9hY2NvdW50X2lzX2ZlZHJhbXAiOmZhbHNlfX0.' +
@@ -78,44 +108,123 @@ fi
 # in one argv element even when it contains quotes or newlines.
 DEVELOPER_INSTRUCTIONS=$(node -e 'process.stdout.write(JSON.stringify(process.env.IRONCURTAIN_SYSTEM_PROMPT || ""))')
 
+# On resume the host names the thread to continue (the session's most recently
+# active rollout, a validated UUID). If Codex cannot resume it, start fresh.
+if [ -n "$${PTY_RESUME_ID_ENV}" ]; then
+  codex --ask-for-approval never --sandbox danger-full-access -c "developer_instructions=$DEVELOPER_INSTRUCTIONS" "\${MODEL_ARGS[@]}" --cd /workspace resume "$${PTY_RESUME_ID_ENV}"
+  STATUS=$?
+  if [ $STATUS -eq 0 ]; then
+    exit 0
+  fi
+fi
+
 exec codex --ask-for-approval never --sandbox danger-full-access -c "developer_instructions=$DEVELOPER_INSTRUCTIONS" "\${MODEL_ARGS[@]}" --cd /workspace
 `;
 }
 
-/** Root model keys precede TOML tables; gateway provider/capability data arrives through client bindings. */
-function buildCodexToml(connectTarget: string, client: ReturnType<typeof resolveResponsesClient> | undefined): string {
-  const rootKeys = ['cli_auth_credentials_store = "file"', 'project_doc_fallback_filenames = ["CLAUDE.md"]'];
-  const gatewayRootKeys = client
-    ? [
-        `model = ${tomlString(client.model)}`,
-        `model_provider = ${tomlString(client.route.id)}`,
-        ...(client.catalogModels
-          ? [`model_catalog_json = ${tomlString(`/etc/ironcurtain/${client.route.id}-models.json`)}`]
-          : []),
-      ]
-    : [];
-  const gatewayProviderTable = client
-    ? [
-        '',
-        `[model_providers.${client.route.id}]`,
-        `name = ${tomlString(client.route.label)}`,
-        `base_url = ${tomlString(client.route.baseUrl)}`,
-        `env_key = ${tomlString(client.credentialEnv)}`,
-        'wire_api = "responses"',
-        ...(client.webSockets === undefined ? [] : [`supports_websockets = ${String(client.webSockets)}`]),
-      ]
-    : [];
+type ResponsesClient = ReturnType<typeof resolveResponsesClient>;
+
+/** A `[model_providers.<id>]` table and the root keys that select it. */
+interface CodexProviderBinding {
+  readonly id: string;
+  readonly rootKeys: readonly string[];
+  readonly fields: readonly string[];
+}
+
+/**
+ * Native ChatGPT route. Codex's built-in `openai` provider talks Responses over
+ * a WebSocket (`wss://chatgpt.com/backend-api/codex/responses`) and falls back
+ * to POST + SSE only after its handshake retries fail. The MITM never bridges
+ * WebSockets on provider hosts (see the inner `upgrade` listener in
+ * mitm-proxy.ts), so every `codex exec` turn spent about 7 s on failed
+ * handshakes before its first request. This binding reproduces the built-in
+ * provider as Codex 0.157.1 defines it, with WebSockets off: the same name,
+ * Responses wire API, ChatGPT login (`requires_openai_auth`) and `version`
+ * header, and no `base_url`, so Codex still derives the ChatGPT backend URL
+ * from the login mode. Left out: the `OPENAI_ORGANIZATION`/`OPENAI_PROJECT`
+ * header variables, which the container never sets, and
+ * `supports_standalone_web_search`, which IronCurtain does not need because
+ * web search is disabled (see `buildCodexToml`).
+ *
+ * Codex lists resumable sessions per provider id, so its own resume picker
+ * does not offer sessions recorded under the built-in id. IronCurtain never
+ * resumes Codex sessions.
+ */
+function nativeProviderBinding(): CodexProviderBinding {
+  return {
+    id: CODEX_NATIVE_PROVIDER_ID,
+    rootKeys: [`model_provider = ${tomlString(CODEX_NATIVE_PROVIDER_ID)}`],
+    fields: [
+      'name = "OpenAI"',
+      'wire_api = "responses"',
+      'requires_openai_auth = true',
+      `http_headers = { version = ${tomlString(CODEX_CLIENT_VERSION)} }`,
+    ],
+  };
+}
+
+/** Built-in gateway route: provider and capability data arrive through the client binding. */
+function gatewayProviderBinding(client: ResponsesClient): CodexProviderBinding {
+  return {
+    id: client.route.id,
+    rootKeys: [
+      `model = ${tomlString(client.model)}`,
+      `model_provider = ${tomlString(client.route.id)}`,
+      ...(client.catalogModels
+        ? [`model_catalog_json = ${tomlString(`/etc/ironcurtain/${client.route.id}-models.json`)}`]
+        : []),
+    ],
+    fields: [
+      `name = ${tomlString(client.route.label)}`,
+      `base_url = ${tomlString(client.route.baseUrl)}`,
+      `env_key = ${tomlString(client.credentialEnv)}`,
+      'wire_api = "responses"',
+    ],
+  };
+}
+
+/**
+ * Root keys precede TOML tables: a key after a table header belongs to that table.
+ *
+ * `web_search = "disabled"`: Codex enables the provider-hosted `web_search`
+ * tool by default (live search under `danger-full-access`), which would let
+ * the provider browse for the agent outside the MCP policy engine. The MITM's
+ * openai-responses sanitizer strips the tool on every route regardless (the
+ * agent can edit this file); disabling it here keeps Codex from offering the
+ * model a tool that would only be removed in flight.
+ *
+ * `supports_websockets = false` on every route: the MITM refuses WebSocket
+ * upgrades on provider hosts instead of bridging them, because the request
+ * sanitizers, credential gate, trajectory capture, token stream and LLM metrics
+ * all work on HTTP requests and SSE responses. With the key off, Codex sends
+ * each turn as POST + SSE at once instead of first failing handshakes. Codex
+ * 0.157.1 already defaults a custom provider to `false`; the explicit key keeps
+ * the binding from depending on that default. The agent can edit this file;
+ * the proxy still refuses any upgrade it then attempts.
+ */
+function buildCodexToml(connectTarget: string, client: ResponsesClient | undefined): string {
+  const transport = mcpClientCommand(connectTarget);
+  const rootKeys = [
+    'cli_auth_credentials_store = "file"',
+    'project_doc_fallback_filenames = ["CLAUDE.md"]',
+    'web_search = "disabled"',
+  ];
+  const provider = client ? gatewayProviderBinding(client) : nativeProviderBinding();
   return [
-    ...gatewayRootKeys,
+    ...provider.rootKeys,
     ...rootKeys,
     '',
     '[projects."/workspace"]',
     'trust_level = "trusted"',
-    ...gatewayProviderTable,
+    '',
+    `[model_providers.${provider.id}]`,
+    ...provider.fields,
+    'supports_websockets = false',
     '',
     '[mcp_servers.ironcurtain]',
-    'command = "socat"',
-    `args = ["STDIO", ${tomlString(connectTarget)}]`,
+    `command = ${tomlString(transport.command)}`,
+    `args = [${transport.args.map(tomlString).join(', ')}]`,
+    ...(transport.tcp ? [`env_vars = [${tomlString(MCP_TCP_TOKEN_ENV)}]`] : []),
     'startup_timeout_sec = 20',
     'tool_timeout_sec = 600',
     'default_tools_approval_mode = "auto"',
@@ -124,19 +233,17 @@ function buildCodexToml(connectTarget: string, client: ReturnType<typeof resolve
 }
 
 /**
- * @param userConfig - Resolved user config, accepted for factory-signature
- *   symmetry with the other adapters (m3). Codex reads no non-profile field
- *   from it today; the ACTIVE PROFILE is read from the per-session stamped
- *   `config.activeProviderProfile` at method-call time, never captured here
- *   (§9 F1 — a factory-captured profile would leak across the process-global
- *   registry's cached instance).
+ * Creates the Codex adapter. It takes no configuration: everything
+ * session-specific (the active provider profile, the agent model) is read
+ * from the per-session `config` or the `buildCommand` options at call time,
+ * never captured here. The registry keeps one adapter instance per process,
+ * and a daemon serves many sessions, each with freshly loaded config (§9 F1).
  */
-// eslint-disable-next-line @typescript-eslint/no-unused-vars -- userConfig kept for factory-signature symmetry (m3)
-export function createCodexAdapter(userConfig?: ResolvedUserConfig): AgentAdapter {
+export function createCodexAdapter(): AgentAdapter {
   return {
     id: 'codex' as AgentId,
     displayName: 'Codex CLI',
-    credentialHelpText:
+    credentialHelpText: () =>
       'No Codex OAuth credentials found. Run `codex login` on the host; OPENAI_API_KEY is not required.',
 
     // eslint-disable-next-line @typescript-eslint/require-await -- interface requires Promise return
@@ -144,14 +251,16 @@ export function createCodexAdapter(userConfig?: ResolvedUserConfig): AgentAdapte
       return CODEX_IMAGE;
     },
 
-    generateMcpConfig(socketPath: string, config: IronCurtainConfig): AgentConfigFile[] {
-      const isTcp = socketPath.includes(':');
-      const connectTarget = isTcp ? `TCP:${socketPath}` : `UNIX-CONNECT:${socketPath}`;
+    // `codex --version` prints `codex-cli <version>`; infra prep checks it
+    // against the qualified range once per image build.
+    versionProbe: ['codex', '--version'],
+    cliVersion: CODEX_CLI_VERSION,
 
+    generateMcpConfig(socketPath: string, config: IronCurtainConfig): AgentConfigFile[] {
       const profile = gatewayProfile(config.activeProviderProfile);
       const client = profile ? resolveResponsesClient(profile, config.agentModelId) : undefined;
       return [
-        { path: 'codex-config.toml', content: buildCodexToml(connectTarget, client) },
+        { path: 'codex-config.toml', content: buildCodexToml(socketPath, client) },
         ...(client?.catalogModels
           ? [
               {
@@ -171,23 +280,30 @@ export function createCodexAdapter(userConfig?: ResolvedUserConfig): AgentAdapte
       ];
     },
 
-    buildCommand(
-      message: string,
-      systemPrompt: string,
-      options: {
-        readonly sessionId: string;
-        readonly firstTurn: boolean;
-        readonly modelOverride?: string;
-        readonly providerProfile?: import('../../config/user-config.js').ResolvedProviderProfile;
-      },
-    ): readonly string[] {
-      const prompt = `${systemPrompt}\n\n---\n\nUser request:\n${message}`;
+    /**
+     * First turn: `codex ... exec --json ... <system prompt + message>`.
+     * Later turns, once a thread was recorded for this conversation:
+     * `codex ... exec --json ... resume -- <thread> <message>`. The exec
+     * options precede `resume` (they belong to `exec`), and the resumed thread
+     * already holds the orientation from its first turn, so only the message
+     * is sent. `--` keeps a message that starts with `-` from being parsed as
+     * an option (the first-turn prompt always starts with the system prompt).
+     * Without a recorded thread a later turn starts a new thread with the
+     * full prompt; it never resumes `--last`.
+     */
+    buildCommand(message: string, systemPrompt: string, options: AgentCommandOptions): readonly string[] {
+      const resumeThread = options.firstTurn ? undefined : normalizeCodexThreadId(options.agentThreadId);
       const cmd = ['codex', '--ask-for-approval', 'never', '--sandbox', 'danger-full-access'];
       if (options.modelOverride) {
         const selected = parseModelId(options.modelOverride).modelId;
         cmd.push('--model', resolveGatewayCommandModel(options.providerProfile, selected, 'codex') ?? selected);
       }
-      cmd.push('exec', '--json', '--skip-git-repo-check', '--cd', '/workspace', prompt);
+      cmd.push('exec', '--json', '--skip-git-repo-check', '--cd', '/workspace');
+      if (resumeThread !== undefined) {
+        cmd.push('resume', '--', resumeThread, message);
+      } else {
+        cmd.push(`${systemPrompt}\n\n---\n\nUser request:\n${message}`);
+      }
       return cmd;
     },
 
@@ -235,56 +351,55 @@ export function createCodexAdapter(userConfig?: ResolvedUserConfig): AgentAdapte
     },
 
     /**
-     * NOTE on quota / transient-failure handling and the assumed Codex
-     * envelope schema.
+     * Parses the `exec --json` JSONL stream (see `scanCodexEvents`): the last
+     * `agent_message` is the response, and `thread.started` names the thread
+     * (reported as `agentThreadId` on every outcome, so a later turn can
+     * resume a thread whose turn failed).
      *
-     * Codex `exec --json` emits a JSONL event stream, one JSON object per
-     * line. The happy path carries `item.completed` events whose `item.type`
-     * is `agent_message` (the model's text). We CANNOT confirm Codex's exact
-     * failure-event schema from the repo, so detection is intentionally
-     * conservative and generic (see `scanCodexEvents`):
-     *
-     *   - A top-level event is treated as a failure when its `type` ends in
-     *     `.failed` (e.g. `turn.failed`) or equals `error`, OR when its
-     *     `item.type` is `error`. We pull a human-readable message from the
-     *     event's / item's `error.message`, `message`, or `text` field.
-     *   - From that failure message (plus the non-zero-exit stderr/stdout on
-     *     the error path), `withFailureSignal` does narrow, string-based
-     *     matching: a rate-limit / usage-limit / quota / HTTP-429 hit sets
-     *     `quotaExhausted` (the orchestrator pauses-and-resumes instead of
-     *     burning the run); anything else error-shaped sets a transient
-     *     `degenerate_response` failure.
-     *
-     * Detection is deliberately narrow so it cannot misfire on normal
-     * output: the happy-path return value below is byte-identical to the
-     * previous implementation (last `agent_message`, else raw stdout). See
-     * the Claude Code adapter (`adapters/claude-code.ts`) for the canonical
-     * contract and `AgentResponse.quotaExhausted` / `transientFailure` in
-     * `../agent-adapter.ts` for the interface requirement.
+     * Failure classification (quota / transient, see `AgentResponse`) reads
+     * only the structured failure events and stderr, never the transcript:
+     * agent messages and command output can say anything, including "429" or
+     * "quota". The turn's own `turn.failed` events decide when present; other
+     * failure-shaped events (top-level `error` events, which include Codex's
+     * retry notices, and `error` items) only when the turn did not report one.
+     * Each signal needs an explicit marker (`classifyCodexFailure`): quota
+     * needs HTTP 429 or a provider quota code, `upstream_5xx` an explicit 5xx
+     * status, `upstream_api_error` a recognized stream or connection failure
+     * after Codex's own retries. Anything else is left unclassified, and a
+     * run that wrote nothing to stdout is a `hardFailure` (the orchestrator
+     * retries it on a fresh conversation), matching the Claude Code adapter.
+     * `degenerate_response` keeps its documented meaning and is not used here.
      */
-    extractResponse(exitCode: number, stdout: string, stderr?: string): AgentResponse {
+    extractResponse(exitCode: number, stdout: string, stderr = ''): AgentResponse {
       const clean = stdout.trim();
       const scan = scanCodexEvents(clean);
+      const thread: Pick<AgentResponse, 'agentThreadId'> =
+        scan.threadId === undefined ? {} : { agentThreadId: scan.threadId };
 
+      if (exitCode === 0 && scan.finalMessage !== null) {
+        return { text: scan.finalMessage, ...thread };
+      }
+
+      const signal = classifyCodexFailure(scan, stderr);
+      const classified = signal.quotaExhausted !== undefined || signal.transientFailure !== undefined;
+      const hardFailure = clean.length === 0 && !classified;
+
+      let text: string;
       if (exitCode !== 0) {
-        const errorOutput = [clean, stderr?.trim()].filter((part) => part && part.length > 0).join('\n\n');
-        const baseText = `Codex exited with code ${exitCode}.\n\nOutput:\n${errorOutput}`;
-        // Combine any in-band failure message with the raw error output so a
-        // 429 surfaced either in-band OR only in stderr/stdout is detected.
-        const probe = [scan.errorMessage, clean, stderr].filter((p) => p && p.length > 0).join('\n');
-        return withFailureSignal({ text: baseText }, probe);
+        const errorOutput = [clean, stderr.trim()].filter((part) => part.length > 0).join('\n\n');
+        text = `Codex exited with code ${exitCode}.\n\nOutput:\n${errorOutput}`;
+      } else if (scan.failureMessage !== null) {
+        // Exit 0 without a final message: describe the failure instead of
+        // dumping a raw JSONL line.
+        text = `Codex reported an error:\n\n${scan.failureMessage}`;
+      } else if (clean.length === 0) {
+        text =
+          'Codex exited without producing output. Check the session log for startup failures ' +
+          '(for example, exhausted Docker storage).';
+      } else {
+        text = clean;
       }
-
-      // Exit 0: prefer the model's final message. If none is present but the
-      // stream carried a failure event, describe the failure (and attach the
-      // structured signal) instead of dumping a raw JSONL line.
-      if (scan.finalMessage) {
-        return { text: scan.finalMessage };
-      }
-      if (scan.errorMessage) {
-        return withFailureSignal({ text: `Codex reported an error:\n\n${scan.errorMessage}` }, scan.errorMessage);
-      }
-      return { text: clean };
+      return { text, ...thread, ...signal, ...(hardFailure ? { hardFailure: true } : {}) };
     },
 
     buildPtyCommand(
@@ -327,36 +442,53 @@ export function createCodexAdapter(userConfig?: ResolvedUserConfig): AgentAdapte
           { path: 'sessions/', content: '' },
           { path: 'logs/', content: '' },
         ],
+        // PTY resume goes by thread id (IRONCURTAIN_RESUME_ID), not by flag.
         resumeFlags: [],
+        transcriptLayout: 'codex-rollouts',
       };
     },
   };
 }
 
+/** One structured failure event of the Codex JSONL stream. */
+interface CodexFailure {
+  /** Human-readable message, for the response text and diagnostics. */
+  readonly message: string;
+  /** The message plus any explicit status / code fields, for classification only. */
+  readonly probe: string;
+}
+
 /**
  * Result of a single pass over the Codex JSONL event stream.
- *
- * `finalMessage` is the last `agent_message` text (the happy path).
- * `errorMessage` is the first failure/error message detected, if any.
  */
 interface CodexScanResult {
+  /** The last `agent_message` text (the happy path). */
   readonly finalMessage: string | null;
-  readonly errorMessage: string | null;
+  /** The validated `thread_id` of the first `thread.started` event. */
+  readonly threadId: string | undefined;
+  /** `turn.failed` (any `*.failed`) events: the turn's own terminal failure. */
+  readonly turnFailures: readonly CodexFailure[];
+  /** Top-level `error` events (fatal errors and retry notices) and `error` items. */
+  readonly otherFailures: readonly CodexFailure[];
+  /** The message to show: the last turn failure, else the last other failure. */
+  readonly failureMessage: string | null;
 }
 
 /**
  * Single-pass scan over the Codex `exec --json` JSONL stream.
  *
- * Collects the last `agent_message` text and the first detected
- * failure/error message. Malformed/truncated lines are skipped (the JSONL
- * stream can be truncated when a process is killed), so a valid
- * `agent_message` on a later line is still recovered.
+ * Collects the last `agent_message` text, the thread id, and the structured
+ * failure events. Malformed/truncated lines are skipped (the JSONL stream can
+ * be truncated when a process is killed), so a valid `agent_message` on a
+ * later line is still recovered. Only top-level event fields are read as
+ * failure signals; model text and command output live inside items and are
+ * never classified.
  */
 function scanCodexEvents(stdout: string): CodexScanResult {
-  if (stdout.length === 0) return { finalMessage: null, errorMessage: null };
-
   let lastAgentMessage: string | null = null;
-  let errorMessage: string | null = null;
+  let threadId: string | undefined;
+  const turnFailures: CodexFailure[] = [];
+  const otherFailures: CodexFailure[] = [];
 
   for (const line of stdout.split(/\r?\n/)) {
     if (line.trim().length === 0) continue;
@@ -366,47 +498,48 @@ function scanCodexEvents(stdout: string): CodexScanResult {
     } catch {
       continue;
     }
-    if (!parsed || typeof parsed !== 'object') continue;
-    const event = parsed as Record<string, unknown>;
-
-    const item = event.item && typeof event.item === 'object' ? (event.item as Record<string, unknown>) : undefined;
+    if (!isRecord(parsed)) continue;
+    const event = parsed;
+    const eventType = typeof event.type === 'string' ? event.type : undefined;
+    const item = isRecord(event.item) ? event.item : undefined;
 
     if (item && item.type === 'agent_message' && typeof item.text === 'string') {
       lastAgentMessage = item.text;
     }
 
-    if (errorMessage === null) {
-      errorMessage = extractCodexErrorMessage(event, item);
+    if (eventType === 'thread.started' && threadId === undefined) {
+      threadId = normalizeCodexThreadId(event.thread_id);
+    }
+
+    if (eventType !== undefined && eventType.endsWith('.failed')) {
+      turnFailures.push(describeCodexFailure(event, eventType));
+    } else if (eventType === 'error') {
+      otherFailures.push(describeCodexFailure(event, eventType));
+    } else if (item !== undefined && item.type === 'error') {
+      otherFailures.push(describeCodexFailure(item, 'error item'));
     }
   }
 
-  return { finalMessage: lastAgentMessage?.trim() || null, errorMessage };
+  const failureMessage = (turnFailures.at(-1) ?? otherFailures.at(-1))?.message ?? null;
+  return { finalMessage: lastAgentMessage?.trim() || null, threadId, turnFailures, otherFailures, failureMessage };
 }
 
-/**
- * Recognizes a Codex failure/error envelope generically (the exact schema
- * is not confirmable from the repo): a top-level `type` ending in `.failed`
- * or equal to `error`, or an item whose `type` is `error`. Returns a
- * best-effort human-readable message, or null when the event is not a
- * failure shape.
- */
-function extractCodexErrorMessage(
-  event: Record<string, unknown>,
-  item: Record<string, unknown> | undefined,
-): string | null {
-  const eventType = typeof event.type === 'string' ? event.type : undefined;
-  const isEventFailure = eventType !== undefined && (eventType.endsWith('.failed') || eventType === 'error');
-  const isItemFailure = item !== undefined && item.type === 'error';
-  if (!isEventFailure && !isItemFailure) return null;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
 
-  return pickErrorMessage(event) ?? (item ? pickErrorMessage(item) : undefined) ?? eventType ?? 'unknown Codex error';
+/** Message and classification probe of one failure-shaped object (event or item). */
+function describeCodexFailure(obj: Record<string, unknown>, fallback: string): CodexFailure {
+  const message = pickErrorMessage(obj) ?? fallback;
+  const structured = describeStructuredFailureFields(obj, 0);
+  return { message, probe: [message, ...structured].join('\n') };
 }
 
 /** Pulls a message string from an `error.message` / `message` / `text` field. */
 function pickErrorMessage(obj: Record<string, unknown>): string | undefined {
   const nested = obj.error;
-  if (nested && typeof nested === 'object') {
-    const msg = (nested as Record<string, unknown>).message;
+  if (isRecord(nested)) {
+    const msg = nested.message;
     if (typeof msg === 'string' && msg.length > 0) return msg;
   }
   if (typeof obj.message === 'string' && obj.message.length > 0) return obj.message;
@@ -414,31 +547,102 @@ function pickErrorMessage(obj: Record<string, unknown>): string | undefined {
   return undefined;
 }
 
-/** Narrow, case-insensitive substring matches for upstream quota/rate-limit. */
-const QUOTA_PROBE_PATTERNS: readonly RegExp[] = [
-  /\b429\b/,
-  /rate.?limit/i,
-  /usage.?limit/i,
-  /\bquota\b/i,
-  /too many requests/i,
+/** Fields that carry an HTTP status on a failure object. */
+const STATUS_FIELDS = ['status', 'status_code', 'statusCode', 'http_status_code', 'httpStatusCode'] as const;
+/** Fields that carry a provider or Codex error code (a string, or an enum object keyed by variant). */
+const CODE_FIELDS = ['code', 'error_code', 'codex_error_info', 'codexErrorInfo'] as const;
+
+/**
+ * Renders the explicit status and code fields of a failure object, if the
+ * Codex release emits any, as `HTTP status <n>` / `error code <code>` lines
+ * so the same explicit patterns classify them as the message text. Looks two
+ * levels deep at most (the nested `error` object, an enum object's payload).
+ */
+function describeStructuredFailureFields(obj: Record<string, unknown>, depth: number): string[] {
+  const lines: string[] = [];
+  for (const field of STATUS_FIELDS) {
+    const value = obj[field];
+    if (typeof value === 'number' && Number.isInteger(value)) lines.push(`HTTP status ${value}`);
+  }
+  for (const field of CODE_FIELDS) {
+    const value = obj[field];
+    if (typeof value === 'string') {
+      lines.push(`error code ${value}`);
+    } else if (isRecord(value) && depth < 2) {
+      for (const [variant, payload] of Object.entries(value)) {
+        lines.push(`error code ${variant}`);
+        if (isRecord(payload)) lines.push(...describeStructuredFailureFields(payload, depth + 1));
+      }
+    }
+  }
+  const nested = obj.error;
+  if (isRecord(nested) && depth < 2) {
+    if (typeof nested.type === 'string') lines.push(`error code ${nested.type}`);
+    lines.push(...describeStructuredFailureFields(nested, depth + 1));
+  }
+  return lines;
+}
+
+/**
+ * Quota exhaustion needs an explicit marker: HTTP 429 as a status (Codex
+ * renders `unexpected status 429 Too Many Requests: ...` and `exceeded retry
+ * limit, last status: 429 ...`; explicit status fields render as `HTTP status
+ * 429`), its reason phrase, a provider quota code, or the text Codex itself
+ * renders for a `usage_limit_reached` / `insufficient_quota` response. A bare
+ * 429 is not a status: a 400 response naming `input[429]`, a file name or a
+ * token count in an error or log line must not pause a workflow as if its
+ * quota were spent. The words "quota", "rate limit" or "usage limit" alone are
+ * not enough either.
+ */
+const QUOTA_PATTERNS: readonly RegExp[] = [
+  /(?:status(?:[ _]?code)?|\bhttp|\bcode)["']?\s?[:=]?\s?429\b/iu,
+  /\btoo many requests\b/iu,
+  /\b(?:rate_limit_exceeded|rate_limit_error|insufficient_quota|usage_limit_reached|usage_limit_exceeded|resource_exhausted)\b/iu,
+  /\byou['’]ve hit your usage limit\b/iu,
+  /\bquota exceeded\. check your plan and billing details\b/iu,
+];
+
+/** An explicit HTTP 5xx status ("last status: 503", "unexpected status 500 ...", "502 Bad Gateway"). */
+const UPSTREAM_5XX_PATTERNS: readonly RegExp[] = [
+  /\bstatus:? 5\d\d\b/iu,
+  /\b5\d\d (?:internal server error|bad gateway|service unavailable|gateway timeout)\b/iu,
+];
+
+/** Codex's renderings of a provider stream or connection that failed after its own retries. */
+const UPSTREAM_API_ERROR_PATTERNS: readonly RegExp[] = [
+  /\bstream disconnected before completion\b/iu,
+  /\bexceeded retry limit\b/iu,
+  /\berror sending request for url\b/iu,
+  /\bconnection failed:/iu,
 ];
 
 /**
- * Best-effort classification of a Codex error string into a structured
- * signal. Quota / rate-limit / 429 hits map to `quotaExhausted`; any other
- * non-empty error string maps to a transient `degenerate_response`.
- * Returns the response unchanged when `probe` is empty.
- *
- * Detection is intentionally string-based and narrow so it cannot misfire
- * on normal model output (only reached when a failure event was detected or
- * the process exited non-zero).
+ * Classify a failed Codex run from its structured failure events and stderr
+ * only. `turn.failed` decides when the turn reported one; otherwise the other
+ * failure events do. Precedence follows the Claude Code adapter: quota, then
+ * an explicit 5xx, then a recognized stream / connection failure. Returns no
+ * signal for anything unrecognized.
  */
-function withFailureSignal(response: AgentResponse, probe: string): AgentResponse {
-  const trimmed = probe.trim();
-  if (trimmed.length === 0) return response;
+function classifyCodexFailure(
+  scan: CodexScanResult,
+  stderr: string,
+): Pick<AgentResponse, 'quotaExhausted' | 'transientFailure'> {
+  const failures = scan.turnFailures.length > 0 ? scan.turnFailures : scan.otherFailures;
+  const stderrText = stderr.trim();
+  const probe = [...failures.map((failure) => failure.probe), stderrText].filter((part) => part.length > 0).join('\n');
+  if (probe.length === 0) return {};
+  const described = [...failures.map((failure) => failure.message), stderrText]
+    .filter((part) => part.length > 0)
+    .join('\n');
+  const rawMessage = described.length > 0 ? described : probe;
 
-  if (QUOTA_PROBE_PATTERNS.some((re) => re.test(trimmed))) {
-    return { ...response, quotaExhausted: { rawMessage: trimmed } };
+  if (QUOTA_PATTERNS.some((pattern) => pattern.test(probe))) {
+    return { quotaExhausted: { rawMessage } };
   }
-  return { ...response, transientFailure: { kind: 'degenerate_response', rawMessage: trimmed } };
+  const transient = (kind: TransientFailureKind): Pick<AgentResponse, 'transientFailure'> => ({
+    transientFailure: { kind, rawMessage },
+  });
+  if (UPSTREAM_5XX_PATTERNS.some((pattern) => pattern.test(probe))) return transient('upstream_5xx');
+  if (UPSTREAM_API_ERROR_PATTERNS.some((pattern) => pattern.test(probe))) return transient('upstream_api_error');
+  return {};
 }

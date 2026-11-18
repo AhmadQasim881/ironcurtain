@@ -20,6 +20,8 @@ const repositoryMocks = vi.hoisted(() => {
     queuedRecords: 0,
     queuedBytes: 0,
     lastError: null,
+    writerRestarts: 0,
+    invalidByReason: {},
     readerState: 'idle',
     readerLastError: null,
   };
@@ -31,6 +33,11 @@ const repositoryMocks = vi.hoisted(() => {
     snapshotMaxSequence: vi.fn(async () => 0),
     scan: vi.fn(async () => []),
     dimensionValues: vi.fn(async () => []),
+    aggregate: vi.fn(async () => []),
+    distribution: vi.fn(async () => ({ bins: [], sampleCount: 0, eligibleCount: 0, minimum: null, maximum: null })),
+    sessionTotals: vi.fn(async () => {
+      throw new Error('not used by retention tests');
+    }),
     deleteBefore: vi.fn(async (cutoffMs: number) => ({
       status: 'complete' as const,
       cutoffMs,

@@ -1,5 +1,7 @@
 # Policy Compilation Performance Investigation
 
+**Status (2026-11-14):** Historical: the investigation that led to parallel per-server compilation (`parallel-compilation.md`).
+
 ## Problem
 
 `compile-policy` for the `exec-assistant` persona (5 servers) takes 20+ minutes. Expected: 2-4 minutes.
@@ -75,3 +77,12 @@ Change `scenario-generator.ts:286-340` from sequential `for` loop to `Promise.al
 - `src/pipeline/policy-verifier.ts` — verification rounds, judge calls
 - `src/pipeline/generate-with-repair.ts` — multi-turn schema repair wrapper
 - `src/pipeline/list-resolver.ts` — sequential list resolution
+
+## Status
+
+- **Server compilation** runs in parallel (`compileServersParallel`, `pLimit(10)` servers, one shared `pLimit(8)` LLM semaphore).
+- **Scenario batches** run concurrently with `Promise.all` (WP-88): the per-server model is already throttled by the shared semaphore, and results are concatenated in batch order before deduplication, so google-workspace's 6 batches now take about as long as the slowest one.
+- **Pre-filter decisions** are cached per server (`servers/<name>/prefilter-decision.json`), so an unchanged recompile makes no pre-filter call (see decision 9 of [haiku-server-prefilter.md](haiku-server-prefilter.md)).
+- **MCP-backed list resolution** connects only when a data-backed list misses the list cache, and one connection serves every resolution of a server's compile, including the repair loop's.
+- **List resolution** within one server still runs one list after another; servers have few lists, so the gain would be small.
+- **Truncated output**: every pipeline LLM call detects a response stopped at its output cap (finish reason "length"), repeats it once with a 32768-token cap, and otherwise fails with "output truncated at N tokens". The compiler and judge sessions keep the raised cap for their later turns, so a large server's recompiles and judge rounds are not cut off once each before the retry.

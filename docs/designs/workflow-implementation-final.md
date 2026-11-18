@@ -1,5 +1,7 @@
 # Multi-Agent Workflow System: Final Implementation Design
 
+**Status (2026-11-14):** Implemented: the workflow system in `src/workflow/`. Kept as the design reference; the code has moved on in many details (YAML definitions, shared containers, a per-state agent harness, the `workflow_commit` tool), so `WORKFLOWS.md` and the code are authoritative.
+
 This document is the definitive implementation reference for IronCurtain's
 multi-agent workflow system. It supersedes all prior design iterations (v1, v2,
 v3) and incorporates every resolved finding from three rounds of design review.
@@ -101,12 +103,17 @@ discriminated union from `src/session/types.ts`:
 // Correct SessionMode construction -- matches src/session/types.ts
 const mode: SessionMode = settings.mode === 'builtin'
   ? { kind: 'builtin' }
-  : { kind: 'docker', agent: (settings.dockerAgent ?? 'claude-code') as AgentId };
+  : { kind: 'docker', agent: toAgentId(resolveStateDockerAgent(stateConfig, settings)) };
 ```
 
 The `WorkflowSettings.mode` field in workflow definitions remains a simple
 string (`'docker' | 'builtin'`). The orchestrator translates it to the proper
-`SessionMode` discriminated union when calling `createSession()`.
+`SessionMode` discriminated union when calling `createSession()`. The Docker
+agent is the state's own `dockerAgent`, else `settings.dockerAgent`, else
+`claude-code` (`src/workflow/agent-harness.ts`); both fields are checked
+against `DOCKER_AGENTS` when the definition loads, and under
+`sharedContainer: true` every agent state of a `containerScope` must resolve
+to the same agent.
 
 ---
 
@@ -131,8 +138,8 @@ export interface WorkflowDefinition {
 export interface WorkflowSettings {
   /** Session mode. Default: 'docker'. */
   readonly mode?: 'docker' | 'builtin';
-  /** Agent ID for Docker mode. Default: 'claude-code'. */
-  readonly dockerAgent?: string;
+  /** Default agent for Docker mode (one of DOCKER_AGENTS); a state's own dockerAgent overrides it. Default: 'claude-code'. */
+  readonly dockerAgent?: DockerAgent;
   /** Default max rounds for iterative loops. Default: 4. */
   readonly maxRounds?: number;
   /** Git repository path for worktree management. */
@@ -760,10 +767,10 @@ private async executeAgentState(
   // 1. Build the command from artifacts + context
   const command = buildAgentCommand(stateConfig, context, workflow.artifactDir);
 
-  // 2. Construct proper SessionMode discriminated union
+  // 2. Construct proper SessionMode discriminated union (per-state agent, §2.3)
   const mode: SessionMode = settings.mode === 'builtin'
     ? { kind: 'builtin' }
-    : { kind: 'docker', agent: (settings.dockerAgent ?? 'claude-code') as AgentId };
+    : { kind: 'docker', agent: toAgentId(resolveStateDockerAgent(stateConfig, settings)) };
 
   // 3. Create a fresh session, passing resumeSessionId for same-role continuity
   const previousSessionId = context.sessionsByRole?.[stateConfig.persona];

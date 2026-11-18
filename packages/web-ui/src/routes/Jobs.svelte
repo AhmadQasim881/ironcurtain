@@ -13,8 +13,10 @@
   import { Alert } from '$lib/components/ui/alert/index.js';
   import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '$lib/components/ui/table/index.js';
   import { Spinner } from '$lib/components/ui/spinner/index.js';
+  import { formatCostUsd } from '$lib/format.js';
 
   import Clock from 'phosphor-svelte/lib/Clock';
+  import { SafeText } from '$lib/components/ui/safe-text/index.js';
 
   let busyJobs = $state<Map<string, string>>(new Map());
   let actionError = $state('');
@@ -117,10 +119,23 @@
                   >
                     {entry.lastRun.outcome.kind}
                   </Badge>
+                  {#if (entry.consecutiveFailures ?? 0) > 1}
+                    <span
+                      class="text-[11px] font-mono text-destructive"
+                      title="{entry.consecutiveFailures} runs in a row ended in an error"
+                    >
+                      &times;{entry.consecutiveFailures}
+                    </span>
+                  {/if}
                   <span class="text-[11px] font-mono text-muted-foreground">
-                    ${entry.lastRun.budget.estimatedCostUsd.toFixed(2)}
+                    {formatCostUsd(entry.lastRun.budget.estimatedCostUsd, entry.lastRun.budget.costSource)}
                   </span>
                 </div>
+                {#each entry.lastRun.notices ?? [] as notice, index (index)}
+                  <div role="alert" class="mt-2 whitespace-pre-wrap text-xs text-warning">
+                    <SafeText text={notice} multiline />
+                  </div>
+                {/each}
               {:else}
                 <span class="text-xs text-muted-foreground/50">--</span>
               {/if}

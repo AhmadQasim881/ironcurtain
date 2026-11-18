@@ -1,5 +1,7 @@
 # Devil's Advocate Review — Evolve Sync (Barrier-Batched) Parallelism Slice
 
+**Status (2026-11-14):** Historical: an adversarial review (2026-06-18) of `evolve-sync-parallelism-slice.md`; its findings were folded into that design.
+
 Adversarial review of `docs/designs/evolve-sync-parallelism-slice.md`. Scope: find what is
 wrong, over-claimed, infeasible, or under-specified. Every finding is grounded in the actual
 tree (`file:line`) as of 2026-06-18, master. Citations in the design doc were independently

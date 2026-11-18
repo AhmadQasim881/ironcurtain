@@ -1,10 +1,13 @@
 /**
  * memory_context tool handler.
  * Validates input and delegates to the engine for session-start briefing.
+ * The briefing is framed as notes from earlier sessions: data, not instructions
+ * (utils/framing.ts).
  */
 
-import type { MemoryEngine } from '../engine.js';
+import type { CallControls, MemoryEngine } from '../engine.js';
 import { MAX_QUERY_LENGTH, validateTokenBudget } from './validation.js';
+import { frameMemoryNotes } from '../utils/framing.js';
 
 export interface ContextInput {
   task?: string;
@@ -28,16 +31,23 @@ export function validateContextInput(args: Record<string, unknown>): ContextInpu
   };
 }
 
-export async function handleContext(engine: MemoryEngine, args: Record<string, unknown>): Promise<string> {
+export async function handleContext(
+  engine: MemoryEngine,
+  args: Record<string, unknown>,
+  controls?: CallControls,
+): Promise<string> {
   const input = validateContextInput(args);
-  const briefing = await engine.context({
-    task: input.task,
-    token_budget: input.token_budget,
-  });
+  const briefing = await engine.context(
+    {
+      task: input.task,
+      token_budget: input.token_budget,
+    },
+    controls,
+  );
 
   if (!briefing || briefing.trim().length === 0) {
     return 'No memories found. This appears to be a fresh session.';
   }
 
-  return briefing;
+  return frameMemoryNotes(briefing);
 }

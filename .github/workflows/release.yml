@@ -1,59 +1,267 @@
 name: Release
 
+# The release is split so that no job that runs dependency, build or test code
+# holds a credential that can publish or write (BLD-4):
+#
+#   build          contents: read. Installs without lifecycle scripts, checks
+#                  npm advisories against the reviewed allowlist and the Go
+#                  toolchain pins, builds (failing if the rebuilt
+#                  build-trust binaries differ from git), packs the npm
+#                  tarball and records its sha256. Restores no
+#                  Actions cache: any run on the default branch that executes
+#                  dependency code can write cache entries (the Go build cache
+#                  is not re-verified on read), so a cache could carry that
+#                  code into the tarball.
+#   test           contents: read. Full install and the complete test suite.
+#   publish        id-token: write only, behind the protected `npm-publish`
+#                  Environment. No checkout and no install: it verifies the
+#                  tarball against the build job's checksum and publishes it
+#                  with provenance through npm trusted publishing.
+#   release-notes  contents: write. Creates the GitHub release.
+#
+# The tag must be v<package.json version>. Running the workflow by hand
+# (workflow_dispatch) is a dry run: build and test only, nothing is published.
+
 on:
   push:
     tags:
       - 'v*'
       - '!*/v*'
+  workflow_dispatch:
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
+
+env:
+  # Exact release toolchain. Node 24.22.2 bundles npm 11.19.1, which supports
+  # npm trusted publishing (needs >= 11.5.1), so no job upgrades npm from the
+  # registry; publish fails if the bundled npm is not NPM_VERSION.
+  NODE_VERSION: '24.22.2'
+  NPM_VERSION: '11.19.1'
+  # Aikido safe-chain screens package installs. It is pinned by publication
+  # date: npm resolves safe-chain and its whole dependency tree to what the
+  # registry held on this date, so a release published later is never
+  # installed. Move the date forward deliberately.
+  SAFE_CHAIN_BEFORE: '2026-10-01'
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tarball: ${{ steps.pack.outputs.tarball }}
+      sha256: ${{ steps.pack.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # No cache restore in the job that makes the tarball (see the top).
       - uses: actions/setup-node@v7
         with:
-          # Node 24 has an isolated-vm 7.0.1 prebuild. The published npm artifact
-          # is IronCurtain's own JS and does not bundle isolated-vm (consumers
-          # install it themselves), so pin a supported prebuilt line.
-          node-version: 24
-          cache: npm
-          registry-url: https://registry.npmjs.org
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
       - uses: actions/setup-go@v7
         with:
-          go-version: 1.26.1
-          cache-dependency-path: docker/build-trust-runtime/go.mod
+          go-version: 1.26.11
+          cache: false
 
-      - name: Install Aikido safe-chain for supply chain protection
-        run: npm install -g @aikidosec/safe-chain && safe-chain setup
+      - name: Check the tag matches package.json
+        id: version
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::package.json version '$version' is not a plain semver version"
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            if [ "$GITHUB_REF_TYPE" != tag ] || [ "$GITHUB_REF_NAME" != "v$version" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match package.json version $version (expected v$version)"
+              exit 1
+            fi
+          else
+            echo "Dry run from $GITHUB_REF_NAME: building and testing $version; nothing will be published"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Upgrade npm for OIDC trusted publishing support
-        run: npx npm@latest install -g npm@latest
+      - name: Install Aikido safe-chain (pinned)
+        run: |
+          npm install --global @aikidosec/safe-chain --before="$SAFE_CHAIN_BEFORE"
+          safe-chain setup-ci
 
-      - run: npm ci
+      # The build needs no dependency lifecycle script (native addons are only
+      # loaded by the tests), so none runs in the job that makes the tarball.
+      - name: Install dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
+      # No release ships with a high or critical advisory nobody reviewed
+      # (BLD-9): the gate ci.yml runs, against today's advisories.
+      - name: Check npm advisories against the reviewed allowlist
+        run: npm run check:audit
+      # Users get sandbox-runtime (the OS sandbox around MCP servers) fixes
+      # only through a release that bumps it; the weekly scheduled check fails
+      # while it is behind. Bump it before releasing, unless the newest
+      # release is known to be broken. Only a warning: a failed registry
+      # lookup does not stop the release either.
+      - name: Report whether sandbox-runtime is the newest release
+        run: |
+          pinned="$(node -p "require('./package-lock.json').packages['node_modules/@anthropic-ai/sandbox-runtime'].version")"
+          if ! latest="$(npm view @anthropic-ai/sandbox-runtime version)"; then
+            echo "::warning::could not look up the newest @anthropic-ai/sandbox-runtime release; releasing with $pinned"
+          elif [ "$pinned" != "$latest" ]; then
+            echo "::warning::releasing with @anthropic-ai/sandbox-runtime $pinned, behind the newest release $latest"
+          fi
+      # Every golang builder stage in the packaged Dockerfiles must be pinned by
+      # a verified digest (pull requests only warn about one that is not), and
+      # every Go pin must agree.
+      - name: Check the Go toolchain pins
+        run: npm run check:go-toolchain -- --strict
+      - run: npm run build --workspace=packages/memory-mcp-server
+      # Same sequence as the prepublishOnly script, which publishing a tarball
+      # does not run.
+      - run: npm run build:build-trust-runtime
+      # --write just rebuilt the committed build-trust binaries with the pinned
+      # toolchain. The build is reproducible, so any change means git holds
+      # binaries this source does not produce: publish nothing (BLD-12).
+      - name: Fail if the rebuild changed the committed build-trust runtime
+        run: |
+          changed="$(git status --porcelain --untracked-files=all -- docker/build-trust-runtime/bin src/docker/build-trust-runtime-contract.ts)"
+          if [ -n "$changed" ]; then
+            echo "::error::the release rebuild differs from the committed build-trust runtime; rebuild it with node build.mjs --write and the pinned Go release, and commit the result"
+            echo "$changed"
+            exit 1
+          fi
+      - run: npm run build
+      - run: npm run check:build-trust-runtime
+
+      - name: Pack the npm tarball
+        id: pack
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          dest="$RUNNER_TEMP/npm-package"
+          mkdir -p "$dest"
+          npm pack --ignore-scripts --pack-destination "$dest"
+          tarball="provos-ironcurtain-$VERSION.tgz"
+          if [ "$(ls -A "$dest")" != "$tarball" ]; then
+            echo "::error::expected exactly $tarball in $dest, found: $(ls -A "$dest" | tr '\n' ' ')"
+            exit 1
+          fi
+          sha256="$(sha256sum "$dest/$tarball" | cut -d' ' -f1)"
+          echo "Packed $tarball sha256=$sha256"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+      - name: Upload the tarball for the publish job
+        uses: actions/upload-artifact@v7
+        with:
+          name: npm-package
+          path: ${{ runner.temp }}/npm-package/${{ steps.pack.outputs.tarball }}
+          if-no-files-found: error
+          retention-days: 7
+
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Install Aikido safe-chain (pinned)
+        run: |
+          npm install --global @aikidosec/safe-chain --before="$SAFE_CHAIN_BEFORE"
+          safe-chain setup-ci
+      # Retried as in ci.yml: some dependencies' postinstall scripts download
+      # native binaries from a CDN, which intermittently fails on runners.
+      - name: Install dependencies (retry on transient network failure)
+        run: |
+          for attempt in 1 2 3; do
+            if npm ci --foreground-scripts; then exit 0; fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::npm ci attempt $attempt failed; cleaning and retrying in 15s"
+              rm -rf node_modules
+              sleep 15
+            fi
+          done
+          echo "::error::npm ci failed after 3 attempts"
+          exit 1
       - run: npm run build --workspace=packages/memory-mcp-server
       - run: npm run format:check
       - run: npm run lint
       - run: npm run build
-      - run: npm run build:build-trust-runtime
-      - run: npm run check:build-trust-runtime
       - run: npm test
 
-      - name: Publish to npm
-        run: npm publish --provenance
-
-      - name: Extract changelog for this version
-        id: changelog
+  publish:
+    needs: [build, test]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # Configure this Environment with required reviewers; its approval gates
+    # the only job that can mint an npm publish token. It is shared with
+    # release-memory-mcp-server.yml, so its deployment rules must allow the
+    # v* and memory-mcp-server/v* tags (and the default branch, for a manual
+    # memory-mcp-server release).
+    environment:
+      name: npm-publish
+      url: https://www.npmjs.com/package/@provos/ironcurtain/v/${{ needs.build.outputs.version }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Check npm supports trusted publishing
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          # Extract the section for this version from CHANGELOG.md
-          awk "/^## \\[${version}\\]/{found=1; next} /^## \\[/{if(found) exit} found" CHANGELOG.md > release-notes.md
+          actual="$(npm --version)"
+          if [ "$actual" != "$NPM_VERSION" ]; then
+            echo "::error::expected npm $NPM_VERSION (bundled with Node $NODE_VERSION), found $actual"
+            exit 1
+          fi
+      - name: Download the tarball the build job packed
+        uses: actions/download-artifact@v8
+        with:
+          name: npm-package
+          path: ${{ runner.temp }}/npm-package
+      - name: Verify the tarball checksum
+        env:
+          TARBALL: ${{ needs.build.outputs.tarball }}
+          SHA256: ${{ needs.build.outputs.sha256 }}
+        run: echo "$SHA256  $RUNNER_TEMP/npm-package/$TARBALL" | sha256sum --check --strict
+      - name: Publish to npm
+        env:
+          TARBALL: ${{ needs.build.outputs.tarball }}
+        run: npm publish "$RUNNER_TEMP/npm-package/$TARBALL" --provenance --ignore-scripts --access public
 
+  release-notes:
+    needs: [build, publish]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Extract changelog for this version
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          awk -v version="$VERSION" '
+            index($0, "## [" version "]") == 1 { found = 1; next }
+            /^## \[/ { if (found) exit }
+            found
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::warning::CHANGELOG.md has no section for $VERSION"
+          fi
       - name: Create GitHub Release
-        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file release-notes.md
         env:
           GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag
+          --title "$GITHUB_REF_NAME" --notes-file release-notes.md

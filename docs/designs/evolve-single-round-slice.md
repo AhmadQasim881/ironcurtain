@@ -1,6 +1,8 @@
 # Evolve Native Workflow — First Vertical Slice (single round, end to end)
 
-Status: **Implemented & merged in #300 (2026-06-16).** The single-round end-to-end slice shipped as designed — linear `preflight → researcher → evaluate → record_node → done/failed`, the packaged `evolve_core` engine, the `evolve_result.py` bridge (`evaluate`/`record`), `numpy`+`pyyaml` per-workflow image, and the gated real-Docker integration test. The sections below are the as-shipped record; both §15 maintainer decisions are resolved as implemented (engine-native `.evolve_runs/` layout shipped; `preflight_review` deferred here landed later in #303).
+**Status (2026-11-14):** Implemented (PR #300, 2026-06-16).
+
+Implementation record: **Implemented & merged in #300 (2026-06-16).** The single-round end-to-end slice shipped as designed — linear `preflight → researcher → evaluate → record_node → done/failed`, the packaged `evolve_core` engine, the `evolve_result.py` bridge (`evaluate`/`record`), `numpy`+`pyyaml` per-workflow image, and the gated real-Docker integration test. The sections below are the as-shipped record; both §15 maintainer decisions are resolved as implemented (engine-native `.evolve_runs/` layout shipped; `preflight_review` deferred here landed later in #303).
 Audience: IronCurtain workflow engineer implementing the first `evolve` workflow package
 Implementation contract: this document is meant to be implemented with **no further design input**. It names exact files, the full `workflow.yaml`, the `evolve_core` CLI argv each state runs, the engine-output→result-contract bridge, the package layout, and the binary end-to-end gate.
 

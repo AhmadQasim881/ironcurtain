@@ -15,6 +15,7 @@ import {
   PTY_KILL_RETRY_MS,
   type PtyBridgeOptions,
 } from '../src/pty/pty-bridge.js';
+import { PTY_MAX_COLS, PTY_MAX_ROWS, PTY_MIN_COLS, PTY_MIN_ROWS } from '../src/pty/pty-size.js';
 
 /** Shared, mutable fake-child state reachable from the hoisted node-pty mock. */
 const ptyMock = vi.hoisted(() => {
@@ -23,30 +24,44 @@ const ptyMock = vi.hoisted(() => {
     exitCb?: (e: { exitCode: number }) => void;
     killCalls: string[];
     killExits: boolean;
-  } = {};
-  state.killCalls = [];
-  state.killExits = true;
+    /** Every `child.resize(cols, rows)` the bridge issued. */
+    resizeCalls: Array<[number, number]>;
+    /** The `{ cols, rows }` the bridge spawned the child with. */
+    spawnSize: { cols: number; rows: number } | undefined;
+    /** The environment the last spawn was given. */
+    lastEnv?: Record<string, string>;
+    /** Every `child.write(data)` the bridge issued (keystrokes and query replies). */
+    writes: string[];
+  } = { killCalls: [], killExits: true, resizeCalls: [], spawnSize: undefined, writes: [] };
   return { state };
 });
 
 vi.mock('node-pty', () => {
-  const spawn = () => ({
-    pid: 424242,
-    onData: (cb: (d: string) => void) => {
-      ptyMock.state.dataCb = cb;
-    },
-    onExit: (cb: (e: { exitCode: number }) => void) => {
-      ptyMock.state.exitCb = cb;
-    },
-    write: vi.fn(),
-    resize: vi.fn(),
-    kill: (signal: string) => {
-      ptyMock.state.killCalls.push(signal);
-      if (ptyMock.state.killExits) {
-        ptyMock.state.exitCb?.({ exitCode: signal === 'SIGTERM' ? 143 : 137 });
-      }
-    },
-  });
+  const spawn = (_bin: string, _args: string[], opts: { cols: number; rows: number; env?: Record<string, string> }) => {
+    ptyMock.state.spawnSize = { cols: opts.cols, rows: opts.rows };
+    ptyMock.state.lastEnv = opts.env;
+    return {
+      pid: 424242,
+      onData: (cb: (d: string) => void) => {
+        ptyMock.state.dataCb = cb;
+      },
+      onExit: (cb: (e: { exitCode: number }) => void) => {
+        ptyMock.state.exitCb = cb;
+      },
+      write: (data: string) => {
+        ptyMock.state.writes.push(data);
+      },
+      resize: (cols: number, rows: number) => {
+        ptyMock.state.resizeCalls.push([cols, rows]);
+      },
+      kill: (signal: string) => {
+        ptyMock.state.killCalls.push(signal);
+        if (ptyMock.state.killExits) {
+          ptyMock.state.exitCb?.({ exitCode: signal === 'SIGTERM' ? 143 : 137 });
+        }
+      },
+    };
+  };
   return { default: { spawn }, spawn };
 });
 
@@ -164,6 +179,48 @@ describe('buildSpawnArgs', () => {
   });
 });
 
+describe('createPtyBridge — child environment', () => {
+  const NAMES = [
+    'NODE_OPTIONS',
+    'MCP_SERVERS_CONFIG',
+    'SERVER_CREDENTIALS',
+    'ANTHROPIC_API_KEY',
+    'LD_PRELOAD',
+  ] as const;
+  const saved = Object.fromEntries(NAMES.map((name) => [name, process.env[name]]));
+
+  afterEach(() => {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
+
+  it("keeps the user's credentials but drops code-injection and relay-internal variables", async () => {
+    // The child is IronCurtain itself (`start --pty`), so it needs the same
+    // credentials as the parent; what must not cross are the variables that
+    // run code in every Node child and the ones that configure one MCP relay.
+    process.env.NODE_OPTIONS = '--require /tmp/evil.js';
+    process.env.LD_PRELOAD = '/tmp/evil.so';
+    process.env.MCP_SERVERS_CONFIG = '{"github":{}}';
+    process.env.SERVER_CREDENTIALS = '{"TOKEN":"x"}';
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-user';
+
+    const bridge = await createPtyBridge(baseOptions({ muxId: 'mux-1', muxPid: 4242 }));
+    const env = ptyMock.state.lastEnv ?? {};
+    expect(env.ANTHROPIC_API_KEY).toBe('sk-ant-user');
+    expect(env.IRONCURTAIN_MUX_ID).toBe('mux-1');
+    expect(env.IRONCURTAIN_MUX_PID).toBe('4242');
+    expect(env.PATH).toBe(process.env.PATH);
+    for (const name of ['NODE_OPTIONS', 'LD_PRELOAD', 'MCP_SERVERS_CONFIG', 'SERVER_CREDENTIALS']) {
+      expect(env, name).not.toHaveProperty(name);
+    }
+    // And process.env itself was not mutated by the spawn.
+    expect(process.env.IRONCURTAIN_MUX_ID).toBeUndefined();
+    bridge.kill();
+  });
+});
+
 describe('createPtyBridge — output wiring (onData / serialize)', () => {
   const tick = () => new Promise((r) => setTimeout(r, 0));
 
@@ -234,6 +291,136 @@ describe('createPtyBridge — output wiring (onData / serialize)', () => {
     await tick();
     const snap = bridge.serialize({ scrollback: 0 });
     expect(typeof snap).toBe('string');
+    bridge.kill();
+  });
+});
+
+// TUI-10: programs query their terminal (cursor position, device attributes)
+// and wait for the answer. Under the mux only the headless terminal can
+// answer; its replies must reach the child's PTY, and only when asked for.
+describe('createPtyBridge — terminal query replies', () => {
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+
+  beforeEach(() => {
+    ptyMock.state.dataCb = undefined;
+    ptyMock.state.exitCb = undefined;
+    ptyMock.state.killCalls = [];
+    ptyMock.state.killExits = true;
+    ptyMock.state.writes = [];
+  });
+
+  it('answers a cursor position request (DSR 6) with a CPR written to the child', async () => {
+    const bridge = await createPtyBridge(baseOptions({ answerTerminalQueries: true }));
+
+    ptyMock.state.dataCb?.('hello\x1b[6n');
+    await tick();
+
+    // Row 1, column 6: after the five characters of "hello".
+    expect(ptyMock.state.writes).toEqual(['\x1b[1;6R']);
+    bridge.kill();
+  });
+
+  it('answers a primary device attributes request (DA1)', async () => {
+    const bridge = await createPtyBridge(baseOptions({ answerTerminalQueries: true }));
+
+    ptyMock.state.dataCb?.('\x1b[c');
+    await tick();
+
+    expect(ptyMock.state.writes).toHaveLength(1);
+    // eslint-disable-next-line no-control-regex
+    expect(ptyMock.state.writes[0]).toMatch(/^\x1b\[\?[0-9;]+c$/u);
+    bridge.kill();
+  });
+
+  it('writes no reply when not asked to (the web UI: the browser xterm answers)', async () => {
+    const bridge = await createPtyBridge(baseOptions());
+
+    ptyMock.state.dataCb?.('hello\x1b[6n\x1b[c');
+    await tick();
+
+    expect(ptyMock.state.writes).toEqual([]);
+    bridge.kill();
+  });
+
+  it('writes no reply once the child has exited', async () => {
+    const bridge = await createPtyBridge(baseOptions({ answerTerminalQueries: true }));
+    bridge.kill();
+    expect(bridge.alive).toBe(false);
+
+    ptyMock.state.dataCb?.('\x1b[6n');
+    await tick();
+
+    expect(ptyMock.state.writes).toEqual([]);
+  });
+
+  it('keystrokes still reach the child unchanged next to the replies', async () => {
+    const bridge = await createPtyBridge(baseOptions({ answerTerminalQueries: true }));
+
+    bridge.write('ls\r');
+    ptyMock.state.dataCb?.('\x1b[6n');
+    await tick();
+
+    expect(ptyMock.state.writes).toEqual(['ls\r', '\x1b[1;1R']);
+    bridge.kill();
+  });
+});
+
+// WEB-12: a single oversized resize made the headless terminal allocate
+// gigabytes (off-heap, unbounded by --max-old-space-size) and wrapped
+// node-pty's unsigned-short winsize. The bridge clamps every resize source.
+describe('createPtyBridge — size bounds', () => {
+  beforeEach(() => {
+    ptyMock.state.dataCb = undefined;
+    ptyMock.state.exitCb = undefined;
+    ptyMock.state.killCalls = [];
+    ptyMock.state.killExits = true;
+    ptyMock.state.resizeCalls = [];
+    ptyMock.state.spawnSize = undefined;
+  });
+
+  it('clamps an oversized resize for both the child PTY and the headless terminal', async () => {
+    const bridge = await createPtyBridge(baseOptions());
+
+    bridge.resize(1_000_000, 1_000_000);
+
+    expect(ptyMock.state.resizeCalls).toEqual([[PTY_MAX_COLS, PTY_MAX_ROWS]]);
+    expect(bridge.terminal.cols).toBe(PTY_MAX_COLS);
+    expect(bridge.terminal.rows).toBe(PTY_MAX_ROWS);
+    bridge.kill();
+  });
+
+  it('clamps an undersized or non-finite resize to the minima (fail-safe: smallest allocation)', async () => {
+    const bridge = await createPtyBridge(baseOptions());
+
+    bridge.resize(0, -5);
+    bridge.resize(Number.NaN, Number.POSITIVE_INFINITY);
+
+    expect(ptyMock.state.resizeCalls).toEqual([
+      [PTY_MIN_COLS, PTY_MIN_ROWS],
+      [PTY_MIN_COLS, PTY_MIN_ROWS],
+    ]);
+    expect(bridge.terminal.cols).toBe(PTY_MIN_COLS);
+    expect(bridge.terminal.rows).toBe(PTY_MIN_ROWS);
+    bridge.kill();
+  });
+
+  it('passes an in-range resize through unchanged', async () => {
+    const bridge = await createPtyBridge(baseOptions());
+
+    bridge.resize(120, 40);
+
+    expect(ptyMock.state.resizeCalls).toEqual([[120, 40]]);
+    expect(bridge.terminal.cols).toBe(120);
+    expect(bridge.terminal.rows).toBe(40);
+    bridge.kill();
+  });
+
+  it('clamps the initial spawn size as well', async () => {
+    const bridge = await createPtyBridge(baseOptions({ cols: 50_000, rows: 9_000 }));
+
+    expect(ptyMock.state.spawnSize).toEqual({ cols: PTY_MAX_COLS, rows: PTY_MAX_ROWS });
+    expect(bridge.terminal.cols).toBe(PTY_MAX_COLS);
+    expect(bridge.terminal.rows).toBe(PTY_MAX_ROWS);
     bridge.kill();
   });
 });

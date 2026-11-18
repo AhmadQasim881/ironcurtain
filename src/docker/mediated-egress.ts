@@ -14,7 +14,7 @@
  * - `followRedirect` — when present, a 3xx is authorized and followed *internally*
  *   under the F1 redirect-body ceiling; when absent, a 3xx streams through.
  * - `onComplete` — a provenance sink invoked once on successful completion
- *   (requested/reported digest and streamed size).
+ *   (requested/reported digest, streamed size, and terminal HTTP status).
  *
  * This is a leaf: it depends only on node, the destination-bound transport, the
  * shared request/response shaping in `egress-forwarding.ts`, and the logger.
@@ -83,8 +83,12 @@ export interface MediatedEgressConfig<A> {
   readonly session?: MediatedEgressSession;
   /** Present follows 3xx internally; absent passes 3xx through to the client. */
   readonly followRedirect?: (current: A, location: string) => A;
-  /** Provenance sink; called once on successful terminal-response completion. */
-  onComplete?(authorized: A, streamedBytes: number, responseHeaders: http.IncomingHttpHeaders): void;
+  /**
+   * Provenance sink; called once on successful terminal-response completion,
+   * whatever its status (a 401 or 404 body also completes), so `status` says
+   * whether the request actually succeeded.
+   */
+  onComplete?(authorized: A, streamedBytes: number, responseHeaders: http.IncomingHttpHeaders, status: number): void;
 }
 
 /** Mutable per-request state: one logical forward, spanning any followed redirects. */
@@ -314,7 +318,7 @@ function streamMediatedToClient<A>(
       clientRes.destroy();
       return;
     }
-    config.onComplete?.(authorized, ceiling.byteCount(), upstreamRes.headers);
+    config.onComplete?.(authorized, ceiling.byteCount(), upstreamRes.headers, status);
   });
 }
 

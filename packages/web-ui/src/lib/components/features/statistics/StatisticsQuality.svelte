@@ -15,8 +15,13 @@
     health: StatisticsRepositoryHealthDto;
   } = $props();
 
+  // A restarting or latched-off writer is not collecting, even before it drops anything.
   const qualityWarning = $derived(
-    health.state === 'degraded' || health.readerState === 'unavailable' || health.dropped > 0,
+    health.state === 'degraded' ||
+      health.state === 'restarting' ||
+      health.state === 'disabled' ||
+      health.readerState === 'unavailable' ||
+      health.dropped > 0,
   );
 </script>
 

@@ -12,12 +12,21 @@
  * sentinel, since `generatedAt`/`resolvedAt` are wall-clock and non-deterministic.
  */
 
-import { describe, it, expect, beforeAll } from 'vitest';
-import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PipelineRunner, type PipelineRunConfig } from '../src/pipeline/pipeline-runner.js';
+import { checkScopedPolicy } from '../src/config/constitution-hash.js';
+import { computeAnnotationContentDigest } from '../src/config/tool-annotations-overlay.js';
+import {
+  ENGINE_SEMANTICS_VERSION,
+  PIPELINE_VERIFIER_VERSION,
+  POLICY_COMPILER_EPOCH,
+  POLICY_PROVENANCE_SCHEMA_VERSION,
+} from '../src/policy-artifacts/provenance.js';
+import { VERSION } from '../src/version.js';
 import { createFakePipelineModels } from './fixtures/fake-pipeline-models.js';
 import {
   GOLDEN_ALLOWED_DIR,
@@ -45,9 +54,12 @@ const CAPTURE = process.env.CAPTURE_GOLDEN === '1';
  *    on macOS but not on Linux). The committed golden is captured on one platform,
  *    so we normalize `within` to a sentinel here and assert the concrete resolved
  *    value separately (see the dedicated test below).
+ *  - `provenance.producerVersion` -> the package version, which changes with
+ *    every release; asserted against VERSION in the provenance test below.
  */
 const TIMESTAMP_KEYS = new Set(['generatedAt', 'resolvedAt']);
 const PATH_KEYS = new Set(['within']);
+const VERSION_KEYS = new Set(['producerVersion']);
 function normalizeForComparison(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(normalizeForComparison);
   if (value !== null && typeof value === 'object') {
@@ -55,6 +67,7 @@ function normalizeForComparison(value: unknown): unknown {
     for (const [k, v] of Object.entries(value)) {
       if (TIMESTAMP_KEYS.has(k)) out[k] = '<timestamp>';
       else if (PATH_KEYS.has(k)) out[k] = '<within>';
+      else if (VERSION_KEYS.has(k)) out[k] = '<version>';
       else out[k] = normalizeForComparison(v);
     }
     return out;
@@ -62,8 +75,7 @@ function normalizeForComparison(value: unknown): unknown {
   return value;
 }
 
-function buildPipelineRun(): { runner: PipelineRunner; config: PipelineRunConfig; outputDir: string } {
-  const workDir = mkdtempSync(resolve(tmpdir(), 'ic-golden-'));
+function buildPipelineRun(workDir: string): { runner: PipelineRunner; config: PipelineRunConfig; outputDir: string } {
   const outputDir = resolve(workDir, 'generated');
   mkdirSync(outputDir, { recursive: true });
   const logPath = resolve(workDir, 'llm-interactions.jsonl');
@@ -93,10 +105,14 @@ function buildPipelineRun(): { runner: PipelineRunner; config: PipelineRunConfig
 describe('Pipeline golden (Phase 0)', () => {
   let compiledActual: unknown;
   let listsActual: unknown;
+  let compiledOutputDir = '';
+  let workDir: string | undefined;
 
   beforeAll(async () => {
-    const { runner, config, outputDir } = buildPipelineRun();
+    workDir = mkdtempSync(resolve(tmpdir(), 'ic-golden-'));
+    const { runner, config, outputDir } = buildPipelineRun(workDir);
     await runner.run(config);
+    compiledOutputDir = outputDir;
 
     compiledActual = JSON.parse(readFileSync(resolve(outputDir, 'compiled-policy.json'), 'utf-8'));
     const listsPath = resolve(outputDir, 'dynamic-lists.json');
@@ -111,6 +127,10 @@ describe('Pipeline golden (Phase 0)', () => {
     }
   });
 
+  afterAll(() => {
+    if (workDir) rmSync(workDir, { recursive: true, force: true });
+  });
+
   it('produces compiled-policy.json matching the committed golden', () => {
     expect(existsSync(GOLDEN_COMPILED)).toBe(true);
     const golden: unknown = JSON.parse(readFileSync(GOLDEN_COMPILED, 'utf-8'));
@@ -123,10 +143,36 @@ describe('Pipeline golden (Phase 0)', () => {
     expect(normalizeForComparison(listsActual)).toEqual(normalizeForComparison(golden));
   });
 
+  // The runtime gate for per-job and per-persona policies (src/config/
+  // constitution-hash.ts) recomputes constitutionHash without importing the
+  // pipeline. If its hash ever disagreed with what a real compile records,
+  // every scoped policy would read as stale; if it accepted another text, a
+  // stale policy would run. Check it against an actual pipeline run.
+  it('the runtime scoped-policy check accepts this output for its constitution only', () => {
+    expect(checkScopedPolicy(compiledOutputDir, GOLDEN_CONSTITUTION)).toEqual({ kind: 'fresh' });
+    expect(checkScopedPolicy(compiledOutputDir, `${GOLDEN_CONSTITUTION} `)).toMatchObject({
+      kind: 'stale',
+      reason: 'constitution',
+    });
+  });
+
   it('compiled policy contains the expected deterministic rule set', () => {
     const compiled = compiledActual as { rules: Array<{ name: string }>; listDefinitions?: unknown[] };
     expect(compiled.rules.map((r) => r.name)).toEqual(['allow-trusted-news', 'allow-temp-reads']);
     expect(compiled.listDefinitions).toBeDefined();
+  });
+
+  it('records the provenance of the compile: current versions and the annotations it was compiled against', () => {
+    const compiled = compiledActual as { provenance?: Record<string, unknown> };
+    expect(compiled.provenance).toEqual({
+      schemaVersion: POLICY_PROVENANCE_SCHEMA_VERSION,
+      producerVersion: VERSION,
+      policyCompilerEpoch: POLICY_COMPILER_EPOCH,
+      engineSemanticsVersion: ENGINE_SEMANTICS_VERSION,
+      verifierVersion: PIPELINE_VERIFIER_VERSION,
+      // The fake models report no policy model, so none is recorded.
+      annotationDigests: { fetch: computeAnnotationContentDigest(GOLDEN_ANNOTATIONS.servers.fetch.tools) },
+    });
   });
 
   it('resolveRulePaths canonicalizes the paths.within value (transform branch ran)', () => {

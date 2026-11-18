@@ -1,5 +1,7 @@
 # Nested Docker implementation and acceptance
 
+**Status (2026-11-14):** Implemented (merged in PR #467, then reconciled with the later macOS validation) for the admitted profiles: Docker Desktop and Apple `container` on macOS, and Docker Desktop on WSL2 (amd64) (`src/docker-workload/environment.ts`). Native Linux Docker Engine is refused; a native Linux profile is deferred (WP-127). The acceptance record separates completed runs from remaining evidence.
+
 Revised 2026-09-10 following the independent review and the user's decisions:
 WSL was the available live test environment for that implementation effort; container users are expected to
 use sudo; native Linux arm64 is out of scope; avoid hash binding wherever a simpler
@@ -23,7 +25,13 @@ historical investigations and link here rather than maintaining parallel status 
   cgroup v2 and the covered security options and rejects native Linux Engine,
   non-Desktop WSL engines and WSL arm64. The selected Docker endpoint is resolved
   once and reused for image, container and recovery operations; ambient Docker
-  context variables cannot redirect part of a bundle to another engine.
+  context variables cannot redirect part of a bundle to another engine. Its
+  `unsupportedNestedDockerHostReason` applies the same macOS/WSL2 host test to
+  the settings editors: `ironcurtain config` and the web UI
+  `config.setDockerWorkload` RPC refuse to turn `dockerWorkload.enabled` on
+  elsewhere (native Linux included) and still allow turning it off. Every
+  admission refusal ends by telling the user to set `dockerWorkload.enabled` to
+  false to get ordinary Docker sessions back.
 - [docker-infrastructure.ts](../../src/docker/docker-infrastructure.ts) owns the
   shared `buildAgentContainerConfig` used by batch and PTY; workflows reuse the
   same infrastructure. It combines mounts, environment, UID remapping, sudo
@@ -212,6 +220,9 @@ Docker API as one untrusted bundle. Container-local root is expected. Preserve
 passwordless `sudo -n` in the agent, including approved package installation,
 system trust setup and normal development operations. Workload images that provide
 sudo may use it too; do not install sudo into arbitrary minimal workload images.
+The user-level `agentSudo: false` opt-in (`src/docker/agent-privileges.ts`), which
+removes agent sudo with no-new-privileges, is therefore refused for nested-Docker
+bundles: their trusted build-state initialization runs as root in the agent.
 
 | Role                     | Authority and enforcement                                                                                                                                                                                                                                                                                                        |
 | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -288,6 +299,30 @@ Remove unused toolchain source IDs, unpopulated provenance labels, compiler-byte
 freshness gates, duplicated fixture hash literals and the generator's rewriting of
 Python `PACKAGE_RUNC_SHA256`. Retain semantic grammar tests and useful diagnostic
 build metadata. Correct comments that call reported versions executable attestation.
+
+> **Update (WP-101).** Two narrow exceptions now apply, both at build time.
+>
+> - The Go builder stages of `docker/nested-relay/Dockerfile` and
+>   `docker/nested-daemon/Dockerfile` name an exact Go release, and must also be
+>   pinned by the digest of the golang index before a release (BLD-13). The relay
+>   image is cached by a hash of its Dockerfile, `main.go` and `go.mod`, so a
+>   toolchain with security fixes reaches users' machines only through an edit
+>   there. `scripts/check-go-toolchain.ts` keeps those stages, the relay's
+>   `go.mod`, the CI and release `setup-go` steps and the build-trust manifest
+>   consistent. Pull requests only warn about an undigested stage, so the images
+>   still build while a verified digest is pending; the release and the weekly
+>   `scheduled-checks` workflow (`--strict`) refuse it, and the weekly run also
+>   fails on a release that is out of support or behind its newest patch. A
+>   placeholder digest is refused everywhere, since no registry serves it. The
+>   Docker toolchain source (`IRONCURTAIN_DOCKER_SOURCE`) and the agent bases stay
+>   versioned tags.
+> - `docker/build-trust-runtime/build.mjs --check` requires the committed wrapper
+>   binaries to be byte-identical to a fresh build when `go` is the release
+>   `manifest.json` records, and fails with a toolchain mismatch with any other
+>   release (BLD-12). CI and the release install that release, and the release
+>   fails when its rebuild changes the committed binaries. This checks that the
+>   committed build output is reproducible from source; it is not an executable
+>   pin, and staging still checks only the ELF format and architecture.
 
 Use one active build-trust contract, generator, staging implementation and common
 preflight for both backends. Move reusable checks from the Apple-named

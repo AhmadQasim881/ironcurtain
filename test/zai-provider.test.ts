@@ -3,11 +3,17 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseToml } from 'smol-toml';
-import { loadUserConfig, userConfigSchema, HOST_MODEL_ROLES, saveUserConfig } from '../src/config/user-config.js';
+import {
+  loadUserConfig,
+  userConfigSchema,
+  HOST_MODEL_ROLES,
+  providerProfileSchema,
+  saveUserConfig,
+} from '../src/config/user-config.js';
 import type { ResolvedZaiProfile, UserConfig } from '../src/config/user-config.js';
 import type { IronCurtainConfig } from '../src/config/types.js';
 import { createLanguageModel, resolveHostModelApiKey, resolveHostModelId } from '../src/config/model-provider.js';
-import { autoApprove } from '../src/trusted-process/auto-approver.js';
+import { autoApprove, type AutoApproveContext } from '../src/trusted-process/auto-approver.js';
 import { createClaudeCodeAdapter } from '../src/docker/adapters/claude-code.js';
 import { createCodexAdapter } from '../src/docker/adapters/codex.js';
 import { createGooseAdapter } from '../src/docker/adapters/goose.js';
@@ -16,6 +22,7 @@ import { buildProviderProfileSnapshots } from '../src/mux/provider-profile-snaps
 import { makeZaiProvider } from '../src/docker/zai.js';
 import { resolveZaiModel, ZAI_HOST } from '../src/config/zai.js';
 import { isEndpointAllowed } from '../src/docker/provider-config.js';
+import { resolvedGatewayToInput } from '../src/config/provider-editor.js';
 import { resolveRealKey } from '../src/docker/docker-infrastructure.js';
 import { resolveSseProvider } from '../src/docker/mitm-proxy.js';
 import { createReassembler, AnthropicReassembler, ResponsesReassembler } from '../src/docker/trajectory-reassembler.js';
@@ -127,10 +134,10 @@ describe('Z.AI provider profiles', () => {
     const c = config();
     const adapter =
       agent === 'claude-code'
-        ? createClaudeCodeAdapter(c.userConfig)
+        ? createClaudeCodeAdapter()
         : agent === 'codex'
-          ? createCodexAdapter(c.userConfig)
-          : createGooseAdapter(c.userConfig);
+          ? createCodexAdapter()
+          : createGooseAdapter();
     const env = adapter.buildEnv(c, new Map([[ZAI_HOST, 'sentinel-zai']]));
     expect(adapter.detectCredential?.(c)).toEqual({ kind: 'apikey', key: 'host-only-zai-key' });
     expect(JSON.stringify(env)).not.toContain('host-only-zai-key');
@@ -180,7 +187,7 @@ describe('Z.AI provider profiles', () => {
         },
       },
     });
-    const adapter = createClaudeCodeAdapter(c.userConfig);
+    const adapter = createClaudeCodeAdapter();
     const cmd = adapter.buildCommand('hello', '', {
       firstTurn: true,
       sessionId: 'id',
@@ -194,7 +201,7 @@ describe('Z.AI provider profiles', () => {
 
   it('honors Goose model selections in batch and PTY startup environments', () => {
     const c = config({ gooseModel: 'glm-4.7', modelProviders: { profiles: { glm: { type: 'zai', modelMap: [] } } } });
-    const env = createGooseAdapter(c.userConfig).buildEnv(c, new Map([[ZAI_HOST, 'sentinel-zai']]));
+    const env = createGooseAdapter().buildEnv(c, new Map([[ZAI_HOST, 'sentinel-zai']]));
     expect(env.GOOSE_MODEL).toBe('glm-4.7');
   });
 
@@ -224,7 +231,9 @@ describe('Z.AI provider profiles', () => {
   it('does not write an env-only Z.AI key back to disk', () => {
     vi.stubEnv('ZAI_API_KEY', 'env-only-key');
     const c = config({ modelProviders: { profiles: { glm: { type: 'zai' } } } });
-    saveUserConfig({ modelProviders: { profiles: { glm: c.activeProviderProfile as ResolvedZaiProfile } } });
+    // As the config editor saves it: the resolved profile, env key included.
+    const edited = providerProfileSchema.parse(resolvedGatewayToInput(c.activeProviderProfile as ResolvedZaiProfile));
+    saveUserConfig({ modelProviders: { profiles: { glm: edited } } });
     vi.stubEnv('ZAI_API_KEY', '');
     expect(loadUserConfig({ readOnly: true }).modelProviders.profiles.glm).toHaveProperty('apiKey', '');
   });
@@ -232,7 +241,7 @@ describe('Z.AI provider profiles', () => {
   it('builds parseable Codex TOML and a scoped GLM catalog without credentials', () => {
     const c = config();
     c.agentModelId = 'anthropic:glm-5.3-flash';
-    const files = createCodexAdapter(c.userConfig).generateMcpConfig('/tmp/proxy.sock', c);
+    const files = createCodexAdapter().generateMcpConfig('/tmp/proxy.sock', c);
     const toml = parseToml(files[0].content);
     expect(toml).toMatchObject({
       model: 'glm-5.3-flash',
@@ -258,10 +267,10 @@ describe('Z.AI provider profiles', () => {
       const c = config();
       const adapter =
         agent === 'claude-code'
-          ? createClaudeCodeAdapter(c.userConfig)
+          ? createClaudeCodeAdapter()
           : agent === 'codex'
             ? createCodexAdapter()
-            : createGooseAdapter(c.userConfig);
+            : createGooseAdapter();
       const profile = c.activeProviderProfile as ResolvedZaiProfile;
       for (const requested of ['glm-5.3', 'glm-5.3-flash']) {
         const cmd = adapter.buildCommand('hello', '', {
@@ -441,11 +450,19 @@ describe('named profiles for host roles using the installed SDK', () => {
       }),
     );
     const model = await createLanguageModel(c.userConfig.autoApprove.modelId, c.userConfig, 'autoApprove');
-    const context = {
+    const context: AutoApproveContext = {
       userMessage: 'Read /workspace/example.txt',
       toolName: 'filesystem/read_file',
+      rule: 'escalate-read-outside-permitted',
       escalationReason: 'Read permission',
-      arguments: { path: '/workspace/example.txt' },
+      arguments: {
+        path: {
+          kind: 'path',
+          values: ['/workspace/example.txt'],
+          escalated: true,
+          anchors: [['/workspace/example.txt', '/workspace']],
+        },
+      },
     };
     expect((await autoApprove(context, model)).decision).toBe('approve');
     expect(requests[0]).toMatchObject({

@@ -55,7 +55,14 @@ describe('shared Docker toolchain image inputs', () => {
   it('uses versioned base sources without maintained source digest pins on either architecture', () => {
     expect(arm64).toMatch(/^FROM node:22-trixie$/mu);
     for (const dockerfile of [amd64, arm64, daemon]) {
-      expect(dockerfile).not.toMatch(/^(?:FROM |# syntax=).*@sha256:/mu);
+      // The daemon's Go builder stage is the one exception: its toolchain is an
+      // exact release, pinned by digest before a release (BLD-13,
+      // scripts/check-go-toolchain.ts).
+      const sources = dockerfile
+        .split('\n')
+        .filter((line) => !/^FROM golang:/u.test(line))
+        .join('\n');
+      expect(sources).not.toMatch(/^(?:FROM |# syntax=).*@sha256:/mu);
     }
   });
 

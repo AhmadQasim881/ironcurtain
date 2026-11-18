@@ -1,11 +1,18 @@
 /**
  * memory_inspect tool handler.
  * Validates input and formats stats/memories/export from the engine.
+ *
+ * Every view shows text that earlier sessions wrote (memory content, tags), so a
+ * non-empty result is framed as notes: data, not instructions (utils/framing.ts).
+ * Memory lists also show who wrote each memory when the row records it.
  */
 
 import type { MemoryEngine } from '../engine.js';
 import type { Memory, MemoryStats } from '../types.js';
 import { MAX_LIMIT, validateIds } from './validation.js';
+import { formatDay } from '../utils/dates.js';
+import { frameMemoryNotes } from '../utils/framing.js';
+import { asMemoryWriter } from '../utils/provenance.js';
 
 export interface InspectInput {
   view?: 'stats' | 'recent' | 'important' | 'tags' | 'export';
@@ -76,18 +83,26 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/** `, written by: cron session <id>` for a row that records its writer, else ''. */
+function writerLabel(memory: Memory): string {
+  const writer = asMemoryWriter(memory.metadata?.writer);
+  if (writer === undefined) return '';
+  return `, written by: ${writer.kind} session${writer.session_id === undefined ? '' : ` ${writer.session_id}`}`;
+}
+
 function formatMemoryList(memories: Memory[]): string {
   if (memories.length === 0) {
     return 'No memories found.';
   }
 
-  return memories
-    .map((m) => {
-      const date = new Date(m.created_at).toISOString().slice(0, 10);
-      const tags = m.tags.length > 0 ? ` [${m.tags.join(', ')}]` : '';
-      return `- [${date}] (id: ${m.id}, importance: ${m.importance})${tags} ${m.content}`;
-    })
-    .join('\n');
+  return frameMemoryNotes(
+    memories
+      .map((m) => {
+        const tags = m.tags.length > 0 ? ` [${m.tags.join(', ')}]` : '';
+        return `- [${formatDay(m.created_at)}] (id: ${m.id}, importance: ${m.importance}${writerLabel(m)})${tags} ${m.content}`;
+      })
+      .join('\n'),
+  );
 }
 
 export async function handleInspect(engine: MemoryEngine, args: Record<string, unknown>): Promise<string> {
@@ -100,12 +115,13 @@ export async function handleInspect(engine: MemoryEngine, args: Record<string, u
 
   // Engine returns different types based on the view
   if (typeof result === 'string') {
-    // String results (tags, export) are returned as-is
-    return result;
+    // String results (tags, export) carry stored text; the empty answers do not.
+    return result === 'No tags found.' || result.trim().length === 0 ? result : frameMemoryNotes(result);
   }
 
   if (isMemoryStats(result)) {
-    return formatStats(result);
+    // The stats view lists the most frequent tags, which earlier sessions wrote.
+    return result.top_tags.length > 0 ? frameMemoryNotes(formatStats(result)) : formatStats(result);
   }
 
   // Memory array (recent, important, ids, tags)

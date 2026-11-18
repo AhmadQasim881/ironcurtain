@@ -77,10 +77,18 @@ it.each(['claude-code', 'codex', 'goose'] as const)(
         body: JSON.stringify(body),
       });
     }
+    // Each route's request sanitizer keeps only its own protocol's client tool
+    // shape, so every agent declares the tool the way it really does.
+    const tools =
+      agent === 'claude-code'
+        ? [{ name: 'execute_code', input_schema: { type: 'object' } }]
+        : agent === 'codex'
+          ? [{ type: 'function', name: 'execute_code', parameters: { type: 'object' } }]
+          : [{ type: 'function', function: { name: 'execute_code', parameters: { type: 'object' } } }];
     const request = {
       model: 'glm-5.3',
       messages: [{ role: 'user', content: 'Calculate 1+1' }],
-      tools: [{ name: 'execute_code', input_schema: { type: 'object' } }],
+      tools,
       cache_control: { type: 'ephemeral' },
     };
     const response = await post(path as string, request);
@@ -101,15 +109,18 @@ it.each(['claude-code', 'codex', 'goose'] as const)(
     expect((await post(path as string, { model: 'glm-5.3', ...resultBody })).statusCode).toBe(200);
     expect(upstream.requests()[1].body).toMatchObject(resultBody);
     expect((await post('/api/unapproved', request)).statusCode).toBe(403);
-    expect((await post(path as string, request, 'agent-owned-key')).statusCode).toBe(200);
-    expect(upstream.requests()[2].headers.authorization).toBe('Bearer agent-owned-key');
-    expect(upstream.requests()).toHaveLength(3);
+    // An agent-supplied key is answered locally: nothing reaches Z.AI, so the
+    // request cannot land in an account the agent chose.
+    const foreign = await post(path as string, request, 'agent-owned-key');
+    expect(foreign.statusCode).toBe(401);
+    expect(foreign.body).not.toContain('agent-owned-key');
+    expect(upstream.requests()).toHaveLength(2);
     if (agent === 'goose') {
       expect(
         (await post(path as string, { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'Title' }] }))
           .statusCode,
       ).toBe(200);
-      expect(upstream.requests()[3].body.model).toBe('glm-5.3');
+      expect(upstream.requests()[2].body.model).toBe('glm-5.3');
     }
   },
 );

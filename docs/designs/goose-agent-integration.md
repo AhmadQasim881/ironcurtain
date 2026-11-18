@@ -1,7 +1,8 @@
 # Goose Agent Integration -- Design Specification
 
+**Status (2026-11-14):** Implemented (`src/docker/adapters/goose.ts`, `docker/Dockerfile.goose`). Since then the MITM sanitizes Goose's provider requests like every other agent's; with the Google provider, only function declarations are kept in `tools`, file-data parts are neutralized and cached content is dropped (`src/docker/request-sanitizers/gemini.ts`).
+
 **Date:** 2026-03-03
-**Status:** Design
 **Depends on:** Research doc at `docs/brainstorm/goose-agent-integration.md`
 **Reference implementation:** `src/docker/adapters/claude-code.ts`
 
@@ -83,8 +84,8 @@ This document specifies how to add Goose (by Block) as the second Docker Agent M
                    |    3. exec "$@" (CMD)                       |
                    |                                             |
                    |  Non-PTY: CMD = sleep infinity              |
-                   |    docker exec: goose run --no-session      |
-                   |      -t "message" -i /tmp/instructions.md   |
+                   |    docker exec: goose run --name <conv-id>  |
+                   |      [--resume] -i /tmp/goose-prompt.md     |
                    |                                             |
                    |  PTY: CMD = socat ... EXEC:goose-session.sh |
                    |    Interactive goose session via PTY proxy   |
@@ -340,29 +341,35 @@ kill -WINCH "$GOOSE_PID" 2>/dev/null
 
 ### 4.5 `buildCommand(message: string, systemPrompt: string): readonly string[]`
 
-Builds the `docker exec` command for a single turn in batch mode.
+Builds the `docker exec` command for a single turn in batch mode. Before parsing the completed response, combined stdout/stderr must fit 4 MiB. Overflow is an explicit error, never truncated JSON or an empty-output retry. Goose strips terminal sequences with the shared linear scanner, including incomplete sequences, rather than a backtracking ANSI expression.
 
 ```typescript
-buildCommand(message: string, systemPrompt: string): readonly string[] {
+buildCommand(message: string, systemPrompt: string, options: AgentCommandOptions): readonly string[] {
   // Write instructions to a temp file inside the container via a shell
-  // command, then invoke goose run.
+  // command, then invoke goose run in the conversation's named session.
   //
-  // The system prompt is injected as instructions so Goose has context
-  // about the MCP-mediated environment on every turn.
-  const instructions = `${systemPrompt}\n\n---\n\nUser request:\n${message}`;
+  // The first turn sends the system prompt with the message; a resumed
+  // session already holds it, so later turns send the message alone.
+  const resume = !options.firstTurn;
+  const instructions = resume ? message : `${systemPrompt}\n\n---\n\nUser request:\n${message}`;
+  const { delimiter } = escapeHeredoc(instructions);
 
   return [
     '/bin/sh', '-c',
     `PROMPT_FILE=$(mktemp /tmp/goose-prompt-XXXXXX.md) && ` +
-    `cat > "$PROMPT_FILE" << 'IRONCURTAIN_EOF'\n${escapeHeredoc(instructions)}\nIRONCURTAIN_EOF\n` +
-    `goose run --no-session -i "$PROMPT_FILE" && rm -f "$PROMPT_FILE"`
+    `trap 'rm -f "$PROMPT_FILE"' EXIT && ` +
+    `cat > "$PROMPT_FILE" << '${delimiter}'\n${instructions}\n${delimiter}\n` +
+    `goose run --quiet --output-format json -i "$PROMPT_FILE" "$@"`,
+    'ironcurtain-goose',
+    '--name', options.sessionId,            // validated plain identifier
+    ...(resume ? ['--resume'] : []),
   ];
 }
 ```
 
 **Key design decisions:**
 
-- **`--no-session`**: Each `docker exec` is stateless. Goose does support `--resume-session`, but the session name would need to be coordinated across turns, and Goose's session storage is internal. Using `--no-session` is simpler and avoids state management complexity. The system prompt provides context on every turn.
+- **Named sessions (as implemented, superseding the original `--no-session`):** each conversation is a Goose session named after the agent conversation id, `goose run --name <id>`; later turns add `--resume` and send the message alone, since the session already holds the system prompt from its first turn. The session arguments are positional parameters (`"$@"`), never part of the script text, and the name must be a plain identifier. The session store (`~/.local/share/goose/sessions/`) is the mounted conversation-state directory (`goose-state`), so sessions survive container restarts and are shared by the turns of one bundle. Whether a new session continues a conversation comes from a host-only record (see `docs/designs/session-resume.md` §3.6).
 
 - **No `--text`/`-t` flag**: The system prompt + user message combined can exceed shell argument length limits. Writing to a temp file and using `--instructions`/`-i` avoids this.
 
@@ -382,7 +389,7 @@ buildCommand(message: string, systemPrompt: string): readonly string[] {
 
   **Edge case:** The theoretical probability of a collision with a random suffix is negligible (1 in 4 billion). The loop check guarantees correctness regardless.
 
-**Multi-turn limitation:** Without `--resume-session`, Goose loses conversation history between turns. Each turn starts fresh with only the system prompt + current message. This is acceptable for task execution but poor for extended conversations. See Section 9 for the multi-turn strategy.
+**Multi-turn history:** named sessions keep the conversation across turns (Section 9). A resumed session's JSON envelope lists the whole conversation, so `extractAssistantText` returns only the assistant text after the last user prompt.
 
 ### 4.6 `buildSystemPrompt(context: OrientationContext): string`
 
@@ -452,7 +459,7 @@ getProviders(authKind?: 'oauth' | 'apikey'): readonly ProviderConfig[] {
 - **Option B:** Read from a module-level config singleton. Less testable.
 - **Option C:** Make `getProviders()` accept an optional config parameter. Breaks the interface contract.
 
-**Recommendation:** Option A. Modify `registerBuiltinAdapters()` to accept `ResolvedUserConfig` and pass it to the Goose adapter factory. The Claude Code adapter does not need config (it always returns Anthropic), so it remains a plain object.
+**Recommendation (superseded):** Option A, capturing the config when the adapter is created, was implemented first and then replaced by Option C in the form the interface already allows: `getProviders`, `buildEnv` and `detectCredential` receive the per-session `IronCurtainConfig` and read `userConfig.gooseProvider` / `userConfig.gooseModel` on every call. The registry keeps one adapter per process (the daemon, Signal bot and web UI serve many sessions, and the first-start wizard registers adapters before any config exists), so a captured value applied the first registration's choice to every later session. The factories take no configuration.
 
 ### 4.8 `buildEnv(config: IronCurtainConfig, fakeKeys: ReadonlyMap<string, string>): Record<string, string>`
 
@@ -468,7 +475,7 @@ buildEnv(config: IronCurtainConfig, fakeKeys: ReadonlyMap<string, string>): Reco
     GOOSE_PROVIDER: provider,
     GOOSE_MODEL: model,
     GOOSE_MODE: 'auto',           // Skip all permission prompts
-    GOOSE_MAX_TURNS: '200',       // Prevent runaway execution
+    GOOSE_MAX_TURNS: '200',       // Prevent runaway execution (as implemented: resourceBudget.maxSteps, omitted when null)
     // TLS: Goose is Rust. If it uses rustls with the `rustls-tls-native-roots`
     // feature (via reqwest), it reads /etc/ssl/certs/ -- update-ca-certificates
     // in the Dockerfile handles this. If it uses compiled-in webpki roots instead,
@@ -868,32 +875,15 @@ This is noisy but functional. The user sees everything Goose produced, including
 
 ### Batch Mode (Non-PTY)
 
-Each `sendMessage()` invokes `docker exec` with `goose run --no-session`. This means:
+Each `sendMessage()` invokes `docker exec` with `goose run --name <agentConversationId>` (as implemented; the original design used `--no-session`). This means:
 
-- **No conversation history between turns.** Each turn is independent.
-- The system prompt provides context for every turn.
-- The user's message is the only variable input per turn.
-
-**Mitigation for lack of history:** The `buildCommand()` method can include a condensed summary of previous turns in the instructions file:
-
-```typescript
-buildCommand(message: string, systemPrompt: string): readonly string[] {
-  // Include previous turn summaries if available
-  // (passed via a session-level mechanism, TBD)
-  const instructions = [
-    systemPrompt,
-    '---',
-    `User request:\n${message}`,
-  ].join('\n\n');
-  // ... write to temp file, invoke goose run
-}
-```
-
-**Future improvement:** If Goose adds `--resume-session` support in headless mode with reliable session ID management, this can be upgraded to maintain history. The adapter interface's `buildCommand()` receives the message and system prompt, which is sufficient to implement either approach.
+- **The conversation continues across turns.** The first turn creates the named session with the system prompt and the message; later turns pass `--resume` and the message alone.
+- A later session that reuses the conversation id (a workflow state re-entered with `freshSession: false`, `ironcurtain start --resume`) resumes the session when the host-only record for that id exists and the mounted session store is non-empty; otherwise it starts the session afresh.
+- Rotating the conversation id (after a hard failure) starts a new named session.
 
 ### PTY Mode (Interactive)
 
-PTY mode runs `goose run -s` (interactive with instructions), which maintains full conversation history within the session. This is the recommended mode for extended work with Goose.
+PTY mode runs `goose run -s --name <IronCurtain session id>` (interactive with instructions), which maintains full conversation history within the session, and a PTY resume runs `goose session --name <id> --resume` against the mounted session store (falling back to a fresh start). This is the recommended mode for extended work with Goose.
 
 - The system prompt is injected once via `--instructions` at session start
 - Goose maintains its own conversation history
@@ -927,7 +917,7 @@ export async function registerBuiltinAdapters(userConfig?: ResolvedUserConfig): 
 }
 ```
 
-**Key design decision:** `createGooseAdapter()` accepts `userConfig` as **optional**. When `undefined`, it uses hardcoded defaults (`gooseProvider: 'anthropic'`, `gooseModel: 'claude-sonnet-4-20250514'`). This means `--list-agents` works without loading config, and the Goose adapter always appears in the list. The actual provider selection only matters at session creation time, when config is always available.
+**Key design decision (as implemented):** `createGooseAdapter()` and `registerBuiltinAdapters()` take no configuration. The adapter reads the provider and model from each session's config (falling back to `anthropic` / `claude-sonnet-4-20250514` for a config without them), so `--list-agents` and the first-start wizard can register it before any config exists, and a config edit reaches the next daemon session without a restart.
 
 **Impact:** Callers of `registerBuiltinAdapters()`:
 - `src/docker/docker-infrastructure.ts` (line 83) -- passes `config.userConfig` (already has access to config)
@@ -1090,7 +1080,7 @@ Test the adapter methods in isolation:
    - Scripts reference correct process name (`goose`, not `claude`)
 
 3. **`buildCommand()`**
-   - Contains `goose run --no-session`
+   - Runs `goose run` in the named session (`--name <conversation id>`, `--resume` on later turns), with the session arguments outside the script text
    - Contains `--instructions` or `-i` flag
    - System prompt is included in the instructions
    - Heredoc delimiter is unique when input contains `IRONCURTAIN_EOF`
@@ -1322,9 +1312,9 @@ Prototype 3 (MCP config) is non-blocking and can be done during Phase 2.
 | 2 | Binary distribution URL format | Prototype 2 verifies download | Yes |
 | 3 | TLS cert store: does Goose trust custom CAs? | Prototype 4 verifies; `SSL_CERT_FILE`/`SSL_CERT_DIR` set defensively; fallbacks documented in Section 5 | Yes |
 | 4 | MCP config.yaml exact format and path | Prototype 3 or verify from Goose docs | No |
-| 5 | Multi-turn history in batch mode | Accept stateless turns initially; upgrade if Goose adds `--resume-session` for headless | No |
+| 5 | Multi-turn history in batch mode | Resolved: named sessions (`--name <conversation id>`, `--resume` on later turns) in the mounted session store | No |
 | 6 | Goose v1.25.0 built-in sandboxing conflict with `--network=none` | `GOOSE_MODE=auto` likely disables it; verify during Prototype 1 | No |
-| 7 | `GOOSE_MAX_TURNS` default value | Start with 200 (matches IronCurtain's default step limit); tune based on usage | No |
+| 7 | `GOOSE_MAX_TURNS` default value | Start with 200 (matches IronCurtain's default step limit); tune based on usage. Resolved: derived from `resourceBudget.maxSteps` (default 200) and omitted when the step limit is disabled | No |
 | 8 | Goose keyring bypass in Docker | Env vars take priority per Goose docs; verified by the `GOOSE_MODE=auto` pattern | No |
 | 9 | System prompt length limits with `--instructions` | File-based injection (`-i /path/to/file`) avoids shell arg limits; verify file size limits during Prototype 1 | No |
 | 10 | Goose arm64 binary availability | Check GitHub releases; the official Docker image supports multi-arch, so binaries should exist | No |
@@ -1339,8 +1329,8 @@ Prototype 3 (MCP config) is non-blocking and can be done during Phase 2.
 | MCP config format | JSON (`mcpServers` key) | YAML (`extensions` key) |
 | Config location | `--mcp-config` CLI flag | `~/.config/goose/config.yaml` |
 | System prompt injection | `--append-system-prompt` (inline) | `--instructions`/`-i` (file-based) |
-| Batch mode command | `claude --continue -p "msg"` | `goose run --no-session -i file` |
-| Session continuity | `--continue` resumes session | No continuity in batch mode |
+| Batch mode command | `claude --session-id/--resume <id> -p "msg"` | `goose run --name <id> [--resume] -i file` |
+| Session continuity | `--resume <id>` resumes session | Named session, `--resume` on later turns |
 | Output format | `--output-format json` | Plain text (parsed heuristically) |
 | Provider selection | Always Anthropic | User-configurable (anthropic/openai/google) |
 | Auth method | API key or OAuth | API key only |

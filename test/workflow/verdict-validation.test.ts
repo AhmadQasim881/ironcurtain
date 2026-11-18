@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import type { WorkflowDefinition } from '../../src/workflow/types.js';
 import { WorkflowOrchestrator } from '../../src/workflow/orchestrator.js';
 import {
+  resolveActiveGate,
   MockSession,
   statusBlock,
   simulateArtifacts,
@@ -351,7 +352,7 @@ describe('verdict validation', () => {
     expect(gate.summary).toContain('Fresh replacement execution hard-failed');
     expect(gate.presentedArtifacts.has('analysis')).toBe(true);
     expect(session.rotateCalls).toEqual([3, 4]);
-    orchestrator.resolveGate(workflowId, { type: 'ABORT' });
+    resolveActiveGate(orchestrator, workflowId, { type: 'ABORT' });
     await waitForCompletion(orchestrator, workflowId);
     expect(orchestrator.getStatus(workflowId)?.phase).toBe('aborted');
   });

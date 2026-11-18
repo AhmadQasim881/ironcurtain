@@ -1,6 +1,7 @@
 # TB1a: Git Server Integration & Role Extensibility
 
-**Status:** Proposed
+**Status (2026-11-14):** Implemented: the git server (`@cyanheads/git-mcp-server`, pinned exactly) and the role categories in `src/types/argument-roles.ts`. Since then the git backend runs with a hardened git environment (`src/trusted-process/git-backend-env.ts`), and the git argument names here predate git-mcp-server 2.15.
+
 **Date:** 2026-02-19
 **Author:** IronCurtain Engineering
 **Depends on:** TB0 (Execution Containment) -- complete
@@ -42,6 +43,7 @@ Two tools (`git_wrapup_instructions`, `git_changelog_analyze`) are AI workflow h
 ### 2.4 Credential Requirements
 
 - **SSH key auth:** Agent needs read access to `~/.ssh/`. The sandbox `denyRead` must not block it.
+  - _Update:_ the read-containment baseline in `sandbox-integration.ts` now denies `~/.ssh/id_*` (and the other credential stores and the IronCurtain home) to every sandboxed server, git included. Git still reads `~/.ssh/known_hosts` and `~/.ssh/config`, and authenticates through ssh-agent (`SSH_AUTH_SOCK` is allowed). Reading key files again needs an explicit per-server opt-out: `"allowRead": ["~/.ssh/id_*"]`.
 - **HTTPS token auth:** Injected via `GH_TOKEN` or similar env vars in the server config.
 - **Recommendation:** SSH key auth for push operations (keys already on disk). Token-based auth deferred to TB1b's user credential configuration.
 
@@ -169,59 +171,25 @@ export function extractGitDomain(value: string): string {
 
 ### 3.5 Named Remote Resolution
 
-The `remote` argument on `git_push`/`git_pull`/`git_fetch` is always a named remote (e.g., `"origin"`), never a URL. To enforce domain policy, we must resolve it to the actual URL.
+The `remote` argument on `git_push`/`git_pull`/`git_fetch` is always a named remote (e.g., `"origin"`), never a URL. To enforce domain policy, we must resolve it to the URL git will actually contact.
 
-```typescript
-import { execFileSync } from 'node:child_process';
-import { resolve } from 'node:path';
+> **Superseded implementation.** The original design ran `git remote get-url <name>` in the repository with `execFileSync`. That ran git inside a repository the agent can write (a FIFO or nested `include.path` stalled the trusted process for seconds), resolved named remotes in repositories outside the sandbox (leaking their remote host into escalation reasons), and returned the _fetch_ URL, while `git push` goes to `remote.<name>.pushurl` or a `url.<base>.pushInsteadOf` rewrite. Resolution is now done in-process by `src/trusted-process/git-remote-resolution.ts`, as described below.
 
-/**
- * Resolves a git remote value to a URL for policy evaluation.
- *
- * If the value is already a URL (contains :// or matches SSH pattern),
- * returns it as-is. Otherwise, treats it as a named remote and runs
- * `git remote get-url <name>` in the repository directory (found via
- * the `path` sibling argument).
- *
- * The policy engine runs in the trusted process (not sandboxed), so
- * it has full filesystem access for resolution -- same pattern as
- * realpathSync() for path resolution.
- *
- * Uses execFileSync (not execSync) to avoid command injection --
- * the value comes from agent-controlled tool call arguments.
- *
- * When resolution fails (repo doesn't exist, remote not found, git
- * not installed), returns the original value. This causes the domain
- * check to escalate (the value won't match any allowed domain),
- * which is the correct behavior -- escalate when we can't verify.
- */
-export function resolveGitRemote(
-  value: string,
-  allArgs: Record<string, unknown>,
-): string {
-  // Already a URL -- return as-is
-  if (value.includes('://') || /^[\w.+-]+@[^:]+:/.test(value)) {
-    return value;
-  }
+`resolveGitRemoteUrls(value, args, { allowedDirectory })` never runs git in a repository:
 
-  // Named remote -- resolve via git (no shell, no injection risk)
-  const rawPath = typeof allArgs.path === 'string' ? allArgs.path : '.';
-  const repoPath = resolve(rawPath); // Resolve relative paths before use as cwd
-  try {
-    return execFileSync('git', ['remote', 'get-url', value], {
-      cwd: repoPath,
-      encoding: 'utf-8',
-      timeout: 5000,
-    }).trim();
-  } catch {
-    return value; // Resolution failed -- escalation will catch it
-  }
-}
-```
+- **Sandbox containment first.** A named remote is resolved only when `args.path` is absolute and its real path lies inside `allowedDirectory`. Otherwise (no path, a relative path, a path outside the sandbox, no repository found below the sandbox root) the result is unresolved and nothing below the path is read. There is no fallback to the trusted process's working directory.
+- **Discovery like git, bounded by the sandbox.** From the path upwards to the sandbox root: a `.git` directory is used; a symlinked `.git`, a gitfile (`gitdir: ...`), `commondir`, `config.worktree`, an incomplete git directory, or a directory that looks like an implicit bare repository (has a `HEAD`) is refused rather than emulated. "Complete" never accepts more than git does (for example, `HEAD` whitespace is git's own `isspace()`: space, tab, LF, CR), because git skips a `.git` it rejects and walks on to an outer repository with a different remote.
+- **Safe reads.** `.git/config` and `HEAD` are read with `readIdentifiedUntrustedRegularFile` / `readUntrustedRegularFile` (`O_NOFOLLOW | O_NONBLOCK`, size-capped), so a FIFO or symlink is refused without blocking. After the read, the config path must still `realpath` to itself inside the sandbox and `lstat` to the inode that was read, which defeats a parent directory swapped for a symlink between the containment check and the open. The file is parsed with the git-faithful parser from `src/security/git-hardening.ts`; a syntax error or any `include.path` / `includeIf.*.path` entry is refused, so includes are never followed.
+- **git's URL rules.** The remote is looked up by exact name among `remote.<name>.url` / `pushurl` entries from the user's trusted system and global config (read once with `git config` from `/`, never inside a repository) and the repository config. A name with no URL is unresolved (legacy `remotes/` / `branches/` entries are refused); a URL-shaped value with no remote of that name is taken as the URL. URLs are rewritten with `url.<base>.insteadOf` (longest prefix wins) and `pushInsteadOf`. Every URL either side could contact (fetch URLs, push URLs, push rewrites) is returned, and callers require all of them to pass.
+- **Repository overrides escalate.** Repository-config entries that change where the remote connects (`remote.<name>.pushurl`, `url.*.insteadOf` / `pushInsteadOf`, proxies, TLS trust, `core.sshCommand`, `core.gitProxy`, `remote.<name>.vcs`) are applied, so a reason can name the real destination, but they also make the result unverifiable, so the domain gate escalates instead of trusting the emulation.
+- **Option-like names** (`-v`, `--all`) are never resolved, even if a remote of that name is configured.
+- **Bounded cost.** Evaluation is synchronous, so a remote with more than 64 URLs, or more than 1024 URL rewrites in all, is unverifiable rather than processed, and a reason names at most three destinations. A config at the 1 MiB size cap evaluates in tens of milliseconds.
 
-The policy engine resolves indirection (e.g., named remote to URL via `resolveGitRemote`) before extracting the domain, giving it the fully resolved URL to extract the domain from.
+When the remote is omitted, the policy engine evaluates `origin`, because git-mcp-server runs `git push|pull|fetch <remote || "origin">`; `branch.<name>.remote`, `remote.pushDefault` and the branch upstream never apply.
 
-**Integration point:** Resolution happens inside the policy engine only (the untrusted domain gate and compiled rule evaluation domain condition evaluation), not in `prepareToolArgs()`. This keeps `prepareToolArgs()` unchanged (it only handles path normalization) and co-locates resolution with the domain validation logic that needs it.
+**Integration point:** Resolution happens in the trusted process only, never in `prepareToolArgs()`: in the policy engine (the untrusted domain gate and compiled rule `domains` conditions), in the approval whitelist (which binds a pattern to the destination, `origin -> github.com/owner/repo`, and re-resolves at every match, so re-pointing the remote ends the match; a remote that cannot be resolved yields no pattern) and in the escalation prompt (which shows the approver where the remote connects). All of them go through `resolveUrlForDomainCheck` with the arguments the engine evaluated (`evaluatedArguments`, so an omitted remote is `origin`). The transport still receives the agent's own arguments.
+
+**Residual risk:** an agent can rewrite an in-sandbox `.git/config` between policy evaluation and the git server's own read of it, and conditional includes in the user's global config (`includeIf "gitdir:..."`) are not evaluated.
 
 ### 3.6 Annotation Pipeline Integration
 
@@ -278,32 +246,38 @@ Structural Checks
 
 **Domain violations escalate, not deny.** A URL targeting an unknown domain is not inherently destructive -- the user might legitimately want to push to a new remote. Escalation lets the human decide.
 
-**Two-layer separation:** The srt sandbox `allowedDomains` controls what the process *can* reach at the OS level (containment backstop). The policy engine's domain check controls what the agent *may* do (semantic authority). The constitution is the source of policy authority; the srt allowlist is a defense-in-depth measure. For TB1a, the git server's srt config hardcodes `["github.com", "*.github.com", "gitlab.com", "*.gitlab.com"]` -- broad enough to avoid the "policy allows but srt blocks" mismatch for common remotes.
+**The gate only adds a restriction.** Its escalation is not a final decision: the compiled rules still evaluate every role of the call (the gate's URL roles included), and the two results are combined. A compiled deny on any role (a path the policy denies, or a URL role no rule covers) still wins, so an off-allowlist or unverifiable destination never turns a denied call into an approvable one: a git call on a repository outside every permitted directory stays denied when its remote is also off the allowlist or cannot be verified (an omitted remote is evaluated as `origin`, which is never resolved outside the sandbox). Otherwise the call escalates with the gate's rule (`structural-domain-escalate`) and reason, and `escalatedRoles` names every URL role that failed the gate plus every role the compiled rules escalated (a path outside the sandbox, say). An approval, a whitelist pattern and roots expansion therefore cover the whole call, not just its URL; the approval whitelist only discharges an escalation when its pattern constrains every one of those roles.
+
+**Two-layer separation:** The srt sandbox `allowedDomains` controls what the process _can_ reach at the OS level (containment backstop). The policy engine's domain check controls what the agent _may_ do (semantic authority). The constitution is the source of policy authority; the srt allowlist is a defense-in-depth measure. For TB1a, the git server's srt config hardcodes `["github.com", "*.github.com", "gitlab.com", "*.gitlab.com"]` -- broad enough to avoid the "policy allows but srt blocks" mismatch for common remotes.
 
 ### 4.2 Resolution Pipeline
 
-For URL-category arguments, the policy engine applies a three-step pipeline:
+For URL-category arguments, `resolveUrlForDomainCheck` in `domain-utils.ts` is the single resolver. The structural domain gate and compiled `domains` conditions both use it (memoized per `evaluate()` call, so they see the same answer), and so do the approval whitelist and the escalation prompt (section 3.5):
 
 ```
-1. Resolve indirection (git-remote-url: named remote → URL via resolveGitRemote)
-2. Canonicalize URL format (roleDef.canonicalize)
-3. Extract domain for allowlist check (extractDomain / extractGitDomain)
+1. Canonicalize the value the way the transport receives it (roleDef.canonicalize)
+2. git-remote-url: resolve the remote to every URL git could contact (section 3.5)
+3. Extract each destination's domain with a canonical host (extractDomain / parseGitRemoteUrl)
 ```
 
 ```typescript
+type DomainCheckTarget =
+  | { status: 'resolved'; domains: readonly string[] } // every domain must pass
+  | { status: 'unverifiable'; reason: string; domains: readonly string[] }; // always fails
+
 function resolveUrlForDomainCheck(
   value: string,
   role: ArgumentRole,
-  roleDef: RoleDefinition,
   allArgs: Record<string, unknown>,
-): string {
-  const resolved = role === 'git-remote-url' ? resolveGitRemote(value, allArgs) : value;
-  const normalized = roleDef.canonicalize(resolved);
-  return role === 'git-remote-url' ? extractGitDomain(normalized) : extractDomain(normalized);
-}
+  context: { allowedDirectory?: string },
+): DomainCheckTarget;
 ```
 
-URL-specific functions (`resolveGitRemote`, `extractDomain`, `extractGitDomain`) are imported from `domain-utils.ts` rather than being defined on the `RoleDefinition` interface. Only 2 of 10 roles need URL handling, so the policy engine dispatches by role identity.
+The gate escalates when any destination is off the allowlist (naming it) or the target is unverifiable (stating why); a compiled `domains` condition matches only a `resolved` target whose every domain matches.
+
+Git URLs are parsed the way git connects, not with the WHATWG URL parser: ssh and git URLs are percent-decoded in full before the host is split out (so `ssh://git@evil.example%2f.github.com/x` reaches `evil.example`, not a `*.github.com` host), the host is canonicalized (lowercased names; `2130706433`, `127.1` and `0x7f000001` become `127.0.0.1`; `git@[::1]:x` becomes `[::1]`), and remote helpers (`transport::address`, unknown or non-lowercase schemes), `file:` URLs, local paths, backslashes, control characters, non-ASCII and ambiguous authorities (two `@`) are unverifiable. Only a validated hostname or canonical IP literal, with a plain repository path, is ever echoed into a reason (`displayableDomain`). A remote argument that names a local repository (an absolute path, a `~` path or a `file://` URL, whose host git ignores: `file://github.com/srv/repo` reads `/srv/repo`) is evaluated as a filesystem read of that path (`withLocalGitSourceReads` in `src/trusted-process/git-structural-rules.ts`): the protected-path check, sandbox containment and compiled read-path rules judge the path, and the URL role still goes through the compiled rules. When the argument is not also the name of a configured remote, the domain gate leaves it alone (`DomainCheckTarget.localSource`); a configured remote whose name merely looks like a path is resolved to where it connects, as before. A remote that a configured remote or a URL rewrite turns into a local path is unverifiable, so the gate escalates it, and it is denied outright when that path is protected (`DomainCheckTarget.localPaths`).
+
+URL-specific functions (`resolveUrlForDomainCheck`, `extractDomain`, `extractGitDomain`) live in `domain-utils.ts` rather than on the `RoleDefinition` interface. Only 2 of 10 roles need URL handling, so the resolver dispatches by role identity.
 
 ### 4.3 PolicyEngine Constructor Extension
 
@@ -329,11 +303,8 @@ Domain allowlists are derived from `mcp-servers.json` sandbox network configurat
 ### 4.4 Domain Matching
 
 ```typescript
-function domainMatchesAllowlist(
-  domain: string,
-  allowedDomains: readonly string[],
-): boolean {
-  return allowedDomains.some(pattern => {
+function domainMatchesAllowlist(domain: string, allowedDomains: readonly string[]): boolean {
+  return allowedDomains.some((pattern) => {
     if (pattern === '*') return true;
     if (pattern.startsWith('*.')) {
       const suffix = pattern.slice(1); // ".github.com"
@@ -358,7 +329,7 @@ export interface CompiledRuleCondition {
   server?: string[];
   tool?: string[];
   paths?: PathCondition;
-  domains?: DomainCondition;  // NEW
+  domains?: DomainCondition; // NEW
 }
 ```
 
@@ -368,16 +339,17 @@ The constitution compiler prompt is updated to document the new `domains` condit
 
 ```
 Tool Call Request (e.g., git_push with remote="origin", path="/sandbox/repo")
-  |
+  |   (an omitted remote is evaluated as "origin", as git-mcp-server uses it)
   v
 Structural Checks
   |-- Protected path check on path="/sandbox/repo" → not protected, continue
   |-- Filesystem sandbox containment on path="/sandbox/repo" → within sandbox, resolve read-path
   |-- Untrusted domain gate on remote="origin":
-  |       resolveGitRemote("origin", {path: "/sandbox/repo"})
-  |         → git remote get-url origin → "git@github.com:user/repo.git"
-  |       extractGitDomain("git@github.com:user/repo.git") → "github.com"
-  |       domainMatchesAllowlist("github.com", ["github.com", "*.github.com"]) → pass
+  |       resolveUrlForDomainCheck("origin", "git-remote-url", {path: "/sandbox/repo"}, {allowedDirectory})
+  |         → /sandbox/repo/.git/config read in-process: url = git@github.com:user/repo.git,
+  |           no pushurl / insteadOf / proxy overrides
+  |         → { status: "resolved", domains: ["github.com/user/repo"] }
+  |       domainMatchesAllowlist("github.com/user/repo", ["github.com", "*.github.com"]) → pass
   |-- Unknown tool denial → tool known, continue
   |
   v
@@ -400,6 +372,7 @@ The pipeline loads both and concatenates them (base first, user second). User gu
 
 ```markdown
 <!-- ~/.ironcurtain/constitution-user.md -->
+
 ## User-Specific Guidance
 
 - The agent must receive human approval before any git push operation.
@@ -427,6 +400,8 @@ The combined constitution is hashed for cache invalidation. Changes to either fi
 
 ### 6.1 Server Config
 
+> **As shipped (2026-11):** the relay spawns the git backend with a hardened git environment applied last (`hardenGitBackendEnv` in `src/trusted-process/git-backend-env.ts`, mechanics in `src/security/git-hardening.ts`): repository configuration that would run programs (fsmonitor, hooks, pager, editors, askpass, signing, alternates, maintenance) is neutralized, only the https and ssh protocols are allowed, and ceiling directories stop repository discovery above the workspace. Renaming the server drops this hardening, which is keyed on the name `git`.
+
 ```jsonc
 // src/config/mcp-servers.json
 "git": {
@@ -437,7 +412,7 @@ The combined constitution is hashed for cache invalidation. Changes to either fi
   },
   "sandbox": {
     "filesystem": {
-      "denyRead": []   // Need ~/.ssh for auth, .gitconfig for identity
+      "denyRead": []   // Need ~/.ssh for auth, .gitconfig for identity (the baseline still denies ~/.ssh/id_*; see 2.4)
     },
     "network": {
       "allowedDomains": ["github.com", "*.github.com", "gitlab.com", "*.gitlab.com"]
@@ -450,12 +425,14 @@ The combined constitution is hashed for cache invalidation. Changes to either fi
 
 ```markdown
 ## Concrete Guidance which supersedes the guiding principles
- ...existing filesystem rules...
- - The agent may perform read-only git operations (status, diff, log, show, blame) within the sandbox without approval.
- - The agent may stage files (git add) and commit within the sandbox without approval.
- - The agent must receive human approval before git push, git pull, git fetch, or any remote-contacting operation.
- - The agent must receive human approval before git reset, git rebase, git merge, or any history-rewriting operation.
- - The agent must receive human approval before git branch deletion or force operations.
+
+...existing filesystem rules...
+
+- The agent may perform read-only git operations (status, diff, log, show, blame) within the sandbox without approval.
+- The agent may stage files (git add) and commit within the sandbox without approval.
+- The agent must receive human approval before git push, git pull, git fetch, or any remote-contacting operation.
+- The agent must receive human approval before git reset, git rebase, git merge, or any history-rewriting operation.
+- The agent must receive human approval before git branch deletion or force operations.
 ```
 
 ### 6.3 Handwritten Scenarios
@@ -464,23 +441,23 @@ New scenarios in `src/pipeline/handwritten-scenarios.ts`:
 
 ```typescript
 // Git read operations in sandbox → allow
-'Git status in sandbox'
-'Git log in sandbox'
-'Git diff in sandbox'
+'Git status in sandbox';
+'Git log in sandbox';
+'Git diff in sandbox';
 
 // Git write operations in sandbox → allow
-'Git add in sandbox'
-'Git commit in sandbox'
+'Git add in sandbox';
+'Git commit in sandbox';
 
 // Git remote/destructive operations → escalate
-'Git push from sandbox'
-'Git pull to sandbox'
-'Git reset in sandbox'
-'Git merge in sandbox'
-'Git branch delete in sandbox'
+'Git push from sandbox';
+'Git pull to sandbox';
+'Git reset in sandbox';
+'Git merge in sandbox';
+'Git branch delete in sandbox';
 
 // Unknown tool → deny
-'Unknown git tool'
+'Unknown git tool';
 ```
 
 ## 7. Developer Onboarding Workflow
@@ -510,8 +487,9 @@ Each step has a natural validation gate. The compile-time completeness check on 
 These must land together. Adding URL roles with `isResourceIdentifier: true` immediately breaks the policy engine if the protected path check and filesystem sandbox containment still use `getResourceRoles()` (see Section 3.7). The category-aware accessors and the engine's domain support must be co-committed.
 
 **Files changed:**
+
 - `src/types/argument-roles.ts` -- add `RoleCategory`, `annotationGuidance` to `RoleDefinition`; add `category` and `annotationGuidance` to existing role entries; add new roles (`fetch-url`, `git-remote-url`, `branch-name`, `commit-message`); add `getRolesByCategory()`, `getPathRoles()`, `getUrlRoles()`
-- `src/trusted-process/domain-utils.ts` -- URL normalizers (`normalizeUrl`, `extractDomain`, `normalizeGitUrl`, `extractGitDomain`) and `resolveGitRemote`
+- `src/trusted-process/domain-utils.ts` -- URL normalizers (`normalizeUrl`, `extractDomain`, `normalizeGitUrl`, `extractGitDomain`) and `resolveGitRemote` (since replaced by `resolveUrlForDomainCheck` and the in-process `git-remote-resolution.ts`; see section 3.5)
 - `src/trusted-process/policy-engine.ts` -- switch the protected path check and filesystem sandbox containment from `getResourceRoles()` to `getPathRoles()`; add `serverDomainAllowlists` constructor param; add `extractAnnotatedUrls()`, `domainMatchesAllowlist()`, untrusted domain gate; add `ruleMatches()` domains condition; add URL resolution pipeline (resolve indirection, canonicalize, extract domain via `domain-utils.ts` functions)
 - `src/trusted-process/mcp-proxy-server.ts` -- extract domain allowlists from deserialized `mcp-servers.json` sandbox configs, pass to `PolicyEngine` constructor
 - `src/pipeline/types.ts` -- add `DomainCondition` to `CompiledRuleCondition`
@@ -524,6 +502,7 @@ These must land together. Adding URL roles with `isResourceIdentifier: true` imm
 ### Phase 2: Git Server Integration + User Constitution
 
 **Files changed:**
+
 - `src/config/mcp-servers.json` -- add git server
 - `src/config/constitution.md` -- add git-specific guidance
 - `src/pipeline/handwritten-scenarios.ts` -- add git scenarios
@@ -541,7 +520,7 @@ These must land together. Adding URL roles with `isResourceIdentifier: true` imm
 
 - URL normalization edge cases (missing protocol, trailing slashes, ports, invalid URLs)
 - SSH URL domain extraction (`git@github.com:user/repo.git` → `github.com`)
-- Named remote resolution (mock `execSync` for `git remote get-url`)
+- Named remote resolution against real temporary repositories (`test/git-remote-resolution.test.ts`): push URLs, URL rewrites, the `origin` default, out-of-sandbox paths, FIFO includes
 - `domainMatchesAllowlist()` (exact, wildcard, `*`, no match)
 - `getRolesByCategory()` returns correct roles per category
 - `isArgumentRole()` accepts new roles
@@ -551,8 +530,8 @@ These must land together. Adding URL roles with `isResourceIdentifier: true` imm
 
 - Untrusted domain gate escalates when URL domain not in allowlist
 - Untrusted domain gate passes when domain matches (including wildcards)
-- Untrusted domain gate skipped when server has no domain allowlist
-- Untrusted domain gate with named remote resolution (mock)
+- A server with URL roles and no domain allowlist is gated by the default `['*']` (names pass, IP literals and unverifiable values escalate)
+- Untrusted domain gate with named remote resolution (real repositories)
 - Compiled rule evaluation `domains` condition matches/doesn't match
 - Multi-role: tool with path + URL roles evaluates both independently
 - All existing `policy-engine.test.ts` tests pass without modification

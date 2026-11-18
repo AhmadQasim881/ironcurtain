@@ -9,11 +9,20 @@
  * instead of raw JSON fragments), thinking text extraction from
  * raw SSE events, and filtering of zero-value protocol events.
  *
- * Depends on observe-tui-types.ts, mux-renderer.ts (truncate), and Node built-ins.
+ * Untrusted text. Every event field is model output or the agent's own
+ * tool results and is written to the user's terminal inside an ANSI line.
+ * It is sanitized where a line is built (observe-text.ts): prose is split
+ * on line feeds first, then each line loses escape sequences and control
+ * characters (finalized and partial lines alike); tool names, inputs,
+ * results, errors and reasons are shown with controls as visible escapes.
+ * Only this module's own SGR styling reaches the terminal.
+ *
+ * Depends on observe-tui-types.ts, observe-text.ts, mux-renderer.ts (truncate), and Node built-ins.
  */
 
 import type { TokenStreamEvent } from '../docker/token-stream-types.js';
 import { truncate } from '../mux/mux-renderer.js';
+import { observedField, observedLine } from './observe-text.js';
 import {
   type PanelLine,
   type SessionPartialLine,
@@ -149,7 +158,8 @@ function wrapFinalizedLine(
     return [makeLine(prefix)];
   }
 
-  const wrappedPlain = wordWrap(text, contentWidth);
+  // One line of untrusted prose: sanitized before it is measured and wrapped.
+  const wrappedPlain = wordWrap(observedLine(text), contentWidth);
   const result: PanelLine[] = [];
 
   for (let i = 0; i < wrappedPlain.length; i++) {
@@ -194,6 +204,9 @@ export function extractThinkingText(data: string): string | null {
 /** Maximum value length in compact key=value rendering. */
 const MAX_KV_VALUE_LEN = 40;
 
+/** Widest raw event type shown in a `[type]` header, in cells. */
+const MAX_RAW_EVENT_TYPE_LEN = 40;
+
 /**
  * Render a compact key=value summary for a tool's parsed input JSON.
  * Each key-value pair is formatted as key=value, joined with " | ".
@@ -207,11 +220,11 @@ function renderCompactToolInput(
   const pairs: string[] = [];
   for (const [key, value] of Object.entries(input)) {
     const valStr = typeof value === 'string' ? value : JSON.stringify(value);
-    const truncVal = truncate(valStr, MAX_KV_VALUE_LEN);
-    pairs.push(`${key}=${truncVal}`);
+    const truncVal = truncate(observedField(valStr), MAX_KV_VALUE_LEN);
+    pairs.push(`${observedField(key)}=${truncVal}`);
   }
   const summary = pairs.join(' | ');
-  const headerText = `\u25B8 ${toolName}`;
+  const headerText = `\u25B8 ${observedField(toolName)}`;
   const available = textCols - prefixWidth - visibleLength(headerText) - 2;
   const truncSummary = available > 0 ? '  ' + truncate(summary, available) : '';
   return [makeLine(headerText + truncSummary)];
@@ -243,7 +256,7 @@ function renderExecuteCodeInput(
 
   const codeLines = code.split('\n');
   for (const codeLine of codeLines) {
-    const wrapped = wordWrap(codeLine, contentWidth);
+    const wrapped = wordWrap(observedLine(codeLine), contentWidth);
     for (const wl of wrapped) {
       const indent = ' '.repeat(prefixWidth) + '  ';
       const ansi = `${indent}${SGR.TEXT_TOOL_DIM}${wl}${SGR.RESET}`;
@@ -398,7 +411,7 @@ export function createTextPanel(startCol: number, textCols: number, textRows: nu
 
     // Fallback: raw accumulated string
     const available = _textCols - prefixWidth;
-    const truncStr = available > 0 ? truncate(acc.inputBuffer, available) : '';
+    const truncStr = available > 0 ? truncate(observedField(acc.inputBuffer), available) : '';
     const ansi = `${prefix}${SGR.TEXT_TOOL_DIM}${truncStr}${SGR.RESET}`;
     lines.push(makeLine(ansi));
   }
@@ -464,7 +477,7 @@ export function createTextPanel(startCol: number, textCols: number, textRows: nu
 
       // Show a "working..." indicator line
       const { prefix } = labelInfo(label, showLabel);
-      const ansi = `${prefix}${SGR.TEXT_TOOL}\u25B8 ${toolName}${SGR.TEXT_DIM} working...${SGR.RESET}`;
+      const ansi = `${prefix}${SGR.TEXT_TOOL}\u25B8 ${observedField(toolName)}${SGR.TEXT_DIM} working...${SGR.RESET}`;
       lines.push(makeLine(ansi));
     } else if (acc) {
       // input_json_delta: accumulate
@@ -479,7 +492,7 @@ export function createTextPanel(startCol: number, textCols: number, textRows: nu
 
   function handleMessageStart(label: number, model: string, showLabel: boolean): void {
     const { prefix, prefixWidth } = labelInfo(label, showLabel);
-    lines.push(buildCenteredSeparator(prefix, ` ${model} `, _textCols, prefixWidth));
+    lines.push(buildCenteredSeparator(prefix, ` ${observedField(model)} `, _textCols, prefixWidth));
   }
 
   function handleMessageEnd(
@@ -490,14 +503,13 @@ export function createTextPanel(startCol: number, textCols: number, textRows: nu
     showLabel: boolean,
   ): void {
     const { prefix, prefixWidth } = labelInfo(label, showLabel);
-    lines.push(
-      buildCenteredSeparator(prefix, ` ${stopReason}, ${inputTokens}+${outputTokens} tokens `, _textCols, prefixWidth),
-    );
+    const summary = ` ${observedField(stopReason)}, ${observedField(inputTokens)}+${observedField(outputTokens)} tokens `;
+    lines.push(buildCenteredSeparator(prefix, summary, _textCols, prefixWidth));
   }
 
   function handleError(label: number, message: string, showLabel: boolean): void {
     const { prefix } = labelInfo(label, showLabel);
-    const ansi = `${prefix}${SGR.TEXT_ERROR}\u2717 ${message}${SGR.RESET}`;
+    const ansi = `${prefix}${SGR.TEXT_ERROR}\u2717 ${observedField(message)}${SGR.RESET}`;
     lines.push(makeLine(ansi));
   }
 
@@ -507,8 +519,8 @@ export function createTextPanel(startCol: number, textCols: number, textRows: nu
     const icon = isError ? '\u2717' : '\u25C1';
     const headerText = `${icon} [tool_result] `;
     const available = _textCols - prefixWidth - headerText.length;
-    // Show first line of content, truncated
-    const firstLine = content.split('\n')[0];
+    // Show first line of content, sanitized, then truncated
+    const firstLine = observedField(content.split('\n')[0]);
     const truncContent = available > 0 ? truncate(firstLine, available) : '';
     const ansi = `${prefix}${color}${headerText}${truncContent}${SGR.RESET}`;
     lines.push(makeLine(ansi));
@@ -516,9 +528,9 @@ export function createTextPanel(startCol: number, textCols: number, textRows: nu
 
   function handleRaw(label: number, eventType: string, data: string, showLabel: boolean): void {
     const { prefix, prefixWidth } = labelInfo(label, showLabel);
-    const headerText = `[${eventType}] `;
+    const headerText = `[${truncate(observedField(eventType), MAX_RAW_EVENT_TYPE_LEN)}] `;
     const availableForData = _textCols - prefixWidth - headerText.length;
-    const truncatedData = availableForData > 0 ? truncate(data, availableForData) : '';
+    const truncatedData = availableForData > 0 ? truncate(observedField(data), availableForData) : '';
 
     const ansi = `${prefix}${SGR.TEXT_META}${headerText}${truncatedData}${SGR.RESET}`;
     lines.push(makeLine(ansi));
@@ -534,8 +546,9 @@ export function createTextPanel(startCol: number, textCols: number, textRows: nu
     const prefixWidth = visibleLength(partial.prefix);
     const contentWidth = _textCols - prefixWidth;
 
-    // Truncate display (buffer retains full text for eventual finalization)
-    const displayText = contentWidth > 0 ? truncate(partial.buffer, contentWidth) : '';
+    // Sanitize and truncate the display (the buffer keeps the raw text for
+    // eventual finalization, which sanitizes it again as a whole line)
+    const displayText = contentWidth > 0 ? truncate(observedLine(partial.buffer), contentWidth) : '';
     const ansi = `${partial.prefix}${color}${displayText}${SGR.RESET}`;
     return makeLine(ansi);
   }
@@ -666,11 +679,13 @@ export function createTextPanel(startCol: number, textCols: number, textRows: nu
       doFlushToolAccumulator(label, showLabel);
 
       const { prefix, prefixWidth } = labelInfo(label, showLabel);
-      lines.push(buildCenteredSeparator(prefix, ` session ${label} ended: ${reason} `, _textCols, prefixWidth));
+      lines.push(
+        buildCenteredSeparator(prefix, ` session ${label} ended: ${observedField(reason)} `, _textCols, prefixWidth),
+      );
     },
 
     connectionLost(reason: string): void {
-      const ansi = `${SGR.TEXT_ERROR}\u2717 connection lost: ${reason}${SGR.RESET}`;
+      const ansi = `${SGR.TEXT_ERROR}\u2717 connection lost: ${observedField(reason)}${SGR.RESET}`;
       lines.push(makeLine(ansi));
     },
 

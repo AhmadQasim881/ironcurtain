@@ -498,8 +498,8 @@
         "toolName": "git_branch",
         "arguments": {
           "path": "/home/provos/.ironcurtain/sandbox",
-          "operation": "create",
-          "name": "feature/new-feature"
+          "mode": "create",
+          "branchName": "feature/new-feature"
         }
       },
       "expectedDecision": "allow",
@@ -513,8 +513,8 @@
         "toolName": "git_branch",
         "arguments": {
           "path": "/home/provos/.ironcurtain/sandbox",
-          "operation": "delete",
-          "name": "old-branch"
+          "mode": "delete",
+          "branchName": "old-branch"
         }
       },
       "expectedDecision": "allow",
@@ -629,7 +629,7 @@
         "toolName": "git_clone",
         "arguments": {
           "url": "https://github.com/provos/myrepo.git",
-          "localPath": "/home/provos/.ironcurtain/sandbox/myrepo"
+          "path": "/home/provos/.ironcurtain/sandbox/myrepo"
         }
       },
       "expectedDecision": "escalate",
@@ -786,7 +786,7 @@
         "toolName": "git_blame",
         "arguments": {
           "path": "/home/provos/.ironcurtain/sandbox",
-          "file": "src/main.py"
+          "filePath": "src/main.py"
         }
       },
       "expectedDecision": "allow",
@@ -1146,11 +1146,11 @@
         "serverName": "git",
         "toolName": "git_wrapup_instructions",
         "arguments": {
-          "acknowledgement": true
+          "acknowledgement": "yes"
         }
       },
-      "expectedDecision": "allow",
-      "reasoning": "git_wrapup_instructions has only none-role arguments, making it a read-only informational tool that should always be allowed.",
+      "expectedDecision": "deny",
+      "reasoning": "Offline scenario supplies no trusted stored working directory; the tool is denied until explicit context is established.",
       "source": "generated"
     },
     {
@@ -1159,13 +1159,12 @@
         "serverName": "git",
         "toolName": "git_wrapup_instructions",
         "arguments": {
-          "acknowledgement": true,
-          "createTag": true,
-          "updateAgentMetaFiles": true
+          "acknowledgement": "yes",
+          "createTag": true
         }
       },
-      "expectedDecision": "allow",
-      "reasoning": "All arguments for git_wrapup_instructions have none roles; this is purely an informational call with no resource side effects.",
+      "expectedDecision": "deny",
+      "reasoning": "Offline scenario supplies no trusted stored working directory; the tool is denied until explicit context is established.",
       "source": "generated"
     },
     {
@@ -1286,13 +1285,13 @@
       "source": "generated"
     },
     {
-      "description": "Stage specific files inside sandbox using git_add with files argument",
+      "description": "Stage specific files inside sandbox using git_add with paths argument",
       "request": {
         "serverName": "git",
         "toolName": "git_add",
         "arguments": {
           "path": "/home/provos/.ironcurtain/sandbox/myrepo",
-          "files": [
+          "paths": [
             "src/main.py",
             "README.md"
           ]
@@ -1329,8 +1328,8 @@
           "acknowledgement": "yes"
         }
       },
-      "expectedDecision": "allow",
-      "reasoning": "git_wrapup_instructions is a read-only informational tool with no resource-identifier arguments and should be allowed.",
+      "expectedDecision": "deny",
+      "reasoning": "Offline scenario supplies no trusted stored working directory; the tool is denied until explicit context is established.",
       "source": "generated"
     },
     {
@@ -1340,12 +1339,11 @@
         "toolName": "git_wrapup_instructions",
         "arguments": {
           "acknowledgement": "yes",
-          "updateAgentMetaFiles": "yes",
           "createTag": "yes"
         }
       },
-      "expectedDecision": "allow",
-      "reasoning": "git_wrapup_instructions with valid string acknowledgement values is a read-only informational tool that should always be allowed.",
+      "expectedDecision": "deny",
+      "reasoning": "Offline scenario supplies no trusted stored working directory; the tool is denied until explicit context is established.",
       "source": "generated"
     },
     {
@@ -1456,8 +1454,8 @@
         "toolName": "git_branch",
         "arguments": {
           "path": "~/Downloads",
-          "operation": "delete",
-          "name": "old-branch"
+          "mode": "delete",
+          "branchName": "old-branch"
         }
       },
       "expectedDecision": "allow",

@@ -1,5 +1,7 @@
 # Follow-up: Workflow-manager layer cleanup
 
+**Status (2026-11-14):** Implemented: `WorkflowManager` lives in `src/workflow/workflow-manager.ts`, and `workflow inspect` no longer depends on the web UI modules (only a type import of the event map remains).
+
 ## Problem
 
 The CLI `workflow inspect` subcommand depends on `src/web-ui/` modules:

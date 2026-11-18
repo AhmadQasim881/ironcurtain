@@ -1,5 +1,7 @@
 # Workspace Support for Workflows
 
+**Status (2026-11-14):** Implemented: `--workspace` for `ironcurtain workflow start`, validated like other workspaces (`src/session/workspace-validation.ts`); artifacts live in the workspace's `.workflow/` directory.
+
 ## Overview
 
 This design adds a `--workspace` flag to the workflow CLI and unifies how the orchestrator handles workspace directories. There is a single workspace model: the workspace is always a directory — either freshly created by the orchestrator or provided by the user via `--workspace`. Workflow artifacts (plans, specs, reviews) live under `.workflow/` inside the workspace. Code lives at the workspace root.
@@ -23,7 +25,11 @@ This design adds a `--workspace` flag to the workflow CLI and unifies how the or
   definition.json                     # Copy of workflow definition
 ```
 
-When no `--workspace` is provided, the orchestrator creates an empty directory at `{baseDir}/{workflowId}/workspace/`. When `--workspace` is provided, the orchestrator uses that path directly. Either way, the agent sees the same layout — a workspace root with `.workflow/` for structured artifacts.
+When no `--workspace` is provided, the orchestrator creates an empty directory at `{baseDir}/{workflowId}/workspace/`. When `--workspace` is provided, the orchestrator validates it with `validateWorkspacePath()` (the same validator `ironcurtain start -w` uses) and runs in the canonical path it returns. Either way, the agent sees the same layout — a workspace root with `.workflow/` for structured artifacts.
+
+The workspace becomes the agent's `allowedDirectory` and, in Docker mode, a read-write bind mount at `/workspace`, so nothing inside it is protected: the PolicyEngine exempts the allowed directory from its protected-path check, and bind-mounted files never reach the PolicyEngine. `validateWorkspacePath()` therefore rejects a workspace that is or contains the user's home directory (lying inside it is the normal case); that is, contains or lies inside the IronCurtain home (apart from the managed `personas/<name>/workspace`, `sessions/<id>/sandbox`, `workflow-runs/<id>/workspace` and `jobs/<id>/workspace` directories), the package configuration directory, the MCP relays' private scratch root (`<os.tmpdir()>/ironcurtain-<uid>`, so on Linux `-w /tmp` is refused), or a protected path; or that contains the user config file. A protected entry that is, or lies below, a dangling symbolic link is checked at the path the link leads to as well, and the workspace may not contain any other link on the way there (`resolveDanglingLink`), since the agent could otherwise create the file, or replace the link, through which a later host run reads the entry. The only cwd-derived protected entry, the configured audit log when `AUDIT_LOG_PATH` is relative (by default `<cwd>/audit.jsonl`, see `getCwdDerivedProtectedPaths()`), is checked in the workspace-inside-entry direction alone, so `-w .` keeps working. A `.env` in the launch directory is never loaded and so not protected, unless it is the explicit `--env-file` (`IRONCURTAIN_ENV_FILE`); that file holds the real credentials, so a workspace that contains it is rejected like any other protected path. Containment is decided by `(st_dev, st_ino)` of each directory on the canonical paths, with a case- and Unicode-folded string comparison for entries that do not exist, so symlinks and case variants on case-insensitive volumes cannot slip through. On macOS the Data volume is also reachable at `/System/Volumes/Data`, so the ancestors of that verified alias (`/System/Volumes/Data`, `/System/Volumes`, `/System`) count as containing the home directory and the IronCurtain home too. `buildContainerWorkspaceMount()` repeats a spelling-level check (never mount the home directory, the IronCurtain home, or an ancestor of either, nor anything that is, contains or lies inside the scratch root) as defense in depth. A read-only workflow state (`workspaceAccess: read-only`) gets the same workspace mounted read-only instead, with the policy engine confining its MCP writes to its declared `.workflow/<output>` directories (see `src/types/read-only-workspace.ts`). Session resume applies the same rule: `ironcurtain start --resume` (from `session-metadata.json`) and PTY resume (from `session-state.json`) re-validate the recorded workspace and run in the canonical path, so a directory swapped for a symlink since the session ran makes it not resumable.
+
+> **The workspace is agent-writable (hardening note).** In Docker mode the workspace is a read-write bind mount, so every entry under it, including `.workflow/` itself, `.workflow/task/description.md`, `.gitignore` and anything an earlier run left in a reused workspace, may be a symlink to a host path, a FIFO, a link to `/dev/zero`, or swapped while the host looks at it. All host-side I/O on the workspace therefore goes through no-follow, non-blocking, bounded helpers (`src/hardened-fs.ts`, used by `src/workflow/artifacts.ts` and the orchestrator). That includes the `<output>.v<N>` snapshots `snapshotArtifacts` takes before a state is re-entered, while a shared container may still be running: they copy regular files only (no symlinks, FIFOs or devices), each read through a contained no-follow descriptor and written to a file created exclusively and re-located inside the workspace, so a link the agent plants in the half-built snapshot is never written through; a snapshot stops, partial and reported, at 20,000 entries or 256 MiB. The sections below describe the original design; the notes marked "current behavior" describe how the code handles that threat.
 
 ## Artifact vs Code Output
 
@@ -79,14 +85,12 @@ const WORKSPACE_HASH_EXCLUDED_DIRS: ReadonlySet<string> = new Set([
 The `computeOutputHash` signature gains a `workspacePath` parameter:
 
 ```typescript
-export function computeOutputHash(
-  outputNames: readonly string[],
-  artifactDir: string,
-  workspacePath: string,
-): string
+export function computeOutputHash(outputNames: readonly string[], artifactDir: string, workspacePath: string): string;
 ```
 
 When `outputNames` is empty, it hashes the workspace root file listing instead of producing an empty hash.
+
+> **Current behavior.** The hash has one consumer, the `isStalled` guard, so the orchestrator computes it only for agent states that have an `isStalled` transition; every other state gets an empty `outputHash` and nothing is walked. Each declared output is walked only if `resolveArtifactOutputDir` accepts it: `.workflow` and every component of the output name must lstat as a real directory, and the directory's realpath must lie inside the workspace. A symlinked output (for example `.workflow/plan -> /`) contributes nothing, counts as missing for the required-artifact check, is never presented at a gate, and is logged once per run as a security event. Every walk (`walkTreeNoFollow`) lstat-s entries instead of following them, reads directories incrementally, skips entries that vanish or become unreadable mid-walk (a concurrent temp-file rename cannot fail the state), and stops after a bounded number of entries and levels (100,000 entries for one output directory, 200,000 for the workspace root, 64 levels); a truncated listing is marked in the hash. Hashed sizes and mtimes come from the walk's own lstat.
 
 ## Workspace Root Hashing (File Listing + mtime)
 
@@ -111,11 +115,7 @@ function hashWorkspaceRoot(hash: Hash, workspacePath: string): void {
   }
 }
 
-function collectFileEntries(
-  basePath: string,
-  relativeTo: string,
-  out: string[],
-): void {
+function collectFileEntries(basePath: string, relativeTo: string, out: string[]): void {
   const dirents = readdirSync(resolve(basePath, relativeTo), {
     withFileTypes: true,
   });
@@ -136,11 +136,7 @@ function collectFileEntries(
 The full `computeOutputHash` function:
 
 ```typescript
-export function computeOutputHash(
-  outputNames: readonly string[],
-  artifactDir: string,
-  workspacePath: string,
-): string {
+export function computeOutputHash(outputNames: readonly string[], artifactDir: string, workspacePath: string): string {
   const hash = createHash('sha256');
 
   if (outputNames.length > 0) {
@@ -173,9 +169,7 @@ function ensureWorkflowGitignored(workspacePath: string): void {
   if (existsSync(gitignorePath)) {
     const content = readFileSync(gitignorePath, 'utf-8');
     const lines = content.split('\n');
-    const alreadyListed = lines.some(
-      (line) => line.trim() === '.workflow/' || line.trim() === '.workflow',
-    );
+    const alreadyListed = lines.some((line) => line.trim() === '.workflow/' || line.trim() === '.workflow');
     if (!alreadyListed) {
       const suffix = content.endsWith('\n') ? '' : '\n';
       appendFileSync(gitignorePath, `${suffix}.workflow/\n`);
@@ -187,6 +181,10 @@ function ensureWorkflowGitignored(workspacePath: string): void {
 ```
 
 This is called in `start()` immediately after creating the `.workflow/` directory. We read `.gitignore` anyway for exclusion purposes, so maintaining it is low-cost.
+
+> **Current behavior.** `ensureWorkflowGitignored` (now in `src/workflow/artifacts.ts`) reads `.gitignore` with `readUntrustedRegularFile` (no-follow, non-blocking, at most 1 MiB) and appends with `appendRegularFileNoFollow` (no-follow, single hard link, dev/ino re-check, same size cap); a missing file is created exclusively, so a dangling symlink is never followed. A `.gitignore` that is a symlink (to a host file or `/dev/zero`), a FIFO, a hard link or oversized is left untouched: the function returns `skipped` with a reason and `start()` prints a warning, because a missing ignore entry should not fail the run.
+
+> **Current behavior (`.workflow/` and the task description).** `start()` and `resume()` call `prepareWorkflowArtifactDir`, which makes `.workflow/` and `.workflow/task/` real directories with `ensureRealDirectoryNoFollow` (a symlink or other non-directory at either name is renamed aside to `<name>.ironcurtain-displaced-<random>`, never followed) and writes `description.md` with `writeFileNoFollowAtomic` (an exclusive temporary file renamed over the name, so a symlink, FIFO or hard link there is replaced, not written through). `resume()` rewrites the description from the checkpoint. Each displaced or replaced entry is reported as a warning on stderr and the workflow tab. As everywhere in Node (no `openat`), a container that is still running can race these checks; the helpers re-verify the directory before the final rename, and the content written is the user's own task text.
 
 ## Message Log
 
@@ -201,21 +199,16 @@ const messageLogPath = resolve(artifactDir, 'messages.jsonl');
 
 ## Definition File Copy
 
-During `start()`, the orchestrator copies the workflow definition JSON to `{baseDir}/{workflowId}/definition.json`. On `resume()`, the definition is read from this copy instead of the original path. This makes resume portable even if the original definition file is moved or deleted.
+During `start()`, the orchestrator copies the validated workflow definition to `{baseDir}/{workflowId}/definition.json`. On `resume()`, the definition is read from this copy instead of the original path. This makes resume portable even if the original definition file is moved or deleted.
+
+The copy is written durably and atomically (`writeRunDefinition` in `src/workflow/run-definition.ts`: temporary file, fsync, rename, directory fsync; mode 0600) and stamped with `schemaVersion` and `writerVersion`, like the checkpoint. A reader refuses a newer format with `WORKFLOW_CHECKPOINT_TOO_NEW` instead of reporting the run as corrupted or silently dropping fields it does not know, and removes the stamp before `validateDefinition` (whose `settings` schema rejects unknown keys).
 
 ```typescript
 // In start():
-const definitionContent = readFileSync(definitionPath, 'utf-8');
-const definition = JSON.parse(definitionContent);
-writeFileSync(
-  resolve(baseDir, workflowId, 'definition.json'),
-  JSON.stringify(definition, null, 2),
-);
+writeRunDefinition(runDir, definition);
 
 // In resume():
-const definition = JSON.parse(
-  readFileSync(resolve(baseDir, workflowId, 'definition.json'), 'utf-8'),
-);
+const definition = validateDefinition(readRunDefinitionRaw(runDefinitionPath(runDir)));
 ```
 
 ## Orchestrator Changes
@@ -227,9 +220,10 @@ interface WorkflowInstance {
   // ... existing fields ...
 
   /**
-   * Root directory where the agent session operates.
-   * Either a fresh directory created by the orchestrator
-   * or a user-provided path via --workspace.
+   * Root directory where the agent session operates. Either the run's
+   * default `<baseDir>/<workflowId>/workspace`, derived and created by the
+   * orchestrator, or the canonical path that `validateWorkspacePath()`
+   * returned for a user-provided `--workspace`.
    */
   readonly workspacePath: string;
 }
@@ -249,8 +243,8 @@ start(
 
 Behavior:
 
-1. If `workspacePath` is provided, validate it exists and is a directory (caller responsibility — CLI validates before calling). Use it directly.
-2. If `workspacePath` is not provided, create `{baseDir}/{workflowId}/workspace/`.
+1. If `workspacePath` is provided, validate it with `validateWorkspacePath(workspacePath, protectedPaths)` before anything is created (`protectedPaths` comes from `WorkflowOrchestratorDeps.protectedPaths`, falling back to `loadConfig().protectedPaths`) and use the canonical path it returns. A rejected path throws a `WorkspaceValidationError` (code `WORKSPACE_NOT_FOUND`, `WORKSPACE_NOT_DIRECTORY` or `WORKSPACE_UNSAFE`); the daemon's `workflows.start` maps it to `INVALID_PARAMS` and also rejects relative paths, which would otherwise resolve against the daemon's cwd. This is the authoritative check for the CLI, `workflow run` and the web UI; the CLI layers pre-check only for early errors.
+2. If `workspacePath` is not provided, create `{baseDir}/{workflowId}/workspace/`. This derived default is not validated.
 3. In both cases:
    - Set `instance.workspacePath` to the resolved workspace path.
    - Set `instance.artifactDir` to `{workspacePath}/.workflow/`.
@@ -279,6 +273,8 @@ This gives the agent the workspace root as its working directory, not the `.work
 
 Already works correctly: checks `{artifactDir}/{output}/` which resolves to `.workflow/{output}/`. The `artifactDir` reassignment handles the prefix.
 
+> **Current behavior.** The check first resolves the output through `resolveArtifactOutputDir` (see the stall-detection note above), so an output that is a symlink, sits under a symlinked `.workflow`, or resolves outside the workspace counts as missing and is reported as a security event, instead of satisfying the check with a host directory.
+
 ### `computeOutputHash` — workspace fallback
 
 When `outputs` is empty, hash the workspace root file listing instead of producing an empty hash. See the [Workspace Root Hashing](#workspace-root-hashing-file-listing--mtime) section for full implementation.
@@ -292,18 +288,25 @@ interface WorkflowCheckpoint {
 }
 ```
 
+The checkpoint also records `runDir` (`{baseDir}/{workflowId}` when it was written). Paths inside it (the default workspace and the staged `workflow-skills` / `workflow-scripts`) are run-local: `rebaseRunLocalPaths` (`src/workflow/checkpoint.ts`) moves them onto the run directory the run is found in now, so a moved `IRONCURTAIN_HOME` (or a copied run directory) resumes in place. Checkpoints written before `runDir` existed are rebased by shape: a `workspacePath` of the form `<dir>/<workflowId>/workspace` names its own run directory, since the id is minted after any user-chosen workspace exists.
+
 On `resume`:
-- If `checkpoint.workspacePath` is set, use it.
-- Reconstruct `artifactDir` from the checkpoint: `resolve(checkpoint.workspacePath, '.workflow')`. Do NOT use `resolve(baseDir, workflowId, 'artifacts')`.
-- Otherwise, fall back to `{baseDir}/{workflowId}/workspace/` (backward compat with any existing checkpoints that used `artifacts/`; can also check for `artifacts/` existence as a fallback).
+
+- If `checkpoint.workspacePath` is unset (checkpoints from before workspaces were recorded), use the derived default `{baseDir}/{workflowId}/workspace/`, creating it.
+- If the rebased path equals the derived default, use it; it must exist. It needs no validation only while it is what `start()` created, a real directory inside a real run directory. A default workspace that is a symlink, or lies below a symlinked run directory, points wherever its author chose (a copied or foreign base directory resumed with `resume-standalone` can hold one), so it is validated like any other path and its canonical form is used.
+- Otherwise the path was user-supplied at start or arrived in an imported checkpoint, and the directory may have changed since: validate it again with `validateWorkspacePath()` and use the canonical path it returns. A rejected path fails the resume with `WorkflowResumeError('WORKFLOW_NOT_RESUMABLE')` before anything is created.
+- A recorded workspace that no longer exists fails the resume with `WorkflowResumeError('WORKFLOW_WORKSPACE_MISSING')`. Resume never recreates it empty, which would let a long run continue without its earlier work (and, for a stale path, outside the active home).
+- Reconstruct `artifactDir` from the workspace: `resolve(workspacePath, '.workflow')`. Do NOT use `resolve(baseDir, workflowId, 'artifacts')`.
 - Read the workflow definition from `{baseDir}/{workflowId}/definition.json` instead of the original path.
 
 ```typescript
 // In resume():
-const workspacePath =
-  checkpoint.workspacePath ?? resolve(baseDir, workflowId, 'workspace');
+const checkpoint = rebaseRunLocalPaths(loaded, workflowId, runDir);
+const workspacePath = this.resolveResumeWorkspace(workflowId, checkpoint.workspacePath, loaded.workspacePath);
 const artifactDir = resolve(workspacePath, '.workflow');
 ```
+
+An external run imported by the daemon (`workflow resume <baseDir>`, `workflows.import`) is rebased onto its external run directory, and its workspace is validated at import time. Its `run.lock`, checked first so a run still live in another process is not imported, is read only when it is a regular file, never through a link or by a blocking open: anything else there (a FIFO, a link to `/dev/zero`) counts as held, so the import refuses the run instead of hanging. The imported checkpoint names the daemon's own definition copy, written from the definition the import checked, so resume never reads a path the external checkpoint chose. A run without a definition copy is checked against the file its checkpoint names, which can ship inside the imported directory: like every definition file, it is read only when it has a `.yaml`, `.yml` or `.json` extension and is a regular file of at most 16 MiB, never by a blocking open, so a FIFO or a link to `/dev/zero` there fails the import instead of hanging the daemon. Its staged skills and scripts are kept only when they are real directories canonically inside the external run directory, never a symlink out of it, and skill discovery reads each staged `SKILL.md` the same non-blocking, bounded way, never through a link, reporting one it cannot read instead of waiting on it. Its run-wide usage is kept, so the resumed run continues its totals and `settings.workflowBudget` ceiling, and so is a task-scoped run's task scope (`taskPolicyDir`), which resume validates again and refuses the run over rather than run it unscoped; container snapshot references are dropped. A base directory that is the daemon's own under another spelling (a symlink to it, say) is not imported over itself.
 
 ## Prompt Builder Changes
 
@@ -314,9 +317,8 @@ The `.workflow/` prefix is hardcoded. No mode flag, no `artifactPrefix` paramete
 ```typescript
 // Before:
 `Read the contents of the \`${name}/\` directory in your workspace...`
-
 // After:
-`Read the contents of the \`.workflow/${name}/\` directory in your workspace...`
+`Read the contents of the \`.workflow/${name}/\` directory in your workspace...`;
 ```
 
 ### Output artifact references
@@ -441,6 +443,7 @@ A single workflow definition works for both fresh tasks and existing repos. The 
 ```
 
 Key points:
+
 - The planner and architect say "if there is existing code" — works for both fresh and existing workspaces.
 - The coder has `outputs: []` — writes code at the workspace root, not under `.workflow/`.
 - The reviewer reads code from the workspace root, writes reviews to `.workflow/reviews/`.
@@ -469,15 +472,20 @@ options: {
 
 ### Validation (in CLI layer, before calling orchestrator)
 
+The CLI pre-checks with the same validator for an early, readable error; the orchestrator re-validates authoritatively.
+
 ```typescript
 if (workspaceArg) {
-  const resolved = resolve(workspaceArg);
-  if (!existsSync(resolved) || !statSync(resolved).isDirectory()) {
-    throw new Error(`Workspace path is not a directory: ${resolved}`);
+  try {
+    workspacePath = validateWorkspacePath(workspaceArg, config.protectedPaths);
+  } catch (err) {
+    writeStderr(`Invalid workspace: ${err.message}`);
+    process.exit(1);
   }
-  workspacePath = resolved;
 }
 ```
+
+`ironcurtain workflow run --workspace` (the daemon client) runs the validator client-side before connecting and reports `WORKSPACE_NOT_DIRECTORY` (missing or not a directory) or `WORKSPACE_UNSAFE` (overlaps a trusted location).
 
 ### Resume
 
@@ -485,17 +493,18 @@ The workspace path is persisted in the checkpoint. On `resume`, the orchestrator
 
 ## File Impact List
 
-| File | Change |
-|---|---|
-| `src/workflow/types.ts` | Add `workspacePath?: string` to `WorkflowCheckpoint` |
-| `src/workflow/orchestrator.ts` | Add `workspacePath: string` to `WorkflowInstance`. `start()` gains optional `workspacePath` param; creates workspace at `{baseDir}/{id}/workspace/` when not provided. `artifactDir` always set to `{workspacePath}/.workflow/`. Session creation uses `instance.workspacePath`. `computeOutputHash` gains `workspacePath` param and workspace-root hashing fallback (file listing + mtime, no content reads) for empty `outputs`. Add `WORKSPACE_HASH_EXCLUDED_DIRS` set, `collectFileEntries`, and `hashWorkspaceRoot` helpers. Checkpoint saves `workspacePath`. `resume()` restores `workspacePath` from checkpoint and reconstructs `artifactDir` as `resolve(workspacePath, '.workflow')`. Copy definition to `{baseDir}/{workflowId}/definition.json` in `start()`; read from there in `resume()`. Add `ensureWorkflowGitignored()` helper, called in `start()`. Message log written to `{workspacePath}/.workflow/messages.jsonl` with agent-writable warning comment. |
-| `src/workflow/prompt-builder.ts` | All input path references get `.workflow/` prefix. All output path references get `.workflow/` prefix. Artifact re-prompt paths get `.workflow/` prefix. Remove `artifactPrefix` parameter (not needed — prefix is always `.workflow/`). |
-| `src/workflow/validate.ts` | No changes needed (`outputs: []` already valid) |
-| `examples/workflow-real-demo.json` | Update to unified model: coder gets `outputs: []`, prompts reference `.workflow/` for artifacts and workspace root for code, `systemPrompt` updated, terminal `done` drops `code` from outputs |
-| `docs/designs/workflow-cli-design.md` | Add `--workspace` flag to help spec, examples, and argument table |
-| `examples/workflow-real-spike.ts` | Parse `--workspace` flag, pass to `orchestrator.start()` |
+| File                                  | Change                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `src/workflow/types.ts`               | Add `workspacePath?: string` to `WorkflowCheckpoint`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `src/workflow/orchestrator.ts`        | Add `workspacePath: string` to `WorkflowInstance`. `start()` gains optional `workspacePath` param; creates workspace at `{baseDir}/{id}/workspace/` when not provided. `artifactDir` always set to `{workspacePath}/.workflow/`. Session creation uses `instance.workspacePath`. `computeOutputHash` gains `workspacePath` param and workspace-root hashing fallback (file listing + mtime, no content reads) for empty `outputs`. Add `WORKSPACE_HASH_EXCLUDED_DIRS` set, `collectFileEntries`, and `hashWorkspaceRoot` helpers. Checkpoint saves `workspacePath`. `resume()` restores `workspacePath` from checkpoint and reconstructs `artifactDir` as `resolve(workspacePath, '.workflow')`. Copy definition to `{baseDir}/{workflowId}/definition.json` in `start()`; read from there in `resume()`. Add `ensureWorkflowGitignored()` helper, called in `start()`. Message log written to `{workspacePath}/.workflow/messages.jsonl` with agent-writable warning comment. |
+| `src/workflow/prompt-builder.ts`      | All input path references get `.workflow/` prefix. All output path references get `.workflow/` prefix. Artifact re-prompt paths get `.workflow/` prefix. Remove `artifactPrefix` parameter (not needed — prefix is always `.workflow/`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `src/workflow/validate.ts`            | No changes needed (`outputs: []` already valid)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `examples/workflow-real-demo.json`    | Update to unified model: coder gets `outputs: []`, prompts reference `.workflow/` for artifacts and workspace root for code, `systemPrompt` updated, terminal `done` drops `code` from outputs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `docs/designs/workflow-cli-design.md` | Add `--workspace` flag to help spec, examples, and argument table                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `examples/workflow-real-spike.ts`     | Parse `--workspace` flag, pass to `orchestrator.start()`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 
 Files explicitly NOT changed:
+
 - `src/workflow/machine-builder.ts` — state machine logic is workspace-agnostic
 - `src/workflow/guards.ts` — guard predicates are workspace-agnostic
 - `src/workflow/status-parser.ts` — agent output parsing is workspace-agnostic

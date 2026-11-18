@@ -5,7 +5,11 @@
  * without a real container runtime, real daemon, or the implementation fuse.
  */
 
-import { chmodSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  APPLE_CONTAINER_ROOTFS_IMAGE,
+  describeAppleContainerRootfs,
+} from '../../../src/docker/apple-container-manager.js';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, beforeEach } from 'vitest';
@@ -94,7 +98,6 @@ export function createTestAppleVmDockerWorkloadBootstrap(
     dockerImageId: selected.configDigest,
     manifestDigest: selected.manifestDigest,
     archivePath: join(hostArtifactDirectory, selected.archive.fileName),
-    archiveSha256: selected.archive.sha256,
     archiveSizeBytes: selected.archive.sizeBytes,
   };
   activeTestImages = new Map([[logicalName, activeTestArtifact.dockerImageId]]);
@@ -188,7 +191,8 @@ export function respondHealthyAppleVmDaemon(argv: readonly string[]): DockerExec
       [DOCKER_BUILD_TRUST_CA_BUNDLE_PATH]: 'fixture-bundle\n',
       [DOCKER_BUILD_TRUST_APT_CONFIG_PATH]: 'fixture-apt\n',
     };
-    if (inputs[argv[1]] !== undefined) return { exitCode: 0, stdout: inputs[argv[1]], stderr: '' };
+    const input = inputs[argv[1]];
+    if (input !== undefined) return { exitCode: 0, stdout: input, stderr: '' };
   }
   if (argv[1] === '--ironcurtain-verify-protected-inputs-v2')
     return { exitCode: 0, stdout: 'ironcurtain-build-trust-inputs/2\n', stderr: '' };
@@ -402,6 +406,11 @@ export function createEventRuntime(initial?: CreateEventRuntimeOptions): EventRu
     async containerExists(id: string) {
       return containers.some((container) => container.id === id);
     },
+    async describeContainerStorage(id: string) {
+      // A real file under a per-test Apple application data root, so the
+      // production path validation and the watchdog's lstat both run.
+      return describeAppleContainerRootfs(createTestAppleContainerRootfs(id), id);
+    },
     async listContainers() {
       return structuredClone(containers);
     },
@@ -434,6 +443,21 @@ export function createEventRuntime(initial?: CreateEventRuntimeOptions): EventRu
     },
   };
   return { runtime, events, execs, execUsers, containers, networks, setLeasePath: (path) => (leasePath = path) };
+}
+
+/**
+ * Create (once) the rootfs image the Apple runtime would hold for `containerId`
+ * under a per-test application data root, and return that root.
+ */
+export function createTestAppleContainerRootfs(containerId: string): string {
+  const home = process.env.IRONCURTAIN_HOME;
+  if (home === undefined) throw new Error('test Apple rootfs images live under the per-test IRONCURTAIN_HOME');
+  const appRoot = join(home, 'apple-container-app-root');
+  const bundleDirectory = join(appRoot, 'containers', containerId);
+  mkdirSync(bundleDirectory, { recursive: true, mode: 0o700 });
+  const image = join(bundleDirectory, APPLE_CONTAINER_ROOTFS_IMAGE);
+  if (!existsSync(image)) writeFileSync(image, Buffer.alloc(4096, 1), { mode: 0o600 });
+  return appRoot;
 }
 
 export interface FakeSupervisorOptions {

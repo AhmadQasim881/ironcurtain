@@ -1,4 +1,4 @@
-import type { IronCurtainConfig } from '../config/types.js';
+import type { IronCurtainConfig, MCPServerConfig } from '../config/types.js';
 import type { ToolCallRequest, ToolCallResult } from '../types/mcp.js';
 import {
   loadGeneratedPolicy,
@@ -7,38 +7,65 @@ import {
   checkAnnotationFreshness,
   getPackageGeneratedDir,
 } from '../config/index.js';
+import { warnOnAnnotationOverlay } from '../config/tool-annotations-overlay.js';
 import { createLanguageModel } from '../config/model-provider.js';
 import type { MCPClientManager } from './mcp-client-manager.js';
 import { MCPClientManager as McpClientManagerImpl } from './mcp-client-manager.js';
 import type { McpRoot } from './mcp-client-manager.js';
-import { EscalationHandler } from './escalation.js';
+import { backendCallTimeoutMsFromConfig, escalationTimeoutMsFromConfig } from './call-timeouts.js';
 import * as logger from '../logger.js';
 import { extractPolicyRoots, toMcpRoots } from './policy-roots.js';
+import { loadTaskScopePolicy } from './task-scope.js';
 import { buildTrustedServerSet } from '../memory/memory-annotations.js';
 import { ToolCallCoordinator, type EscalationPromptFn } from './tool-call-coordinator.js';
-import { checkSandboxAvailability, resolveSandboxConfigsForAudit } from './sandbox-integration.js';
+import { collectAuditRedactionSecrets } from './audit-secrets.js';
+import { contentAssessorOptionsFromConfig } from './assessment-config.js';
+import {
+  planServerSandboxing,
+  formatOsSandboxNotice,
+  writeOsSandboxNotice,
+  type OsSandboxAvailability,
+  type OsSandboxPlan,
+} from './sandbox-integration.js';
+import { effectiveSandboxPolicy } from '../config/sandbox-policy.js';
+import { missingPassthroughEnvVars } from './child-env.js';
+import { isGitBackend } from './git-backend-env.js';
 import type { ProxiedTool } from './tool-call-pipeline.js';
 
 /** Re-export for backward compatibility with callers that import from here. */
 export type { EscalationPromptFn };
 export type { EscalationResult } from './tool-call-coordinator.js';
 
+/**
+ * In-process mode spawns every backend directly through `MCPClientManager`;
+ * it never wraps a server in sandbox-runtime. For servers that ask for an
+ * OS sandbox it is therefore always unavailable here, whatever the host
+ * supports, and the availability policy decides whether they start.
+ */
+const IN_PROCESS_OS_SANDBOX: OsSandboxAvailability = {
+  available: false,
+  platformSupported: true,
+  problems: ['in-process MCP connections are not wrapped by sandbox-runtime'],
+  warnings: [],
+};
+
 export interface TrustedProcessOptions {
   /**
-   * In-process escalation callback used by direct-tool-call code paths
-   * (integration tests). When set, the coordinator invokes this
-   * instead of consulting the file-IPC escalation directory.
+   * In-process escalation callback (integration tests). When set, the
+   * coordinator invokes this instead of consulting the file-IPC
+   * escalation directory.
    */
   onEscalation?: EscalationPromptFn;
 }
 
 /**
  * In-process trusted process. Wraps `ToolCallCoordinator` for callers
- * (integration tests, fallback direct-tool-call mode) that want a
- * pre-wired object with a single `handleToolCall` entry point.
+ * (integration tests) that want a pre-wired object with a single
+ * `handleToolCall` entry point. Sessions never use it: Code Mode goes
+ * through the Sandbox's coordinator and its MCP relays.
  *
- * After Step 1, both in-process and Code Mode paths share the same
- * coordinator implementation for policy evaluation and audit logging.
+ * Both this in-process path and Code Mode share the same coordinator
+ * implementation for policy evaluation and audit logging.
  *
  * Lifecycle: `new TrustedProcess(config)` + `await initialize()`. The
  * coordinator is constructed during `initialize()` (not the constructor)
@@ -50,7 +77,6 @@ export class TrustedProcess {
   private coordinator: ToolCallCoordinator | null = null;
   private mcpManager: MCPClientManager;
   private mcpRoots: McpRoot[] = [];
-  private escalation: EscalationHandler;
   private readonly options: TrustedProcessOptions;
 
   constructor(
@@ -62,7 +88,6 @@ export class TrustedProcess {
     // call spawns a real backend directly (no router subprocess). The
     // coordinator wraps it for the policy gate.
     this.mcpManager = new McpClientManagerImpl();
-    this.escalation = new EscalationHandler();
   }
 
   /** Internal accessor: throws if used before `initialize()`. */
@@ -82,13 +107,19 @@ export class TrustedProcess {
   }
 
   async initialize(): Promise<void> {
-    const { compiledPolicy, toolAnnotations, dynamicLists } = loadGeneratedPolicy({
+    const { compiledPolicy, toolAnnotations, toolAnnotationsOverlay, dynamicLists } = loadGeneratedPolicy({
       policyDir: this.config.generatedDir,
       toolAnnotationsDir: this.config.toolAnnotationsDir ?? this.config.generatedDir,
       fallbackDir: getPackageGeneratedDir(),
     });
     checkConstitutionFreshness(compiledPolicy, this.config.constitutionPath);
     checkAnnotationFreshness(toolAnnotations, this.config.mcpServers);
+    warnOnAnnotationOverlay(toolAnnotationsOverlay);
+
+    // `--task-scoped`: same task-scope loading as the sandbox path; a scope
+    // that cannot be loaded fails initialization.
+    const taskScope =
+      this.config.taskPolicyDir === undefined ? undefined : loadTaskScopePolicy(this.config.taskPolicyDir);
 
     const serverDomainAllowlists = extractServerDomainAllowlists(this.config.mcpServers);
     const trustedServers = buildTrustedServerSet(this.config.mcpServers);
@@ -96,37 +127,58 @@ export class TrustedProcess {
     // Build the auto-approve model BEFORE constructing the coordinator
     // so it can be passed in as a construction-time invariant.
     const autoApproveModel = await this.buildAutoApproveModel();
+    const contentAssessment = await contentAssessorOptionsFromConfig(this.config.userConfig);
 
-    // Compute per-server sandbox disposition for audit annotation.
-    const { platformSupported } = checkSandboxAvailability();
-    const resolvedSandboxConfigs = resolveSandboxConfigsForAudit(
+    // Per-server sandbox disposition for audit annotation. Nothing is
+    // sandboxed in this mode, so no audit entry may claim `sandboxed: true`;
+    // servers that ask for a sandbox are refused under "enforce" and stamped
+    // `platform-unavailable` under "warn".
+    const osSandboxPlan = planServerSandboxing(
       this.config.mcpServers,
       this.config.allowedDirectory,
-      platformSupported,
-      this.config.sandboxPolicy ?? 'warn',
+      IN_PROCESS_OS_SANDBOX,
+      effectiveSandboxPolicy(this.config),
     );
+    const notice = formatOsSandboxNotice(osSandboxPlan);
+    if (notice !== undefined) {
+      logger.warn(`[sandbox] ${notice}`);
+      writeOsSandboxNotice(notice);
+    }
+    const resolvedSandboxConfigs = new Map(osSandboxPlan.resolved);
 
     this.coordinator = new ToolCallCoordinator({
       compiledPolicy,
       toolAnnotations,
+      ...(taskScope ? { taskScope: taskScope.policy } : {}),
       protectedPaths: this.config.protectedPaths,
       allowedDirectory: this.config.allowedDirectory,
+      // Same source as the sandbox path: a read-only workspace config
+      // confines changes to its writable directories here too.
+      readOnlyWorkspace: this.config.readOnlyWorkspace,
       serverDomainAllowlists,
       dynamicLists,
       trustedServers,
       auditLogPath: this.config.auditLogPath,
       auditRedact: this.config.userConfig.auditRedaction.enabled,
+      auditRedactSecrets: collectAuditRedactionSecrets(this.config.userConfig),
       escalationDir: this.config.escalationDir,
+      // Same source as the sandbox path: the session mode that gates the
+      // auto-approver's trust in user-context.json comes from the config.
+      isPtySession: this.config.isPtySession === true,
+      escalationTimeoutMs: escalationTimeoutMsFromConfig(this.config),
+      backendCallTimeoutMs: backendCallTimeoutMsFromConfig(this.config),
       mcpManager: this.mcpManager,
       onEscalation: this.options.onEscalation,
       autoApproveModel,
+      contentAssessment,
       resolvedSandboxConfigs,
+      taintEscalation: this.config.userConfig.taintEscalation,
     });
 
     const policyRoots = extractPolicyRoots(compiledPolicy, this.config.allowedDirectory);
     this.mcpRoots = toMcpRoots(policyRoots);
 
-    await this.connectMcpServers();
+    await this.connectMcpServers(osSandboxPlan);
   }
 
   /**
@@ -147,13 +199,29 @@ export class TrustedProcess {
 
   /**
    * Connects to every configured MCP server and registers its tools
-   * with the coordinator. Unavailable servers are logged and skipped.
+   * with the coordinator. Unavailable servers are logged and skipped, and
+   * servers the OS-sandbox plan refuses are never spawned.
    */
-  private async connectMcpServers(): Promise<void> {
+  private async connectMcpServers(osSandboxPlan: OsSandboxPlan): Promise<void> {
     const coordinator = this.requireCoordinator();
     const failedServers: string[] = [];
+    const refused = new Set(osSandboxPlan.refused);
     for (const [name, serverConfig] of Object.entries(this.config.mcpServers)) {
-      const missingVars = getMissingEnvVars(serverConfig.args);
+      if (refused.has(name)) {
+        logger.warn(`Skipping MCP server '${name}': it requires an OS sandbox and sandboxPolicy is "enforce"`);
+        failedServers.push(name);
+        continue;
+      }
+      // The server's stored credentials (config.json serverCredentials) are
+      // injected into its environment below, so a `-e NAME` variable that
+      // exists only there counts as present, as it does for the relay and
+      // for `ironcurtain doctor`.
+      const credentials = this.config.userConfig.serverCredentials[name] as Record<string, string> | undefined;
+      const missingVars = missingPassthroughEnvVars(serverConfig.args, {
+        env: process.env,
+        configEnv: serverConfig.env,
+        credentials,
+      });
       if (missingVars.length > 0) {
         logger.warn(`Skipping MCP server '${name}': missing environment variable(s) ${missingVars.join(', ')}`);
         failedServers.push(name);
@@ -161,12 +229,18 @@ export class TrustedProcess {
       }
       logger.info(`Connecting to MCP server: ${name}...`);
       try {
-        await this.mcpManager.connect(name, serverConfig, this.mcpRoots);
+        // Direct spawn (no relay): the manager gives the server the
+        // allowlisted environment plus this `env` block, so the credentials
+        // ride along with its configured variables.
+        const spawnConfig: MCPServerConfig = credentials
+          ? { ...serverConfig, env: { ...serverConfig.env, ...credentials } }
+          : serverConfig;
+        await this.mcpManager.connect(name, spawnConfig, this.mcpRoots, { sshAgent: isGitBackend(name) });
         logger.info(`Connected to MCP server: ${name}`);
 
         // Publish this server's tools to the coordinator so the policy
         // gate can route calls through it. Share the manager's live
-        // `ClientState` so `addRootToClient` mutates the same roots
+        // `ClientState` so `addRootsToClient` mutates the same roots
         // array the manager returns from its `roots/list` handler.
         const tools = await this.mcpManager.listTools(name);
         const clientState = this.mcpManager.getClientState(name);
@@ -203,7 +277,6 @@ export class TrustedProcess {
   }
 
   async shutdown(): Promise<void> {
-    this.escalation.close();
     // We injected our own MCPClientManager into the coordinator, so
     // the coordinator will NOT close it. Do that here, then close the
     // coordinator (which flushes the audit log).
@@ -212,21 +285,4 @@ export class TrustedProcess {
       await this.coordinator.close();
     }
   }
-}
-
-/**
- * Detects Docker-style `-e VAR_NAME` args (no `=`) where the env var is unset.
- */
-function getMissingEnvVars(args: string[]): string[] {
-  const missing: string[] = [];
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === '-e' && i + 1 < args.length) {
-      const val = args[i + 1];
-      if (!val.includes('=') && !process.env[val]) {
-        missing.push(val);
-      }
-      i++;
-    }
-  }
-  return missing;
 }

@@ -33,7 +33,7 @@ export type FixtureExchangeDto = StatisticsExchangeDto;
 const HOUR_MS = 60 * 60 * 1_000;
 const MINUTE_MS = 60 * 1_000;
 const DAY_MS = 24 * HOUR_MS;
-const FORMULA_VERSION = 1;
+const FORMULA_VERSION = 4;
 const ALLOWED_BUCKET_SIZES_MS = [60_000, 300_000, 900_000, HOUR_MS, DAY_MS] as const;
 
 function exchange(index: number, completedAtMs: number, overrides: Partial<FixtureExchangeDto>): FixtureExchangeDto {
@@ -625,14 +625,6 @@ function scalarMeasure(row: FixtureExchangeDto, measure: ScalarMeasure): number 
       return row.upstreamResponseEndOffsetMs;
     case 'clientLatencyMs':
       return row.clientDeliveryEndOffsetMs;
-    case 'observableOutputTokensPerSecond': {
-      if (!row.qualityFlags.includes('output_timing_population_exact')) return null;
-      if (row.firstOutputOffsetMs === null || row.lastOutputOffsetMs === null || row.nonThinkingOutputTokens === null) {
-        return null;
-      }
-      const spanMs = row.lastOutputOffsetMs - row.firstOutputOffsetMs;
-      return spanMs > 0 ? row.nonThinkingOutputTokens / (spanMs / 1_000) : null;
-    }
     case 'effectiveOutputTokensPerSecond':
       return row.clientAborted ||
         row.outcome === 'error' ||
@@ -694,7 +686,6 @@ function summarizeMeasure(
       measure === 'ttftMs' ||
       measure === 'upstreamLatencyMs' ||
       measure === 'clientLatencyMs' ||
-      measure === 'observableOutputTokensPerSecond' ||
       measure === 'effectiveOutputTokensPerSecond';
     value = sampleCount === 0 ? null : values.reduce((total, entry) => total + entry, 0) / (averaged ? sampleCount : 1);
   }
@@ -914,12 +905,17 @@ export class StatisticsFixtureEngine {
         (health.state === 'ready' || health.state === 'degraded') &&
         health.readerState !== 'unavailable' &&
         health.readerState !== 'closed',
-      dtoVersion: 2,
+      dtoVersion: 3,
       formulaVersion: FORMULA_VERSION,
       schemaVersion: health.schemaVersion,
       maxPageSize: 500,
-      maxScannedRows: 100_000,
+      maxScannedRows: 1_000_000,
       maxGroups: 500,
+      maxOutputItems: 10_000,
+      maxTimeSeriesBuckets: 1_000,
+      maxRangeDays: 366,
+      maxResponseBytes: 4 * 1024 * 1024,
+      quantileSampleSize: 2_048,
       allowedBucketSizesMs: [...ALLOWED_BUCKET_SIZES_MS],
       allowedCalendarBucketUnits: ['day'],
       health,

@@ -1,5 +1,7 @@
 # Design: Observe TUI v2 -- Rain Enhancements and Text Panel Improvements
 
+**Status (2026-11-14):** Implemented: word drops and phase-driven colour in `src/observe/observe-tui-rain.ts`, with `observe-tui-word-scorer.ts` and the text-panel changes in `observe-tui-text-panel.ts`.
+
 ## Overview
 
 This document specifies two sets of enhancements to the observe TUI. **Part A**

@@ -25,25 +25,47 @@ import type { ExchangeRecord, PoisonReason } from './trajectory-types.js';
 import { createReassembler, providerForHost, ReassemblyError, TruncatedStreamError } from './trajectory-reassembler.js';
 import type { SessionId } from '../session/types.js';
 import * as logger from '../logger.js';
-import { BoundedContentDecoder, type ContentDecoderFailure } from './llm-observation/content-decoder.js';
+import {
+  BoundedContentDecoder,
+  type ContentDecoderFailure,
+  type ContentDecodingFailureReason,
+} from './llm-observation/content-decoder.js';
+import { isSseFramingLimitError, type SseEventFramerLimits } from './llm-observation/sse-event-framer.js';
+import { DEFAULT_MAX_REQUEST_BODY_BYTES } from './mitm-resource-limits.js';
+import { TRAJECTORY_DECODER_LIMITS, TRAJECTORY_MAX_RAW_RESPONSE_BYTES } from './trajectory-limits.js';
 
 /** Reused for the (ignored) responseBody arg on the reassembler path. */
 const EMPTY_BODY = Buffer.alloc(0);
 
 /**
- * Trajectory capture predates the bounded metrics observer and deliberately
- * records a whole exchange or none of it. Do not silently
- * inherit metrics' smaller per-response limits here: a partial training record
- * is not useful. These deliberately generous finite caps still protect the
- * process from an unbounded response or a decompressor that falls behind.
+ * A capture resource limit was exceeded (decoded size, framing, or the
+ * verbatim-body cap; see trajectory-limits.ts). Like a transport truncation
+ * it costs exactly this exchange: no record is written, the exchange is
+ * counted in `session-end.abortedExchanges`, and the session keeps capturing.
  */
-const TRAJECTORY_DECODER_LIMITS = Object.freeze({
-  maxCompressedBytes: 64 * 1024 * 1024,
-  maxDecodedBytes: 128 * 1024 * 1024,
-  maxExpansionRatio: 4_096,
-  expansionRatioSlackBytes: 4 * 1024 * 1024,
-  maxPendingInputBytes: 8 * 1024 * 1024,
-});
+export class CaptureLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CaptureLimitError';
+  }
+}
+
+/** True for an error that drops one exchange because a capture limit was exceeded. */
+function isCaptureLimitError(err: unknown): boolean {
+  return err instanceof CaptureLimitError || isSseFramingLimitError(err);
+}
+
+/**
+ * Decoder failures that are resource limits rather than undecodable bytes.
+ * They drop the exchange; corrupt data (`decoder-error`) and an unsupported
+ * encoding still poison the session.
+ */
+const DECODER_LIMIT_REASONS: ReadonlySet<ContentDecodingFailureReason> = new Set<ContentDecodingFailureReason>([
+  'compressed-byte-limit',
+  'decoded-byte-limit',
+  'expansion-ratio-limit',
+  'decoder-backlog-limit',
+]);
 
 /**
  * Decode a Buffer as UTF-8 if it round-trips losslessly, otherwise
@@ -78,6 +100,27 @@ export interface BeginCaptureExchangeInputs {
   /** Encoding header from the request body, captured verbatim (no decode). */
   readonly requestContentEncoding?: string;
   readonly requestStartedAt: number;
+  /**
+   * Ceiling on the request bytes teed through {@link CaptureExchangeHandle.pushRequestChunk}
+   * (MITM-14). A streamed request is forwarded without a size limit, but the
+   * tee holds every byte until the exchange settles, so past this ceiling
+   * THIS exchange is dropped and counted in `session-end.abortedExchanges`;
+   * the request itself and the rest of the session are unaffected. The proxy
+   * passes the provider's request limit; defaults to
+   * {@link DEFAULT_MAX_REQUEST_BODY_BYTES}.
+   */
+  readonly maxRequestBytes?: number;
+  /**
+   * Overrides of the reassembler's SSE framing limits (defaults:
+   * `TRAJECTORY_SSE_FRAMER_LIMITS`). The proxy never sets this; it lets tests
+   * reach a limit without streaming hundreds of MiB.
+   */
+  readonly sseFramerLimits?: Partial<SseEventFramerLimits>;
+  /**
+   * Ceiling on a response captured verbatim (no reassembler); defaults to
+   * `TRAJECTORY_MAX_RAW_RESPONSE_BYTES`. Past it the exchange is dropped.
+   */
+  readonly maxRawResponseBytes?: number;
 }
 
 export interface CaptureExchangeHandle {
@@ -119,6 +162,8 @@ export interface AttachResponseInputs {
  */
 export function beginCaptureExchange(inputs: BeginCaptureExchangeInputs): CaptureExchangeHandle {
   const exchangeId = randomUUID();
+  const maxRequestBytes = inputs.maxRequestBytes ?? DEFAULT_MAX_REQUEST_BODY_BYTES;
+  const maxRawResponseBytes = inputs.maxRawResponseBytes ?? TRAJECTORY_MAX_RAW_RESPONSE_BYTES;
   const requestChunks: Buffer[] = [];
   let requestBytes = 0;
   let requestFinishedAt = 0;
@@ -214,6 +259,25 @@ export function beginCaptureExchange(inputs: BeginCaptureExchangeInputs): Captur
   return {
     pushRequestChunk(chunk: Buffer) {
       if (aborted || requestFinalized) return;
+      if (requestBytes + chunk.length > maxRequestBytes) {
+        // Drop THIS exchange only (MITM-14), with the same survivorship
+        // contract as a mid-stream abort: release what was teed, count it as
+        // an aborted exchange, and let the session keep capturing. The
+        // response is never recorded (attachResponse sees `aborted`).
+        aborted = true;
+        requestChunks.length = 0;
+        requestBytes = 0;
+        logger.warn(
+          `[trajectory-tap] exchange dropped (request body over ${maxRequestBytes} bytes): ` +
+            `sessionId=${inputs.sessionId} exchangeId=${exchangeId} host=${inputs.host} path=${inputs.path}`,
+        );
+        try {
+          inputs.writer.noteAbortedExchange(inputs.sessionId);
+        } catch {
+          /* swallow — accounting is best-effort */
+        }
+        return;
+      }
       requestChunks.push(chunk);
       requestBytes += chunk.length;
     },
@@ -229,6 +293,12 @@ export function beginCaptureExchange(inputs: BeginCaptureExchangeInputs): Captur
     },
     attachResponse(args: AttachResponseInputs): PassThrough {
       const tap = new PassThrough();
+      if (aborted) {
+        // Already dropped (its request outgrew the tee): no record can be
+        // written, so register nothing in flight and discard the response.
+        tap.resume();
+        return tap;
+      }
       const responseChunks: Buffer[] = [];
       let responseBytes = 0;
       /**
@@ -257,7 +327,9 @@ export function beginCaptureExchange(inputs: BeginCaptureExchangeInputs): Captur
       const contentType = String(args.headers['content-type'] ?? '').toLowerCase();
       const isSse = contentType.includes('text/event-stream');
       const reassembler: Reassembler | undefined =
-        isSse || contentType === '' ? createReassembler(inputs.host, inputs.path) : undefined;
+        isSse || contentType === ''
+          ? createReassembler(inputs.host, inputs.path, { framerLimits: inputs.sseFramerLimits })
+          : undefined;
       const streaming = reassembler !== undefined || isSse;
       // The caller is responsible for wiring a decompressor in front of
       // this tap (see `createResponseCaptureInlet`). The bytes reaching
@@ -301,14 +373,18 @@ export function beginCaptureExchange(inputs: BeginCaptureExchangeInputs): Captur
       /**
        * Abandon THIS exchange and nothing else. An upstream stream that
        * ends before its terminal event is a transport event scoped to a
-       * single request — the agent's SDK simply retries it. It says
-       * nothing about the fidelity of the session's other records, so
-       * the session keeps capturing and the gap is surfaced as
-       * `session-end.abortedExchanges`.
+       * single request — the agent's SDK simply retries it. A response
+       * past a capture limit (trajectory-limits.ts) is a resource
+       * condition of that one response. Neither says anything about the
+       * fidelity of the session's other records, so the session keeps
+       * capturing and the gap is surfaced as `session-end.abortedExchanges`.
        */
       const dropExchange = (err: Error): void => {
         aborted = true;
-        logger.warn(`[trajectory-tap] exchange dropped (mid-stream-abort): ${describeExchange()} — ${err.message}`);
+        responseChunks.length = 0;
+        responseBytes = 0;
+        const reason = isCaptureLimitError(err) ? 'capture-limit' : 'mid-stream-abort';
+        logger.warn(`[trajectory-tap] exchange dropped (${reason}): ${describeExchange()} — ${err.message}`);
         try {
           inputs.writer.noteAbortedExchange(inputs.sessionId);
         } catch {
@@ -346,6 +422,12 @@ export function beginCaptureExchange(inputs: BeginCaptureExchangeInputs): Captur
           } catch {
             /* reassembler accumulates; failures surface at finalize */
           }
+          return;
+        }
+        // A verbatim capture holds the whole body until the exchange
+        // settles, so it is bounded like the reassembled path.
+        if (responseBytes + chunk.length > maxRawResponseBytes) {
+          dropExchange(new CaptureLimitError(`response body exceeds the ${maxRawResponseBytes}-byte capture limit`));
           return;
         }
         responseChunks.push(chunk);
@@ -386,15 +468,16 @@ export function beginCaptureExchange(inputs: BeginCaptureExchangeInputs): Captur
             finishCompletion(true);
           } catch (err) {
             // Do NOT emit a partial record. Distinguish a transport
-            // truncation (stream ended before the terminal event) from a
-            // genuine reassembly bug (a parse/dispatch/assembly failure):
-            // the former costs one exchange, the latter means the parser
-            // is untrustworthy and poisons the session. A clean `end()`
-            // with no terminal event reaches here e.g. when an upstream
-            // reset is flushed gracefully via `inlet.end()` (the
-            // gzip-tail recovery path).
+            // truncation (stream ended before the terminal event) or an
+            // exceeded framing limit (the reassembler keeps the framer's
+            // SseFramingError) from a genuine reassembly bug (a
+            // parse/dispatch/assembly failure): the former two cost one
+            // exchange, the latter means the parser is untrustworthy and
+            // poisons the session. A clean `end()` with no terminal event
+            // reaches here e.g. when an upstream reset is flushed
+            // gracefully via `inlet.end()` (the gzip-tail recovery path).
             const msg = err instanceof ReassemblyError ? err.message : String(err);
-            if (err instanceof TruncatedStreamError) {
+            if (err instanceof TruncatedStreamError || isSseFramingLimitError(err)) {
               dropExchange(err);
             } else {
               poisonAndAbort('reassembly-failure', err instanceof Error ? err : new Error(msg));
@@ -470,7 +553,12 @@ export function beginCaptureExchange(inputs: BeginCaptureExchangeInputs): Captur
  * is unaffected.
  *
  * Decompression failures (truncated gzip, corrupt frame) poison the
- * session with `reassembly-failure`. See §3 of the design doc.
+ * session with `reassembly-failure`. A decoder resource limit (the
+ * compressed, decoded, expansion-ratio or backlog cap of
+ * `TRAJECTORY_DECODER_LIMITS`) instead drops only this exchange, exactly as
+ * the same oversized response does uncompressed: the tap is torn down with a
+ * {@link CaptureLimitError} and counts the exchange in
+ * `session-end.abortedExchanges`. See §3 of the design doc.
  */
 export function createResponseCaptureInlet(args: {
   readonly captureTap: PassThrough;
@@ -492,9 +580,14 @@ export function createResponseCaptureInlet(args: {
   const failCapture = (failure: ContentDecoderFailure): void => {
     if (failed) return;
     failed = true;
+    logger.warn(`[trajectory-tap] response decoder detached (${encoding}): ${failure.message}`);
+    if (DECODER_LIMIT_REASONS.has(failure.reason)) {
+      // The tap's teardown path drops (and counts) just this exchange.
+      if (!args.captureTap.destroyed) args.captureTap.destroy(new CaptureLimitError(failure.message));
+      return;
+    }
     const poisonReason: PoisonReason =
       failure.reason === 'unsupported-encoding' ? 'unsupported-encoding' : 'reassembly-failure';
-    logger.warn(`[trajectory-tap] response decoder detached (${encoding}): ${failure.message}`);
     args.onPoison(poisonReason);
     args.captureHandle.abort();
     if (!args.captureTap.destroyed) args.captureTap.destroy(new Error(failure.message));

@@ -1,10 +1,11 @@
 /**
  * Tests for AuditLogTailer: incremental JSONL file reading,
- * offset tracking, diagnostic event emission, and preview building.
+ * offset tracking, diagnostic event emission, and preview building; line-exact
+ * reads across appends still in progress and the start offset (WP-83).
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -197,6 +198,206 @@ describe('AuditLogTailer', () => {
       }
       expect(events).toHaveLength(3);
     });
+
+    it('reports outcomes only: the write-ahead dispatching record emits no event', () => {
+      // The pipeline appends a `dispatching` record before it forwards an
+      // allowed call and the outcome record once the call settles. Consumers
+      // keep seeing one diagnostic per tool call.
+      appendEntry(logPath, makeEntry({ requestId: 'req-9', result: { status: 'dispatching' }, durationMs: 0 }));
+      tailer.readNewEntries();
+      expect(events).toHaveLength(0);
+
+      appendEntry(logPath, makeEntry({ requestId: 'req-9', result: { status: 'success' } }));
+      tailer.readNewEntries();
+      expect(events).toHaveLength(1);
+      const ev = events[0] as Extract<DiagnosticEvent, { kind: 'tool_call' }>;
+      expect(ev.preview).toMatch(/^\[success\]/);
+    });
+  });
+
+  // ── Line-exact reads (WP-83, GAP4-7) ────────────────────────────────────
+
+  describe('entries split across reads', () => {
+    function toolNames(): string[] {
+      return events.map((ev) => (ev.kind === 'tool_call' ? ev.toolName : ev.kind));
+    }
+
+    it('completes an entry whose append was still in progress at the previous read', () => {
+      const line = JSON.stringify(makeEntry({ toolName: 'split_tool' })) + '\n';
+      const cut = Math.floor(line.length / 2);
+      appendFileSync(logPath, line.slice(0, cut), 'utf-8');
+      tailer.readNewEntries();
+      expect(events).toHaveLength(0);
+
+      appendFileSync(logPath, line.slice(cut), 'utf-8');
+      tailer.readNewEntries();
+      expect(toolNames()).toEqual(['filesystem.split_tool']);
+    });
+
+    it('completes an entry split over several reads, including inside a multi-byte character', () => {
+      const line = Buffer.from(
+        JSON.stringify(makeEntry({ toolName: 'utf8_tool', arguments: { text: 'héllo ✓ 世界' } })) + '\n',
+      );
+      const multiByte = line.indexOf(Buffer.from('✓')) + 1; // inside the 3-byte sequence
+      const cuts = [5, multiByte, line.length - 1];
+      let from = 0;
+      for (const cut of cuts) {
+        appendFileSync(logPath, line.subarray(from, cut));
+        tailer.readNewEntries();
+        expect(events).toHaveLength(0);
+        from = cut;
+      }
+      appendFileSync(logPath, line.subarray(from));
+      tailer.readNewEntries();
+
+      expect(toolNames()).toEqual(['filesystem.utf8_tool']);
+      const ev = events[0] as Extract<DiagnosticEvent, { kind: 'tool_call' }>;
+      expect(ev.preview).toContain('héllo ✓ 世界');
+    });
+
+    it('reports the complete entries of a read and keeps the unfinished one for the next', () => {
+      const first = JSON.stringify(makeEntry({ toolName: 'first' })) + '\n';
+      const second = JSON.stringify(makeEntry({ toolName: 'second' })) + '\n';
+      appendFileSync(logPath, first + second.slice(0, 10), 'utf-8');
+      tailer.readNewEntries();
+      expect(toolNames()).toEqual(['filesystem.first']);
+
+      appendFileSync(logPath, second.slice(10), 'utf-8');
+      tailer.readNewEntries();
+      expect(toolNames()).toEqual(['filesystem.first', 'filesystem.second']);
+    });
+
+    it('reads a backlog larger than one read chunk without losing entries at chunk boundaries', () => {
+      // ~2.5 MiB of entries of varying length: several 1 MiB chunks, with
+      // entries straddling every chunk boundary.
+      const lines: string[] = [];
+      let bytes = 0;
+      for (let i = 0; bytes < 2.5 * 1024 * 1024; i++) {
+        const line = JSON.stringify(makeEntry({ toolName: `tool_${i}`, arguments: { pad: 'p'.repeat(i % 977) } }));
+        lines.push(line + '\n');
+        bytes += line.length + 1;
+      }
+      writeFileSync(logPath, lines.join(''), 'utf-8');
+
+      tailer.readNewEntries();
+
+      expect(events).toHaveLength(lines.length);
+      expect(toolNames()).toEqual(lines.map((_line, i) => `filesystem.tool_${i}`));
+    });
+
+    it('skips a line longer than maxLineBytes without buffering it, then resumes with the next line', () => {
+      const small = new AuditLogTailer(logPath, (event) => events.push(event), { maxLineBytes: 2048 });
+      const huge = JSON.stringify(makeEntry({ toolName: 'huge', arguments: { blob: 'x'.repeat(10_000) } })) + '\n';
+      appendFileSync(logPath, huge.slice(0, 3000), 'utf-8');
+      small.readNewEntries();
+      appendFileSync(logPath, huge.slice(3000), 'utf-8');
+      appendEntry(logPath, makeEntry({ toolName: 'after' }));
+      small.readNewEntries();
+
+      expect(toolNames()).toEqual(['filesystem.after']);
+    });
+
+    it('skips an over-long line that arrives complete in one read', () => {
+      const small = new AuditLogTailer(logPath, (event) => events.push(event), { maxLineBytes: 2048 });
+      appendEntry(logPath, makeEntry({ toolName: 'huge', arguments: { blob: 'x'.repeat(10_000) } }));
+      appendEntry(logPath, makeEntry({ toolName: 'after' }));
+      small.readNewEntries();
+
+      expect(toolNames()).toEqual(['filesystem.after']);
+    });
+
+    it('starts over at offset 0 when the log is truncated', () => {
+      appendEntry(logPath, makeEntry({ toolName: 'before' }));
+      appendEntry(logPath, makeEntry({ toolName: 'before_too' }));
+      tailer.readNewEntries();
+      expect(events).toHaveLength(2);
+
+      writeFileSync(logPath, JSON.stringify(makeEntry({ toolName: 'after_truncate' })) + '\n', 'utf-8');
+      tailer.readNewEntries();
+
+      expect(toolNames()).toEqual(['filesystem.before', 'filesystem.before_too', 'filesystem.after_truncate']);
+    });
+
+    it('never throws when the log path is unreadable as a file', () => {
+      mkdirSync(logPath);
+      expect(() => tailer.readNewEntries()).not.toThrow();
+      expect(events).toHaveLength(0);
+    });
+  });
+
+  describe('startOffset', () => {
+    it("'end' reports only entries appended after the tailer was created", () => {
+      // A borrowed workflow bundle's log (or a resumed session's) already
+      // holds earlier sessions' entries.
+      appendEntry(logPath, makeEntry({ toolName: 'earlier_state_1' }));
+      appendEntry(logPath, makeEntry({ toolName: 'earlier_state_2' }));
+      const fromEnd = new AuditLogTailer(logPath, (event) => events.push(event), { startOffset: 'end' });
+
+      fromEnd.readNewEntries();
+      expect(events).toHaveLength(0);
+
+      appendEntry(logPath, makeEntry({ toolName: 'mine' }));
+      fromEnd.readNewEntries();
+      expect(events.map((ev) => (ev.kind === 'tool_call' ? ev.toolName : ev.kind))).toEqual(['filesystem.mine']);
+    });
+
+    it("'end' on a log that does not exist yet reports everything written to it", () => {
+      const fromEnd = new AuditLogTailer(logPath, (event) => events.push(event), { startOffset: 'end' });
+      appendEntry(logPath, makeEntry({ toolName: 'first_call' }));
+      fromEnd.readNewEntries();
+      expect(events).toHaveLength(1);
+    });
+
+    it("'end' inside an entry still being written skips that entry and reports the next", () => {
+      const earlier = JSON.stringify(makeEntry({ toolName: 'earlier' })) + '\n';
+      appendFileSync(logPath, earlier.slice(0, 20), 'utf-8');
+      const fromEnd = new AuditLogTailer(logPath, (event) => events.push(event), { startOffset: 'end' });
+
+      appendFileSync(logPath, earlier.slice(20), 'utf-8');
+      appendEntry(logPath, makeEntry({ toolName: 'mine' }));
+      fromEnd.readNewEntries();
+
+      expect(events.map((ev) => (ev.kind === 'tool_call' ? ev.toolName : ev.kind))).toEqual(['filesystem.mine']);
+    });
+
+    it('a numeric offset at a line start reports from that line; inside a line, from the next', () => {
+      const first = JSON.stringify(makeEntry({ toolName: 'first' })) + '\n';
+      appendFileSync(logPath, first, 'utf-8');
+      appendEntry(logPath, makeEntry({ toolName: 'second' }));
+      appendEntry(logPath, makeEntry({ toolName: 'third' }));
+
+      const atLine: DiagnosticEvent[] = [];
+      new AuditLogTailer(logPath, (event) => atLine.push(event), { startOffset: first.length }).readNewEntries();
+      expect(atLine.map((ev) => (ev.kind === 'tool_call' ? ev.toolName : ev.kind))).toEqual([
+        'filesystem.second',
+        'filesystem.third',
+      ]);
+
+      const inLine: DiagnosticEvent[] = [];
+      new AuditLogTailer(logPath, (event) => inLine.push(event), { startOffset: first.length + 5 }).readNewEntries();
+      expect(inLine.map((ev) => (ev.kind === 'tool_call' ? ev.toolName : ev.kind))).toEqual(['filesystem.third']);
+    });
+
+    it('rejects a negative or fractional offset', () => {
+      expect(() => new AuditLogTailer(logPath, () => {}, { startOffset: -1 })).toThrow(RangeError);
+      expect(() => new AuditLogTailer(logPath, () => {}, { startOffset: 1.5 })).toThrow(RangeError);
+    });
+
+    it('an offset past the end of the log starts over at 0, even when the log has grown past it by the first read', () => {
+      appendEntry(logPath, makeEntry({ toolName: 'first' }));
+      const pastEnd = new AuditLogTailer(logPath, (event) => events.push(event), { startOffset: 300 });
+      // The log grows past the requested offset before anything is read:
+      // offset 300 now falls inside an entry, which must not be read from there.
+      appendEntry(logPath, makeEntry({ toolName: 'second', arguments: { pad: 'p'.repeat(200) } }));
+      appendEntry(logPath, makeEntry({ toolName: 'third' }));
+      pastEnd.readNewEntries();
+
+      expect(events.map((ev) => (ev.kind === 'tool_call' ? ev.toolName : ev.kind))).toEqual([
+        'filesystem.first',
+        'filesystem.second',
+        'filesystem.third',
+      ]);
+    });
   });
 
   // ── start() / stop() ─────────────────────────────────────────────────────
@@ -236,6 +437,27 @@ describe('AuditLogTailer', () => {
       tailer.stop();
       tailer.stop();
       expect(unwatchFile).toHaveBeenCalledOnce();
+    });
+
+    it('removes only its own listener, so another tailer of the same log keeps watching', () => {
+      // Workflow fan-out lanes share one bundle audit log; closing one lane's
+      // session must not stop the others' tailers.
+      const other = new AuditLogTailer(logPath, () => {});
+      tailer.start();
+      other.start();
+      tailer.stop();
+
+      const watchCalls = (watchFile as ReturnType<typeof vi.fn>).mock.calls as unknown[][];
+      const ownListener = watchCalls[0][watchCalls[0].length - 1];
+      expect(unwatchFile).toHaveBeenCalledExactlyOnceWith(logPath, ownListener);
+      expect(ownListener).not.toBe(watchCalls[1][watchCalls[1].length - 1]);
+      other.stop();
+    });
+
+    it('start() twice registers one listener', () => {
+      tailer.start();
+      tailer.start();
+      expect(watchFile).toHaveBeenCalledOnce();
     });
   });
 });

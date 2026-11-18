@@ -1,6 +1,7 @@
 # Design: Workflow System Web UI Integration
 
-**Status:** Draft v3
+**Status (2026-11-14):** Partial: the workflow views shipped (state-machine graph, gate review panel, workspace browser, and the artifact, message-log and file RPCs). Not built: the diff view and its `workflows.diff` RPC.
+
 **Date:** 2026-04-04
 **Author:** IronCurtain Engineering
 
@@ -71,7 +72,7 @@ This is an orchestrator fix, not a web UI concern, but it is a prerequisite for 
 
 The `WorkflowManager` is instantiated in `IronCurtainDaemon` alongside `SessionManager`. It wires lifecycle events to the `WebEventBus` for frontend consumption.
 
-**Global agent session limit.** A global limit on concurrent Docker containers across all workflows is planned but not yet implemented. The per-workflow `maxParallelism` setting in `WorkflowDefinition.settings` controls fan-out within a single workflow (currently 1 -- sequential states). A global limit will be added when parallel workflow execution is supported.
+**Global agent session limit.** The orchestrator caps concurrent workflow agent environments across all workflows at `maxConcurrentAgentSessions` (user config, default 4; `src/workflow/agent-slot-pool.ts`). The daemon runs every workflow through the `WorkflowManager`'s single orchestrator, so the cap is daemon-wide. A shared-container run reserves one slot per container scope before its first bundle mint and returns them at teardown; an agent session with its own container or sandbox (per-state Docker, builtin) holds one slot while it lives. Requests over the cap wait instead of failing; the waiting run logs why to stderr (the daemon log, or the CLI run's output, which also shows it on the run's tab), while the web UI only shows the run as running in its current state; only a shared-container workflow with more scopes than the cap is refused at start. Within one workflow, `settings.workers` (the retired `maxParallelism` is rejected) sets the fan-out width, at most 16 lanes.
 
 **No new abstraction for gate callbacks.** The `WorkflowOrchestrator` already receives `raiseGate` and `dismissGate` as callbacks via `WorkflowOrchestratorDeps`. The TUI provides readline-based callbacks; the web UI provides `WebEventBus`-based callbacks. Same interface, different implementations -- the orchestrator is already agnostic to the UI layer. The `WorkflowManager` simply wires these callbacks when constructing the orchestrator:
 
@@ -150,13 +151,15 @@ New methods added to the `MethodName` union in `web-ui-types.ts` and dispatched 
 | `workflows.start`        | `{ definitionPath: string, taskDescription: string, workspacePath?: string }` | `{ workflowId: string }`                | Fire-and-forget; progress via events                                                                   |
 | `workflows.resume`       | `{ workflowId: string }`                                                      | `{ accepted: true }`                    | Resume from checkpoint                                                                                 |
 | `workflows.abort`        | `{ workflowId: string }`                                                      | --                                      |                                                                                                        |
-| `workflows.resolveGate`  | `{ workflowId: string, event: HumanGateEventType, prompt?: string }`          | --                                      |                                                                                                        |
+| `workflows.resolveGate`  | `{ workflowId: string, gateId: string, event: HumanGateEventType, prompt?: string, resolvedBy?: 'web-ui' \| 'cli' \| 'signal' }` | --                                      | `gateId` must be the active raise (`GATE_MISMATCH` otherwise); `event` must be one the gate transitions on (`EVENT_NOT_ACCEPTED`). `resolvedBy` is the declared channel recorded in the message log. |
 | `workflows.definitions`  | --                                                                            | `WorkflowDefinitionSummary[]`           | List available definitions                                                                             |
-| `workflows.artifacts`    | `{ workflowId: string, artifactName: string }`                                | `ArtifactContentDto`                    | Read artifact content for review                                                                       |
-| `workflows.messageLog`   | `{ workflowId: string, limit?: number }`                                      | `MessageLogEntry[]`                     | Read message log entries                                                                               |
+| `workflows.artifacts`    | `{ workflowId: string, artifactName: string }`                                | `ArtifactContentDto`                    | List an artifact's files (paths and sizes only; bounded, `truncated`)                                  |
+| `workflows.artifactFile` | `{ workflowId: string, artifactName: string, path: string }`                  | `FileContentResponseDto`                | Read one artifact file for review (fetched lazily, one file per request)                               |
+| `workflows.messageLog`   | `{ workflowId: string, before?: string, limit?: number }`                     | `MessageLogResponseDto`                 | Newest-first page, capped in entries and bytes; long strings cut with a `ref`                          |
+| `workflows.messageLogEntry` | `{ workflowId: string, ref: string }`                                      | `{ entry: MessageLogEntry }`            | Full text of a page entry that was cut                                                                 |
 | `workflows.diff`         | `{ workflowId: string }`                                                      | `DiffEntry[]`                           | Git diff of workspace changes                                                                          |
-| `workflows.fileTree`     | `{ workflowId: string, path?: string }`                                       | `FileTreeNode[]`                        | Browse workspace files                                                                                 |
-| `workflows.fileContent`  | `{ workflowId: string, path: string }`                                        | `{ content: string, language: string }` | Read a single file                                                                                     |
+| `workflows.fileTree`     | `{ workflowId: string, path?: string }`                                       | `FileTreeResponseDto`                   | Browse workspace files (directories and regular files only; at most 2,000 entries, `truncated`)        |
+| `workflows.fileContent`  | `{ workflowId: string, path: string }`                                        | `FileContentResponseDto`                | Read a single regular file (≤ 1 MiB; `{ error }` for a FIFO, device, symlink or larger file)           |
 | `personas.list`          | --                                                                            | `PersonaListItem[]`                     | Already exists                                                                                         |
 | `personas.get`           | `{ name: string }`                                                            | `PersonaDetailDto`                      | Full persona definition                                                                                |
 | `personas.create`        | `{ name: string, description: string, servers?: string[] }`                   | --                                      |                                                                                                        |
@@ -287,15 +290,18 @@ export function toHumanGateRequestDto(gate: HumanGateRequest): HumanGateRequestD
   };
 }
 
+// As implemented (WP-32): the listing carries no file contents. Each file is
+// fetched separately through `workflows.artifactFile` (a FileContentResponseDto),
+// so an artifact of many or large files never becomes one oversized reply.
 export interface ArtifactContentDto {
-  readonly name: string;
   readonly files: readonly ArtifactFileDto[];
+  /** True when the walk stopped at its file-count, depth or byte budget. */
+  readonly truncated: boolean;
 }
 
 export interface ArtifactFileDto {
-  readonly path: string;
-  readonly content: string;
-  readonly language: string;
+  readonly path: string; // `/`-separated, relative to the artifact directory
+  readonly size: number; // bytes
 }
 
 export interface DiffEntry {
@@ -870,10 +876,12 @@ User clicks "Start"
 ### 8.2 Gate Resolution Data Flow
 
 ```
-User clicks "Approve" in GateReviewPanel
-  -> resolveWorkflowGate() store action
-    -> WS request: workflows.resolveGate { workflowId, event: 'APPROVE' }
-      -> json-rpc-dispatch: orchestrator.resolveGate(id, { type: 'APPROVE' })
+User clicks "Approve" in GateReviewPanel (showing gate g2)
+  -> resolveWorkflowGate(workflowId, g2, 'APPROVE') store action
+    -> WS request: workflows.resolveGate { workflowId, gateId: g2, event: 'APPROVE', resolvedBy: 'web-ui' }
+      -> json-rpc-dispatch: orchestrator.resolveGate(id, { gateId: g2, type: 'APPROVE', resolvedBy: 'web-ui' })
+        -> gate-binding check: g2 is the active raise AND the gate transitions on APPROVE
+           (else GATE_MISMATCH / EVENT_NOT_ACCEPTED: nothing dismissed, nothing logged)
         -> XState actor receives HUMAN_APPROVE event
           -> State transitions to next state
             -> 'gate_dismissed' + 'state_entered' lifecycle events
@@ -928,6 +936,50 @@ appState.workflows = newWorkflows;
 ```
 
 Gate watermarks follow the same reconnect pattern as escalations -- suppress auto-open for pre-existing gates on initial connect.
+
+**Pending gates are rebuilt from server state, not merged.** Events can be
+lost in both directions while disconnected: a gate raised meanwhile is
+missing from `pendingGates`, and a gate dismissed meanwhile is still in it. A
+stale entry is dangerous rather than untidy -- the review panel would show
+one gate's summary while the user decides about it (the daemon refuses a
+decision bound to a raise that is gone, but the user was still shown the
+wrong gate) -- so `refreshAll` keeps a gate only for workflows
+`workflows.list` reports as `waiting_human`, and only the gate
+`workflows.get` returns for them. Each `workflows.get` answer is applied the
+moment it arrives (`syncWorkflowGateFromDetail`): answers and events share
+one ordered socket, so a dismissal or newer raise handled after an answer
+lands on top of it instead of being overwritten when the other fetches
+finish. A gate that arrives by event during the refresh is newer than the
+list snapshot and is kept; a gate held from before the refresh whose
+`workflows.get` fails is dropped rather than kept unconfirmed. Every raise
+has its own `gateId`, so the same rule applies on the live path:
+`workflow.gate_raised` evicts any other gate held for that workflow, and
+`WorkflowDetail`'s fetched detail replaces (never merges into) the
+workflow's entry. When the daemon refuses a decision as stale
+(`GATE_MISMATCH`, `WORKFLOW_NOT_AT_GATE`), `resolveWorkflowGate` re-reads the
+workflow and replaces its gate the same way before reporting the error, so
+the panel shows what is actually waiting. Several of these paths swap the
+displayed gate for a new raise in one step, without the panel unmounting in
+between, so `WorkflowDetail` keys `GateReviewPanel` on `gate.gateId`: each
+raise gets a fresh panel, and artifact content fetched for an earlier raise, a
+half-confirmed abort or a feedback draft never carry over to the new one.
+
+**Pending tool-call escalations are rebuilt the same way.** They feed the
+Workflows badge (gates plus `pendingWorkflowEscalations`) and the
+WorkflowDetail panel, and the events that maintain them can be missed while
+disconnected too. `refreshAll` fetches `workflows.get` for every workflow the
+list reports as live (`running`, where an agent blocks inside an escalated
+call, or `waiting_human`), and each answer's `escalations` replace what the
+client held for that workflow; entries held from before the refresh for a
+workflow that finished or is no longer listed, or whose detail cannot be read,
+are dropped, while one raised by an event during the refresh is kept. Every
+`workflows.get` the store sends (`getWorkflowDetail`, used by WorkflowDetail
+and by the stale-gate re-read) applies its answer's escalations the same way.
+An answer is merged with the `workflow.escalation_*` and terminal events
+received while it was requested (`src/lib/escalation-snapshots.ts`), so an
+escalation raised in that window is not dropped and one resolved in it does
+not come back; the session escalations of `escalations.list` are merged the
+same way.
 
 ---
 
@@ -1232,26 +1284,30 @@ const CANNED_MESSAGE_LOG: MessageLogEntry[] = [
 
 1. **Workflow persistence across daemon restarts.** The orchestrator uses in-memory `WorkflowInstance` maps. When the daemon restarts, active workflows are lost but checkpoints survive on disk. Should the web UI show checkpointed-but-not-running workflows as "interrupted" with a resume button? (Recommendation: yes, this is what `listResumable()` already provides.)
 
-2. **Concurrent gate resolution.** ~~Resolved.~~ If both CLI and web UI are running, both could attempt to resolve the same gate. The orchestrator's `resolveGate()` must guard against double resolution by checking `activeGateId` before sending the XState event. This is an orchestrator fix (not a web UI concern) but is a prerequisite for safe concurrent access. The fix:
+2. **Concurrent gate resolution.** ~~Resolved.~~ If both CLI and web UI are running, both could attempt to resolve the same gate, or a decision made while one visit of a gate was shown could land on a later visit. Checking `activeGateId` alone is not enough, because the id used to be `${workflowId}-${gateName}`, identical on every visit. Every raise now mints its own id (`src/workflow/gate-binding.ts`), `HumanGateEvent` carries the `gateId` the decider reviewed, and `resolveGate()` validates before mutating:
 
    ```typescript
    resolveGate(id: WorkflowId, event: HumanGateEvent): void {
-     const instance = this.workflows.get(id);
-     if (!instance?.activeGateId) return; // already resolved or no gate
-     // ... proceed with resolution
-     instance.activeGateId = null; // clear before sending event
+     const instance = this.workflows.get(id); // else WORKFLOW_NOT_FOUND
+     assertGateResolutionAllowed(
+       // a terminal run (e.g. aborted while waiting) has no active gate
+       { workflowId: id, activeGateId: instance.finalStatus ? undefined : instance.activeGateId, gate: currentHumanGateDef },
+       event, // WORKFLOW_NOT_AT_GATE | GATE_MISMATCH | EVENT_NOT_ACCEPTED | FEEDBACK_REQUIRED
+     );
+     instance.activeGateId = undefined; // clear before sending the event
+     // dismiss, log gate_resolved { gateId, event, prompt, resolvedBy }, actor.send(HUMAN_<event>)
    }
    ```
 
-   The JSON-RPC dispatch layer returns `WORKFLOW_NOT_AT_GATE` error when `resolveGate()` is called on a workflow with no active gate.
+   The JSON-RPC dispatch layer maps these to `WORKFLOW_NOT_AT_GATE`, `GATE_MISMATCH`, `EVENT_NOT_ACCEPTED` and `INVALID_PARAMS`; a refused decision leaves the gate up under the same id and logs nothing.
 
 3. **Diff computation strategy.** The `workflows.diff` RPC needs to compute a git diff of the workspace. For fresh workspaces (no git history), should we initialize a git repo at workflow start and commit after each agent state? This would give clean diffs between states. (Recommendation: yes, the orchestrator should `git init` + `git add -A` + `git commit` the workspace at the start and after each agent state completes. The commit message includes the state name.)
 
-4. **Artifact size limits.** Large artifacts (e.g., a full codebase review) could be expensive to transmit over WebSocket. Should the `workflows.artifacts` RPC support pagination or streaming? (Recommendation: for v1, limit artifact content to 1MB per file and paginate the file list. Larger files show a "too large to display" message with a download link.)
+4. **Artifact size limits.** Large artifacts (e.g., a full codebase review) could be expensive to transmit over WebSocket. Should the `workflows.artifacts` RPC support pagination or streaming? (Resolved: `workflows.artifacts` returns paths and sizes only, bounded at 2,000 entries, 8 directory levels and 1 MiB of serialized listing, with `truncated`; contents come one file at a time from `workflows.artifactFile`, capped at 1 MiB per file. The gate review panel opens the first file and loads the others when the reviewer expands them. A reply that still exceeds 8 MiB becomes a `RESPONSE_TOO_LARGE` error; the socket stays open.)
 
 5. **State machine graph for custom workflows.** The `StateMachineGraph` component is designed for the `design-and-code` workflow's topology. Custom workflows could have arbitrarily complex graphs. How should the component handle graphs with 20+ states? (Recommendation: dagre handles this well up to ~50 nodes. For very large graphs, add a minimap overlay and viewport controls. This is unlikely to be needed in practice -- most workflows will have fewer than 15 states.)
 
-6. **Workspace path security.** The `workflows.fileTree` and `workflows.fileContent` RPCs serve arbitrary file content from the workspace directory. The backend must enforce that the requested path is within the workspace boundary (same `resolveRealPath` + containment check used by the policy engine). Symlink escapes must be prevented.
+6. **Workspace path security.** The `workflows.fileTree` and `workflows.fileContent` RPCs serve arbitrary file content from the workspace directory. The backend must enforce that the requested path is within the workspace boundary (same `resolveRealPath` + containment check used by the policy engine). Symlink escapes must be prevented. (As implemented: the workspace is agent-writable, so every byte is read through `readUntrustedRegularFileBelow` in `src/hardened-fs.ts`, which realpath-contains the directory components, opens the final component `O_NOFOLLOW | O_NONBLOCK`, requires a regular file and reads at most 1 MiB + 1 bytes; a FIFO, device or symlink the agent swaps in yields "Not a regular file" instead of blocking the daemon. Listings open each directory through `openDirectoryBelow`, which requires the directory actually opened to lie in the real workspace and, on Linux, reads and sizes its entries through the open descriptor, so a symlink the agent swaps in mid-listing cannot redirect it; they are asynchronous, skip non-regular entries and are bounded in entries read and returned.)
 
 7. **Dagre bundle size.** `@dagrejs/dagre` is ~30KB minified. This is acceptable for the web UI bundle. However, if we want to avoid the dependency entirely, we could implement a simplified layered layout for the specific topology patterns we support (linear pipeline with optional backward edges). This would be ~200 lines of custom code. (Recommendation: use dagre. The library is well-tested and handles edge cases we would miss in a custom implementation.)
 

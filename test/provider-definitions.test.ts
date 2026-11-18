@@ -3,8 +3,8 @@ import { parse as parseToml } from 'smol-toml';
 import * as definitions from '../src/config/provider-definitions.js';
 import type { GatewayDefinition, GatewayProfile } from '../src/config/provider-definitions.js';
 import type { IronCurtainConfig } from '../src/config/types.js';
-import type { ResolvedProviderProfile } from '../src/config/user-config.js';
-import { userConfigSchema } from '../src/config/user-config.js';
+import type { DockerAgent, ResolvedProviderProfile } from '../src/config/user-config.js';
+import { DOCKER_AGENTS, userConfigSchema } from '../src/config/user-config.js';
 import { resolveMessagesClient, resolveResponsesClient, resolveChatClient } from '../src/config/gateway-client.js';
 import { buildProviderEditorOptions } from '../src/config/config-command.js';
 import { resolvedGatewayToInput } from '../src/config/provider-editor.js';
@@ -125,7 +125,7 @@ it('generates all three harness configurations from one compatible definition', 
     const providers = adapter.getProviders(c);
     expect(providers[0]).toMatchObject({ id: 'fixture', host: compatible.host });
     expect(JSON.stringify(adapter.buildEnv(c, sentinel))).not.toContain('host-only-real-key');
-    expect(adapter.detectCredential(c)).toEqual({ kind: 'apikey', key: 'host-only-real-key' });
+    expect(adapter.detectCredential?.(c)).toEqual({ kind: 'apikey', key: 'host-only-real-key' });
     const command = adapter.buildCommand('hello', 'system', {
       sessionId: 'fixture-session',
       firstTurn: true,
@@ -237,6 +237,12 @@ describe('proxy-owned routing maps once across harness requests', () => {
       ...overrides,
     };
   }
+  /** The built-in Docker agent an adapter id names. */
+  function dockerAgentOf(id: string): DockerAgent {
+    const agent = DOCKER_AGENTS.find((candidate) => candidate === id);
+    if (agent === undefined) throw new Error(`not a built-in Docker agent: ${id}`);
+    return agent;
+  }
   function served(
     p: GatewayProfile,
     protocol: 'messages' | 'responses' | 'chat',
@@ -285,7 +291,7 @@ describe('proxy-owned routing maps once across harness requests', () => {
       });
       expect(command[command.indexOf('--model') + 1]).toBe('A');
       const protocol = adapter.id === 'claude-code' ? 'messages' : adapter.id === 'codex' ? 'responses' : 'chat';
-      expect(served(p, protocol, 'A', adapter.id)).toBe('B');
+      expect(served(p, protocol, 'A', dockerAgentOf(adapter.id))).toBe('B');
     },
   );
   it('distinguishes no request, unmatched fallback seeds, and explicit empty maps', () => {

@@ -23,6 +23,12 @@ export interface GatewayProfile {
 }
 export type GatewayProtocol = 'messages' | 'responses' | 'chat';
 
+/**
+ * Gateway-level request sanitizers, resolved by `src/docker/gateway-runtime.ts`
+ * (implementations live in `src/docker/request-sanitizers/`).
+ */
+export type GatewaySanitizerId = 'openrouter';
+
 export interface ProviderEditorDescriptor {
   readonly id: string;
   readonly label: string;
@@ -52,18 +58,43 @@ export interface GatewayDefinition {
     Record<GatewayProtocol, 'omit' | 'profile-default' | 'requested' | 'requested-or-default'>
   >;
   readonly aliasFallback: 'omit' | 'requested';
+  /**
+   * Shape of the model IDs the gateway routes. `vendor/model`: every ID names
+   * its vendor (`openai/gpt-5`, `z-ai/glm-5.3`), so a bare ID that no map rule
+   * or per-agent setting replaces cannot be routed. Absent: bare IDs are
+   * normal (Z.AI's `glm-5.3`).
+   */
+  readonly modelIdFormat?: 'vendor/model';
   readonly fakeKeyPrefix: string;
-  readonly codex: { readonly credentialEnv: string; readonly catalog: boolean; readonly webSockets?: boolean };
+  /**
+   * Codex harness binding. There is no WebSocket capability here: the Codex
+   * adapter turns WebSockets off on every route, because the MITM never
+   * bridges them on provider hosts.
+   */
+  readonly codex: { readonly credentialEnv: string; readonly catalog: boolean };
   readonly goose: { readonly provider: string; readonly credentialEnv: string; readonly endpointOverride: boolean };
   readonly structuredOutput: 'schema' | 'json-object';
-  /** Preserve the existing native credential diagnostic for this legacy gateway. */
-  readonly nativeCredentialHelp?: boolean;
   readonly preferProxyCost?: boolean;
   readonly models?: Readonly<Record<string, ProviderModelMetadata>>;
   readonly defaultModelMetadata?: ProviderModelMetadata;
   readonly sessionAffinityModelPrefix?: string;
   readonly stripContextManagementOn: readonly GatewayProtocol[];
+  /**
+   * Apply the Claude Code compatibility rewrite (schedule-skill tool strips
+   * for one-shot agents) on the messages route. Provider-hosted tools are
+   * removed on every messages route regardless of this flag, by the
+   * `anthropic-messages` request sanitizer (src/docker/request-sanitizers).
+   */
   readonly filterMessagesTools: boolean;
+  /**
+   * The gateway's own request sanitizer, bound on every POST route of every
+   * protocol and run before the wire protocol's sanitizer. It covers egress
+   * features the gateway adds to the protocols it serves, which no protocol
+   * sanitizer knows about (OpenRouter: the web plugin, `:online` model
+   * variants, web-search models and fallback model lists). Absent when the
+   * gateway adds none.
+   */
+  readonly gatewaySanitizer?: GatewaySanitizerId;
   readonly keyInjection: { readonly type: 'bearer' };
   /** Authorization is declared independently of client base URLs. */
   proxyPaths(profile: Pick<GatewayProfile, 'type' | 'plan'>): Readonly<
@@ -128,13 +159,13 @@ const GLM_MODEL_METADATA: ProviderModelMetadata = {
 const DEFINITIONS: readonly GatewayDefinition[] = [
   {
     id: 'openrouter',
-    nativeCredentialHelp: true,
     preferProxyCost: true,
     label: 'OpenRouter',
     host: 'openrouter.ai',
     modelSelection: 'proxy',
     clientModels: { messages: 'omit', responses: 'profile-default', chat: 'requested-or-default' },
     aliasFallback: 'omit',
+    modelIdFormat: 'vendor/model',
     fakeKeyPrefix: 'sk-or-v1-ironcurtain-',
     codex: { credentialEnv: 'OPENROUTER_API_KEY', catalog: true },
     goose: { provider: 'openrouter', credentialEnv: 'OPENROUTER_API_KEY', endpointOverride: false },
@@ -142,6 +173,7 @@ const DEFINITIONS: readonly GatewayDefinition[] = [
     keyInjection: { type: 'bearer' },
     stripContextManagementOn: ['messages', 'responses', 'chat'],
     filterMessagesTools: false,
+    gatewaySanitizer: 'openrouter',
     sessionAffinityModelPrefix: 'z-ai/',
     requestFields: openRouterRequestFields,
     formatRequest: formatOpenRouterGooseRequest,
@@ -183,7 +215,7 @@ const DEFINITIONS: readonly GatewayDefinition[] = [
     clientModels: { messages: 'requested', responses: 'requested', chat: 'requested' },
     aliasFallback: 'requested',
     fakeKeyPrefix: 'sk-ironcurtain-zai-',
-    codex: { credentialEnv: 'ZAI_API_KEY', catalog: true, webSockets: false },
+    codex: { credentialEnv: 'ZAI_API_KEY', catalog: true },
     goose: { provider: 'openai', credentialEnv: 'OPENAI_API_KEY', endpointOverride: true },
     structuredOutput: 'json-object',
     keyInjection: { type: 'bearer' },
@@ -278,6 +310,27 @@ export function resolveGatewayModel(
             ? 'default'
             : 'requested',
   };
+}
+
+/**
+ * Why `qualifiedId`, requested by a host role (agent, policy, summary, ...)
+ * bound to `profile`, would reach the gateway as an ID it cannot route, or
+ * undefined when it would not. Host roles send the requested ID through the
+ * profile's model map only (no per-agent setting applies), so on a gateway
+ * whose IDs are `vendor/model` an unmapped bare ID such as `gpt-5` (from
+ * `openai:gpt-5`, or the default Anthropic IDs under `modelMap: []`) fails
+ * with a provider error mid-session. Offline: no model catalog is consulted.
+ */
+export function describeGatewayModelIdProblem(profile: GatewayProfile, qualifiedId: string): string | undefined {
+  const definition = getGatewayDefinition(profile.type);
+  if (definition.modelIdFormat !== 'vendor/model') return undefined;
+  const selection = resolveGatewayModel(profile, qualifiedId, {}, definition);
+  if (selection.source !== 'requested' || selection.selected.includes('/')) return undefined;
+  return (
+    `"${qualifiedId}" reaches ${definition.label} as "${selection.selected}", which no model map rule replaces; ` +
+    `${definition.label} expects "vendor/model" IDs such as ${definition.editor.modelPlaceholder}. ` +
+    'Add a model map rule for it or choose a vendor-qualified model ID.'
+  );
 }
 
 /** Defaults stay derived; explicit maps (including []) are never replaced. */

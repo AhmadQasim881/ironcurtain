@@ -5,14 +5,23 @@
 
 import type { ContainerRuntime } from './types.js';
 import type { DockerWorkloadBundleHandle } from '../docker-workload/infrastructure.js';
-import { releaseManagedResourceLease } from './docker-resource-lifecycle.js';
+import { finalizeManagedResourceLease, type ManagedLeaseFinalization } from './docker-resource-lifecycle.js';
 import { errorMessage } from '../utils/error-message.js';
 import * as logger from '../logger.js';
+
+/** What a best-effort teardown could prove about the resources it removed. */
+export interface ContainerCleanupResult {
+  /** True only when every container and network passed to the cleanup was verified absent. */
+  readonly verified: boolean;
+  /** Resources that still existed after removal, or whose absence could not be checked. */
+  readonly remaining: readonly string[];
+}
 
 /**
  * Stop and remove Docker containers and their per-session network in parallel.
  * Best-effort: individual failures are swallowed so one broken container
- * doesn't prevent cleanup of the others.
+ * doesn't prevent cleanup of the others, but the result reports what could
+ * not be verified gone so the owner lease can be finalized truthfully.
  */
 export async function cleanupContainers(
   docker: ContainerRuntime,
@@ -21,8 +30,9 @@ export async function cleanupContainers(
     sidecarContainerId: string | null;
     networkName: string | null;
   },
-): Promise<void> {
+): Promise<ContainerCleanupResult> {
   const cleanups: Promise<void>[] = [];
+  const remaining: string[] = [];
 
   if (opts.containerId) {
     const cid = opts.containerId;
@@ -47,18 +57,25 @@ export async function cleanupContainers(
   await Promise.all(cleanups);
 
   for (const id of [opts.containerId, opts.sidecarContainerId]) {
-    if (id && (await docker.containerExists(id))) {
+    if (!id) continue;
+    if (await docker.containerExists(id).catch(() => true)) {
       logger.warn(`cleanupContainers: container ${id} still exists after removal`);
+      remaining.push(`container ${id}`);
     }
   }
 
   // Remove per-session internal network after both containers are gone
   if (opts.networkName !== null) {
     await docker.removeNetwork(opts.networkName).catch(() => {});
-    if (docker.networkExists && (await docker.networkExists(opts.networkName))) {
+    if (!docker.networkExists) {
+      remaining.push(`network ${opts.networkName} (unverifiable)`);
+    } else if (await docker.networkExists(opts.networkName).catch(() => true)) {
       logger.warn(`cleanupContainers: network ${opts.networkName} still exists after removal`);
+      remaining.push(`network ${opts.networkName}`);
     }
   }
+
+  return { verified: remaining.length === 0, remaining };
 }
 
 export interface DestroyBundleOuterResourcesOptions {
@@ -68,7 +85,7 @@ export interface DestroyBundleOuterResourcesOptions {
   readonly containerId: string | null;
   readonly sidecarContainerId: string | null;
   readonly networkName: string | null;
-  /** The bundle id whose managed-resource owner lease should be released. */
+  /** The bundle id whose managed-resource owner lease should be finalized. */
   readonly bundleId: string;
   /** Call-site name, used to prefix a teardown-failure warning. */
   readonly context: string;
@@ -89,10 +106,16 @@ export interface DestroyBundleOuterResourcesOptions {
  * remains a harmless belt-and-braces sweep and owns the transport lifecycle for
  * ordinary Docker sessions, which have no workload lease.
  *
- * Finally the managed-resource owner lease is released unconditionally — a
- * genuine no-op for non-docker runtimes, which never acquire one.
+ * Finally the managed-resource owner lease is finalized
+ * (docs/designs/pty-gc-ownership.md): deleted when the teardown was verified
+ * and no resource carries its token, otherwise left as a `released`
+ * tombstone so the next reconciliation reclaims the leftovers even though
+ * this (possibly long-lived) process is still running. A no-op for bundles
+ * that never minted a lease (Docker-workload bundles).
  */
-export async function destroyBundleOuterResources(options: DestroyBundleOuterResourcesOptions): Promise<void> {
+export async function destroyBundleOuterResources(
+  options: DestroyBundleOuterResourcesOptions,
+): Promise<ManagedLeaseFinalization> {
   if (options.dockerWorkload) {
     await options.dockerWorkload
       .teardown()
@@ -100,10 +123,16 @@ export async function destroyBundleOuterResources(options: DestroyBundleOuterRes
         logger.warn(`${options.context}: dockerWorkload.teardown() failed: ${errorMessage(err)}`),
       );
   }
-  await cleanupContainers(options.docker, {
+  const cleanup = await cleanupContainers(options.docker, {
     containerId: options.containerId,
     sidecarContainerId: options.sidecarContainerId,
     networkName: options.networkName,
   });
-  releaseManagedResourceLease(options.bundleId);
+  if (!cleanup.verified) {
+    logger.warn(`${options.context}: teardown left or could not verify: ${cleanup.remaining.join(', ')}`);
+  }
+  return finalizeManagedResourceLease(options.bundleId, {
+    runtime: options.docker,
+    teardownVerified: cleanup.verified,
+  });
 }

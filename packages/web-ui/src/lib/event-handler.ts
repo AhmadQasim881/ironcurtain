@@ -15,6 +15,7 @@ import type {
   PendingEscalation,
   WorkflowSummaryDto,
   HumanGateRequestDto,
+  WorkflowEscalationDto,
   LatestVerdictDto,
   LiveWorkflowPhase,
   PersonaCompileOperationDto,
@@ -25,8 +26,16 @@ import type {
   PtyOutputEvent,
   PtyReplayEvent,
   PtySink,
+  SessionNoticeEntry,
 } from './types.js';
 import { PHASE } from './types.js';
+import {
+  addSessionNotices,
+  isSameSession,
+  retainHostNotice,
+  toSessionNotice,
+  type RetainedHostNotice,
+} from './session-notices.js';
 
 // ---------------------------------------------------------------------------
 // Eviction policy (D7 from the workflow-display plan)
@@ -100,8 +109,13 @@ export interface AppStateLike {
   jobs: JobListDto[];
   workflows: Map<string, WorkflowSummaryDto>;
   pendingGates: Map<string, HumanGateRequestDto>;
+  /** Workflow tool-call escalations waiting for a human, keyed by escalationId. */
+  pendingWorkflowEscalations: Map<string, WorkflowEscalationDto>;
   /** Live + recently-terminal persona compile operations, keyed by operationId. */
   personaCompiles: Map<string, PersonaCompileOperationDto>;
+  /** The notices (`session-notices.ts`) each session reported, keyed by session label. */
+  sessionNotices: Map<number, readonly SessionNoticeEntry[]>;
+  retainedHostNotices?: readonly RetainedHostNotice[];
   addOutput(label: number, line: OutputLine): void;
   removeOutput(label: number): void;
   filterOutput(label: number, predicate: (line: OutputLine) => boolean): void;
@@ -122,6 +136,13 @@ export interface EventSideEffects {
    * event (a `config.setModelProviders` write), mirroring `refreshPersonas`.
    */
   refreshConfig(): void;
+  /**
+   * Refetch the whole app state, as after a reconnect. Invoked on
+   * `daemon.resync`, which the daemon sends to a client that was skipped for
+   * event frames while its send buffer was backpressured (WP-32): the events
+   * it missed may have carried escalations, gates or session changes.
+   */
+  resync(): void;
   assignDisplayNumber(escalationId: string): number;
   /**
    * Look up the terminal sink the Sessions route installed for a `web-pty`
@@ -134,6 +155,17 @@ export interface EventSideEffects {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Removes every pending tool-call escalation of a workflow (it reached a terminal). */
+function dropWorkflowEscalations(state: AppStateLike, workflowId: string): void {
+  let next: Map<string, WorkflowEscalationDto> | null = null;
+  for (const [escalationId, escalation] of state.pendingWorkflowEscalations) {
+    if (escalation.workflowId !== workflowId) continue;
+    next ??= new Map(state.pendingWorkflowEscalations);
+    next.delete(escalationId);
+  }
+  if (next) state.pendingWorkflowEscalations = next;
+}
 
 /** Returns true if any gate in the map belongs to the given workflow. */
 function hasGateForWorkflow(gates: ReadonlyMap<string, HumanGateRequestDto>, workflowId: string): boolean {
@@ -150,6 +182,7 @@ function hasGateForWorkflow(gates: ReadonlyMap<string, HumanGateRequestDto>, wor
 /** All recognized event types with their typed payloads. */
 export type WebEvent =
   | { event: 'daemon.status'; payload: DaemonStatusDto }
+  | { event: 'daemon.resync'; payload: { reason: string } }
   | { event: 'session.created'; payload: SessionDto }
   | { event: 'session.updated'; payload: SessionDto }
   | { event: 'session.ended'; payload: { label: number; reason?: string } }
@@ -157,6 +190,7 @@ export type WebEvent =
   | { event: 'session.tool_call'; payload: { label: number; toolName: string; preview: string } }
   | { event: 'session.output'; payload: { label: number; text: string; turnNumber: number } }
   | { event: 'session.budget_update'; payload: { label: number; budget: BudgetSummaryDto } }
+  | { event: 'session.diagnostic'; payload: { label: number; event: unknown } }
   | { event: 'escalation.created'; payload: EscalationDto }
   | { event: 'escalation.resolved'; payload: { escalationId: string; decision: string } }
   | { event: 'escalation.expired'; payload: { escalationId: string; sessionLabel: number } }
@@ -198,6 +232,14 @@ export type WebEvent =
     }
   | { event: 'workflow.gate_raised'; payload: { workflowId: string; gate: HumanGateRequestDto } }
   | { event: 'workflow.gate_dismissed'; payload: { workflowId: string; gateId: string } }
+  | {
+      event: 'workflow.escalation_raised';
+      payload: { workflowId: string; escalation: WorkflowEscalationDto };
+    }
+  | {
+      event: 'workflow.escalation_resolved';
+      payload: { workflowId: string; escalationId: string; outcome: string };
+    }
   | { event: 'persona.compile.started'; payload: PersonaCompileStartedEvent }
   | { event: 'persona.compile.progress'; payload: PersonaCompileProgressEvent }
   | { event: 'persona.compile.done'; payload: PersonaCompileDoneEvent }
@@ -230,6 +272,8 @@ export function parseEvent(event: string, payload: unknown): WebEvent | undefine
   switch (event) {
     case 'daemon.status':
       return { event, payload: data as unknown as DaemonStatusDto };
+    case 'daemon.resync':
+      return { event, payload: data as { reason: string } };
     case 'session.created':
     case 'session.updated':
       return { event, payload: data as unknown as SessionDto };
@@ -243,6 +287,8 @@ export function parseEvent(event: string, payload: unknown): WebEvent | undefine
       return { event, payload: data as { label: number; text: string; turnNumber: number } };
     case 'session.budget_update':
       return { event, payload: data as { label: number; budget: BudgetSummaryDto } };
+    case 'session.diagnostic':
+      return { event, payload: data as { label: number; event: unknown } };
     case 'escalation.created':
       return { event, payload: data as unknown as EscalationDto };
     case 'escalation.resolved':
@@ -293,6 +339,10 @@ export function parseEvent(event: string, payload: unknown): WebEvent | undefine
       };
     case 'workflow.gate_dismissed':
       return { event, payload: data as { workflowId: string; gateId: string } };
+    case 'workflow.escalation_raised':
+      return { event, payload: data as unknown as { workflowId: string; escalation: WorkflowEscalationDto } };
+    case 'workflow.escalation_resolved':
+      return { event, payload: data as { workflowId: string; escalationId: string; outcome: string } };
     case 'persona.compile.started':
       return { event, payload: data as unknown as PersonaCompileStartedEvent };
     case 'persona.compile.progress':
@@ -351,10 +401,22 @@ function applyEvent(state: AppStateLike, effects: EventSideEffects, parsed: WebE
       state.daemonStatus = parsed.payload;
       return true;
 
+    case 'daemon.resync':
+      effects.resync();
+      return true;
+
     case 'session.created':
     case 'session.updated': {
       const session = parsed.payload;
+      const before = state.sessions.get(session.label);
       state.sessions = new Map(state.sessions).set(session.label, session);
+      // The label now names another session (a restarted daemon numbers its
+      // sessions from 1 again): the notices held for it are the other one's.
+      if (before !== undefined && !isSameSession(before, session) && state.sessionNotices.has(session.label)) {
+        const notices = new Map(state.sessionNotices);
+        notices.delete(session.label);
+        state.sessionNotices = notices;
+      }
       return true;
     }
 
@@ -364,6 +426,22 @@ function applyEvent(state: AppStateLike, effects: EventSideEffects, parsed: WebE
       next.delete(label);
       state.sessions = next;
       state.removeOutput(label);
+      if (state.sessionNotices.has(label)) {
+        const notices = new Map(state.sessionNotices);
+        notices.delete(label);
+        state.sessionNotices = notices;
+      }
+      // An escalation can never be answered once its session is gone. The
+      // daemon emits escalation.expired for them too, but a card must not
+      // outlive its session even if that event was lost or never sent (older
+      // daemons), so drop them here as well.
+      let remaining: Map<string, PendingEscalation> | null = null;
+      for (const [escalationId, esc] of state.pendingEscalations) {
+        if (esc.sessionLabel !== label) continue;
+        remaining ??= new Map(state.pendingEscalations);
+        remaining.delete(escalationId);
+      }
+      if (remaining) state.pendingEscalations = remaining;
       if (state.selectedSessionLabel === label) {
         state.selectedSessionLabel = null;
       }
@@ -410,6 +488,23 @@ function applyEvent(state: AppStateLike, effects: EventSideEffects, parsed: WebE
       if (session) {
         state.sessions = new Map(state.sessions).set(label, { ...session, budget });
       }
+      return true;
+    }
+
+    // A notice for the session view (start-up notices, host-mount findings);
+    // other diagnostics are not shown. A notice for a session the client no
+    // longer lists (one that has ended) is dropped.
+    case 'session.diagnostic': {
+      const { label, event } = parsed.payload;
+      const notice = toSessionNotice(event);
+      if (notice?.kind === 'host_privileged_files') {
+        state.retainedHostNotices = retainHostNotice(state.retainedHostNotices ?? [], label, notice);
+      }
+      if (notice === undefined || !state.sessions.has(label)) return true;
+      state.sessionNotices = new Map(state.sessionNotices).set(
+        label,
+        addSessionNotices(state.sessionNotices.get(label), [notice]),
+      );
       return true;
     }
 
@@ -522,6 +617,7 @@ function applyEvent(state: AppStateLike, effects: EventSideEffects, parsed: WebE
         if (gate.workflowId === workflowId) nextGates.delete(gateId);
       }
       state.pendingGates = nextGates;
+      dropWorkflowEscalations(state, workflowId);
       effects.refreshWorkflowHistory();
       return true;
     }
@@ -543,6 +639,7 @@ function applyEvent(state: AppStateLike, effects: EventSideEffects, parsed: WebE
           if (gate.workflowId === workflowId) nextGates.delete(gateId);
         }
         state.pendingGates = nextGates;
+        dropWorkflowEscalations(state, workflowId);
       }
       // Older daemons do not include a terminal phase. Refresh history for
       // every failure so their durable terminal checkpoint can still update
@@ -553,7 +650,14 @@ function applyEvent(state: AppStateLike, effects: EventSideEffects, parsed: WebE
 
     case 'workflow.gate_raised': {
       const { workflowId, gate } = parsed.payload;
-      state.pendingGates = new Map(state.pendingGates).set(gate.gateId, gate);
+      // A workflow waits at one gate at a time and every raise has a new id,
+      // so any other entry for this workflow is stale (its `gate_dismissed`
+      // was missed) and must not stay selectable beside the live gate.
+      const nextGates = new Map(state.pendingGates);
+      for (const [gateId, existing] of nextGates) {
+        if (existing.workflowId === workflowId && gateId !== gate.gateId) nextGates.delete(gateId);
+      }
+      state.pendingGates = nextGates.set(gate.gateId, gate);
       const wf = state.workflows.get(workflowId);
       if (wf) {
         state.workflows = new Map(state.workflows).set(workflowId, {
@@ -576,6 +680,25 @@ function applyEvent(state: AppStateLike, effects: EventSideEffects, parsed: WebE
           ...wf,
           phase: PHASE.RUNNING,
         });
+      }
+      return true;
+    }
+
+    case 'workflow.escalation_raised': {
+      const { escalation } = parsed.payload;
+      state.pendingWorkflowEscalations = new Map(state.pendingWorkflowEscalations).set(
+        escalation.escalationId,
+        escalation,
+      );
+      return true;
+    }
+
+    case 'workflow.escalation_resolved': {
+      const { escalationId } = parsed.payload;
+      if (state.pendingWorkflowEscalations.has(escalationId)) {
+        const next = new Map(state.pendingWorkflowEscalations);
+        next.delete(escalationId);
+        state.pendingWorkflowEscalations = next;
       }
       return true;
     }

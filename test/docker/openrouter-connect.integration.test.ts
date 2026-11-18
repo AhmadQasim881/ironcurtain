@@ -52,6 +52,7 @@ import { join, dirname } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { isIP } from 'node:net';
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import { loadOrCreateCA, type CertificateAuthority } from '../../src/docker/ca.js';
@@ -108,7 +109,9 @@ const OPENROUTER_PROFILE: ResolvedOpenRouterProfile = {
 function findHostCaDir(): string | null {
   const home = process.env.IRONCURTAIN_HOME ?? join(homedir(), '.ironcurtain');
   const ca = join(home, 'ca');
-  return existsSync(join(ca, 'ca-cert.pem')) ? ca : null;
+  // Current CAs use an atomic generations/current.json store. The public
+  // certificate is loaded below and mounted as runtime trust material.
+  return existsSync(ca) ? ca : null;
 }
 
 const hostCaDir = findHostCaDir();
@@ -139,8 +142,12 @@ async function dockerExec(
     });
     return { stdout, stderr, exitCode: 0 };
   } catch (err: unknown) {
-    const e = err as { stdout?: string; stderr?: string; code?: number };
-    return { stdout: e.stdout ?? '', stderr: e.stderr ?? '', exitCode: typeof e.code === 'number' ? e.code : 1 };
+    const e = err as { stdout?: string; stderr?: string; code?: number; killed?: boolean; signal?: string };
+    return {
+      stdout: e.stdout ?? '',
+      stderr: e.stderr ?? '',
+      exitCode: !e.killed && !e.signal && typeof e.code === 'number' ? e.code : 1,
+    };
   }
 }
 
@@ -205,18 +212,6 @@ describe.skipIf(!process.env.INTEGRATION_TEST || !dockerReady)('OpenRouter real-
     const redirected = buildRedirectedProvider(upstream.port);
     fakeKey = generateFakeKey(redirected.fakeKeyPrefix);
 
-    // Host TCP listen (portable to macOS + Linux). The container reaches this
-    // through `host.docker.internal`. `listenPort: 0` → OS-assigned.
-    proxy = createMitmProxy({
-      ca,
-      providers: [{ config: redirected, fakeKey, realKey: REAL_KEY }],
-      listenPort: 0,
-      initialTokenSessionId: TOKEN_SESSION_ID,
-      allowPrivateDestinationsForTests: true,
-    });
-    const started = await proxy.start();
-    proxyPort = (started as { port: number }).port;
-
     // Write the session CA cert into the bind-mount for curl's explicit
     // `--cacert`. Product containers receive this same public certificate as
     // runtime trust material; this integration harness mounts it directly.
@@ -239,6 +234,29 @@ describe.skipIf(!process.env.INTEGRATION_TEST || !dockerReady)('OpenRouter real-
       'infinity',
     );
     await docker('start', containerId);
+
+    // The production listener defaults to loopback. Linux's Docker bridge
+    // reaches its own host gateway instead; bind exactly that interface and
+    // accept only this fixture container's allocated source address.
+    let linuxListener: { listenHost: string; allowRemoteAddress: (address: string | undefined) => boolean } | undefined;
+    if (process.platform === 'linux') {
+      const bridge = JSON.parse(
+        await docker('inspect', '--format', '{{json .NetworkSettings.Networks.bridge}}', containerId),
+      ) as { IPAddress: string; Gateway: string };
+      if (isIP(bridge.IPAddress) !== 4 || isIP(bridge.Gateway) !== 4)
+        throw new Error('Missing fixture bridge allocation');
+      linuxListener = { listenHost: bridge.Gateway, allowRemoteAddress: (address) => address === bridge.IPAddress };
+    }
+    proxy = createMitmProxy({
+      ca,
+      providers: [{ config: redirected, fakeKey, realKey: REAL_KEY }],
+      listenPort: 0,
+      ...linuxListener,
+      initialTokenSessionId: TOKEN_SESSION_ID,
+      allowPrivateDestinationsForTests: true,
+    });
+    const started = await proxy.start();
+    proxyPort = (started as { port: number }).port;
 
     const proxyUrl = `http://host.docker.internal:${proxyPort}`;
     execEnvArgs = [
@@ -299,7 +317,7 @@ describe.skipIf(!process.env.INTEGRATION_TEST || !dockerReady)('OpenRouter real-
         'https://openrouter.ai/api/v1/messages',
       ]);
 
-      expect(result.exitCode).toBe(0);
+      expect(result.exitCode, result.stderr).toBe(0);
       expect(result.stdout.trim()).toBe('200');
 
       // The upstream captured exactly this request with the swapped real key.
@@ -384,7 +402,7 @@ describe.skipIf(!process.env.INTEGRATION_TEST || !dockerReady)('OpenRouter real-
 
       // (c) The turn completes: `claude --output-format json` exits 0 and emits
       // a parseable result envelope.
-      expect(result.exitCode).toBe(0);
+      expect(result.exitCode, result.stderr).toBe(0);
       const envelope = JSON.parse(result.stdout) as { type?: string; is_error?: boolean };
       expect(envelope.is_error).not.toBe(true);
 

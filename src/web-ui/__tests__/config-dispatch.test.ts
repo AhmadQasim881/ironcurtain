@@ -16,6 +16,22 @@ import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 
+// Nested Docker can only be enabled on a supported host. Run the real host
+// check against a simulated host so these tests do not depend on the runner
+// (macOS by default; individual tests switch to native Linux or WSL2).
+const simulatedHost = vi.hoisted(() => {
+  const current: { platform: NodeJS.Platform; release: string } = { platform: 'darwin', release: '25.0.0' };
+  return { current };
+});
+vi.mock('../../docker-workload/environment.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../docker-workload/environment.js')>();
+  return {
+    ...actual,
+    unsupportedNestedDockerHostReason: (host?: Parameters<typeof actual.unsupportedNestedDockerHostReason>[0]) =>
+      actual.unsupportedNestedDockerHostReason(host ?? simulatedHost.current),
+  };
+});
+
 import { configDispatch } from '../dispatch/config-dispatch.js';
 import type { WorkflowDispatchContext } from '../dispatch/workflow-dispatch.js';
 import { WebEventBus } from '../web-event-bus.js';
@@ -74,6 +90,7 @@ const SK_KIMI = 'sk-or-v1-kimikeyREDACTED000000000end';
 const MASK_GLM = 'sk-...end';
 
 beforeEach(() => {
+  simulatedHost.current = { platform: 'darwin', release: '25.0.0' };
   testHome = mkdtempSync(resolve(tmpdir(), 'ironcurtain-config-dispatch-'));
   for (const key of ENV_VARS_TO_ISOLATE) {
     savedEnv[key] = process.env[key];
@@ -236,6 +253,63 @@ describe('config.setDockerWorkload', () => {
     await expect(
       setDockerWorkload(ctx, { enabled: true, networkAccess: 'packages', backend: 'docker' }),
     ).rejects.toMatchObject({ code: 'INVALID_PARAMS' });
+  });
+
+  it('refuses to enable nested Docker on native Linux with a clear message and writes nothing', async () => {
+    simulatedHost.current = { platform: 'linux', release: '7.0.0-42-generic' };
+    writeConfig({ agentModelId: 'test-model' });
+    const prior = readFileSync(configPath(), 'utf-8');
+    const ctx = makeCtx(true);
+    const emitSpy = vi.spyOn(ctx.eventBus, 'emit');
+
+    let error: unknown;
+    try {
+      await setDockerWorkload(ctx, { enabled: true, networkAccess: 'packages' });
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(RpcError);
+    if (!(error instanceof RpcError)) throw new Error('expected enabling on native Linux to fail');
+    expect(error.code).toBe('INVALID_PARAMS');
+    expect(error.message).toBe(
+      'Nested Docker is not yet supported on native Linux (Docker Engine or Docker Desktop for Linux). It requires macOS with Docker Desktop or Apple Container, or Windows with WSL2 and Docker Desktop. Nothing was saved; on this host nested Docker can only be turned off.',
+    );
+    expect(readFileSync(configPath(), 'utf-8')).toBe(prior);
+    expect(emitSpy).not.toHaveBeenCalled();
+  });
+
+  it('still lets native Linux turn an already-enabled nested Docker off, but not keep it on', async () => {
+    simulatedHost.current = { platform: 'linux', release: '7.0.0-42-generic' };
+    writeConfig({ dockerWorkload: { enabled: true, networkAccess: 'images' } });
+
+    const keepOn = setDockerWorkload(makeCtx(true), { enabled: true, networkAccess: 'offline' });
+    await expect(keepOn).rejects.toMatchObject({ code: 'INVALID_PARAMS' });
+    await expect(keepOn).rejects.toThrow('not yet supported on native Linux');
+    expect(readConfig().dockerWorkload).toEqual({ enabled: true, networkAccess: 'images' });
+
+    await expect(setDockerWorkload(makeCtx(true), { enabled: false, networkAccess: 'images' })).resolves.toEqual({
+      enabled: false,
+      networkAccess: 'images',
+    });
+    expect(readConfig().dockerWorkload).toEqual({ enabled: false, networkAccess: 'images' });
+  });
+
+  it('keeps the policy-mutation gate ahead of the host check', async () => {
+    simulatedHost.current = { platform: 'linux', release: '7.0.0-42-generic' };
+    writeConfig({});
+    await expect(setDockerWorkload(makeCtx(false), { enabled: true, networkAccess: 'packages' })).rejects.toMatchObject(
+      { code: 'POLICY_MUTATION_FORBIDDEN' },
+    );
+  });
+
+  it('enables nested Docker on WSL2', async () => {
+    simulatedHost.current = { platform: 'linux', release: '6.18.33.2-microsoft-standard-WSL2' };
+    writeConfig({});
+    await expect(setDockerWorkload(makeCtx(true), { enabled: true, networkAccess: 'packages' })).resolves.toEqual({
+      enabled: true,
+      networkAccess: 'packages',
+    });
+    expect(readConfig().dockerWorkload).toEqual({ enabled: true, networkAccess: 'packages' });
   });
 });
 

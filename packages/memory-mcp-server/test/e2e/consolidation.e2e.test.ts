@@ -14,6 +14,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { unlinkSync, existsSync, readFileSync } from 'node:fs';
+import { testModelEnv } from '../helpers/test-models.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = resolve(__dirname, '../..');
@@ -126,6 +127,7 @@ describe.skipIf(!llmConfig)('Consolidation E2E', () => {
       env: {
         ...process.env,
         ...envFile,
+        ...testModelEnv(),
         MEMORY_DB_PATH: dbPath,
         MEMORY_NAMESPACE: 'consolidation-test',
         MEMORY_MAINTENANCE_INTERVAL: '5',
@@ -176,16 +178,25 @@ describe.skipIf(!llmConfig)('Consolidation E2E', () => {
         tags: ['team'],
       });
 
-      // Verification: consolidation runs synchronously during the 5th store call.
+      // Verification: the 5th store starts a consolidation pass in the background (the
+      // call does not wait for it), so poll the stats until the pass has merged something.
 
       // 1. Check total memory count decreased (at least one merge/supersede)
-      const statsResponse = await callTool(client, 'memory_inspect', {
-        view: 'stats',
-      });
-      // Parse total count from stats output
-      const totalMatch = statsResponse.match(/total[^\d]*(\d+)/i);
-      expect(totalMatch).toBeTruthy();
-      const totalCount = parseInt(totalMatch![1], 10);
+      const totalMemories = async (): Promise<number> => {
+        const statsResponse = await callTool(client, 'memory_inspect', {
+          view: 'stats',
+        });
+        // Parse total count from stats output
+        const totalMatch = statsResponse.match(/total[^\d]*(\d+)/i);
+        expect(totalMatch).toBeTruthy();
+        return parseInt(totalMatch?.[1] ?? '', 10);
+      };
+      let totalCount = await totalMemories();
+      const consolidationDeadline = Date.now() + 90_000;
+      while (totalCount > 4 && Date.now() < consolidationDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        totalCount = await totalMemories();
+      }
 
       // At least one consolidation should have happened (5 -> 4 or fewer)
       // but distinct memories (Alice, at least one DB, at least one deployment) survive

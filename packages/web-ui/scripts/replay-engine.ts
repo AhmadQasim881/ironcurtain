@@ -29,6 +29,8 @@ interface JournalEntry {
   readonly event?: string;
   readonly acceptedEvents?: readonly string[];
   readonly prompt?: string | null;
+  /** Per-raise gate id on gate_raised / gate_resolved entries (absent on older journals). */
+  readonly gateId?: string;
 }
 
 /** Minimal workflow definition shape (matches design-and-code.json). */
@@ -333,9 +335,11 @@ export function translateEntry(entry: JournalEntry, definition: WorkflowDefiniti
     }
 
     case 'gate_raised': {
-      const gateId = `${state.workflowId}-${entry.state}`;
+      // Journals written with per-raise ids carry the real id; older ones
+      // fall back to the deterministic per-state spelling.
+      const gateId = entry.gateId ?? `${state.workflowId}-${entry.state}`;
 
-      // Skip duplicate gate_raised for the same state (happens after resume)
+      // Skip duplicate gate_raised for the same raise (happens after resume)
       if (state.activeGateId === gateId) {
         return [];
       }
@@ -366,7 +370,7 @@ export function translateEntry(entry: JournalEntry, definition: WorkflowDefiniti
     }
 
     case 'gate_resolved': {
-      const gateId = `${state.workflowId}-${entry.state}`;
+      const gateId = entry.gateId ?? state.activeGateId ?? `${state.workflowId}-${entry.state}`;
       state.activeGateId = null;
       state.phase = 'running';
       state.lastHumanPrompt = entry.prompt ?? null;

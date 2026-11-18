@@ -1,3 +1,5 @@
+import { testUserConfig } from '../helpers/user-config.js';
+import { USER_CONFIG_DEFAULTS } from '../../src/config/user-config.js';
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -17,6 +19,7 @@ import {
 } from '../../src/workflow/orchestrator.js';
 import type { SessionOptions } from '../../src/session/types.js';
 import {
+  resolveActiveGate,
   approvedResponse,
   createDeps,
   MockSession,
@@ -24,6 +27,7 @@ import {
   waitForCompletion,
   waitForGate,
 } from './test-helpers.js';
+import type { AgentId } from '../../src/docker/agent-adapter.js';
 
 const IMAGE = 'ironcurtain-claude-code:latest';
 const TEST_HOME = `${REAL_TMP}/ironcurtain-evolve-single-round-${process.pid}`;
@@ -51,13 +55,10 @@ function buildDockerSessionConfig(workspaceDir: string, generatedDir: string): I
     constitutionPath: join(generatedDir, 'constitution.md'),
     agentModelId: 'anthropic:claude-sonnet-4-6',
     escalationTimeoutSeconds: 300,
-    userConfig: {
+    userConfig: testUserConfig({
       agentModelId: 'anthropic:claude-sonnet-4-6',
       policyModelId: 'anthropic:claude-sonnet-4-6',
       anthropicApiKey: 'test-fake-key-no-network',
-      googleApiKey: '',
-      openaiApiKey: '',
-      escalationTimeoutSeconds: 300,
       resourceBudget: {
         maxTotalTokens: 1_000_000,
         maxSteps: 200,
@@ -65,25 +66,17 @@ function buildDockerSessionConfig(workspaceDir: string, generatedDir: string): I
         maxEstimatedCostUsd: 5.0,
         warnThresholdPercent: 80,
       },
-      autoCompact: {
-        enabled: false,
-        thresholdTokens: 80_000,
-        keepRecentMessages: 10,
-        summaryModelId: 'anthropic:claude-haiku-4-5',
-      },
-      autoApprove: { enabled: false, modelId: 'anthropic:claude-haiku-4-5' },
       auditRedaction: { enabled: false },
-      memory: { enabled: false, llmBaseUrl: undefined, llmApiKey: undefined },
       packageInstall: {
         enabled: true,
         quarantineDays: 2,
         allowedPackages: ['numpy', 'pyyaml'],
         deniedPackages: [],
       },
-      serverCredentials: {},
-      dockerResources: { memoryMb: null, cpus: null },
-    },
-  } as unknown as IronCurtainConfig;
+      dockerResources: { ...USER_CONFIG_DEFAULTS.dockerResources, memoryMb: null, cpus: null },
+      containerRuntime: 'docker',
+    }),
+  };
 }
 
 function writePreflightRunSpec(workspacePath: string): void {
@@ -326,6 +319,7 @@ describe.skipIf(!dockerReady)('evolve single-round workflow with real Docker con
   let originalAuth: string | undefined;
   let originalApiKey: string | undefined;
   const liveBundles = new Set<DockerInfrastructure>();
+  const liveOrchestrators = new Set<WorkflowOrchestrator>();
 
   beforeAll(() => {
     originalHome = process.env.IRONCURTAIN_HOME;
@@ -338,11 +332,31 @@ describe.skipIf(!dockerReady)('evolve single-round workflow with real Docker con
     cpSync(hostCaDir as string, join(TEST_HOME, 'ca'), { recursive: true });
   });
 
+  async function drainFixtures(): Promise<void> {
+    const orchestratorResults = await Promise.allSettled(
+      [...liveOrchestrators].map(async (orchestrator) => {
+        await orchestrator.shutdownAll();
+        liveOrchestrators.delete(orchestrator);
+      }),
+    );
+    const bundleResults = await Promise.allSettled(
+      [...liveBundles].map(async (bundle) => {
+        await destroyDockerInfrastructure(bundle);
+        liveBundles.delete(bundle);
+      }),
+    );
+    const failures = [...orchestratorResults, ...bundleResults].filter(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    );
+    if (failures.length > 0)
+      throw new AggregateError(
+        failures.map((result) => result.reason),
+        'Docker fixture cleanup failed',
+      );
+  }
+
   afterAll(async () => {
-    for (const bundle of liveBundles) {
-      await destroyDockerInfrastructure(bundle).catch(() => {});
-    }
-    liveBundles.clear();
+    await drainFixtures();
 
     if (originalHome === undefined) delete process.env.IRONCURTAIN_HOME;
     else process.env.IRONCURTAIN_HOME = originalHome;
@@ -352,15 +366,17 @@ describe.skipIf(!dockerReady)('evolve single-round workflow with real Docker con
     else process.env.ANTHROPIC_API_KEY = originalApiKey;
 
     rmSync(TEST_HOME, { recursive: true, force: true });
-  });
+  }, 120_000);
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'evolve-single-round-'));
   });
 
-  afterEach(() => {
+  // Stop workflow activity and containers before deleting their run files.
+  afterEach(async () => {
+    await drainFixtures();
     rmSync(tmpDir, { recursive: true, force: true });
-  });
+  }, 120_000);
 
   async function runEvolve(kind: CandidateKind): Promise<{ states: readonly string[]; workspaceDir: string }> {
     const runDir = resolve(tmpDir, `run-${kind}`);
@@ -380,7 +396,7 @@ describe.skipIf(!dockerReady)('evolve single-round workflow with real Docker con
       mkdirSync(escalationDir, { recursive: true });
       const bundle = await createDockerInfrastructure(
         config,
-        { kind: 'docker', agent: 'claude-code' },
+        { kind: 'docker', agent: 'claude-code' as AgentId },
         bundleDir,
         input.workspacePath,
         escalationDir,
@@ -390,14 +406,15 @@ describe.skipIf(!dockerReady)('evolve single-round workflow with real Docker con
         input.resolvedSkills,
         undefined,
         input.workflowScriptsDir,
+        { workflowRunDir: input.workflowRunDir },
       );
       liveBundles.add(bundle);
       return bundle;
     });
 
     const destroyInfra = vi.fn(async (bundle: DockerInfrastructure) => {
-      liveBundles.delete(bundle);
       await destroyDockerInfrastructure(bundle);
+      liveBundles.delete(bundle);
     });
 
     const orchestratorScript = kind === 'crash' ? ['design'] : ['design', 'complete'];
@@ -458,6 +475,7 @@ describe.skipIf(!dockerReady)('evolve single-round workflow with real Docker con
       }),
     );
     const states: string[] = [];
+    liveOrchestrators.add(orchestrator);
     orchestrator.onEvent((event: WorkflowLifecycleEvent) => {
       if (event.kind === 'state_entered') states.push(event.state);
     });
@@ -468,19 +486,19 @@ describe.skipIf(!dockerReady)('evolve single-round workflow with real Docker con
     const firstGate = await waitForGate(raiseGate, 1, 150_000);
     expect(firstGate[0].stateName).toBe('preflight_review');
     expect([...firstGate[0].presentedArtifacts.keys()].sort()).toEqual(['cognition_seed', 'run_spec']);
-    orchestrator.resolveGate(workflowId, { type: 'APPROVE' });
+    resolveActiveGate(orchestrator, workflowId, { type: 'APPROVE' });
 
     if (kind === 'crash') {
       const gates = await waitForGate(raiseGate, 2, 150_000);
       expect(gates[1].stateName).toBe('human_escalation');
       expect(gates[1].acceptedEvents).toEqual(['APPROVE', 'FORCE_REVISION', 'ABORT']);
       expect(gates[1].presentedArtifacts.has('run_spec')).toBe(true);
-      orchestrator.resolveGate(workflowId, { type: 'ABORT' });
+      resolveActiveGate(orchestrator, workflowId, { type: 'ABORT' });
     } else {
       const gates = await waitForGate(raiseGate, 2, 150_000);
       expect(gates[1].stateName).toBe('final_review');
       expect(gates[1].presentedArtifacts.has('final_report')).toBe(true);
-      orchestrator.resolveGate(workflowId, { type: 'APPROVE' });
+      resolveActiveGate(orchestrator, workflowId, { type: 'APPROVE' });
     }
 
     await waitForCompletion(orchestrator, workflowId, 150_000);
@@ -576,7 +594,7 @@ describe.skipIf(!dockerReady)('evolve single-round workflow with real Docker con
       mkdirSync(escalationDir, { recursive: true });
       const bundle = await createDockerInfrastructure(
         config,
-        { kind: 'docker', agent: 'claude-code' },
+        { kind: 'docker', agent: 'claude-code' as AgentId },
         bundleDir,
         input.workspacePath,
         escalationDir,
@@ -586,13 +604,14 @@ describe.skipIf(!dockerReady)('evolve single-round workflow with real Docker con
         input.resolvedSkills,
         undefined,
         input.workflowScriptsDir,
+        { workflowRunDir: input.workflowRunDir },
       );
       liveBundles.add(bundle);
       return bundle;
     });
     const destroyInfra = vi.fn(async (bundle: DockerInfrastructure) => {
-      liveBundles.delete(bundle);
       await destroyDockerInfrastructure(bundle);
+      liveBundles.delete(bundle);
     });
 
     let orchestratorCount = 0;
@@ -641,6 +660,7 @@ describe.skipIf(!dockerReady)('evolve single-round workflow with real Docker con
       }),
     );
     const states: string[] = [];
+    liveOrchestrators.add(orchestrator);
     orchestrator.onEvent((event: WorkflowLifecycleEvent) => {
       if (event.kind === 'state_entered') states.push(event.state);
     });
@@ -648,10 +668,10 @@ describe.skipIf(!dockerReady)('evolve single-round workflow with real Docker con
     const workflowId = await orchestrator.start(manifestPath, TASK, workspaceDir);
     const firstGate = await waitForGate(raiseGate, 1, 180_000);
     expect(firstGate[0].stateName).toBe('preflight_review');
-    orchestrator.resolveGate(workflowId, { type: 'APPROVE' });
+    resolveActiveGate(orchestrator, workflowId, { type: 'APPROVE' });
     const finalGate = await waitForGate(raiseGate, 2, 180_000);
     expect(finalGate[1].stateName).toBe('final_review');
-    orchestrator.resolveGate(workflowId, { type: 'APPROVE' });
+    resolveActiveGate(orchestrator, workflowId, { type: 'APPROVE' });
     await waitForCompletion(orchestrator, workflowId, 180_000);
     await orchestrator.shutdownAll();
 

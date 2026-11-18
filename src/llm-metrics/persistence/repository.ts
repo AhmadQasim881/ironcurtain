@@ -1,7 +1,14 @@
-import type { IdentitySource, LlmExchangeCompleted } from '../types.js';
-import type { StatisticsDimension } from '../query-contract.js';
+import type { IdentitySource, LlmCostSource, LlmExchangeCompleted } from '../types.js';
+import type { StatisticsDimension, StatisticsDistributionMeasure, StatisticsMeasure } from '../query-contract.js';
 
-export type LlmMetricsRepositoryState = 'starting' | 'ready' | 'degraded' | 'disabled' | 'closed';
+/**
+ * Writer state. `restarting`: the writer worker failed, stalled, or could not
+ * start, and a replacement is scheduled with backoff while the bounded queue
+ * keeps accepting. `disabled` is latched only for failures no restart can
+ * repair: an incompatible (future) schema, a corrupt database, or a
+ * permission error.
+ */
+export type LlmMetricsRepositoryState = 'starting' | 'ready' | 'degraded' | 'restarting' | 'disabled' | 'closed';
 export type LlmMetricsReaderState = 'idle' | 'starting' | 'ready' | 'unavailable' | 'closed';
 
 export interface LlmMetricsRepositoryHealth {
@@ -16,6 +23,10 @@ export interface LlmMetricsRepositoryHealth {
   readonly queuedRecords: number;
   readonly queuedBytes: number;
   readonly lastError: string | null;
+  /** Writer workers started to replace a failed, stalled, or unstartable one. */
+  readonly writerRestarts: number;
+  /** Records refused as invalid at the durable boundary, by reason (bounded key set). Included in `dropped`. */
+  readonly invalidByReason: Readonly<Record<string, number>>;
   readonly readerState: LlmMetricsReaderState;
   readonly readerLastError: string | null;
 }
@@ -113,17 +124,28 @@ export interface StoredLlmExchange {
   readonly providerStopReason: string;
   readonly refusal: boolean | null;
   readonly refusalCategory: string | null;
+  /** The provider's own input count (protocol semantics; a component of `inputTokens`). */
+  readonly inputTokensReported: number | null;
   readonly inputTokens: number | null;
   readonly uncachedInputTokens: number | null;
   readonly cacheReadInputTokens: number | null;
   readonly cacheWriteInputTokens: number | null;
   readonly toolUseInputTokens: number | null;
+  /** The provider's own output count (protocol semantics; a component of `outputTokens`). */
+  readonly outputTokensReported: number | null;
   readonly outputTokens: number | null;
   readonly thinkingTokens: number | null;
   readonly nonThinkingOutputTokens: number | null;
   readonly providerTotalTokens: number | null;
   readonly totalTokens: number | null;
+  /** Cost the gateway reported (column `cost_usd`). */
   readonly costUsd: number | null;
+  /** Host estimate at first-party list prices (column `estimated_cost_usd`). */
+  readonly estimatedCostUsd: number | null;
+  /** Which of the two is the exchange's cost; null when neither is known. */
+  readonly costSource: LlmCostSource | null;
+  /** `PRICING_VERSION` of the table behind `estimatedCostUsd`. */
+  readonly pricingVersion: string | null;
   readonly usageCompleteness: string;
   readonly usageSemanticsVersion: number;
   readonly inputMeasurementProvenance: string;
@@ -150,6 +172,107 @@ export interface LlmDimensionCount {
   readonly count: number;
 }
 
+/**
+ * Limits one aggregation request runs under. The query service chooses them
+ * (it advertises the same values in its capabilities); the reader rejects any
+ * value above the contract maximum.
+ */
+export interface LlmStatisticsAggregationLimits {
+  /** Most rows matching the range and filters; counted through an index before aggregating. */
+  readonly maxRows: number;
+  /** Most groups in the whole result (no bucket) or in any one bucket. */
+  readonly maxGroups: number;
+  /** Most summaries (partitions x measures) in the result. */
+  readonly maxOutputItems: number;
+  /** Most time-series buckets the range may span. */
+  readonly maxBuckets: number;
+  /** Most exact values the quartiles of one partition and measure come from. */
+  readonly quantileSampleSize: number;
+}
+
+export type LlmStatisticsBucketSpec =
+  { readonly kind: 'fixed'; readonly widthMs: number } | { readonly kind: 'calendarDay'; readonly timeZone: string };
+
+export interface LlmStatisticsAggregateQuery {
+  readonly fromMs: number;
+  readonly toMs: number;
+  readonly filters?: LlmExchangeFilters;
+  readonly measures: readonly StatisticsMeasure[];
+  readonly groupBy?: readonly LlmStatisticsDimension[];
+  /** Keep only the groups with the most requests over the whole range. */
+  readonly topGroups?: number;
+  readonly bucket?: LlmStatisticsBucketSpec;
+  readonly limits: LlmStatisticsAggregationLimits;
+}
+
+/** One measure of one partition, with the semantics `MetricSummary` documents. */
+export interface LlmStatisticsMeasureAggregate {
+  readonly value: number | null;
+  readonly sampleCount: number;
+  readonly lowerBoundCount: number;
+  readonly sampleSessionCount: number;
+  readonly median: number | null;
+  readonly lowerQuartile: number | null;
+  readonly upperQuartile: number | null;
+}
+
+/** One group within one time bucket (or the whole range when unbucketed). */
+export interface LlmStatisticsPartition {
+  /** Inclusive start of the bucket; null when the query has no bucket. */
+  readonly bucketFromMs: number | null;
+  /** Exclusive end of the bucket; null when the query has no bucket. */
+  readonly bucketToMs: number | null;
+  /** Grouping values, in `groupBy` order. */
+  readonly dimensions: readonly LlmStatisticsDimensionValue[];
+  readonly eligibleCount: number;
+  /** In `measures` order. */
+  readonly measures: readonly LlmStatisticsMeasureAggregate[];
+}
+
+export interface LlmStatisticsDistributionQuery {
+  readonly fromMs: number;
+  readonly toMs: number;
+  readonly filters?: LlmExchangeFilters;
+  readonly measure: StatisticsDistributionMeasure;
+  readonly maxBins: number;
+  readonly limits: Pick<LlmStatisticsAggregationLimits, 'maxRows' | 'quantileSampleSize'>;
+}
+
+export interface LlmStatisticsDistributionResult {
+  readonly bins: readonly { readonly lower: number; readonly upper: number; readonly count: number }[];
+  readonly sampleCount: number;
+  readonly eligibleCount: number;
+  readonly minimum: number | null;
+  readonly maximum: number | null;
+}
+
+/** Whole-session token and cost totals with the lower-bound rule applied to partly measured rows. */
+export interface LlmSessionUsageTotalsResult {
+  readonly exchanges: number;
+  readonly inputTokens: number | null;
+  readonly uncachedInputTokens: number | null;
+  readonly cacheReadInputTokens: number | null;
+  readonly cacheWriteInputTokens: number | null;
+  readonly toolUseInputTokens: number | null;
+  readonly thinkingTokens: number | null;
+  readonly nonThinkingOutputTokens: number | null;
+  readonly outputTokens: number | null;
+  readonly totalTokens: number | null;
+  /** Sum of the exchanges' known costs (gateway-reported, else list-price); null when none is known. */
+  readonly costUsd: number | null;
+  readonly completeUsageExchanges: number;
+  readonly partialUsageExchanges: number;
+  readonly missingOrInvalidUsageExchanges: number;
+  readonly tokenTotalsLowerBound: boolean;
+}
+
+export interface LlmSessionTotalsQuery {
+  readonly sessionId: string;
+  /** Inclusive upper completion bound (rows stamped later, e.g. by a skewed clock, are excluded). */
+  readonly toMs: number;
+  readonly limits: Pick<LlmStatisticsAggregationLimits, 'maxRows'>;
+}
+
 export interface LlmDeleteBeforeOptions {
   /** Stable upper bound returned by an earlier partial call. */
   readonly snapshotMaxSequence?: number;
@@ -171,11 +294,11 @@ export interface LlmDeleteBeforeResult {
   readonly chunksProcessed: number;
 }
 
-export interface LlmMetricsRepository {
-  /** Non-blocking, fail-open enqueue. False means this observation was dropped. */
-  enqueue(exchange: LlmExchangeCompleted): boolean;
-  flush(): Promise<void>;
-  close(): Promise<void>;
+/**
+ * The read half of the repository. Aggregation runs inside SQLite on the
+ * reader worker; only grouped results cross into the caller's thread.
+ */
+export interface LlmMetricsReadRepository {
   health(): LlmMetricsRepositoryHealth;
   snapshotMaxSequence(): Promise<number>;
   scan(query: LlmExchangeScanQuery): Promise<readonly StoredLlmExchange[]>;
@@ -183,6 +306,16 @@ export interface LlmMetricsRepository {
     dimension: LlmStatisticsDimension,
     query: Omit<LlmExchangeScanQuery, 'cursor'>,
   ): Promise<readonly LlmDimensionCount[]>;
+  aggregate(query: LlmStatisticsAggregateQuery): Promise<readonly LlmStatisticsPartition[]>;
+  distribution(query: LlmStatisticsDistributionQuery): Promise<LlmStatisticsDistributionResult>;
+  sessionTotals(query: LlmSessionTotalsQuery): Promise<LlmSessionUsageTotalsResult>;
+}
+
+export interface LlmMetricsRepository extends LlmMetricsReadRepository {
+  /** Non-blocking, fail-open enqueue. False means this observation was dropped. */
+  enqueue(exchange: LlmExchangeCompleted): boolean;
+  flush(): Promise<void>;
+  close(): Promise<void>;
   deleteBefore(cutoffMs: number, options?: LlmDeleteBeforeOptions): Promise<LlmDeleteBeforeResult>;
 }
 

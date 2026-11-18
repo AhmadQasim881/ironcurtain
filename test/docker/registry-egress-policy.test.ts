@@ -25,18 +25,22 @@ const FROZEN_MANIFEST_PATH = join(process.cwd(), 'config/docker-workload/registr
 describe('anonymous registry-egress manifest loading (fail-closed)', () => {
   it('fails closed when the manifest is missing', () => {
     const directory = tempDirectory();
-    expect(() => loadRegistryEgressManifest(join(directory, 'absent.json'))).toThrow(/readable regular non-symlink/u);
+    expect(() => loadRegistryEgressManifest(join(directory, 'absent.json'), directory)).toThrow(
+      /readable regular non-symlink/u,
+    );
   });
 
-  it('fails closed on a group/world-writable or symlinked manifest', () => {
+  it('fails closed on a world-writable or symlinked manifest', () => {
     const directory = tempDirectory();
     const path = join(directory, 'manifest.json');
     writeFileSync(path, JSON.stringify(manifest()), { mode: 0o400 });
     chmodSync(path, 0o666);
-    expect(() => loadRegistryEgressManifest(path)).toThrow(/group\/world writable/u);
+    expect(() => loadRegistryEgressManifest(path, directory)).toThrow(
+      /must not be world-writable: .* Fix it with: chmod o-w /u,
+    );
     const link = join(directory, 'link.json');
     symlinkSync(path, link);
-    expect(() => loadRegistryEgressManifest(link)).toThrow(/readable regular non-symlink/u);
+    expect(() => loadRegistryEgressManifest(link, directory)).toThrow(/readable regular non-symlink/u);
   });
 
   it('fails closed on a schema-invalid manifest (credential header allowed)', () => {
@@ -45,7 +49,7 @@ describe('anonymous registry-egress manifest loading (fail-closed)', () => {
     const invalid = manifest();
     invalid.origins[0].requestHeaders.allow.push('authorization');
     writeFileSync(path, JSON.stringify(invalid), { mode: 0o400 });
-    expect(() => loadRegistryEgressManifest(path)).toThrow(/credential header cannot be allowed/u);
+    expect(() => loadRegistryEgressManifest(path, directory)).toThrow(/credential header cannot be allowed/u);
   });
 
   it('loads a strict draft manifest and reports its identity', () => {
@@ -53,11 +57,18 @@ describe('anonymous registry-egress manifest loading (fail-closed)', () => {
     const path = join(directory, 'manifest.json');
     const bytes = JSON.stringify(manifest());
     writeFileSync(path, bytes, { mode: 0o400 });
-    const loaded = loadRegistryEgressManifest(path);
+    const loaded = loadRegistryEgressManifest(path, directory);
     expect(loaded.manifest.status).toBe('draft');
     expect(loaded.manifest.origins).toHaveLength(2);
     expect(loaded.manifest.perSession.maxConcurrentRequests).toBe(4);
     expect(loaded.sha256).toBe(createHash('sha256').update(bytes).digest('hex'));
+  });
+
+  it('refuses a manifest outside the IronCurtain package unless a test names its root', () => {
+    const directory = tempDirectory();
+    const path = join(directory, 'manifest.json');
+    writeFileSync(path, JSON.stringify(manifest()), { mode: 0o400 });
+    expect(() => loadRegistryEgressManifest(path)).toThrow(/must ship inside the package root/u);
   });
 
   it('loads the checked-in frozen manifest cleanly', () => {
@@ -237,7 +248,7 @@ describe('anonymous registry-egress authorization', () => {
     const directory = tempDirectory();
     const path = join(directory, 'manifest.json');
     writeFileSync(path, JSON.stringify(manifest()), { mode: 0o400 });
-    const loaded = loadRegistryEgressManifest(path);
+    const loaded = loadRegistryEgressManifest(path, directory);
     expect(
       authorizeValidatedRegistryEgressRequest(loaded.manifest, {
         method: 'GET',

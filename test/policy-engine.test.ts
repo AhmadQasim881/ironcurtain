@@ -2,8 +2,24 @@ import { homedir } from 'node:os';
 import { mkdirSync, mkdtempSync, rmSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import type { CompiledPolicyFile, ToolAnnotationsFile, StoredToolAnnotationsFile } from '../src/pipeline/types.js';
-import { PolicyEngine, domainMatchesAllowlist, isIpAddress } from '../src/trusted-process/policy-engine.js';
+import type { CompiledPolicyFile, CompiledRule, StoredToolAnnotationsFile } from '../src/pipeline/types.js';
+import {
+  PolicyEngine,
+  domainMatchesAllowlist,
+  isIpAddress,
+  reasonForAutoApprover,
+} from '../src/trusted-process/policy-engine.js';
+import { proxyAnnotations, proxyPolicyRules } from '../src/docker/proxy-tools.js';
+import {
+  CLASSIFIED_MEMORY_TOOLS,
+  MEMORY_BULK_FORGET_RULE,
+  MEMORY_FORGET_ESCALATE_IDS,
+  MEMORY_INGEST_ESCALATE_CHARS,
+  MEMORY_LARGE_INGEST_RULE,
+  TRUSTED_SERVER_UNKNOWN_TOOL_RULE,
+} from '../src/trusted-process/trusted-server-policy.js';
+// The memory server's own tool list (one description per registered tool).
+import { TOOL_DESCRIPTIONS as MEMORY_TOOL_DESCRIPTIONS } from '../packages/memory-mcp-server/src/prompts.js';
 import { extractServerDomainAllowlists } from '../src/config/index.js';
 import type { MCPServerConfig } from '../src/config/types.js';
 import type { ToolCallRequest } from '../src/types/mcp.js';
@@ -13,6 +29,8 @@ import {
   TEST_SANDBOX_DIR,
   TEST_PROTECTED_PATHS,
   REAL_TMP,
+  objectSchema,
+  withInputSchemas,
 } from './fixtures/test-policy.js';
 
 const protectedPaths = TEST_PROTECTED_PATHS;
@@ -26,6 +44,30 @@ function makeRequest(overrides: Partial<ToolCallRequest> = {}): ToolCallRequest 
     arguments: { path: `${SANDBOX_DIR}/test.txt` },
     timestamp: new Date().toISOString(),
     ...overrides,
+  };
+}
+
+/** Adds a git tool with a delete-path role (git_clean) to a copy of the annotations. */
+function withGitClean(annotations: StoredToolAnnotationsFile): StoredToolAnnotationsFile {
+  const git = annotations.servers.git;
+  return {
+    ...annotations,
+    servers: {
+      ...annotations.servers,
+      git: {
+        ...git,
+        tools: [
+          ...git.tools,
+          {
+            toolName: 'git_clean',
+            serverName: 'git',
+            comment: 'Removes untracked files.',
+            args: { path: ['delete-path'], force: ['none'] },
+            inputSchema: objectSchema({ path: 'string', force: 'boolean' }),
+          },
+        ],
+      },
+    },
   };
 }
 
@@ -700,7 +742,7 @@ describe('PolicyEngine', () => {
     };
 
     // Minimal annotations: just edit_file with read-path + write-path
-    const minimalAnnotations: ToolAnnotationsFile = {
+    const minimalAnnotations = withInputSchemas({
       generatedAt: 'test',
       servers: {
         filesystem: {
@@ -728,7 +770,7 @@ describe('PolicyEngine', () => {
           ],
         },
       },
-    };
+    });
 
     const asymmetricEngine = new PolicyEngine(asymmetricPolicy, minimalAnnotations, []);
 
@@ -906,7 +948,7 @@ describe('PolicyEngine', () => {
 
   describe('Untrusted domain gate', () => {
     // Annotations that include a git server with URL-category arguments
-    const gitAnnotations: ToolAnnotationsFile = {
+    const gitAnnotations = withInputSchemas({
       generatedAt: 'test',
       servers: {
         git: {
@@ -945,7 +987,7 @@ describe('PolicyEngine', () => {
           ],
         },
       },
-    };
+    });
 
     const gitPolicy: CompiledPolicyFile = {
       generatedAt: 'test',
@@ -1041,19 +1083,30 @@ describe('PolicyEngine', () => {
       expect(result.rule).not.toBe('structural-domain-escalate');
     });
 
-    it('skips untrusted domain gate when server has no domain allowlist', () => {
-      // No allowlist for 'git' server
+    it('gates a server without a domain allowlist with the default wildcard', () => {
+      // No allowlist for 'git' server: names pass to the compiled rules, IP
+      // literals escalate structurally.
       const gitEngine = new PolicyEngine(gitPolicy, gitAnnotations, [], SANDBOX_DIR);
 
-      const result = gitEngine.evaluate(
+      const named = gitEngine.evaluate(
         makeRequest({
           serverName: 'git',
           toolName: 'git_clone',
           arguments: { url: 'https://evil.com/repo.git', path: `${SANDBOX_DIR}/repo` },
         }),
       );
-      // No structural domain check, falls through to compiled rule evaluation
-      expect(result.rule).not.toBe('structural-domain-escalate');
+      expect(named.rule).not.toBe('structural-domain-escalate');
+      expect(named.rule).toBe('escalate-git-clone');
+
+      const literal = gitEngine.evaluate(
+        makeRequest({
+          serverName: 'git',
+          toolName: 'git_clone',
+          arguments: { url: 'https://10.0.0.5/repo.git', path: `${SANDBOX_DIR}/repo` },
+        }),
+      );
+      expect(literal).toMatchObject({ decision: 'escalate', rule: 'structural-domain-escalate' });
+      expect(literal.reason).toContain('"10.0.0.5/repo"');
     });
 
     it('sandbox-resolves write-path for git_clone when URL roles are present (Issue 3)', () => {
@@ -1125,10 +1178,148 @@ describe('PolicyEngine', () => {
       expect(result.decision).toBe('allow');
       expect(result.rule).toBe('structural-sandbox-allow');
     });
+
+    // The gate used to return a final escalation before any compiled rule
+    // ran: a path the policy denies became approvable, and escalatedRoles
+    // named only the URL, so an approval (or a whitelist pattern) covered
+    // the URL alone.
+    describe('combined with compiled rules', () => {
+      const allowlists = new Map([['git', ['github.com']]]);
+      const allowedClonePolicy: CompiledPolicyFile = {
+        generatedAt: 'test',
+        constitutionHash: 'test',
+        inputHash: 'test',
+        rules: [
+          {
+            name: 'allow-clone-into-allowed',
+            description: 'Clones only into the allowed directory',
+            principle: 'Least privilege',
+            if: {
+              server: ['git'],
+              tool: ['git_clone'],
+              paths: { roles: ['write-path'], within: `${SANDBOX_DIR}-allowed` },
+            },
+            then: 'allow',
+            reason: 'Clones into the allowed directory are permitted',
+          },
+          {
+            name: 'escalate-clone-url',
+            description: 'Clone sources need approval',
+            principle: 'Human oversight',
+            if: { server: ['git'], tool: ['git_clone'], roles: ['git-remote-url'] },
+            then: 'escalate',
+            reason: 'Clone requires human approval',
+          },
+        ],
+      };
+
+      it('lets a compiled deny on a path role win over the gate', () => {
+        const engine = new PolicyEngine(allowedClonePolicy, gitAnnotations, [], SANDBOX_DIR, allowlists);
+        const result = engine.evaluate(
+          makeRequest({
+            serverName: 'git',
+            toolName: 'git_clone',
+            arguments: { url: 'https://evil.example/team/x.git', path: '/srv/denied/x' },
+          }),
+        );
+        expect(result).toMatchObject({ decision: 'deny', rule: 'default-deny' });
+      });
+
+      it('lets a compiled deny on the URL role win over the gate', () => {
+        // The path is sandbox-resolved; no rule covers git_push's URL role.
+        const engine = new PolicyEngine(allowedClonePolicy, gitAnnotations, [], SANDBOX_DIR, allowlists);
+        const result = engine.evaluate(
+          makeRequest({
+            serverName: 'git',
+            toolName: 'git_push',
+            arguments: { path: `${SANDBOX_DIR}/repo`, remote: 'https://evil.example/team/x.git' },
+          }),
+        );
+        expect(result).toMatchObject({ decision: 'deny', rule: 'default-deny' });
+      });
+
+      it('still escalates on the gate when the compiled rules allow the other roles', () => {
+        const engine = new PolicyEngine(allowedClonePolicy, gitAnnotations, [], SANDBOX_DIR, allowlists);
+        const result = engine.evaluate(
+          makeRequest({
+            serverName: 'git',
+            toolName: 'git_clone',
+            arguments: { url: 'https://evil.example/team/x.git', path: `${SANDBOX_DIR}-allowed/x` },
+          }),
+        );
+        expect(result).toMatchObject({
+          decision: 'escalate',
+          rule: 'structural-domain-escalate',
+          escalatedRoles: ['git-remote-url'],
+        });
+        expect(result.reason).toContain('"evil.example/team/x"');
+      });
+
+      it('names every role that escalated, not just the URL', () => {
+        const engine = new PolicyEngine(gitPolicy, gitAnnotations, [], SANDBOX_DIR, allowlists);
+        const result = engine.evaluate(
+          makeRequest({
+            serverName: 'git',
+            toolName: 'git_clone',
+            arguments: { url: 'https://evil.example/team/x.git', path: '/srv/elsewhere/x' },
+          }),
+        );
+        expect(result).toMatchObject({ decision: 'escalate', rule: 'structural-domain-escalate' });
+        expect([...(result.escalatedRoles ?? [])].sort()).toEqual(['git-remote-url', 'write-path']);
+      });
+
+      it('names every URL role that failed the gate', () => {
+        const mirrorAnnotations = withInputSchemas({
+          generatedAt: 'test',
+          servers: {
+            git: {
+              inputHash: 'test',
+              tools: [
+                {
+                  toolName: 'git_mirror',
+                  serverName: 'git',
+                  comment: 'Mirror a repository to a web hook',
+                  args: { url: ['git-remote-url'], hook: ['fetch-url'], path: ['write-path'] },
+                },
+              ],
+            },
+          },
+        });
+        const mirrorPolicy: CompiledPolicyFile = {
+          generatedAt: 'test',
+          constitutionHash: 'test',
+          inputHash: 'test',
+          rules: [
+            {
+              name: 'allow-mirror',
+              description: 'Allow mirroring',
+              principle: 'test',
+              if: { server: ['git'], tool: ['git_mirror'] },
+              then: 'allow',
+              reason: 'Mirroring is allowed',
+            },
+          ],
+        };
+        const engine = new PolicyEngine(mirrorPolicy, mirrorAnnotations, [], SANDBOX_DIR, allowlists);
+        const result = engine.evaluate(
+          makeRequest({
+            serverName: 'git',
+            toolName: 'git_mirror',
+            arguments: {
+              url: 'https://evil.example/a.git',
+              hook: 'https://hooks.evil.example/b',
+              path: `${SANDBOX_DIR}/m`,
+            },
+          }),
+        );
+        expect(result).toMatchObject({ decision: 'escalate', rule: 'structural-domain-escalate' });
+        expect([...(result.escalatedRoles ?? [])].sort()).toEqual(['fetch-url', 'git-remote-url']);
+      });
+    });
   });
 
   describe('Repo-level domain matching in compiled rules', () => {
-    const gitAnnotations: ToolAnnotationsFile = {
+    const gitAnnotations = withInputSchemas({
       generatedAt: 'test',
       servers: {
         git: {
@@ -1144,7 +1335,7 @@ describe('PolicyEngine', () => {
           ],
         },
       },
-    };
+    });
 
     const repoPolicy: CompiledPolicyFile = {
       generatedAt: 'test',
@@ -1243,9 +1434,9 @@ describe('PolicyEngine', () => {
     });
   });
 
-  describe('Git remote enrichment (absent remote resolved from filesystem)', () => {
+  describe('Git remote enrichment (absent remote evaluated as origin)', () => {
     // Annotations for git_push: path is repo locator ('none'), remote is 'git-remote-url'
-    const pushAnnotations: ToolAnnotationsFile = {
+    const pushAnnotations = withInputSchemas({
       generatedAt: 'test',
       servers: {
         git: {
@@ -1261,7 +1452,7 @@ describe('PolicyEngine', () => {
           ],
         },
       },
-    };
+    });
 
     const escalatePushPolicy: CompiledPolicyFile = {
       generatedAt: 'test',
@@ -1313,8 +1504,11 @@ describe('PolicyEngine', () => {
       expect(result.decision).toBe('escalate');
     });
 
-    it('falls back cleanly when path is not a git repo (no enrichment, compiled rule fires)', () => {
-      // When enrichment fails, request is unchanged → no URL arg → no domain gate → compiled rule
+    it('escalates structurally when path is not a git repo and the server has no allowlist (default gate)', () => {
+      // The absent remote is evaluated as `origin`. A server without an
+      // allowlist is gated by the default `['*']`, and an unresolvable remote
+      // fails that gate, so the structural escalation is reported ahead of
+      // the compiled rule (which escalates too).
       const engine = new PolicyEngine(escalatePushPolicy, pushAnnotations, [], SANDBOX_DIR);
       const result = engine.evaluate(
         makeRequest({
@@ -1324,11 +1518,13 @@ describe('PolicyEngine', () => {
         }),
       );
       expect(result.decision).toBe('escalate');
-      expect(result.rule).toBe('escalate-git-push');
+      expect(result.rule).toBe('structural-domain-escalate');
+      expect(result.reason).toContain('Cannot verify where git remote "origin" connects');
+      expect(result.escalatedRoles).toContain('git-remote-url');
     });
 
     it('does not enrich for non-git server even if annotation has git-remote-url role', () => {
-      const otherAnnotations: ToolAnnotationsFile = {
+      const otherAnnotations = withInputSchemas({
         generatedAt: 'test',
         servers: {
           custom: {
@@ -1344,7 +1540,7 @@ describe('PolicyEngine', () => {
             ],
           },
         },
-      };
+      });
       const allowPolicy: CompiledPolicyFile = {
         generatedAt: 'test',
         constitutionHash: 'test',
@@ -1380,7 +1576,7 @@ describe('PolicyEngine', () => {
         const opts = {
           cwd: repoDir,
           encoding: 'utf-8' as const,
-          stdio: ['pipe', 'pipe', 'pipe'] as const,
+          stdio: 'pipe' as const,
           timeout: 10_000,
         };
         execFileSync('git', ['init'], opts);
@@ -1404,7 +1600,7 @@ describe('PolicyEngine', () => {
             arguments: { path: repoDir, branch: 'main' }, // remote absent
           }),
         );
-        // Enrichment resolves 'origin' → 'https://github.com/org/repo.git'
+        // The absent remote is evaluated as 'origin' → 'https://github.com/org/repo.git'
         // Domain gate: github.com ∈ allowlist → passes
         // Compiled rule: escalate-git-push fires
         expect(result.rule).not.toBe('structural-domain-escalate');
@@ -1441,7 +1637,7 @@ describe('PolicyEngine', () => {
             arguments: { path: repoDir, branch: 'main' }, // remote absent
           }),
         );
-        // Enrichment injects github.com URL; domains condition matches → allow
+        // 'origin' resolves to the github.com URL; domains condition matches → allow
         expect(result.decision).toBe('allow');
         expect(result.rule).toBe('allow-github-push');
       });
@@ -1458,9 +1654,10 @@ describe('PolicyEngine', () => {
             arguments: { path: repoDir, branch: 'main' },
           }),
         );
-        // Enrichment runs after structural checks, so the enriched URL is
-        // evaluated by compiled rules (not the structural domain gate).
+        // The enriched remote passes through the structural domain gate.
         expect(result.decision).toBe('escalate');
+        expect(result.rule).toBe('structural-domain-escalate');
+        expect(result.reason).toContain('"github.com/org/repo"');
       });
     });
 
@@ -1473,7 +1670,7 @@ describe('PolicyEngine', () => {
         const opts = {
           cwd: repoDir,
           encoding: 'utf-8' as const,
-          stdio: ['pipe', 'pipe', 'pipe'] as const,
+          stdio: 'pipe' as const,
           timeout: 10_000,
         };
         execFileSync('git', ['init'], opts);
@@ -1497,13 +1694,18 @@ describe('PolicyEngine', () => {
             arguments: { path: repoDir, branch: 'main' }, // remote absent
           }),
         );
-        // Enrichment runs after structural checks, so the enriched URL
-        // (evil.com) is evaluated by compiled rules, not the structural domain gate.
+        // The enriched remote (evil.com) is caught by the structural domain gate,
+        // not left to compiled rules.
         expect(result.decision).toBe('escalate');
+        expect(result.rule).toBe('structural-domain-escalate');
+        expect(result.reason).toContain('"evil.com/stolen/repo"');
       });
     });
 
     describe('with tracking branch pointing to non-origin remote', () => {
+      // git-mcp-server pushes to `origin` when no remote is given, whatever
+      // branch.<name>.remote says, so origin (here off the allowlist) is what
+      // must be evaluated. This used to resolve the tracking remote instead.
       let repoDir: string;
       const upstreamUrl = 'https://github.com/upstream/repo.git';
 
@@ -1513,7 +1715,7 @@ describe('PolicyEngine', () => {
         const opts = {
           cwd: repoDir,
           encoding: 'utf-8' as const,
-          stdio: ['pipe', 'pipe', 'pipe'] as const,
+          stdio: 'pipe' as const,
           timeout: 10_000,
           env: {
             ...process.env,
@@ -1526,7 +1728,7 @@ describe('PolicyEngine', () => {
         execFileSync('git', ['init'], { ...opts });
         execFileSync('git', ['config', 'user.email', 'test@test.local'], opts);
         execFileSync('git', ['config', 'user.name', 'Test'], opts);
-        execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/fork/repo.git'], opts);
+        execFileSync('git', ['remote', 'add', 'origin', 'https://evil.example/fork/repo.git'], opts);
         execFileSync('git', ['remote', 'add', 'upstream', upstreamUrl], opts);
         execFileSync('git', ['commit', '--allow-empty', '-m', 'init'], opts);
         // Discover the current branch name and configure tracking → upstream
@@ -1539,7 +1741,7 @@ describe('PolicyEngine', () => {
         rmSync(repoDir, { recursive: true, force: true });
       });
 
-      it('enriches absent remote using tracking remote (not origin)', () => {
+      it('evaluates an absent remote as origin, not the tracking remote', () => {
         const allowlists = new Map([['git', ['github.com']]]);
         const engine = new PolicyEngine(escalatePushPolicy, pushAnnotations, [], SANDBOX_DIR, allowlists);
 
@@ -1550,18 +1752,17 @@ describe('PolicyEngine', () => {
             arguments: { path: repoDir, branch: 'main' }, // remote absent
           }),
         );
-        // Enrichment resolves via branch config → 'upstream' → upstreamUrl (github.com)
-        // Domain gate passes; compiled rule escalates
-        expect(result.rule).not.toBe('structural-domain-escalate');
+        // 'origin' (evil.example), not branch.<name>.remote → 'upstream' (github.com)
         expect(result.decision).toBe('escalate');
-        expect(result.rule).toBe('escalate-git-push');
+        expect(result.rule).toBe('structural-domain-escalate');
+        expect(result.reason).toContain('"evil.example/fork/repo"');
       });
     });
   });
 
   describe('Compiled rule evaluation: domains condition matching', () => {
     // Use a tool with only URL roles to isolate domain matching behavior
-    const fetchAnnotations: ToolAnnotationsFile = {
+    const fetchAnnotations = withInputSchemas({
       generatedAt: 'test',
       servers: {
         fetch: {
@@ -1579,7 +1780,7 @@ describe('PolicyEngine', () => {
           ],
         },
       },
-    };
+    });
 
     it('matches when domain is in the allowed list', () => {
       const policy: CompiledPolicyFile = {
@@ -1663,7 +1864,7 @@ describe('PolicyEngine', () => {
 
     it('handles multi-role tools with domain and path conditions', () => {
       // git_clone has both write-path (path) and git-remote-url (url)
-      const cloneAnnotations: ToolAnnotationsFile = {
+      const cloneAnnotations = withInputSchemas({
         generatedAt: 'test',
         servers: {
           git: {
@@ -1682,7 +1883,7 @@ describe('PolicyEngine', () => {
             ],
           },
         },
-      };
+      });
 
       const policy: CompiledPolicyFile = {
         generatedAt: 'test',
@@ -1726,10 +1927,11 @@ describe('PolicyEngine', () => {
   });
 
   describe('git sandbox containment (all path roles are sandbox-safe)', () => {
-    // Git tools operating within the sandbox are structurally auto-allowed.
-    // Rationale: the agent can already freely read/write/delete files in
-    // the sandbox (including .git/ contents), so git operations inside the
-    // sandbox are no more privileged than direct file manipulation.
+    // Git tools operating within the sandbox are structurally auto-allowed:
+    // they act on the agent's working repository, whose files the agent can
+    // already rewrite or delete. Writes inside `.git` and repositories whose
+    // config host git must not run unseen escalate instead
+    // (test/git-structural-rules.test.ts).
 
     it('allows git_reset in sandbox via structural sandbox-allow', () => {
       const result = engine.evaluate(
@@ -1829,7 +2031,7 @@ describe('PolicyEngine', () => {
   });
 
   describe('multi-role evaluation (path + URL roles)', () => {
-    const mixedAnnotations: ToolAnnotationsFile = {
+    const mixedAnnotations = withInputSchemas({
       generatedAt: 'test',
       servers: {
         git: {
@@ -1848,7 +2050,7 @@ describe('PolicyEngine', () => {
           ],
         },
       },
-    };
+    });
 
     it('evaluates both path and URL roles independently', () => {
       const policy: CompiledPolicyFile = {
@@ -1977,7 +2179,7 @@ describe('PolicyEngine', () => {
   describe('lists conditions with github-owner + github-repo', () => {
     // Build a minimal engine with a rule that allows create_branch only for
     // provos/ironcurtain using two list conditions targeting different roles.
-    const githubRepoAnnotations: StoredToolAnnotationsFile = {
+    const githubRepoAnnotations = withInputSchemas({
       generatedAt: '2025-01-01T00:00:00Z',
       servers: {
         github: {
@@ -1993,7 +2195,7 @@ describe('PolicyEngine', () => {
           ],
         },
       },
-    };
+    });
 
     const githubRepoPolicy: CompiledPolicyFile = {
       generatedAt: '2025-01-01T00:00:00Z',
@@ -2065,11 +2267,148 @@ describe('PolicyEngine', () => {
     });
   });
 
+  describe('lists conditions with matchType "domains" on URL roles', () => {
+    // A domain list on a URL role matches where the value connects (as a
+    // `domains` condition does), never the value's spelling: a git remote
+    // named like an allowed host must not admit the URL it points to.
+    const urlAnnotations = withInputSchemas({
+      generatedAt: 'test',
+      servers: {
+        git: {
+          inputHash: 'test',
+          tools: [
+            {
+              toolName: 'git_push',
+              serverName: 'git',
+              comment: 'Push to remote',
+              args: { path: ['none'], remote: ['git-remote-url'], branch: ['branch-name'] },
+            },
+          ],
+        },
+        fetch: {
+          inputHash: 'test',
+          tools: [
+            {
+              toolName: 'fetch_url',
+              serverName: 'fetch',
+              comment: 'Fetch a URL',
+              args: { url: ['fetch-url'] },
+            },
+          ],
+        },
+      },
+    });
+
+    function listPolicy(name: string, condition: CompiledRule['if']): CompiledPolicyFile {
+      return {
+        generatedAt: 'test',
+        constitutionHash: 'test',
+        inputHash: 'test',
+        rules: [
+          { name, description: name, principle: 'test', if: condition, then: 'allow', reason: 'Trusted destination' },
+        ],
+      };
+    }
+
+    const gitlabPushList = listPolicy('allow-push-gitlab-list', {
+      server: ['git'],
+      tool: ['git_push'],
+      lists: [{ roles: ['git-remote-url'], allowed: ['gitlab.com'], matchType: 'domains' }],
+    });
+    const gitlabPushDomains = listPolicy('allow-push-gitlab-domains', {
+      server: ['git'],
+      tool: ['git_push'],
+      domains: { roles: ['git-remote-url'], allowed: ['gitlab.com'] },
+    });
+    // Both hosts pass the structural gate, so the compiled rule decides.
+    const gitAllowlists = new Map([['git', ['github.com', 'gitlab.com']]]);
+
+    let repoDir: string;
+
+    beforeAll(() => {
+      mkdirSync(SANDBOX_DIR, { recursive: true });
+      repoDir = realpathSync(mkdtempSync(`${SANDBOX_DIR}/ic-domain-list-`));
+      const opts = { cwd: repoDir, encoding: 'utf-8' as const, stdio: 'pipe' as const, timeout: 10_000 };
+      execFileSync('git', ['init', '-q'], opts);
+      // A remote named after the allowed host that pushes somewhere else.
+      execFileSync('git', ['remote', 'add', 'gitlab.com', 'https://github.com/attacker/x.git'], opts);
+      execFileSync('git', ['remote', 'add', 'upstream', 'https://gitlab.com/org/x.git'], opts);
+    });
+
+    afterAll(() => {
+      rmSync(repoDir, { recursive: true, force: true });
+    });
+
+    function push(remote: string): ToolCallRequest {
+      return makeRequest({
+        serverName: 'git',
+        toolName: 'git_push',
+        arguments: { path: repoDir, remote, branch: 'main' },
+      });
+    }
+
+    it('does not allow a push to a remote named like an allowed host that resolves elsewhere', () => {
+      const engine = new PolicyEngine(gitlabPushList, urlAnnotations, [], SANDBOX_DIR, gitAllowlists);
+      const result = engine.evaluate(push('gitlab.com'));
+      expect(result.decision).not.toBe('allow');
+      expect(result).toMatchObject({ decision: 'deny', rule: 'default-deny' });
+
+      // The same rule written as a domains condition decides the same way.
+      const domainsEngine = new PolicyEngine(gitlabPushDomains, urlAnnotations, [], SANDBOX_DIR, gitAllowlists);
+      expect(domainsEngine.evaluate(push('gitlab.com'))).toMatchObject({ decision: 'deny', rule: 'default-deny' });
+    });
+
+    it('allows a push whose remote resolves to an allowed host, whatever the remote is called', () => {
+      const engine = new PolicyEngine(gitlabPushList, urlAnnotations, [], SANDBOX_DIR, gitAllowlists);
+      expect(engine.evaluate(push('upstream'))).toMatchObject({ decision: 'allow', rule: 'allow-push-gitlab-list' });
+      expect(engine.evaluate(push('https://gitlab.com/org/x.git'))).toMatchObject({
+        decision: 'allow',
+        rule: 'allow-push-gitlab-list',
+      });
+    });
+
+    it('never matches a destination that cannot be verified', () => {
+      const engine = new PolicyEngine(gitlabPushList, urlAnnotations, [], SANDBOX_DIR, gitAllowlists);
+      // The remotes of a repository outside the sandbox are never read, so
+      // where "gitlab.com" connects is unknown: the spelling alone must not match.
+      const result = engine.evaluate(
+        makeRequest({
+          serverName: 'git',
+          toolName: 'git_push',
+          arguments: { path: `${REAL_TMP}/ic-domain-list-outside`, remote: 'gitlab.com', branch: 'main' },
+        }),
+      );
+      expect(result).toMatchObject({ decision: 'deny', rule: 'default-deny' });
+    });
+
+    it('matches a fetch-url by the host it connects to', () => {
+      const policy = listPolicy('allow-python-docs', {
+        server: ['fetch'],
+        lists: [{ roles: ['fetch-url'], allowed: ['docs.python.org', '*.readthedocs.io'], matchType: 'domains' }],
+      });
+      const engine = new PolicyEngine(policy, urlAnnotations, []);
+      const fetch = (url: string): ToolCallRequest =>
+        makeRequest({ serverName: 'fetch', toolName: 'fetch_url', arguments: { url } });
+
+      expect(engine.evaluate(fetch('https://docs.python.org/x'))).toMatchObject({
+        decision: 'allow',
+        rule: 'allow-python-docs',
+      });
+      expect(engine.evaluate(fetch('https://pip.readthedocs.io/en/stable/'))).toMatchObject({ decision: 'allow' });
+      expect(engine.evaluate(fetch('https://evil.example/docs.python.org'))).toMatchObject({
+        decision: 'deny',
+        rule: 'default-deny',
+      });
+      // Not an http(s) URL with a host: unverifiable, so no entry matches it.
+      expect(engine.evaluate(fetch('docs.python.org'))).toMatchObject({ decision: 'deny', rule: 'default-deny' });
+    });
+  });
+
   describe('protected path exclusions', () => {
-    // The PolicyEngine excludes allowedDirectory (the sandbox) from protected
-    // path checks. This means the sandbox can live under a protected directory
-    // (like ~/.ironcurtain/) without being blocked, while sibling paths
-    // (audit logs, escalation files) remain protected.
+    // A protected entry that strictly contains allowedDirectory (the sandbox)
+    // does not cover paths inside the sandbox. This means the sandbox can live
+    // under a protected directory (like ~/.ironcurtain/) without being blocked,
+    // while sibling paths (audit logs, escalation files) remain protected.
     const ironcurtainHome = `${REAL_TMP}/fake-ironcurtain-home`;
     const sessionsDir = `${ironcurtainHome}/sessions`;
     const sessionSandbox = `${sessionsDir}/test-session/sandbox`;
@@ -2078,7 +2417,7 @@ describe('PolicyEngine', () => {
 
     const exclusionEngine = new PolicyEngine(
       testCompiledPolicy,
-      testToolAnnotations,
+      withGitClean(testToolAnnotations),
       exclusionProtectedPaths,
       sessionSandbox,
     );
@@ -2116,6 +2455,310 @@ describe('PolicyEngine', () => {
       );
       expect(result.decision).toBe('allow');
       expect(result.rule).toBe('structural-sandbox-allow');
+    });
+
+    it('keeps a session sandbox under the protected home writable and deletable', () => {
+      const requests: Array<Partial<ToolCallRequest>> = [
+        { toolName: 'write_file', arguments: { path: `${sessionSandbox}/out.md`, content: 'x' } },
+        { toolName: 'create_directory', arguments: { path: `${sessionSandbox}/src/new` } },
+        {
+          toolName: 'move_file',
+          arguments: { source: `${sessionSandbox}/a.txt`, destination: `${sessionSandbox}/b.txt` },
+        },
+        { serverName: 'git', toolName: 'git_status', arguments: { path: sessionSandbox } },
+        { serverName: 'git', toolName: 'git_add', arguments: { path: sessionSandbox, files: ['.'] } },
+        { serverName: 'git', toolName: 'git_clean', arguments: { path: `${sessionSandbox}/build`, force: true } },
+      ];
+      for (const req of requests) {
+        const result = exclusionEngine.evaluate(makeRequest(req));
+        expect(result.decision, `${req.toolName}`).toBe('allow');
+        expect(result.rule, `${req.toolName}`).toBe('structural-sandbox-allow');
+      }
+    });
+
+    it('does not fold the exemption: a case variant of the sandbox stays protected', () => {
+      // On a case-sensitive volume .../SANDBOX is a different directory under
+      // the protected home, so it must not inherit the sandbox's exemption.
+      const result = exclusionEngine.evaluate(
+        makeRequest({
+          toolName: 'write_file',
+          arguments: { path: `${sessionsDir}/test-session/SANDBOX/x.txt`, content: 'x' },
+        }),
+      );
+      expect(result.decision).toBe('deny');
+      expect(result.rule).toBe('structural-protected-path');
+    });
+  });
+
+  describe('protected entries inside the sandbox', () => {
+    // `ironcurtain start -w .` makes the launch directory the sandbox, and that
+    // directory can hold protected entries: an explicit --env-file loaded on the
+    // next run, or a checkout's policy directory, constitution and
+    // mcp-servers.json. The sandbox exemption only applies to entries that
+    // strictly contain the sandbox, so these stay denied for every tool and role.
+    const workspace = `${REAL_TMP}/ironcurtain-wp03-workspace`;
+    const envFile = `${workspace}/.env`;
+    const generatedDir = `${workspace}/src/config/generated`;
+    const mcpServersFile = `${workspace}/src/config/mcp-servers.json`;
+    const constitutionFile = `${workspace}/src/config/constitution.md`;
+    const wsEngine = new PolicyEngine(
+      testCompiledPolicy,
+      withGitClean(testToolAnnotations),
+      [envFile, generatedDir, mcpServersFile, constitutionFile],
+      workspace,
+    );
+
+    function expectProtectedDeny(req: Partial<ToolCallRequest>): void {
+      const result = wsEngine.evaluate(makeRequest(req));
+      expect(result.decision, JSON.stringify(req)).toBe('deny');
+      expect(result.rule, JSON.stringify(req)).toBe('structural-protected-path');
+    }
+
+    it('denies filesystem read, write and delete of a protected file inside the sandbox', () => {
+      expectProtectedDeny({ toolName: 'read_file', arguments: { path: envFile } });
+      expectProtectedDeny({ toolName: 'read_text_file', arguments: { path: envFile } });
+      expectProtectedDeny({ toolName: 'write_file', arguments: { path: envFile, content: 'NODE_OPTIONS=x' } });
+      expectProtectedDeny({ toolName: 'edit_file', arguments: { path: mcpServersFile, edits: [] } });
+      expectProtectedDeny({ toolName: 'write_file', arguments: { path: constitutionFile, content: 'x' } });
+      // move_file's source carries read-path + delete-path: deleting the protected file
+      expectProtectedDeny({
+        toolName: 'move_file',
+        arguments: { source: envFile, destination: `${workspace}/env.bak` },
+      });
+      // ...and its destination carries write-path: replacing the protected file
+      expectProtectedDeny({
+        toolName: 'move_file',
+        arguments: { source: `${workspace}/staged`, destination: envFile },
+      });
+    });
+
+    it('denies paths inside a protected directory inside the sandbox', () => {
+      expectProtectedDeny({
+        toolName: 'write_file',
+        arguments: { path: `${generatedDir}/compiled-policy.json`, content: '{}' },
+      });
+      expectProtectedDeny({ toolName: 'list_directory', arguments: { path: generatedDir } });
+      expectProtectedDeny({
+        toolName: 'read_multiple_files',
+        arguments: { paths: [`${workspace}/README.md`, `${generatedDir}/tool-annotations.json`] },
+      });
+    });
+
+    it('denies git read, write and delete of a protected path inside the sandbox', () => {
+      expectProtectedDeny({ serverName: 'git', toolName: 'git_status', arguments: { path: generatedDir } });
+      expectProtectedDeny({ serverName: 'git', toolName: 'git_log', arguments: { path: `${generatedDir}/x` } });
+      expectProtectedDeny({ serverName: 'git', toolName: 'git_add', arguments: { path: generatedDir, files: ['.'] } });
+      expectProtectedDeny({
+        serverName: 'git',
+        toolName: 'git_commit',
+        arguments: { path: generatedDir, message: 'm' },
+      });
+      expectProtectedDeny({ serverName: 'git', toolName: 'git_clean', arguments: { path: generatedDir, force: true } });
+      expectProtectedDeny({ serverName: 'git', toolName: 'git_clean', arguments: { path: envFile, force: true } });
+    });
+
+    it('denies dot-segment spellings that resolve onto a protected entry', () => {
+      expectProtectedDeny({ toolName: 'read_file', arguments: { path: `${workspace}/src/../.env` } });
+      expectProtectedDeny({ toolName: 'write_file', arguments: { path: `${workspace}/./.env`, content: 'x' } });
+    });
+
+    it('still sandbox-allows unprotected paths next to the protected entries', () => {
+      const requests: Array<Partial<ToolCallRequest>> = [
+        { toolName: 'read_file', arguments: { path: `${workspace}/README.md` } },
+        { toolName: 'write_file', arguments: { path: `${workspace}/src/config/notes.md`, content: 'x' } },
+        { toolName: 'write_file', arguments: { path: `${workspace}/.env.example`, content: 'x' } },
+        { toolName: 'list_directory', arguments: { path: `${workspace}/src/config` } },
+        { serverName: 'git', toolName: 'git_clean', arguments: { path: `${workspace}/build`, force: true } },
+      ];
+      for (const req of requests) {
+        const result = wsEngine.evaluate(makeRequest(req));
+        expect(result.decision, JSON.stringify(req)).toBe('allow');
+        expect(result.rule, JSON.stringify(req)).toBe('structural-sandbox-allow');
+      }
+    });
+
+    it('denies a Git repository selector containing a protected descendant', () => {
+      const result = wsEngine.evaluate(
+        makeRequest({
+          serverName: 'git',
+          toolName: 'git_status',
+          arguments: { path: workspace },
+        }),
+      );
+      expect(result).toMatchObject({ decision: 'deny', rule: 'structural-git-protected-repository' });
+    });
+
+    it('keeps a protected entry equal to the sandbox protected', () => {
+      const engineEqual = new PolicyEngine(testCompiledPolicy, testToolAnnotations, [workspace], workspace);
+      const result = engineEqual.evaluate(makeRequest({ arguments: { path: `${workspace}/README.md` } }));
+      expect(result.decision).toBe('deny');
+      expect(result.rule).toBe('structural-protected-path');
+    });
+
+    it('applies the exemption per entry when an ancestor entry also contains the sandbox', () => {
+      const home = `${REAL_TMP}/ironcurtain-wp03-home/.ironcurtain`;
+      const sandbox = `${home}/sessions/s1/sandbox`;
+      const nestedEnv = `${sandbox}/.env`;
+      const engineNested = new PolicyEngine(testCompiledPolicy, testToolAnnotations, [home, nestedEnv], sandbox);
+
+      const nested = engineNested.evaluate(makeRequest({ toolName: 'write_file', arguments: { path: nestedEnv } }));
+      expect(nested.decision).toBe('deny');
+      expect(nested.rule).toBe('structural-protected-path');
+
+      const sibling = engineNested.evaluate(
+        makeRequest({ toolName: 'write_file', arguments: { path: `${sandbox}/out.md` } }),
+      );
+      expect(sibling.decision).toBe('allow');
+      expect(sibling.rule).toBe('structural-sandbox-allow');
+
+      const config = engineNested.evaluate(makeRequest({ arguments: { path: `${home}/config.json` } }));
+      expect(config.decision).toBe('deny');
+      expect(config.rule).toBe('structural-protected-path');
+    });
+
+    it('does not echo the protected path in the deny reason', () => {
+      const result = wsEngine.evaluate(makeRequest({ toolName: 'read_file', arguments: { path: envFile } }));
+      expect(result.reason).toBe('Access to a protected path is forbidden');
+      expect(result.reason).not.toContain(workspace);
+      expect(result.reason).not.toContain('.env');
+    });
+  });
+
+  describe('spelling variants of protected paths', () => {
+    // Case and Unicode-normalization variants name the protected file on
+    // case-insensitive volumes (macOS, WSL /mnt/c, casefold dirs), and the
+    // filesystem MCP server itself maps NFD requests onto NFC entries on any
+    // volume. The deny side folds both sides, so these tests are string-level
+    // and behave the same on every filesystem.
+    const project = `${REAL_TMP}/ironcurtain-wp03-project`;
+    const projectEnv = `${project}/.env`;
+    const fakeHome = `${REAL_TMP}/ironcurtain-wp03-home`;
+    const icHome = `${fakeHome}/.ironcurtain`;
+    const cafe = `${REAL_TMP}/ironcurtain-wp03-Caf\u00e9`;
+    const variantEngine = new PolicyEngine(
+      testCompiledPolicy,
+      testToolAnnotations,
+      [...protectedPaths, projectEnv, icHome, `${cafe}/.env`, `${REAL_TMP}/ironcurtain-wp03-R\u00e9sum\u00e9`],
+      SANDBOX_DIR,
+    );
+
+    function expectProtectedDeny(req: Partial<ToolCallRequest>): void {
+      const result = variantEngine.evaluate(makeRequest(req));
+      expect(result.decision, JSON.stringify(req)).toBe('deny');
+      expect(result.rule, JSON.stringify(req)).toBe('structural-protected-path');
+    }
+
+    it('denies .ENV and .Env spellings of a protected .env', () => {
+      expectProtectedDeny({ toolName: 'write_file', arguments: { path: `${project}/.ENV`, content: 'x' } });
+      expectProtectedDeny({ toolName: 'read_file', arguments: { path: `${project}/.Env` } });
+      expectProtectedDeny({ toolName: 'read_file', arguments: { path: `${project.toUpperCase()}/.env` } });
+    });
+
+    it('denies a case variant of mcp-servers.json', () => {
+      const variant = protectedPaths[2].replace(/mcp-servers\.json$/, 'MCP-SERVERS.json');
+      expect(variant).not.toBe(protectedPaths[2]);
+      expectProtectedDeny({ toolName: 'write_file', arguments: { path: variant, content: '{}' } });
+      expectProtectedDeny({ toolName: 'read_file', arguments: { path: variant } });
+    });
+
+    it('denies a case-variant ~/.IronCurtain path', () => {
+      expectProtectedDeny({ toolName: 'read_file', arguments: { path: `${fakeHome}/.IronCurtain/config.json` } });
+      expectProtectedDeny({
+        toolName: 'write_file',
+        arguments: { path: `${fakeHome}/.IRONCURTAIN/generated/compiled-policy.json`, content: '{}' },
+      });
+
+      // The same through a literal "~/" spelling against the real home directory.
+      const homeEngine = new PolicyEngine(
+        testCompiledPolicy,
+        testToolAnnotations,
+        [`${homedir()}/.ironcurtain`],
+        SANDBOX_DIR,
+      );
+      const result = homeEngine.evaluate(makeRequest({ arguments: { path: '~/.IronCurtain/config.json' } }));
+      expect(result.decision).toBe('deny');
+      expect(result.rule).toBe('structural-protected-path');
+    });
+
+    it('denies an NFD spelling of an accented protected directory', () => {
+      const nfd = `${REAL_TMP}/ironcurtain-wp03-Cafe\u0301`;
+      expect(nfd).not.toBe(cafe);
+      expectProtectedDeny({ toolName: 'write_file', arguments: { path: `${nfd}/.env`, content: 'x' } });
+      expectProtectedDeny({ toolName: 'read_file', arguments: { path: `${nfd}/.env` } });
+      // NFD combined with a case change
+      expectProtectedDeny({ toolName: 'read_file', arguments: { path: `${nfd.toUpperCase()}/.ENV` } });
+      // a protected accented directory reached through its NFD spelling
+      expectProtectedDeny({
+        toolName: 'read_file',
+        arguments: { path: `${REAL_TMP}/ironcurtain-wp03-Re\u0301sume\u0301/notes.txt` },
+      });
+    });
+
+    it('denies spellings with default-ignorable code points', () => {
+      expectProtectedDeny({ toolName: 'write_file', arguments: { path: `${project}/.e\u200dnv`, content: 'x' } });
+    });
+
+    it('denies a case variant inside the sandbox when the sandbox holds the protected entry', () => {
+      const wsEngine = new PolicyEngine(testCompiledPolicy, testToolAnnotations, [projectEnv], project);
+      const result = wsEngine.evaluate(
+        makeRequest({ toolName: 'write_file', arguments: { path: `${project}/.ENV`, content: 'x' } }),
+      );
+      expect(result.decision).toBe('deny');
+      expect(result.rule).toBe('structural-protected-path');
+    });
+
+    // The two allow-side tests below use directories that never exist on disk:
+    // on a case-insensitive volume (macOS) the native realpath would rightly map
+    // a case variant of an EXISTING directory onto its on-disk spelling.
+    const permittedDir = `${REAL_TMP}/ironcurtain-wp03-permitted`;
+    const allowSideSandbox = `${REAL_TMP}/ironcurtain-wp03-sandbox`;
+    const allowSideEngine = new PolicyEngine(
+      {
+        ...testCompiledPolicy,
+        rules: [
+          {
+            name: 'allow-reads-within-permitted',
+            description: 'reads in the permitted dir',
+            principle: 'test',
+            if: { paths: { roles: ['read-path'], within: permittedDir }, server: ['filesystem'] },
+            then: 'allow',
+            reason: 'permitted',
+          },
+          ...testCompiledPolicy.rules,
+        ],
+      },
+      testToolAnnotations,
+      protectedPaths,
+      allowSideSandbox,
+    );
+
+    it('does not fold allow-side checks: a case variant of a paths.within dir is not allowed', () => {
+      const exact = allowSideEngine.evaluate(makeRequest({ arguments: { path: `${permittedDir}/x.txt` } }));
+      expect(exact.decision).toBe('allow');
+      expect(exact.rule).toBe('allow-reads-within-permitted');
+
+      const variant = allowSideEngine.evaluate(
+        makeRequest({ arguments: { path: `${permittedDir.toUpperCase()}/x.txt` } }),
+      );
+      expect(variant.decision).toBe('escalate');
+      expect(variant.rule).toBe('escalate-read-outside-permitted-areas');
+    });
+
+    it('does not fold allow-side checks: a case variant of the sandbox is not sandbox-allowed', () => {
+      const exact = allowSideEngine.evaluate(
+        makeRequest({ toolName: 'write_file', arguments: { path: `${allowSideSandbox}/x.txt`, content: 'x' } }),
+      );
+      expect(exact.decision).toBe('allow');
+      expect(exact.rule).toBe('structural-sandbox-allow');
+
+      const variant = allowSideEngine.evaluate(
+        makeRequest({
+          toolName: 'write_file',
+          arguments: { path: `${allowSideSandbox.toUpperCase()}/x.txt`, content: 'x' },
+        }),
+      );
+      expect(variant.decision).toBe('escalate');
+      expect(variant.rule).toBe('escalate-write-outside-permitted-areas');
     });
   });
 
@@ -2273,7 +2916,7 @@ describe('PolicyEngine', () => {
 
 describe('PolicyEngine with conditional roles', () => {
   // Annotations with conditional role specs for multi-mode git tools
-  const conditionalAnnotations: StoredToolAnnotationsFile = {
+  const conditionalAnnotations = withInputSchemas({
     generatedAt: 'test-fixture',
     servers: {
       git: {
@@ -2362,7 +3005,7 @@ describe('PolicyEngine with conditional roles', () => {
         ],
       },
     },
-  };
+  });
 
   // Policy rules matching the conditional annotation test scenarios
   const conditionalPolicy: CompiledPolicyFile = {
@@ -2644,12 +3287,135 @@ describe('PolicyEngine with conditional roles', () => {
       expect(result.rule).toBe('trusted-server');
     });
 
-    it('allows unknown tool names from a trusted server', () => {
+    it('denies a tool the trusted-server policy does not classify', () => {
       const result = trustedEngine.evaluate(
         makeRequest({ serverName: 'memory', toolName: 'nonexistent_tool', arguments: {} }),
       );
+      expect(result.decision).toBe('deny');
+      expect(result.rule).toBe(TRUSTED_SERVER_UNKNOWN_TOOL_RULE);
+    });
+
+    it('classifies every tool the memory server registers', () => {
+      for (const toolName of Object.keys(MEMORY_TOOL_DESCRIPTIONS)) {
+        expect(CLASSIFIED_MEMORY_TOOLS.has(toolName)).toBe(true);
+        const result = trustedEngine.evaluate(
+          makeRequest({ serverName: 'memory', toolName, arguments: { content: 'x', query: 'q', ids: ['a'] } }),
+        );
+        expect(result.rule).not.toBe(TRUSTED_SERVER_UNKNOWN_TOOL_RULE);
+      }
+    });
+
+    it.each([
+      ['memory_context', {}],
+      ['memory_expand', { segment_id: 'seg' }],
+      ['memory_inspect', { view: 'export' }],
+      ['memory_forget', { ids: ['a', 'b'] }],
+      ['memory_forget', { ids: ['a'], confirm: true }],
+      ['memory_forget', { tags: ['old'], dry_run: true }],
+      ['memory_forget', { before: '2100-01-01T00:00:00Z', confirm: true, dry_run: true }],
+      ['memory_forget', { ids: ['a'], tags: [] }],
+      ['memory_forget', { ids: Array.from({ length: MEMORY_FORGET_ESCALATE_IDS }, (_, i) => `id-${i}`) }],
+      // A preview of many ids deletes nothing.
+      ['memory_forget', { ids: Array.from({ length: 100 }, (_, i) => `id-${i}`), dry_run: true }],
+      ['memory_ingest', { content: 'x'.repeat(MEMORY_INGEST_ESCALATE_CHARS) }],
+    ])('allows %s with %o', (toolName, args) => {
+      const result = trustedEngine.evaluate(makeRequest({ serverName: 'memory', toolName, arguments: args }));
       expect(result.decision).toBe('allow');
       expect(result.rule).toBe('trusted-server');
+    });
+
+    it.each([
+      [{ tags: ['project:foo'], confirm: true }],
+      [{ query: 'everything', confirm: true }],
+      [{ before: '2100-01-01T00:00:00Z', confirm: true }],
+      [{ ids: ['a'], tags: ['x'], confirm: true }],
+      // Without confirm the server refuses, but the selector alone decides: no
+      // human is skipped if the server's confirm rule ever changes.
+      [{ tags: ['project:foo'] }],
+      // Only dry_run: true makes a preview; anything else may delete.
+      [{ tags: ['project:foo'], confirm: true, dry_run: 'true' }],
+      [{ tags: null, confirm: true }],
+    ])('escalates a bulk memory_forget to a human only: %o', (args) => {
+      const result = trustedEngine.evaluate(
+        makeRequest({ serverName: 'memory', toolName: 'memory_forget', arguments: args }),
+      );
+      expect(result.decision).toBe('escalate');
+      expect(result.rule).toBe(MEMORY_BULK_FORGET_RULE);
+      expect(result.humanOnly).toBe(true);
+    });
+
+    // memory_inspect lists every id and ids need no confirm: without a bound, one
+    // call could delete 100 memories (the server's maximum) and a few calls a whole
+    // namespace, with no human asked.
+    it.each([
+      [{ ids: Array.from({ length: MEMORY_FORGET_ESCALATE_IDS + 1 }, (_, i) => `id-${i}`) }],
+      [{ ids: Array.from({ length: 100 }, (_, i) => `id-${i}`), confirm: true }],
+      [{ ids: Array.from({ length: 100 }, (_, i) => `id-${i}`), dry_run: false }],
+      // Not a list the server would take as ids: judged as the worst case.
+      [{ ids: 'id-1' }],
+    ])('escalates a memory_forget that names too many ids to a human only', (args) => {
+      const result = trustedEngine.evaluate(
+        makeRequest({ serverName: 'memory', toolName: 'memory_forget', arguments: args }),
+      );
+      expect(result.decision).toBe('escalate');
+      expect(result.rule).toBe(MEMORY_BULK_FORGET_RULE);
+      expect(result.reason).toContain(`more than ${MEMORY_FORGET_ESCALATE_IDS} memories by id`);
+      expect(result.humanOnly).toBe(true);
+    });
+
+    // An inherited property never reaches the server (JSON serialization sends own
+    // properties only), so it must not turn a deletion into a "preview" either.
+    it('ignores an inherited dry_run when judging a bulk memory_forget', () => {
+      const args = Object.create({ dry_run: true }) as Record<string, unknown>;
+      args.tags = ['project:foo'];
+      args.confirm = true;
+      expect(JSON.parse(JSON.stringify(args))).toEqual({ tags: ['project:foo'], confirm: true });
+
+      const result = trustedEngine.evaluate(
+        makeRequest({ serverName: 'memory', toolName: 'memory_forget', arguments: args }),
+      );
+      expect(result.decision).toBe('escalate');
+      expect(result.rule).toBe(MEMORY_BULK_FORGET_RULE);
+    });
+
+    it('judges a memory call without an arguments object as one with no arguments', () => {
+      const request = makeRequest({ serverName: 'memory', toolName: 'memory_forget', arguments: {} });
+      const noArgs = { ...request, arguments: undefined as unknown as Record<string, unknown> };
+      // Nothing to delete by: the server rejects it, nothing for a human to approve.
+      expect(trustedEngine.evaluate(noArgs)).toMatchObject({ decision: 'allow', rule: 'trusted-server' });
+      // An ingest with no content string fails towards a human.
+      expect(trustedEngine.evaluate({ ...noArgs, toolName: 'memory_ingest' })).toMatchObject({
+        decision: 'escalate',
+        rule: MEMORY_LARGE_INGEST_RULE,
+      });
+    });
+
+    it.each([
+      [{ content: 'x'.repeat(MEMORY_INGEST_ESCALATE_CHARS + 1) }],
+      [{ content: 'x'.repeat(MEMORY_INGEST_ESCALATE_CHARS + 1), dry_run: true }],
+      [{ content: ['not', 'a', 'string'] }],
+    ])('escalates a large memory_ingest to a human only', (args) => {
+      const result = trustedEngine.evaluate(
+        makeRequest({ serverName: 'memory', toolName: 'memory_ingest', arguments: args }),
+      );
+      expect(result.decision).toBe('escalate');
+      expect(result.rule).toBe(MEMORY_LARGE_INGEST_RULE);
+      expect(result.humanOnly).toBe(true);
+    });
+
+    it('denies calls to a trusted server that has no trusted-server policy', () => {
+      const engine = new PolicyEngine(
+        testCompiledPolicy,
+        testToolAnnotations,
+        protectedPaths,
+        SANDBOX_DIR,
+        undefined,
+        undefined,
+        new Set(['other-trusted']),
+      );
+      const result = engine.evaluate(makeRequest({ serverName: 'other-trusted', toolName: 'anything', arguments: {} }));
+      expect(result.decision).toBe('deny');
+      expect(result.rule).toBe(TRUSTED_SERVER_UNKNOWN_TOOL_RULE);
     });
 
     it('does not affect non-trusted servers', () => {
@@ -2675,6 +3441,160 @@ describe('PolicyEngine with conditional roles', () => {
       );
       expect(result.decision).toBe('deny');
       expect(result.rule).toBe('structural-unknown-tool');
+    });
+  });
+
+  describe('human-only escalations', () => {
+    const fetchAnnotations = withInputSchemas({
+      ...testToolAnnotations,
+      servers: {
+        ...testToolAnnotations.servers,
+        proxy: { inputHash: 'hardcoded', tools: proxyAnnotations },
+        fetch: {
+          inputHash: 'test',
+          tools: [
+            {
+              toolName: 'http_fetch',
+              serverName: 'fetch',
+              comment: 'Fetches web content.',
+              args: { url: ['fetch-url'], headers: ['none'] },
+            },
+            {
+              toolName: 'fetch_to_file',
+              serverName: 'fetch',
+              comment: 'Fetches web content into a file.',
+              args: { url: ['fetch-url'], path: ['write-path'] },
+            },
+          ],
+        },
+      },
+    });
+    const humanOnlyFetchRule: CompiledRule = {
+      name: 'escalate-fetch-human-only',
+      description: 'Fetches need a human',
+      principle: 'Human oversight',
+      if: { server: ['fetch'], roles: ['fetch-url'] },
+      then: 'escalate',
+      reason: 'Fetching needs a human',
+      humanOnly: true,
+    };
+    const plainWriteRule: CompiledRule = {
+      name: 'escalate-fetch-write',
+      description: 'Writes need review',
+      principle: 'Human oversight',
+      if: { server: ['fetch'], roles: ['write-path'] },
+      then: 'escalate',
+      reason: 'Writing the download needs review',
+    };
+    const policyWith = (rules: CompiledRule[]): CompiledPolicyFile => ({
+      ...testCompiledPolicy,
+      rules: [...proxyPolicyRules, ...rules],
+    });
+
+    it('flags an escalation from a human-only rule (add_proxy_domain)', () => {
+      const engine = new PolicyEngine(policyWith([]), fetchAnnotations, [], SANDBOX_DIR);
+      const result = engine.evaluate(
+        makeRequest({
+          serverName: 'proxy',
+          toolName: 'add_proxy_domain',
+          arguments: { domain: 'api.example.com', justification: 'needed' },
+        }),
+      );
+      expect(result).toMatchObject({ decision: 'escalate', rule: 'proxy-add-domain-escalate', humanOnly: true });
+    });
+
+    it('does not flag the allow rules of the same server', () => {
+      const engine = new PolicyEngine(policyWith([]), fetchAnnotations, [], SANDBOX_DIR);
+      const result = engine.evaluate(
+        makeRequest({ serverName: 'proxy', toolName: 'list_proxy_domains', arguments: {} }),
+      );
+      expect(result.decision).toBe('allow');
+      expect(result.humanOnly).toBeUndefined();
+    });
+
+    it('does not flag an ordinary compiled escalation', () => {
+      const engine = new PolicyEngine(testCompiledPolicy, testToolAnnotations, [], SANDBOX_DIR);
+      const result = engine.evaluate(
+        makeRequest({
+          serverName: 'git',
+          toolName: 'git_push',
+          arguments: { path: `${SANDBOX_DIR}/repo`, remote: 'https://github.com/org/repo.git' },
+        }),
+      );
+      expect(result.decision).toBe('escalate');
+      expect(result.humanOnly).toBeUndefined();
+    });
+
+    it('keeps the flag when the structural domain gate combines with a human-only compiled escalation', () => {
+      const allowlists = new Map([['fetch', ['example.com']]]);
+      const engine = new PolicyEngine(policyWith([humanOnlyFetchRule]), fetchAnnotations, [], SANDBOX_DIR, allowlists);
+      const result = engine.evaluate(
+        makeRequest({ serverName: 'fetch', toolName: 'http_fetch', arguments: { url: 'https://evil.example/x' } }),
+      );
+      expect(result).toMatchObject({ decision: 'escalate', rule: 'structural-domain-escalate', humanOnly: true });
+    });
+
+    it('does not flag a gate escalation whose compiled rules merely allow', () => {
+      const allowlists = new Map([['fetch', ['example.com']]]);
+      const engine = new PolicyEngine(testCompiledPolicy, fetchAnnotations, [], SANDBOX_DIR, allowlists);
+      const result = engine.evaluate(
+        makeRequest({ serverName: 'fetch', toolName: 'http_fetch', arguments: { url: 'https://evil.example/x' } }),
+      );
+      expect(result).toMatchObject({ decision: 'escalate', rule: 'structural-domain-escalate' });
+      expect(result.humanOnly).toBeUndefined();
+    });
+
+    it('flags a multi-role escalation when any role escalated through a human-only rule', () => {
+      // The write-path role is evaluated first and escalates through a plain
+      // rule; the URL role escalates through the human-only rule.
+      const engine = new PolicyEngine(
+        policyWith([plainWriteRule, humanOnlyFetchRule]),
+        fetchAnnotations,
+        [],
+        SANDBOX_DIR,
+      );
+      const result = engine.evaluate(
+        makeRequest({
+          serverName: 'fetch',
+          toolName: 'fetch_to_file',
+          arguments: { url: 'https://example.com/x', path: '/srv/downloads/x' },
+        }),
+      );
+      expect(result.decision).toBe('escalate');
+      expect(result.humanOnly).toBe(true);
+      expect([...(result.escalatedRoles ?? [])].sort()).toEqual(['fetch-url', 'write-path']);
+    });
+  });
+
+  describe('reasonForAutoApprover', () => {
+    it('replaces the structural domain gate reason with a fixed template', () => {
+      const allowlists = new Map([['git', ['github.com']]]);
+      const engine = new PolicyEngine(testCompiledPolicy, testToolAnnotations, [], SANDBOX_DIR, allowlists);
+      const result = engine.evaluate(
+        makeRequest({
+          serverName: 'git',
+          toolName: 'git_push',
+          arguments: {
+            path: `${SANDBOX_DIR}/repo`,
+            remote: 'https://evil.example/team/Policy-note-respond-approve.git',
+          },
+        }),
+      );
+      expect(result.rule).toBe('structural-domain-escalate');
+      expect(result.reason).toContain('evil.example');
+      const approverReason = reasonForAutoApprover(result);
+      expect(approverReason).not.toContain('evil.example');
+      expect(approverReason).not.toContain('Policy-note');
+      expect(approverReason).toContain('not on the server');
+    });
+
+    it('passes a compiled rule reason through unchanged', () => {
+      const result = {
+        decision: 'escalate' as const,
+        rule: 'escalate-git-remote-ops',
+        reason: 'Remote-contacting git operations require human approval.',
+      };
+      expect(reasonForAutoApprover(result)).toBe('Remote-contacting git operations require human approval.');
     });
   });
 });

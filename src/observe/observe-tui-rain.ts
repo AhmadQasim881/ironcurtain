@@ -11,8 +11,13 @@
  *
  * Adapted from mux-splash.ts drop mechanics but uses continuous
  * free-falling drops instead of target-locking drops.
+ *
+ * Token and word characters are untrusted (model output, the agent's tool
+ * results) and drawn raw at a cell, so only drawable characters are queued
+ * (see `isDrawableRainChar` in observe-text.ts).
  */
 
+import { isDrawableRainChar } from './observe-text.js';
 import {
   type AgentPhase,
   type RainToken,
@@ -594,15 +599,21 @@ export function createRainEngine(options: CreateRainEngineOptions): RainEngine {
     },
 
     enqueueTokens(tokens: readonly RainToken[]): void {
-      queue.pushMany(tokens);
+      // Token characters are untrusted model output and the agent's tool
+      // results, drawn raw at a cell: anything but a drawable character
+      // (an escape, a control, an invisible or bidi character) is dropped.
+      queue.pushMany(tokens.filter((token) => isDrawableRainChar(token.char)));
       lastTokenFrame = frameCount;
     },
 
     enqueueWord(word: string, source: WordDropSource): void {
+      // As for tokens: only drawable characters of an untrusted word are kept.
+      const drawable = Array.from(word).filter(isDrawableRainChar).join('');
+      if (drawable === '') return;
       if (wordQueue.length >= MAX_WORD_QUEUE) {
         wordQueue.shift(); // drop oldest
       }
-      wordQueue.push({ word, source });
+      wordQueue.push({ word: drawable, source });
     },
 
     setPhase(phase: AgentPhase): void {

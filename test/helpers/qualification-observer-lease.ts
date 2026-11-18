@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, statSync } from 'node:fs';
+import { mkdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import {
   activateDockerWorkloadLease,
@@ -6,7 +6,10 @@ import {
   observeDockerWorkloadOuterResource,
   requestDockerWorkloadOuterResource,
 } from '../../src/docker-workload/bundle-lease.js';
-import { resourceWatchdogPolicySchema } from '../../src/docker/resource-watchdog.js';
+import {
+  buildRuntimeWatchdogPolicy,
+  loadFrozenWatchdogPolicyTemplate,
+} from '../../src/docker-workload/watchdog-policy.js';
 import { DOCKER_WORKLOAD_OWNERSHIP_LABEL_KEY } from '../../src/docker-workload/infrastructure.js';
 
 /** Real current-format lease for observer lifecycle and workflow tests. */
@@ -15,12 +18,11 @@ export function createQualificationObserverLease(root: string, runtimeKind: 'doc
   const stateRoot = join(root, 'state');
   mkdirSync(stateRoot, { mode: 0o700 });
   const identity = statSync(stateRoot);
-  const watchdogPolicy = resourceWatchdogPolicySchema.parse({
-    ...JSON.parse(readFileSync(resolve('config/docker-workload/resource-watchdog-policy.json'), 'utf8')),
-    targetRoot: stateRoot,
-    targetDevice: identity.dev,
-    targetInode: identity.ino,
-  });
+  const watchdogPolicy = buildRuntimeWatchdogPolicy(
+    loadFrozenWatchdogPolicyTemplate(resolve('config/docker-workload/resource-watchdog-policy.json')),
+    runtimeKind,
+    { root: stateRoot, device: identity.dev, inode: identity.ino },
+  );
   const generation = 'generation-one';
   createDockerWorkloadLease(leasePath, {
     leaseId: 'observer-lease',

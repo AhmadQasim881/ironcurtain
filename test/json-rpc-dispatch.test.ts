@@ -14,32 +14,54 @@ import {
   buildStatusDto,
   type DispatchContext,
 } from '../src/web-ui/json-rpc-dispatch.js';
-import { WebEventBus } from '../src/web-ui/web-event-bus.js';
+import { WebEventBus, type WebEventMap } from '../src/web-ui/web-event-bus.js';
 import { SessionManager, type PendingEscalationData } from '../src/session/session-manager.js';
 import type { ControlRequestHandler } from '../src/daemon/control-socket.js';
+import { JobAlreadyRunningError, JobNotFoundError, type RunRecord } from '../src/cron/types.js';
 import type { Session, SessionInfo, BudgetStatus } from '../src/session/types.js';
 import type { Transport } from '../src/session/transport.js';
 import { BudgetExhaustedError } from '../src/types/errors.js';
+import type { AgentId } from '../src/docker/agent-adapter.js';
 
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * An idle builtin session after a few turns: the per-turn fields are reset to
+ * zero by endTurn(); the totals the web UI shows live in `cumulative`.
+ */
 function makeBudgetStatus(): BudgetStatus {
   return {
-    totalInputTokens: 500,
-    totalOutputTokens: 300,
-    totalTokens: 800,
-    stepCount: 5,
-    elapsedSeconds: 120,
-    estimatedCostUsd: 0.05,
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+    totalTokens: 0,
+    stepCount: 0,
+    elapsedSeconds: 0,
+    estimatedCostUsd: 0,
     tokenTrackingAvailable: true,
-    cumulative: { totalInputTokens: 500, totalOutputTokens: 300, totalTokens: 800 },
+    lastTurn: {
+      totalInputTokens: 200,
+      totalOutputTokens: 100,
+      totalTokens: 300,
+      stepCount: 2,
+      elapsedSeconds: 30,
+      estimatedCostUsd: 0.02,
+    },
+    cumulative: {
+      totalInputTokens: 500,
+      totalOutputTokens: 300,
+      totalTokens: 800,
+      stepCount: 5,
+      activeSeconds: 120,
+      estimatedCostUsd: 0.05,
+    },
     limits: {
       maxTotalTokens: 1_000_000,
       maxSteps: 200,
       maxSessionSeconds: 1800,
       maxEstimatedCostUsd: 5,
+      warnThresholdPercent: 80,
     },
   };
 }
@@ -65,7 +87,7 @@ function stubSession(): Session {
     ]),
     getDiagnosticLog: vi.fn().mockReturnValue([]),
     resolveEscalation: vi.fn().mockResolvedValue(undefined),
-    getPendingEscalation: vi.fn(),
+    getPendingEscalations: vi.fn(() => []),
     getBudgetStatus: vi.fn().mockReturnValue(makeBudgetStatus()),
     close: vi.fn().mockResolvedValue(undefined),
   };
@@ -78,30 +100,34 @@ function stubTransport(): Transport {
   };
 }
 
+const RUN_RECORD: RunRecord = {
+  startedAt: '2026-03-05T09:00:00Z',
+  completedAt: '2026-03-05T09:01:00Z',
+  outcome: { kind: 'success' },
+  budget: { totalTokens: 100, stepCount: 3, elapsedSeconds: 60, estimatedCostUsd: 0.01 },
+  summary: 'Done',
+  escalationsEncountered: 0,
+  escalationsApproved: 0,
+  discardedChanges: null,
+};
+
 function makeMockHandler(): ControlRequestHandler {
   return {
     getStatus: vi.fn().mockReturnValue({
       uptimeSeconds: 300,
-      jobs: { total: 2, enabled: 1, running: 0 },
+      jobs: { total: 2, enabled: 1, running: 0, failing: 0 },
+      failingJobs: [],
       signalConnected: false,
       nextFireTime: new Date('2026-03-05T10:00:00Z'),
     }),
-    addJob: vi.fn().mockResolvedValue(undefined),
     removeJob: vi.fn().mockResolvedValue(undefined),
     enableJob: vi.fn().mockResolvedValue(undefined),
     disableJob: vi.fn().mockResolvedValue(undefined),
     recompileJob: vi.fn().mockResolvedValue(undefined),
+    refreshLists: vi.fn(),
     reloadJob: vi.fn().mockResolvedValue(undefined),
-    runJobNow: vi.fn().mockResolvedValue({
-      startedAt: '2026-03-05T09:00:00Z',
-      completedAt: '2026-03-05T09:01:00Z',
-      outcome: { kind: 'success' },
-      budget: { totalTokens: 100, stepCount: 3, elapsedSeconds: 60, estimatedCostUsd: 0.01 },
-      summary: 'Done',
-      escalationsEncountered: 0,
-      escalationsApproved: 0,
-      discardedChanges: null,
-    }),
+    startJobRun: vi.fn(() => ({ completion: Promise.resolve(RUN_RECORD) })),
+    runJobNow: vi.fn().mockResolvedValue(RUN_RECORD),
     listJobs: vi.fn().mockReturnValue([]),
   };
 }
@@ -239,7 +265,8 @@ describe('json-rpc-dispatch', () => {
 
       let sessionAtEndedEvent: unknown = 'event-not-emitted';
       ctx.eventBus.subscribe((event, payload) => {
-        if (event === 'session.ended' && payload.label === label) {
+        // The handler is generic over the event: narrowing `event` does not narrow `payload`.
+        if (event === 'session.ended' && (payload as WebEventMap['session.ended']).label === label) {
           sessionAtEndedEvent = ctx.sessionManager.get(label);
         }
       });
@@ -283,6 +310,38 @@ describe('json-rpc-dispatch', () => {
   });
 
   describe('escalations', () => {
+    it('keeps a complete item visible beside a deny-only review and refuses approval of the original', async () => {
+      const ctx = makeCtx();
+      const session = stubSession();
+      const label = ctx.sessionManager.register(session, stubTransport(), { kind: 'web' });
+      const original: PendingEscalationData = {
+        escalationId: 'example-large-review',
+        sessionLabel: label,
+        serverName: 'filesystem',
+        toolName: 'write_file',
+        arguments: { content: 'Example prose. '.repeat(1200) },
+        reason: 'Review the example.',
+        receivedAt: '2026-11-16T00:00:00Z',
+      };
+      ctx.sessionManager.setPendingEscalation(label, original);
+      ctx.sessionManager.setPendingEscalation(label, {
+        ...original,
+        escalationId: 'example-small-review',
+        arguments: { content: 'Example.' },
+      });
+      const listed = await dispatch(ctx, 'escalations.list', {});
+      expect(listed).toEqual([
+        expect.objectContaining({ escalationId: original.escalationId, reviewUnavailable: true, arguments: {} }),
+        expect.objectContaining({ escalationId: 'example-small-review', arguments: { content: 'Example.' } }),
+      ]);
+      await expect(
+        dispatch(ctx, 'escalations.resolve', { escalationId: original.escalationId, decision: 'approved' }),
+      ).rejects.toThrow('can only be denied');
+      expect(session.resolveEscalation).not.toHaveBeenCalled();
+      await dispatch(ctx, 'escalations.resolve', { escalationId: original.escalationId, decision: 'denied' });
+      expect(session.resolveEscalation).toHaveBeenCalledWith(original.escalationId, 'denied', undefined);
+    });
+
     it('escalations.list returns empty when no escalations', async () => {
       const ctx = makeCtx();
       const result = await dispatch(ctx, 'escalations.list', {});
@@ -342,6 +401,43 @@ describe('json-rpc-dispatch', () => {
           decision: 'approved',
         }),
       ).rejects.toThrow('not_found');
+    });
+
+    it('escalations.resolve settles a workflow tool-call escalation by id', async () => {
+      const resolveToolCallEscalation = vi.fn().mockReturnValue(true);
+      const workflowManager = {
+        findToolCallEscalation: vi.fn((id: string) =>
+          id === 'wf-esc-1' ? { workflowId: 'wf-1', escalation: { escalationId: id } } : undefined,
+        ),
+        resolveToolCallEscalation,
+      } as unknown as NonNullable<DispatchContext['workflowManager']>;
+      const ctx = makeCtx({ workflowManager });
+
+      await dispatch(ctx, 'escalations.resolve', {
+        escalationId: 'wf-esc-1',
+        decision: 'approved',
+        whitelistSelection: 0,
+      });
+      expect(resolveToolCallEscalation).toHaveBeenCalledWith('wf-esc-1', {
+        decision: 'approved',
+        whitelistSelection: 0,
+      });
+
+      // Not a workflow escalation: falls through to the session managers.
+      await expect(dispatch(ctx, 'escalations.resolve', { escalationId: 'other', decision: 'denied' })).rejects.toThrow(
+        'not_found',
+      );
+    });
+
+    it('escalations.resolve reports a workflow escalation that expired meanwhile', async () => {
+      const workflowManager = {
+        findToolCallEscalation: vi.fn().mockReturnValue({ workflowId: 'wf-1', escalation: {} }),
+        resolveToolCallEscalation: vi.fn().mockReturnValue(false),
+      } as unknown as NonNullable<DispatchContext['workflowManager']>;
+      const ctx = makeCtx({ workflowManager });
+      await expect(
+        dispatch(ctx, 'escalations.resolve', { escalationId: 'wf-esc-2', decision: 'approved' }),
+      ).rejects.toMatchObject({ code: 'ESCALATION_NOT_FOUND' });
     });
   });
 
@@ -404,7 +500,55 @@ describe('json-rpc-dispatch', () => {
 
       const result = await dispatch(ctx, 'jobs.run', { jobId: 'j1' });
       expect(result).toEqual({ accepted: true, jobId: 'j1' });
+      expect(handler.startJobRun).toHaveBeenCalledWith('j1');
       expect(eventHandler).toHaveBeenCalledWith('job.started', { jobId: 'j1', sessionLabel: 0 });
+      await vi.waitFor(() => {
+        expect(eventHandler).toHaveBeenCalledWith('job.completed', { jobId: 'j1', record: RUN_RECORD });
+      });
+    });
+
+    it('jobs.run refuses a job that is already running before accepting it', async () => {
+      const handler = makeMockHandler();
+      vi.mocked(handler.startJobRun).mockImplementation((jobId) => {
+        throw new JobAlreadyRunningError(jobId, 4);
+      });
+      const ctx = makeCtx({ handler });
+      const eventHandler = vi.fn();
+      ctx.eventBus.subscribe(eventHandler);
+
+      await expect(dispatch(ctx, 'jobs.run', { jobId: 'j1' })).rejects.toMatchObject({
+        name: 'RpcError',
+        code: 'JOB_ALREADY_RUNNING',
+        message: 'Job "j1" is already running (session #4)',
+      });
+      expect(eventHandler).not.toHaveBeenCalled();
+    });
+
+    it('jobs.run reports an unknown job as JOB_NOT_FOUND before accepting it', async () => {
+      const handler = makeMockHandler();
+      vi.mocked(handler.startJobRun).mockImplementation((jobId) => {
+        throw new JobNotFoundError(jobId);
+      });
+      const ctx = makeCtx({ handler });
+      const eventHandler = vi.fn();
+      ctx.eventBus.subscribe(eventHandler);
+
+      await expect(dispatch(ctx, 'jobs.run', { jobId: 'nope' })).rejects.toMatchObject({
+        name: 'RpcError',
+        code: 'JOB_NOT_FOUND',
+        message: 'Job not found: nope',
+      });
+      expect(eventHandler).not.toHaveBeenCalled();
+    });
+
+    it('jobs.run passes other refusals through unchanged', async () => {
+      const handler = makeMockHandler();
+      vi.mocked(handler.startJobRun).mockImplementation(() => {
+        throw new Error('the job store is unreadable');
+      });
+      const ctx = makeCtx({ handler });
+
+      await expect(dispatch(ctx, 'jobs.run', { jobId: 'j1' })).rejects.toThrow('the job store is unreadable');
     });
   });
 
@@ -444,7 +588,7 @@ describe('json-rpc-dispatch', () => {
       expect(toSessionDto(managed).hasPendingEscalation).toBe(true);
     });
 
-    it('toBudgetDto maps budget fields correctly', () => {
+    it('toBudgetDto reports session totals, not the zeroed per-turn fields of an idle session', () => {
       const mgr = new SessionManager();
       const label = mgr.register(stubSession(), stubTransport(), { kind: 'web' });
       const managed = mgr.get(label)!;
@@ -464,6 +608,21 @@ describe('json-rpc-dispatch', () => {
           maxEstimatedCostUsd: 5,
         },
       });
+      // A session that prices every step itself carries no cost source.
+      expect(dto).not.toHaveProperty('costSource');
+    });
+
+    it('toBudgetDto passes an unknown cost source through, so the UI does not show $0.00', () => {
+      const session = stubSession();
+      const status = session.getBudgetStatus();
+      const mgr = new SessionManager();
+      const label = mgr.register(
+        { ...session, getBudgetStatus: () => ({ ...status, estimatedCostUsd: 0, costSource: 'unknown' as const }) },
+        stubTransport(),
+        { kind: 'web' },
+      );
+
+      expect(toBudgetDto(mgr.get(label)!)).toMatchObject({ costSource: 'unknown' });
     });
 
     it('buildStatusDto includes webUiListening=true', () => {
@@ -477,7 +636,7 @@ describe('json-rpc-dispatch', () => {
     });
 
     it('buildStatusDto maps internal docker mode to public container mode', () => {
-      const ctx = makeCtx({ mode: { kind: 'docker', agent: 'claude-code', authKind: 'apikey' } });
+      const ctx = makeCtx({ mode: { kind: 'docker', agent: 'claude-code' as AgentId, authKind: 'apikey' } });
       const dto = buildStatusDto(ctx);
 
       expect(dto.sessionMode).toBe('container');

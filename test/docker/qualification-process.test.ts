@@ -8,7 +8,7 @@ import { waitForQualificationProcess } from '../../src/docker-workload/qualifica
 describe('qualification process ownership', () => {
   it('bounds draining inherited pipes even after the process group has exited', async () => {
     const child = new ChildProcess();
-    child.pid = 12345;
+    Object.defineProperty(child, 'pid', { value: 12345 });
     child.stdout = new PassThrough();
     child.stderr = new PassThrough();
     const kill = vi.spyOn(process, 'kill').mockImplementation(() => {

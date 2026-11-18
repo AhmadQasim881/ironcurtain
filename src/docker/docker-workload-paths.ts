@@ -6,7 +6,10 @@
  * reviewed egress origins and host/runtime ceilings. Every
  * consumer must import a helper from here instead of re-deriving the package
  * root inline, so the frozen locations can never drift apart and no caller can
- * be pointed at an unreviewed manifest by passing a different path.
+ * be pointed at an unreviewed manifest by passing a different path. Loaders read
+ * them with `readPackageAsset` (src/hardened-fs.ts) below
+ * {@link getIronCurtainPackageRoot}: an install made under umask 002 is accepted,
+ * a file or directory another local user could change is not.
  *
  * Runtime *staging* copies (which live under `$IRONCURTAIN_HOME`) are a
  * separate from the per-session selected-agent artifact cache.
@@ -34,7 +37,11 @@ export function getFrozenRegistryEgressManifestPath(): string {
   return resolve(getFrozenDockerWorkloadDir(), 'registry-egress-manifest.json');
 }
 
-/** Frozen host-authoritative outer profile ceiling bound at Docker-workload admission. */
+/**
+ * Frozen reviewed ceiling for the nested-daemon sidecar's seccomp additions and
+ * capabilities. Admission does not read it: test/docker-workload/profile-ceiling.test.ts
+ * holds the in-code profile to it, and `ironcurtain doctor` checks the packaged asset.
+ */
 export function getFrozenProfileCeilingPath(): string {
   return resolve(getFrozenDockerWorkloadDir(), 'profile-ceiling.json');
 }

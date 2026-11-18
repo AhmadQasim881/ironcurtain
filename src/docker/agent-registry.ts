@@ -3,10 +3,16 @@
  *
  * New agents are added by implementing AgentAdapter and registering here.
  * The registry is a simple Map -- no dynamic loading or plugin system.
+ *
+ * One adapter instance serves every session of the process (the daemon, the
+ * Signal bot and the web UI run many sessions in one process). Adapters
+ * therefore take no configuration when they are created: every
+ * session-specific value (provider profile, agent model, Goose provider and
+ * model) is read from the per-session `IronCurtainConfig` or the
+ * `buildCommand` options at call time.
  */
 
 import type { AgentAdapter, AgentId } from './agent-adapter.js';
-import type { ResolvedUserConfig } from '../config/user-config.js';
 
 const registry = new Map<AgentId, AgentAdapter>();
 
@@ -32,28 +38,26 @@ export function listAgents(): readonly AgentAdapter[] {
 
 /**
  * Ensures all built-in agent adapters are registered. Safe to call
- * multiple times -- skips adapters that are already registered.
- *
- * @param userConfig - Resolved user config. When provided, the Goose adapter
- *   uses it for provider selection. When undefined, defaults apply (anthropic
- *   provider, default model). This allows --list-agents to work without config.
+ * multiple times -- skips adapters that are already registered. Takes no
+ * config: whichever caller registers first (`--list-agents`, the first-start
+ * wizard, a daemon's first session) cannot fix any session's settings.
  */
-export async function registerBuiltinAdapters(userConfig?: ResolvedUserConfig): Promise<void> {
+export async function registerBuiltinAdapters(): Promise<void> {
   if (!registry.has('claude-code' as AgentId)) {
     const { createClaudeCodeAdapter } = await import('./adapters/claude-code.js');
-    const claudeCodeAdapter = createClaudeCodeAdapter(userConfig);
+    const claudeCodeAdapter = createClaudeCodeAdapter();
     registry.set(claudeCodeAdapter.id, claudeCodeAdapter);
   }
 
   if (!registry.has('goose' as AgentId)) {
     const { createGooseAdapter } = await import('./adapters/goose.js');
-    const gooseAdapter = createGooseAdapter(userConfig);
+    const gooseAdapter = createGooseAdapter();
     registry.set(gooseAdapter.id, gooseAdapter);
   }
 
   if (!registry.has('codex' as AgentId)) {
     const { createCodexAdapter } = await import('./adapters/codex.js');
-    const codexAdapter = createCodexAdapter(userConfig);
+    const codexAdapter = createCodexAdapter();
     registry.set(codexAdapter.id, codexAdapter);
   }
 }

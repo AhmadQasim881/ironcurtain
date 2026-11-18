@@ -12,6 +12,8 @@
  */
 import { describe, it, expect } from 'vitest';
 import { spawn } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -109,5 +111,49 @@ describe('mcp-proxy-server no-backend exit', { timeout: 30_000 }, () => {
     expect(stderr).toContain('WARNING: Skipping MCP server "testserver": failed to connect');
     expect(stderr).toContain('ERROR: proxy subprocess for SERVER_FILTER="testserver" has no connected backend');
     expect(stderr).not.toContain('MCP Proxy Server fatal error');
+  });
+
+  // Regression: loadClientCredentials() threw out of the backend loop on a
+  // malformed credentials file, killing the relay (and, in the pipeline's
+  // shared relay, every other server with it) instead of skipping one server.
+  it('skips an OAuth-backed server whose client credentials file is malformed', async () => {
+    const generatedDir = resolve(__dirname, '..', 'src', 'config', 'generated');
+    const home = mkdtempSync(resolve(tmpdir(), 'ironcurtain-relay-oauth-'));
+    try {
+      mkdirSync(resolve(home, 'oauth'), { recursive: true, mode: 0o700 });
+      writeFileSync(resolve(home, 'oauth', 'google-credentials.json'), '{ not valid json', { mode: 0o600 });
+      const mcpServersConfig = {
+        'google-workspace': { command: 'true', args: [], sandbox: false },
+      };
+      const env: Record<string, string> = {
+        ...(process.env as Record<string, string>),
+        IRONCURTAIN_HOME: home,
+        MCP_SERVERS_CONFIG: JSON.stringify(mcpServersConfig),
+        SERVER_FILTER: 'google-workspace',
+        GENERATED_DIR: generatedDir,
+        PROTECTED_PATHS: '[]',
+        SANDBOX_POLICY: 'warn',
+      };
+
+      const child = spawn(tsxBin, [proxyServerPath], { env, stdio: ['ignore', 'ignore', 'pipe'] });
+      let stderr = '';
+      child.stderr.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString('utf-8');
+      });
+      const exitCode: number = await new Promise((resolveExit, rejectExit) => {
+        child.once('close', (code) => resolveExit(code ?? -1));
+        child.once('error', rejectExit);
+      });
+
+      expect(exitCode).toBe(1);
+      expect(stderr).toContain(
+        'WARNING: Skipping MCP server "google-workspace": its OAuth credentials could not be loaded',
+      );
+      expect(stderr).toContain('ironcurtain auth import google <file>');
+      expect(stderr).toContain('ERROR: proxy subprocess for SERVER_FILTER="google-workspace" has no connected backend');
+      expect(stderr).not.toContain('MCP Proxy Server fatal error');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

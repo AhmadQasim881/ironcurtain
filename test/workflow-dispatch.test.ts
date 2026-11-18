@@ -23,8 +23,13 @@ import {
   type WorkflowDispatchContext,
 } from '../src/web-ui/dispatch/workflow-dispatch.js';
 import { RpcError, type PastRunDto, type MessageLogResponseDto } from '../src/web-ui/web-ui-types.js';
+import { GateResolutionError, WorkflowResumeError } from '../src/workflow/errors.js';
 import { resolveWorkflowResourceBudget } from '../src/workflow/resource-budget.js';
-import type { MessageLogEntry } from '../src/workflow/message-log.js';
+import {
+  CHECKPOINT_SAVE_ERROR_CONTEXT,
+  HOST_MOUNT_SCAN_ERROR_CONTEXT,
+  type MessageLogEntry,
+} from '../src/workflow/message-log.js';
 import type { WorkflowRunSummary } from '../src/workflow/workflow-discovery.js';
 import * as logger from '../src/logger.js';
 import { WebEventBus } from '../src/web-ui/web-event-bus.js';
@@ -36,6 +41,7 @@ import type {
   WorkflowCheckpoint,
   WorkflowContext,
   WorkflowDefinition,
+  WorkflowToolCallEscalation,
 } from '../src/workflow/types.js';
 import type { ControlRequestHandler } from '../src/daemon/control-socket.js';
 import type { PastRunLoadSuccess, WorkflowManager, PastRunLoadResult } from '../src/workflow/workflow-manager.js';
@@ -133,12 +139,14 @@ function makeLoad(opts: {
   definition?: WorkflowDefinition;
   messageLogPath?: string;
   isLive?: boolean;
+  runningElsewhere?: boolean;
 }): PastRunLoadSuccess {
   return {
     checkpoint: 'checkpoint' in opts ? opts.checkpoint : makeCheckpoint(),
     definition: opts.definition ?? makeDefinition(),
     messageLogPath: opts.messageLogPath ?? '/tmp/nonexistent-messages.jsonl',
     isLive: opts.isLive ?? false,
+    runningElsewhere: opts.runningElsewhere ?? false,
   };
 }
 
@@ -159,6 +167,7 @@ function makeSummary(opts: {
     hasDefinition: opts.hasDefinition ?? true,
     hasMessageLog: opts.hasMessageLog ?? false,
     mtime: opts.mtime ?? new Date('2026-04-23T10:00:00.000Z'),
+    filesKey: `fixture:${opts.workflowId}`,
   };
 }
 
@@ -214,6 +223,8 @@ function createContext(opts: {
     getBudget: vi.fn().mockReturnValue(undefined),
     listActive: vi.fn().mockReturnValue([]),
     resolveGate: vi.fn(),
+    listToolCallEscalations: vi.fn().mockReturnValue([]),
+    resolveToolCallEscalation: vi.fn().mockReturnValue(false),
     abort: vi.fn().mockResolvedValue(undefined),
     onEvent: vi.fn(),
     shutdownAll: vi.fn().mockResolvedValue(undefined),
@@ -249,6 +260,23 @@ describe('computePastRunPhase', () => {
     const cp = makeCheckpoint({ machineState: 'plan' });
     const def = makeDefinition();
     expect(computePastRunPhase(cp, def, true)).toBe('running');
+  });
+
+  it('returns "running_elsewhere" for a run another process holds, whatever its checkpoint says', () => {
+    const def = makeDefinition();
+    // A mid-run checkpoint would otherwise read as interrupted, a stale
+    // aborted one as aborted: both are live in the holder.
+    expect(computePastRunPhase(makeCheckpoint({ machineState: 'plan' }), def, false, true)).toBe('running_elsewhere');
+    expect(
+      computePastRunPhase(
+        makeCheckpoint({ machineState: 'plan', finalStatus: { phase: 'aborted', reason: 'earlier stop' } }),
+        def,
+        false,
+        true,
+      ),
+    ).toBe('running_elsewhere');
+    // A run live here is reported as running.
+    expect(computePastRunPhase(makeCheckpoint({ machineState: 'plan' }), def, true, false)).toBe('running');
   });
 
   it('returns "completed" when terminal state name does not look aborted', () => {
@@ -588,6 +616,80 @@ describe('synthesizePhaseFromMessageLog', () => {
     expect(synthesizePhaseFromMessageLog(entries, def)).toBe('failed');
   });
 
+  it('does not count a failed checkpoint save as the run failing', () => {
+    // Every save of this run failed (a full disk), so it has no checkpoint;
+    // the run itself carried on until the process stopped.
+    const def = defWithStates({
+      start: {
+        type: 'agent',
+        description: 's',
+        persona: 'global',
+        prompt: 'p',
+        inputs: [],
+        outputs: [],
+        transitions: [{ to: 'plan' }],
+      },
+      plan: {
+        type: 'agent',
+        description: 'p',
+        persona: 'global',
+        prompt: 'p',
+        inputs: [],
+        outputs: [],
+        transitions: [],
+      },
+    });
+    const saveFailure: MessageLogEntry = {
+      type: 'error',
+      ts: '2026-04-23T10:05:00.000Z',
+      workflowId,
+      state: 'plan',
+      error: 'Failed to save checkpoint for wf-synth: no space left on device',
+      context: CHECKPOINT_SAVE_ERROR_CONTEXT,
+    };
+    const entries: MessageLogEntry[] = [transitionTo('plan', 'start', '2026-04-23T10:00:00.000Z'), saveFailure];
+    expect(synthesizePhaseFromMessageLog(entries, def)).toBe('interrupted');
+
+    // A real failure after it still reads as one.
+    const realFailure: MessageLogEntry = { ...saveFailure, ts: '2026-04-23T10:06:00.000Z', error: 'agent crashed' };
+    delete (realFailure as { context?: string }).context;
+    expect(synthesizePhaseFromMessageLog([...entries, realFailure], def)).toBe('failed');
+  });
+
+  it('does not count a host-mount privilege finding as the run failing', () => {
+    // The finding a bundle teardown recorded after the run was interrupted.
+    const def = defWithStates({
+      start: {
+        type: 'agent',
+        description: 's',
+        persona: 'global',
+        prompt: 'p',
+        inputs: [],
+        outputs: [],
+        transitions: [{ to: 'plan' }],
+      },
+      plan: {
+        type: 'agent',
+        description: 'p',
+        persona: 'global',
+        prompt: 'p',
+        inputs: [],
+        outputs: [],
+        transitions: [],
+      },
+    });
+    const finding: MessageLogEntry = {
+      type: 'error',
+      ts: '2026-04-23T10:05:00.000Z',
+      workflowId,
+      state: 'plan',
+      error: '[host-files] Warning (session end): IronCurtain found setuid/setgid or root-owned files ...',
+      context: HOST_MOUNT_SCAN_ERROR_CONTEXT,
+    };
+    const entries: MessageLogEntry[] = [transitionTo('plan', 'start', '2026-04-23T10:00:00.000Z'), finding];
+    expect(synthesizePhaseFromMessageLog(entries, def)).toBe('interrupted');
+  });
+
   it('returns "interrupted" when last state is non-terminal and no post-transition events exist (case 8)', () => {
     const def = defWithStates({
       start: {
@@ -815,6 +917,23 @@ describe('synthesizePhaseFromMessageLog', () => {
 // ---------------------------------------------------------------------------
 
 describe('buildDetailFromPastRun', () => {
+  it('reports a run another process holds as running_elsewhere', () => {
+    const id = 'past-elsewhere' as WorkflowId;
+    const withCheckpoint = buildDetailFromPastRun(
+      id,
+      makeLoad({ checkpoint: makeCheckpoint({ machineState: 'plan' }), runningElsewhere: true }),
+      makeSummary({ workflowId: id }),
+    );
+    expect(withCheckpoint.phase).toBe('running_elsewhere');
+
+    const fromLog = buildDetailFromPastRun(
+      id,
+      makeLoad({ checkpoint: undefined, runningElsewhere: true }),
+      makeSummary({ workflowId: id }),
+    );
+    expect(fromLog.phase).toBe('running_elsewhere');
+  });
+
   it('reports zero live agent sessions for recorded past-run budget snapshots', () => {
     const id = 'past-budget-count' as WorkflowId;
     const budget = {
@@ -828,6 +947,46 @@ describe('buildDetailFromPastRun', () => {
       makeSummary({ workflowId: id }),
     );
     expect(dto.budget).toEqual({ ...budget, activeSessionCount: 0 });
+  });
+
+  it('reports a saved run-wide usage record instead of the legacy output-only total', () => {
+    const id = 'past-usage' as WorkflowId;
+    const usage = {
+      inputTokens: 90_000,
+      cacheReadTokens: 70_000,
+      cacheWriteTokens: 5_000,
+      outputTokens: 4_000,
+      totalTokens: 94_000,
+      estimatedCostUsd: 3.5,
+      gateOnlyTokens: 0,
+      gateOnlyCostUsd: 0,
+      activeSeconds: 600,
+      observedExchanges: 20,
+      incompleteExchanges: 0,
+      unmeasuredExchanges: 0,
+      meteredSessions: 3,
+      reportedSessions: 0,
+      untrackedSessions: 0,
+      uncountedSessions: 0,
+      lowerBound: false,
+      tokenTrackingStatus: 'complete' as const,
+    };
+    const load = makeLoad({ checkpoint: makeCheckpoint({ machineState: 'plan', usage }) });
+    const dto = buildDetailFromPastRun(id, load, makeSummary({ workflowId: id }));
+    expect(dto.totalTokens).toBe(94_000);
+    expect(dto.context.totalTokens).toBe(94_000);
+    expect(dto.usage).toMatchObject({ totalTokens: 94_000, cacheReadTokens: 70_000, tokenTrackingStatus: 'complete' });
+    expect(dto.budget?.workflowUsage).toMatchObject({ totalTokens: 94_000 });
+    expect(buildPastRunDto(id, load, makeSummary({ workflowId: id })).totalTokens).toBe(94_000);
+
+    // A checkpoint written before the record existed keeps its context total.
+    const legacy = buildDetailFromPastRun(
+      id,
+      makeLoad({ checkpoint: makeCheckpoint({ machineState: 'plan' }) }),
+      makeSummary({ workflowId: id }),
+    );
+    expect(legacy.totalTokens).toBe(1234);
+    expect(legacy.usage).toBeUndefined();
   });
 
   it('produces a WorkflowDetailDto with synthesized "interrupted" phase', () => {
@@ -1069,6 +1228,224 @@ describe('workflows.get -- live path', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Tool-call escalations (WP-35): workflows.get / workflows.resolveEscalation
+// ---------------------------------------------------------------------------
+
+function makeEscalation(overrides: Partial<WorkflowToolCallEscalation> = {}): WorkflowToolCallEscalation {
+  return {
+    escalationId: 'esc-1',
+    workflowId: 'wf-esc',
+    stateId: 'plan',
+    persona: 'global',
+    serverName: 'filesystem',
+    toolName: 'write_file',
+    arguments: { path: '/outside/f.txt' },
+    reason: 'Writes outside the workspace require approval.',
+    whitelistCandidates: [
+      { description: 'Allow writes within /outside' },
+    ] as WorkflowToolCallEscalation['whitelistCandidates'],
+    receivedAt: '2026-11-11T00:00:00.000Z',
+    ...overrides,
+  };
+}
+
+describe('workflow tool-call escalations over JSON-RPC', () => {
+  const id = 'wf-esc' as WorkflowId;
+
+  it('returns a deny-only workflow review and rejects approval of its complete original', async () => {
+    const escalation = makeEscalation({ arguments: { content: 'Example prose. '.repeat(1200) } });
+    const resolveToolCallEscalation = vi.fn().mockReturnValue(true);
+    const ctx = createContext({
+      controller: {
+        getStatus: vi.fn().mockReturnValue(makeRunningStatus('plan')),
+        getDetail: vi.fn().mockReturnValue(makeDetail()),
+        listToolCallEscalations: vi.fn().mockReturnValue([escalation]),
+        resolveToolCallEscalation,
+      },
+    });
+    const detail = await workflowDispatch(ctx, 'workflows.get', { workflowId: id });
+    expect(detail).toMatchObject({
+      escalations: [{ escalationId: escalation.escalationId, reviewUnavailable: true, arguments: {} }],
+    });
+    await expect(
+      workflowDispatch(ctx, 'workflows.resolveEscalation', {
+        workflowId: id,
+        escalationId: escalation.escalationId,
+        decision: 'approved',
+      }),
+    ).rejects.toThrow('can only be denied');
+    expect(resolveToolCallEscalation).not.toHaveBeenCalled();
+    await workflowDispatch(ctx, 'workflows.resolveEscalation', {
+      workflowId: id,
+      escalationId: escalation.escalationId,
+      decision: 'denied',
+    });
+    expect(resolveToolCallEscalation).toHaveBeenCalledWith(id, escalation.escalationId, { decision: 'denied' });
+  });
+
+  it('workflows.get lists the pending escalations of a running workflow', async () => {
+    const escalation = makeEscalation();
+    const ctx = createContext({
+      controller: {
+        getStatus: vi.fn().mockReturnValue(makeRunningStatus('plan')),
+        getDetail: vi.fn().mockReturnValue(makeDetail()),
+        listToolCallEscalations: vi.fn().mockReturnValue([escalation]),
+      },
+    });
+    const result = (await workflowDispatch(ctx, 'workflows.get', { workflowId: id })) as {
+      phase: string;
+      escalations?: unknown[];
+    };
+    expect(result.phase).toBe('running');
+    expect(result.escalations).toEqual([escalation]);
+  });
+
+  it('workflows.get omits escalations when none is pending', async () => {
+    const ctx = createContext({
+      controller: {
+        getStatus: vi.fn().mockReturnValue(makeRunningStatus('plan')),
+        getDetail: vi.fn().mockReturnValue(makeDetail()),
+      },
+    });
+    const result = (await workflowDispatch(ctx, 'workflows.get', { workflowId: id })) as Record<string, unknown>;
+    expect(result).not.toHaveProperty('escalations');
+  });
+
+  it('denies the only pending escalation when no id is given', async () => {
+    const resolveToolCallEscalation = vi.fn().mockReturnValue(true);
+    const ctx = createContext({
+      controller: {
+        getStatus: vi.fn().mockReturnValue(makeRunningStatus('plan')),
+        listToolCallEscalations: vi.fn().mockReturnValue([makeEscalation()]),
+        resolveToolCallEscalation,
+      },
+    });
+    const result = await workflowDispatch(ctx, 'workflows.resolveEscalation', {
+      workflowId: id,
+      decision: 'denied',
+    });
+    expect(result).toEqual({ escalationId: 'esc-1', decision: 'denied' });
+    expect(resolveToolCallEscalation).toHaveBeenCalledWith(id, 'esc-1', { decision: 'denied' });
+  });
+
+  it('refuses an approval that does not name the escalation it approves', async () => {
+    // The decider reviewed one escalation; if it expired and the agent
+    // raised another, an id-less approval would land on a call nobody saw.
+    const resolveToolCallEscalation = vi.fn().mockReturnValue(true);
+    const ctx = createContext({
+      controller: {
+        getStatus: vi.fn().mockReturnValue(makeRunningStatus('plan')),
+        listToolCallEscalations: vi.fn().mockReturnValue([makeEscalation({ escalationId: 'raised-later' })]),
+        resolveToolCallEscalation,
+      },
+    });
+    await expect(
+      workflowDispatch(ctx, 'workflows.resolveEscalation', { workflowId: id, decision: 'approved' }),
+    ).rejects.toMatchObject({ code: 'INVALID_PARAMS' });
+    await expect(
+      workflowDispatch(ctx, 'workflows.resolveEscalation', {
+        workflowId: id,
+        decision: 'approved',
+        whitelistSelection: 0,
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_PARAMS' });
+    expect(resolveToolCallEscalation).not.toHaveBeenCalled();
+
+    const result = await workflowDispatch(ctx, 'workflows.resolveEscalation', {
+      workflowId: id,
+      escalationId: 'raised-later',
+      decision: 'approved',
+      whitelistSelection: 0,
+    });
+    expect(result).toEqual({ escalationId: 'raised-later', decision: 'approved' });
+    expect(resolveToolCallEscalation).toHaveBeenCalledWith(id, 'raised-later', {
+      decision: 'approved',
+      whitelistSelection: 0,
+    });
+  });
+
+  it('requires an escalation id when several are pending, and resolves the named one', async () => {
+    const resolveToolCallEscalation = vi.fn().mockReturnValue(true);
+    const ctx = createContext({
+      controller: {
+        getStatus: vi.fn().mockReturnValue(makeRunningStatus('plan')),
+        listToolCallEscalations: vi
+          .fn()
+          .mockReturnValue([makeEscalation({ escalationId: 'a' }), makeEscalation({ escalationId: 'b' })]),
+        resolveToolCallEscalation,
+      },
+    });
+    await expect(
+      workflowDispatch(ctx, 'workflows.resolveEscalation', { workflowId: id, decision: 'denied' }),
+    ).rejects.toMatchObject({ code: 'INVALID_PARAMS' });
+    await workflowDispatch(ctx, 'workflows.resolveEscalation', {
+      workflowId: id,
+      escalationId: 'b',
+      decision: 'denied',
+    });
+    expect(resolveToolCallEscalation).toHaveBeenCalledWith(id, 'b', { decision: 'denied' });
+  });
+
+  it('reports an unknown or no-longer-pending escalation as ESCALATION_NOT_FOUND', async () => {
+    const ctx = createContext({
+      controller: {
+        getStatus: vi.fn().mockReturnValue(makeRunningStatus('plan')),
+        listToolCallEscalations: vi.fn().mockReturnValue([makeEscalation()]),
+        // Expired between the listing and the resolution.
+        resolveToolCallEscalation: vi.fn().mockReturnValue(false),
+      },
+    });
+    await expect(
+      workflowDispatch(ctx, 'workflows.resolveEscalation', {
+        workflowId: id,
+        escalationId: 'nope',
+        decision: 'approved',
+      }),
+    ).rejects.toMatchObject({ code: 'ESCALATION_NOT_FOUND' });
+    await expect(
+      workflowDispatch(ctx, 'workflows.resolveEscalation', { workflowId: id, decision: 'denied' }),
+    ).rejects.toMatchObject({ code: 'ESCALATION_NOT_FOUND' });
+  });
+
+  it('rejects a whitelist selection out of range or on a denial', async () => {
+    const resolveToolCallEscalation = vi.fn().mockReturnValue(true);
+    const ctx = createContext({
+      controller: {
+        getStatus: vi.fn().mockReturnValue(makeRunningStatus('plan')),
+        listToolCallEscalations: vi.fn().mockReturnValue([makeEscalation()]),
+        resolveToolCallEscalation,
+      },
+    });
+    await expect(
+      workflowDispatch(ctx, 'workflows.resolveEscalation', {
+        workflowId: id,
+        escalationId: 'esc-1',
+        decision: 'approved',
+        whitelistSelection: 1,
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_PARAMS' });
+    await expect(
+      workflowDispatch(ctx, 'workflows.resolveEscalation', {
+        workflowId: id,
+        decision: 'denied',
+        whitelistSelection: 0,
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_PARAMS' });
+    expect(resolveToolCallEscalation).not.toHaveBeenCalled();
+  });
+
+  it('reports an unknown workflow as WORKFLOW_NOT_FOUND', async () => {
+    const ctx = createContext({});
+    await expect(
+      workflowDispatch(ctx, 'workflows.resolveEscalation', { workflowId: id, decision: 'approved' }),
+    ).rejects.toBeInstanceOf(RpcError);
+    await expect(
+      workflowDispatch(ctx, 'workflows.resolveEscalation', { workflowId: id, decision: 'approved' }),
+    ).rejects.toMatchObject({ code: 'WORKFLOW_NOT_FOUND' });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // workflows.get -- disk fallback path
 // ---------------------------------------------------------------------------
 
@@ -1226,6 +1603,25 @@ describe('buildPastRunDto', () => {
     const dto = buildPastRunDto(id, makeLoad({ checkpoint: cp }), makeSummary({ workflowId: id }));
     expect(dto.phase).toBe('completed');
     expect(dto.error).toBeUndefined();
+  });
+
+  it('reports a run held by another process as running_elsewhere, without its stale error', () => {
+    const id = 'wf-103b' as WorkflowId;
+    const cp = makeCheckpoint({ machineState: 'plan', context: makeContext({ lastError: 'recovered since' }) });
+    const dto = buildPastRunDto(
+      id,
+      makeLoad({ checkpoint: cp, runningElsewhere: true }),
+      makeSummary({ workflowId: id }),
+    );
+    expect(dto.phase).toBe('running_elsewhere');
+    expect(dto.error).toBeUndefined();
+
+    const noCheckpoint = buildPastRunDto(
+      id,
+      makeLoad({ checkpoint: undefined, runningElsewhere: true }),
+      makeSummary({ workflowId: id }),
+    );
+    expect(noCheckpoint.phase).toBe('running_elsewhere');
   });
 
   it('coerces a race-with-start "running" phase to "interrupted" to keep the DTO well-typed', () => {
@@ -2180,5 +2576,225 @@ describe('workflows.fileTree -- workspace path resolution', () => {
     }
     expect(caught).toBeInstanceOf(RpcError);
     expect((caught as RpcError).code).toBe('WORKFLOW_NOT_FOUND');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// workflows.resolveGate -- gate binding
+// ---------------------------------------------------------------------------
+
+describe('workflows.resolveGate -- gate binding', () => {
+  const id = 'wf-gate' as WorkflowId;
+  const waiting: WorkflowStatus = {
+    phase: 'waiting_human',
+    gate: {
+      gateId: 'wf-gate-review-1-0123456789abcdef',
+      workflowId: id,
+      stateName: 'review',
+      acceptedEvents: ['APPROVE', 'ABORT'],
+      presentedArtifacts: new Map<string, string>(),
+      summary: 'Waiting for human review at review',
+    },
+  };
+
+  async function rpcCode(promise: Promise<unknown>): Promise<string | undefined> {
+    try {
+      await promise;
+      return undefined;
+    } catch (err) {
+      return err instanceof RpcError ? err.code : `unexpected: ${String(err)}`;
+    }
+  }
+
+  it('rejects a decision without gateId before it reaches the orchestrator', async () => {
+    const resolveGate = vi.fn();
+    const ctx = createContext({ controller: { getStatus: vi.fn().mockReturnValue(waiting), resolveGate } });
+
+    const code = await rpcCode(workflowDispatch(ctx, 'workflows.resolveGate', { workflowId: id, event: 'APPROVE' }));
+    expect(code).toBe('INVALID_PARAMS');
+    expect(resolveGate).not.toHaveBeenCalled();
+  });
+
+  it('passes gateId and the declared channel through, defaulting an undeclared caller to rpc', async () => {
+    const resolveGate = vi.fn();
+    const ctx = createContext({ controller: { getStatus: vi.fn().mockReturnValue(waiting), resolveGate } });
+
+    await workflowDispatch(ctx, 'workflows.resolveGate', {
+      workflowId: id,
+      gateId: waiting.gate.gateId,
+      event: 'FORCE_REVISION',
+      prompt: 'tighten it',
+      resolvedBy: 'cli',
+    });
+    expect(resolveGate).toHaveBeenLastCalledWith(id, {
+      gateId: waiting.gate.gateId,
+      type: 'FORCE_REVISION',
+      prompt: 'tighten it',
+      resolvedBy: 'cli',
+    });
+
+    await workflowDispatch(ctx, 'workflows.resolveGate', {
+      workflowId: id,
+      gateId: waiting.gate.gateId,
+      event: 'APPROVE',
+    });
+    expect(resolveGate).toHaveBeenLastCalledWith(id, {
+      gateId: waiting.gate.gateId,
+      type: 'APPROVE',
+      prompt: undefined,
+      resolvedBy: 'rpc',
+    });
+  });
+
+  it('rejects a channel outside the declarable set', async () => {
+    const resolveGate = vi.fn();
+    const ctx = createContext({ controller: { getStatus: vi.fn().mockReturnValue(waiting), resolveGate } });
+    const code = await rpcCode(
+      workflowDispatch(ctx, 'workflows.resolveGate', {
+        workflowId: id,
+        gateId: waiting.gate.gateId,
+        event: 'APPROVE',
+        resolvedBy: 'root',
+      }),
+    );
+    expect(code).toBe('INVALID_PARAMS');
+    expect(resolveGate).not.toHaveBeenCalled();
+  });
+
+  it('maps orchestrator refusals onto typed RPC errors', async () => {
+    const cases: Array<[GateResolutionError['code'], string]> = [
+      ['GATE_MISMATCH', 'GATE_MISMATCH'],
+      ['EVENT_NOT_ACCEPTED', 'EVENT_NOT_ACCEPTED'],
+      ['WORKFLOW_NOT_AT_GATE', 'WORKFLOW_NOT_AT_GATE'],
+      ['WORKFLOW_NOT_FOUND', 'WORKFLOW_NOT_FOUND'],
+      ['FEEDBACK_REQUIRED', 'INVALID_PARAMS'],
+    ];
+    for (const [domainCode, rpc] of cases) {
+      const resolveGate = vi.fn(() => {
+        throw new GateResolutionError(domainCode, `refused: ${domainCode}`);
+      });
+      const ctx = createContext({ controller: { getStatus: vi.fn().mockReturnValue(waiting), resolveGate } });
+      const code = await rpcCode(
+        workflowDispatch(ctx, 'workflows.resolveGate', {
+          workflowId: id,
+          gateId: 'wf-gate-review-0-stale',
+          event: 'APPROVE',
+        }),
+      );
+      expect(code).toBe(rpc);
+    }
+  });
+
+  it('still reports WORKFLOW_NOT_AT_GATE from the status pre-check for a running workflow', async () => {
+    const resolveGate = vi.fn();
+    const ctx = createContext({
+      controller: { getStatus: vi.fn().mockReturnValue(makeRunningStatus('plan')), resolveGate },
+    });
+    const code = await rpcCode(
+      workflowDispatch(ctx, 'workflows.resolveGate', { workflowId: id, gateId: 'anything', event: 'APPROVE' }),
+    );
+    expect(code).toBe('WORKFLOW_NOT_AT_GATE');
+    expect(resolveGate).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Workflow ids are single path segments; import / resume refusals map to codes
+// ---------------------------------------------------------------------------
+
+describe('workflows.* workflow id validation', () => {
+  const unsafeIds = ['../../x', '../escaped', 'a/b', '..', 'x'.repeat(129), 'with space'];
+
+  async function rpcErrorOf(promise: Promise<unknown>): Promise<RpcError> {
+    try {
+      await promise;
+    } catch (err) {
+      if (err instanceof RpcError) return err;
+      throw err;
+    }
+    throw new Error('expected the RPC to fail');
+  }
+
+  it.each([
+    ['workflows.get', {}],
+    ['workflows.getBudget', {}],
+    ['workflows.abort', {}],
+    ['workflows.inspect', {}],
+    ['workflows.messageLog', {}],
+    ['workflows.messageLogEntry', { ref: '0:10' }],
+    ['workflows.fileTree', {}],
+    ['workflows.fileContent', { path: 'a.txt' }],
+    ['workflows.artifacts', { artifactName: 'plan' }],
+    ['workflows.artifactFile', { artifactName: 'plan', path: 'a.md' }],
+    ['workflows.resolveGate', { gateId: 'g', event: 'APPROVE' }],
+    ['workflows.resolveEscalation', { decision: 'denied' }],
+    ['workflows.readme', {}],
+    ['workflows.resume', {}],
+    ['workflows.import', { baseDir: '/tmp' }],
+  ])('%s refuses an id that is not one path segment before touching anything', async (method, extra) => {
+    for (const workflowId of unsafeIds) {
+      const loadPastRun = vi.fn(() => ({ error: 'not_found' as const }));
+      const ctx = createContext({ loadPastRun });
+      const err = await rpcErrorOf(workflowDispatch(ctx, method, { ...extra, workflowId }));
+      expect(err.code).toBe('INVALID_PARAMS');
+      expect(loadPastRun).not.toHaveBeenCalled();
+      const manager = ctx.workflowManager as unknown as {
+        importExternalCheckpoint: ReturnType<typeof vi.fn>;
+      };
+      expect(manager.importExternalCheckpoint).not.toHaveBeenCalled();
+    }
+  });
+
+  it('passes trust to the import only when the caller sets it', async () => {
+    const dir = mkdtempSync(resolve(tmpdir(), 'wf-import-trust-'));
+    try {
+      const ctx = createContext({});
+      const manager = ctx.workflowManager as unknown as { importExternalCheckpoint: ReturnType<typeof vi.fn> };
+      manager.importExternalCheckpoint.mockReturnValue('wf-imported');
+
+      await workflowDispatch(ctx, 'workflows.import', { baseDir: dir });
+      expect(manager.importExternalCheckpoint).toHaveBeenLastCalledWith(dir, undefined, { trust: false });
+
+      await workflowDispatch(ctx, 'workflows.import', { baseDir: dir, workflowId: 'wf-imported', trust: true });
+      expect(manager.importExternalCheckpoint).toHaveBeenLastCalledWith(dir, 'wf-imported', { trust: true });
+
+      await workflowDispatch(ctx, 'workflows.resume', { baseDir: dir, trust: true });
+      expect(manager.importExternalCheckpoint).toHaveBeenLastCalledWith(dir, undefined, { trust: true });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ['WORKFLOW_IMPORT_UNTRUSTED', 'WORKFLOW_IMPORT_UNTRUSTED'],
+    ['WORKFLOW_CHECKPOINT_TOO_NEW', 'WORKFLOW_CHECKPOINT_TOO_NEW'],
+    ['WORKFLOW_WORKSPACE_MISSING', 'WORKFLOW_WORKSPACE_MISSING'],
+    ['WORKFLOW_CHECKPOINT_CORRUPTED', 'WORKFLOW_CORRUPTED'],
+    ['WORKFLOW_INVALID_BASE_DIR', 'INVALID_PARAMS'],
+  ] as const)('maps an import refusal %s to %s on both import and resume', async (code, rpcCode) => {
+    const dir = mkdtempSync(resolve(tmpdir(), 'wf-import-codes-'));
+    try {
+      const ctx = createContext({});
+      const manager = ctx.workflowManager as unknown as { importExternalCheckpoint: ReturnType<typeof vi.fn> };
+      manager.importExternalCheckpoint.mockImplementation(() => {
+        throw new WorkflowResumeError(code, `refused: ${code}`);
+      });
+      for (const method of ['workflows.import', 'workflows.resume']) {
+        const err = await rpcErrorOf(workflowDispatch(ctx, method, { baseDir: dir }));
+        expect(err.code).toBe(rpcCode);
+        expect(err.message).toBe(`refused: ${code}`);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('maps a past run written by a newer IronCurtain to WORKFLOW_CHECKPOINT_TOO_NEW', async () => {
+    const ctx = createContext({
+      loadPastRun: () => ({ error: 'too_new' as const, message: 'written by IronCurtain 99.0.0' }),
+    });
+    const err = await rpcErrorOf(workflowDispatch(ctx, 'workflows.get', { workflowId: 'wf-newer' }));
+    expect(err.code).toBe('WORKFLOW_CHECKPOINT_TOO_NEW');
+    expect(err.message).toContain('99.0.0');
   });
 });

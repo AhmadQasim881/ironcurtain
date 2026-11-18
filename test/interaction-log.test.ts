@@ -1,11 +1,22 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { readFileSync, mkdirSync, rmSync } from 'node:fs';
+import { readFileSync, mkdirSync, rmSync, statSync, chmodSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { InteractionLog, type InteractionEntry } from '../src/session/interaction-log.js';
-import type { Session } from '../src/session/types.js';
+import { prepareRedactionSecrets } from '../src/trusted-process/audit-redactor.js';
+import type { Session, SessionId } from '../src/session/types.js';
 
 const TEST_DIR = resolve('/tmp', `interaction-log-test-${process.pid}`);
 const LOG_PATH = resolve(TEST_DIR, 'interactions.jsonl');
+
+const ANTHROPIC_KEY = 'sk-ant-api03-' + 'abcdefghijklmnopqrstuvWXYZ';
+const CUSTOM_TOKEN = 'corp-deploy-token-' + '0123456789abcdef';
+const ENTRY: InteractionEntry = {
+  timestamp: '2026-02-27T12:00:00.000Z',
+  sessionId: 'test-123',
+  turnNumber: 1,
+  role: 'user',
+  content: '',
+};
 
 function readLogEntries(): InteractionEntry[] {
   const content = readFileSync(LOG_PATH, 'utf-8').trim();
@@ -15,11 +26,16 @@ function readLogEntries(): InteractionEntry[] {
 
 function createMockSession(sessionId: string, sendMessage: (msg: string) => Promise<string>): Session {
   return {
-    getInfo: () => ({ id: sessionId, status: 'ready' as const, turnCount: 0, createdAt: new Date().toISOString() }),
+    getInfo: () => ({
+      id: sessionId as SessionId,
+      status: 'ready' as const,
+      turnCount: 0,
+      createdAt: new Date().toISOString(),
+    }),
     sendMessage,
     getHistory: () => [],
     getDiagnosticLog: () => [],
-    getPendingEscalation: () => undefined,
+    getPendingEscalations: () => [],
     resolveEscalation: async () => {},
     getBudgetStatus: () => ({
       totalInputTokens: 0,
@@ -34,8 +50,12 @@ function createMockSession(sessionId: string, sendMessage: (msg: string) => Prom
         maxSteps: null,
         maxSessionSeconds: null,
         maxEstimatedCostUsd: null,
+        warnThresholdPercent: 80,
       },
+      lastTurn: null,
       cumulative: {
+        totalInputTokens: 0,
+        totalOutputTokens: 0,
         totalTokens: 0,
         stepCount: 0,
         activeSeconds: 0,
@@ -43,7 +63,7 @@ function createMockSession(sessionId: string, sendMessage: (msg: string) => Prom
       },
     }),
     close: async () => {},
-  } as Session;
+  };
 }
 
 describe('InteractionLog', () => {
@@ -127,6 +147,48 @@ describe('InteractionLog', () => {
     expect(entries).toHaveLength(2);
     expect(entries[0].content).toBe('first');
     expect(entries[1].content).toBe('second');
+  });
+
+  it('creates the transcript owner-only (0600) and tightens an existing one', async () => {
+    const log = new InteractionLog(LOG_PATH);
+    await log.close();
+    expect(statSync(LOG_PATH).mode & 0o777).toBe(0o600);
+
+    chmodSync(LOG_PATH, 0o644);
+    const reopened = new InteractionLog(LOG_PATH);
+    await reopened.close();
+    expect(statSync(LOG_PATH).mode & 0o777).toBe(0o600);
+  });
+
+  it('creates a missing directory owner-only (0700)', async () => {
+    const nestedPath = resolve(TEST_DIR, 'sessions', 'abc', 'interactions.jsonl');
+    const log = new InteractionLog(nestedPath);
+    await log.close();
+    expect(statSync(resolve(TEST_DIR, 'sessions', 'abc')).mode & 0o777).toBe(0o700);
+  });
+
+  it('masks API keys and card numbers by default', async () => {
+    const log = new InteractionLog(LOG_PATH);
+    log.log({ ...ENTRY, content: `use ${ANTHROPIC_KEY} and card 4111 1111 1111 1111` });
+    await log.close();
+
+    const raw = readFileSync(LOG_PATH, 'utf-8');
+    expect(raw).not.toContain(ANTHROPIC_KEY);
+    expect(raw).not.toContain('4111 1111 1111 1111');
+    expect(readLogEntries()[0].content).toBe('use sk-a...WXYZ and card 4111 ******** 1111');
+  });
+
+  it('masks the exact credential values it is given, and writes verbatim with null redaction', async () => {
+    const redacted = new InteractionLog(LOG_PATH, { redaction: { secrets: prepareRedactionSecrets([CUSTOM_TOKEN]) } });
+    redacted.log({ ...ENTRY, content: `deploy with ${CUSTOM_TOKEN}` });
+    await redacted.close();
+    const verbatim = new InteractionLog(LOG_PATH, { redaction: null });
+    verbatim.log({ ...ENTRY, content: `deploy with ${CUSTOM_TOKEN}` });
+    await verbatim.close();
+
+    const entries = readLogEntries();
+    expect(entries[0]).toEqual({ ...ENTRY, content: 'deploy with ***REDACTED***' });
+    expect(entries[1].content).toBe(`deploy with ${CUSTOM_TOKEN}`);
   });
 });
 
@@ -244,5 +306,52 @@ describe('BaseTransport.sendAndLog', () => {
     expect(entries).toHaveLength(1);
     expect(entries[0].role).toBe('user');
     expect(entries[0].content).toBe('will fail');
+  });
+
+  /** Runs one sendAndLog turn of `session` through a BaseTransport and returns the transcript. */
+  async function runOneTurn(session: Session, message: string): Promise<InteractionEntry[]> {
+    const { BaseTransport: MockedBaseTransport } = await import('../src/session/base-transport.js');
+    class OneTurnTransport extends MockedBaseTransport {
+      protected async runSession(s: Session): Promise<void> {
+        await this.sendAndLog(s, message);
+      }
+      close(): void {}
+    }
+    await new OneTurnTransport().run(session);
+    return readLogEntries();
+  }
+
+  it("masks the session's known credentials in both sides of the transcript", async () => {
+    const session = {
+      ...createMockSession('sess-redact', async () => `the token is ${CUSTOM_TOKEN}`),
+      getLogRedaction: () => ({ secrets: prepareRedactionSecrets([CUSTOM_TOKEN]) }),
+    } as Session;
+
+    const entries = await runOneTurn(session, `deploy with ${CUSTOM_TOKEN} and ${ANTHROPIC_KEY}`);
+
+    expect(readFileSync(LOG_PATH, 'utf-8')).not.toContain(CUSTOM_TOKEN);
+    expect(entries.map((e) => e.content)).toEqual([
+      'deploy with ***REDACTED*** and sk-a...WXYZ',
+      'the token is ***REDACTED***',
+    ]);
+  });
+
+  it('keeps the transcript verbatim when the session has audit redaction turned off', async () => {
+    const session = {
+      ...createMockSession('sess-verbatim', async () => 'ok'),
+      getLogRedaction: () => null,
+    } as Session;
+
+    const entries = await runOneTurn(session, `key ${ANTHROPIC_KEY}`);
+
+    expect(entries[0].content).toBe(`key ${ANTHROPIC_KEY}`);
+  });
+
+  it('applies the audit redactor patterns for a session that does not say', async () => {
+    const entries = await runOneTurn(
+      createMockSession('sess-default', async () => 'ok'),
+      `key ${ANTHROPIC_KEY}`,
+    );
+    expect(entries[0].content).toBe('key sk-a...WXYZ');
   });
 });

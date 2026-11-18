@@ -24,7 +24,7 @@ import type { LanguageModelV3CallOptions } from '@ai-sdk/provider';
 
 import { PipelineRunner, type PipelineRunConfig, type PipelineModels } from '../src/pipeline/pipeline-runner.js';
 import type { ServerProgressReporter } from '../src/pipeline/pipeline-shared.js';
-import type { PromptCacheStrategy } from '../src/session/prompt-cache.js';
+import { NoOpCacheStrategy } from '../src/session/prompt-cache.js';
 import type { StoredToolAnnotationsFile } from '../src/pipeline/types.js';
 import { createFakePipelineModels } from './fixtures/fake-pipeline-models.js';
 import {
@@ -68,6 +68,7 @@ describe('R3 — MCP-backed list with allowMcpLists:false surfaces past per-serv
             principle: 'Allow fetching news only from major trusted news sites.',
             generationPrompt: 'List the major trusted news site domains.',
             requiresMcp: true, // <-- now needs live MCP
+            mcpServerHint: 'news-db', // a data-backed list must name its server
           },
         ],
       },
@@ -160,7 +161,7 @@ const noopReporter: ServerProgressReporter = {
   done: () => {},
 };
 
-const identityCacheStrategy: PromptCacheStrategy = { wrapSystemPrompt: (s: string) => s };
+const identityCacheStrategy = new NoOpCacheStrategy();
 
 /** System-prompt text from V3 call options (string or system-role message). */
 function systemTextOf(options: LanguageModelV3CallOptions): string {
@@ -209,6 +210,7 @@ function makePerServerFakeModels(logPath: string): PipelineModels {
               principle: 'Allow fetching news only from major trusted news sites.',
               generationPrompt: 'List the major trusted news site domains.',
               requiresMcp: true,
+              mcpServerHint: 'news-db',
             },
           ],
         });

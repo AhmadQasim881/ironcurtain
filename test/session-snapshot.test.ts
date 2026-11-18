@@ -162,10 +162,10 @@ describe('resolveSnapshotResumability (Docker-workload sessions are ephemeral)',
   beforeEach(() => {
     baseDir = mkdtempSync(join(tmpdir(), 'snapshot-workload-'));
     process.env.IRONCURTAIN_HOME = baseDir;
-    // Non-empty conversation state: an ordinary session with this dir resumes.
+    // A real Claude Code transcript: an ordinary session with this dir resumes.
     conversationStateDir = join(baseDir, 'conversation-state');
-    mkdirSync(conversationStateDir, { recursive: true });
-    writeFileSync(join(conversationStateDir, 'history.jsonl'), '{}\n');
+    mkdirSync(join(conversationStateDir, 'projects', '-workspace'), { recursive: true });
+    writeFileSync(join(conversationStateDir, 'projects', '-workspace', 'conversation.jsonl'), '{"type":"user"}\n');
   });
 
   afterEach(() => {
@@ -174,18 +174,30 @@ describe('resolveSnapshotResumability (Docker-workload sessions are ephemeral)',
   });
 
   it('refuses resume for a workload session even with conversation state on disk', () => {
-    const verdict = resolveSnapshotResumability({ conversationStateDir, dockerWorkloadAdmitted: true });
+    const verdict = resolveSnapshotResumability({
+      conversationStateDir,
+      transcriptLayout: 'claude-projects',
+      dockerWorkloadAdmitted: true,
+    });
     expect(verdict.resumable).toBe(false);
     expect(verdict.reason).toMatch(/ephemeral/u);
   });
 
   it('keeps an ordinary session with conversation state resumable', () => {
-    const verdict = resolveSnapshotResumability({ conversationStateDir, dockerWorkloadAdmitted: false });
+    const verdict = resolveSnapshotResumability({
+      conversationStateDir,
+      transcriptLayout: 'claude-projects',
+      dockerWorkloadAdmitted: false,
+    });
     expect(verdict).toEqual({ resumable: true, reason: undefined });
   });
 
   it('refuses resume when no conversation state was recorded', () => {
-    const verdict = resolveSnapshotResumability({ conversationStateDir: undefined, dockerWorkloadAdmitted: false });
+    const verdict = resolveSnapshotResumability({
+      conversationStateDir: undefined,
+      transcriptLayout: undefined,
+      dockerWorkloadAdmitted: false,
+    });
     expect(verdict.resumable).toBe(false);
     expect(verdict.reason).toMatch(/conversation state/u);
   });
@@ -197,7 +209,11 @@ describe('resolveSnapshotResumability (Docker-workload sessions are ephemeral)',
       ['workload-session', true],
       ['ordinary-session', false],
     ] as const) {
-      const verdict = resolveSnapshotResumability({ conversationStateDir, dockerWorkloadAdmitted });
+      const verdict = resolveSnapshotResumability({
+        conversationStateDir,
+        transcriptLayout: 'claude-projects',
+        dockerWorkloadAdmitted,
+      });
       createFakeSessionDir(
         baseDir,
         sessionId,
@@ -209,5 +225,60 @@ describe('resolveSnapshotResumability (Docker-workload sessions are ephemeral)',
     expect(validateResumeSession('ordinary-session').resumable).toBe(true);
 
     rmSync(workspaceDir, { recursive: true, force: true });
+  });
+});
+
+/**
+ * Resumability comes from real transcripts, not from a non-empty state
+ * directory: the seeds (`projects/`, `sessions/`, `logs/`), settings files and
+ * CLAUDE.md make every directory non-empty, so a session that never held a
+ * conversation used to be listed by mux /resume.
+ */
+describe('resolveSnapshotResumability (real transcripts only)', () => {
+  let stateDir: string;
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), 'snapshot-transcripts-'));
+  });
+
+  afterEach(() => {
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  function verdict(transcriptLayout: 'claude-projects' | 'codex-rollouts' | 'goose-sessions') {
+    return resolveSnapshotResumability({
+      conversationStateDir: stateDir,
+      transcriptLayout,
+      dockerWorkloadAdmitted: false,
+    });
+  }
+
+  it('Claude Code: seeded projects/, settings.json and CLAUDE.md are not resumable', () => {
+    mkdirSync(join(stateDir, 'projects'));
+    writeFileSync(join(stateDir, 'settings.json'), '{}');
+    writeFileSync(join(stateDir, 'CLAUDE.md'), '# rules');
+    expect(verdict('claude-projects')).toEqual({ resumable: false, reason: 'no conversation transcript was recorded' });
+
+    mkdirSync(join(stateDir, 'projects', '-workspace'));
+    writeFileSync(join(stateDir, 'projects', '-workspace', 'c0ffee.jsonl'), '{"type":"user"}\n');
+    expect(verdict('claude-projects').resumable).toBe(true);
+  });
+
+  it('Codex: seeded sessions/ and logs/ are not resumable; a rollout is', () => {
+    mkdirSync(join(stateDir, 'sessions'));
+    mkdirSync(join(stateDir, 'logs'));
+    writeFileSync(join(stateDir, 'config.toml'), 'web_search = "disabled"\n');
+    expect(verdict('codex-rollouts').resumable).toBe(false);
+
+    const dayDir = join(stateDir, 'sessions', '2026', '11', '11');
+    mkdirSync(dayDir, { recursive: true });
+    writeFileSync(join(dayDir, 'rollout-2026-11-11T10-00-00-01a1b67b-5e92-7fb0-aa3e-ebe122186d0b.jsonl'), '{}\n');
+    expect(verdict('codex-rollouts').resumable).toBe(true);
+  });
+
+  it('Goose: resumable once its session store holds data', () => {
+    expect(verdict('goose-sessions').resumable).toBe(false);
+    writeFileSync(join(stateDir, 'sessions.db'), 'SQLite format 3\0');
+    expect(verdict('goose-sessions').resumable).toBe(true);
   });
 });

@@ -5,9 +5,10 @@
  */
 
 import { resolve } from 'node:path';
-import { getRoleDefinition, resolveRealPath, expandTilde } from '../types/argument-roles.js';
+import { getRoleDefinition, resolveRealPath } from '../types/argument-roles.js';
 import type { ToolAnnotation, ArgumentRole } from '../pipeline/types.js';
 import type { RoleDefinition } from '../types/argument-roles.js';
+import { assertArgumentValueBudget, type ArgumentValueLimits } from './argument-budget.js';
 
 export { expandTilde } from '../types/argument-roles.js';
 
@@ -15,20 +16,21 @@ export { expandTilde } from '../types/argument-roles.js';
 // Absolute vs relative path detection
 // ---------------------------------------------------------------------------
 
-/** Returns true if the path is absolute (starts with `/` or `~`). */
+/**
+ * Returns true if the path is absolute: it starts with `/`, or is `~` or
+ * `~/...` (which `expandTilde` turns into the home directory). A
+ * `~name/...` value is relative: nothing expands it.
+ */
 function isAbsolutePath(value: string): boolean {
-  return value.startsWith('/') || value.startsWith('~');
+  return value.startsWith('/') || value === '~' || value.startsWith('~/');
 }
 
 /**
- * Resolves a relative path against the sandbox directory for policy evaluation.
- * Applies tilde expansion first, then resolves against the sandbox base,
- * then follows symlinks via resolveRealPath.
+ * Resolves a relative path against the sandbox directory, then follows
+ * symlinks via resolveRealPath.
  */
 function resolveAgainstSandbox(value: string, sandboxDir: string): string {
-  const expanded = expandTilde(value);
-  const absolute = resolve(sandboxDir, expanded);
-  return resolveRealPath(absolute);
+  return resolveRealPath(resolve(sandboxDir, value));
 }
 
 // ---------------------------------------------------------------------------
@@ -38,7 +40,11 @@ function resolveAgainstSandbox(value: string, sandboxDir: string): string {
 export interface PreparedToolArgs {
   /** Canonical args sent to the real MCP server. */
   argsForTransport: Record<string, unknown>;
-  /** Args presented to the policy engine (may differ for relative paths when allowedDirectory is set). */
+  /**
+   * Args presented to the policy engine. Every resource-role value is the
+   * same canonical value sent in `argsForTransport`, so the server acts on
+   * exactly what policy evaluated.
+   */
   argsForPolicy: Record<string, unknown>;
 }
 
@@ -66,22 +72,15 @@ function normalizeArgValue(value: unknown, normalize: (v: string) => string): un
 }
 
 /**
- * Normalizes a single path argument for transport, handling the
- * absolute/relative split. Absolute paths get full normalization;
- * relative paths pass through unchanged (the MCP server resolves
- * them against its own CWD, which is the sandbox directory).
+ * Normalizes a path argument to an absolute canonical path. Absolute paths
+ * get full normalization; relative paths are resolved against the sandbox
+ * (allowedDirectory). The result is used for both policy evaluation and
+ * transport: a relative value left for the MCP server would be resolved
+ * against the server's own working directory (a per-server temp directory,
+ * the IronCurtain launch directory, or for git's '.' its session working
+ * directory), i.e. against a different directory than policy checked.
  */
-function normalizePathForTransport(value: unknown, def: RoleDefinition): unknown {
-  return normalizeArgValue(value, (v) => (isAbsolutePath(v) ? def.canonicalize(v) : v));
-}
-
-/**
- * Normalizes a single path argument for policy evaluation. Absolute
- * paths get full normalization; relative paths are resolved against
- * the sandbox (allowedDirectory) so the policy engine can perform
- * containment checks with absolute canonical paths.
- */
-function normalizePathForPolicy(value: unknown, def: RoleDefinition, allowedDirectory: string): unknown {
+function normalizePathArg(value: unknown, def: RoleDefinition, allowedDirectory: string): unknown {
   return normalizeArgValue(value, (v) =>
     isAbsolutePath(v) ? def.canonicalize(v) : resolveAgainstSandbox(v, allowedDirectory),
   );
@@ -165,22 +164,50 @@ export function rewriteResultContent(content: unknown, hostDir: string, containe
 }
 
 /**
+ * Rewrites host sandbox paths back to container workspace paths in an MCP
+ * result's `structuredContent` (any JSON value), the same way
+ * {@link rewriteResultContent} does in its text blocks: every occurrence of
+ * the host directory in any string becomes the container directory. The
+ * value is never mutated; one that does not mention the host directory is
+ * returned as is.
+ *
+ * Throws when the value cannot be serialized (it came from JSON, so it always
+ * can); the caller then drops it rather than forward host paths.
+ */
+export function rewriteStructuredContent(value: unknown, hostDir: string, containerDir: string): unknown {
+  if (value === undefined || value === null) return value;
+  const normHost = hostDir !== '/' && hostDir.endsWith('/') ? hostDir.slice(0, -1) : hostDir;
+  if (!normHost) return value;
+  const json = JSON.stringify(value);
+  // Both directories are matched and written in their JSON-escaped spelling, so a
+  // path with a quote or a backslash in it is still found and stays valid JSON.
+  const escapedHost = JSON.stringify(normHost).slice(1, -1);
+  if (!json.includes(escapedHost)) return value;
+  const escapedContainer = JSON.stringify(containerDir).slice(1, -1);
+  return JSON.parse(json.replaceAll(escapedHost, escapedContainer)) as unknown;
+}
+
+/**
  * Annotation-driven normalization of tool call arguments.
  *
  * For each argument, looks up its annotated roles and applies the
  * corresponding normalizer from the registry. Returns two argument
  * objects: one for transport (MCP server) and one for policy evaluation.
  *
- * For path-category roles, relative paths (not starting with `/` or `~`)
- * are treated differently:
- *   - Transport: passed through unchanged (the MCP server resolves them
- *     against its own sandbox CWD)
- *   - Policy: resolved against `allowedDirectory` so the policy engine
- *     has absolute canonical paths for containment checks
+ * For path-category roles with `allowedDirectory` set, relative paths (not
+ * `/...`, `~` or `~/...`) are resolved against `allowedDirectory` and
+ * canonicalized, and that absolute path is what both policy and transport
+ * receive. The MCP server therefore never resolves a relative path against
+ * its own working directory, which is not the sandbox (for git: a per-server
+ * temp directory under srt, the IronCurtain launch directory otherwise).
  *
  * When `containerWorkspaceDir` is set (Docker agent mode), path arguments
  * starting with that prefix are rewritten to host paths under
  * `allowedDirectory` before any other normalization.
+ *
+ * Arguments without a resource role are copied unchanged. The pipeline
+ * denies calls carrying arguments the annotation does not list at all
+ * (rule `unannotated-arguments`) before calling this function.
  *
  * The input object is never mutated.
  */
@@ -189,7 +216,9 @@ export function prepareToolArgs(
   annotation: ToolAnnotation,
   allowedDirectory?: string,
   containerWorkspaceDir?: string,
+  argumentValueLimits?: Partial<ArgumentValueLimits>,
 ): PreparedToolArgs {
+  assertArgumentValueBudget(args, annotation, argumentValueLimits);
   const argsForTransport: Record<string, unknown> = {};
   const argsForPolicy: Record<string, unknown> = {};
 
@@ -207,9 +236,11 @@ export function prepareToolArgs(
           : value;
 
       if (def.category === 'path' && allowedDirectory) {
-        // Path roles with sandbox context: split relative vs absolute
-        argsForTransport[key] = normalizePathForTransport(rewritten, def);
-        argsForPolicy[key] = normalizePathForPolicy(rewritten, def, allowedDirectory);
+        // Path roles with sandbox context: relative values resolve against
+        // the sandbox, and transport receives the path policy evaluates.
+        const normalized = normalizePathArg(rewritten, def, allowedDirectory);
+        argsForTransport[key] = normalized;
+        argsForPolicy[key] = normalized;
       } else {
         // Non-path roles (URLs, opaque) or no sandbox: normalize for both
         const transportValue = normalizeArgValue(rewritten, def.canonicalize);

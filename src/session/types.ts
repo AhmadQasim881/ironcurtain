@@ -1,14 +1,18 @@
 import { randomUUID } from 'node:crypto';
 import type { DockerAuthKind, IronCurtainConfig } from '../config/types.js';
-import type { Sandbox } from '../sandbox/index.js';
+import type { Sandbox, SandboxInitOptions } from '../sandbox/index.js';
 import type { ResolvedResourceBudgetConfig } from '../config/user-config.js';
-import type { CumulativeBudgetSnapshot } from './resource-budget-tracker.js';
+import type { CumulativeBudgetSnapshot, TurnBudgetSnapshot } from './resource-budget-tracker.js';
 import type { AgentId, TransientFailureKind } from '../docker/agent-adapter.js';
 import type { AgentImageResolution, DockerInfrastructure } from '../docker/docker-infrastructure.js';
 import type { WhitelistCandidateIpc } from '../trusted-process/approval-whitelist.js';
+import type { LogRedaction } from '../trusted-process/audit-redactor.js';
+import type { TrustedUserMessage } from '../trusted-process/escalation-context.js';
+import type { WorkflowCommitHandler } from '../trusted-process/workflow-commit-tool.js';
 import type { WorkflowId } from '../workflow/types.js';
 import type { ResolvedDockerWorkloadConfig } from '../docker-workload/config.js';
 import type { ResourceWatchdogPolicy } from '../docker/resource-watchdog.js';
+import type { ReadOnlyWorkspace } from '../types/read-only-workspace.js';
 
 /**
  * Unique identifier for a session. Branded to prevent accidental
@@ -126,6 +130,14 @@ export interface SessionMetadata {
   readonly persona?: string;
   readonly workspacePath?: string;
   /**
+   * The agent the session was created with: `'builtin'` or a container
+   * agent ID. `ironcurtain start --resume` defaults to it, and the session
+   * factory refuses a resume across the builtin/container boundary (see
+   * `findResumeAgentConflict()` in session-metadata.ts). Absent on sessions
+   * created before it was recorded.
+   */
+  readonly agent?: string;
+  /**
    * Resolved provider-profile name (`'native'` or a configured profile).
    * Stored as the resolved name — not "no intent" — so a resumed session
    * keeps its original profile even if `modelProviders.default` later
@@ -133,6 +145,12 @@ export interface SessionMetadata {
    */
   readonly providerProfileName?: string;
   readonly policyDir?: string;
+  /**
+   * Task-scope directory of a `--task-scoped` session (canonical path).
+   * Restored on resume so the resumed session keeps the same task scope; a
+   * directory that no longer validates refuses the resume.
+   */
+  readonly taskPolicyDir?: string;
   readonly disableAutoApprove?: boolean;
   /**
    * Agent-CLI conversation id assigned when this session was first
@@ -143,6 +161,15 @@ export interface SessionMetadata {
    * case (legacy-session fallback).
    */
   readonly agentConversationId?: AgentConversationId;
+
+  /**
+   * The workflow run this session is an agent state of (absent outside
+   * workflows, and for sessions created before the field). A state that runs
+   * as its own session (builtin, or Docker without `sharedContainer`) keeps
+   * its audit log under `sessions/`, so `ironcurtain audit report --workflow
+   * <id>` finds that log by this field.
+   */
+  readonly workflowRunId?: string;
 
   /**
    * Present only for secure nested Docker-workload sessions. Records the
@@ -219,10 +246,16 @@ export interface ConversationTurn {
     cacheWriteTokens: number;
     /** Provider-reported thinking/reasoning subset when available. */
     thinkingTokens?: number | null;
-    /** Whether the numeric values cover every observed exchange in the turn. */
+    /**
+     * Whether the numeric values cover every observed exchange in the turn.
+     * When partial, the values are lower bounds: the known parts of partly
+     * measured exchanges are included.
+     */
     usageCompleteness?: 'complete' | 'partial' | 'unavailable';
     observedExchanges?: number;
     incompleteExchanges?: number;
+    /** Exchanges whose usage is entirely unknown (counted as nothing, not as a measured zero). */
+    unmeasuredExchanges?: number;
   };
 
   /** ISO 8601 timestamp when this turn started. */
@@ -256,11 +289,145 @@ export type DiagnosticEvent =
       readonly originalMessageCount: number;
       readonly newMessageCount: number;
       readonly summaryPreview: string;
+    }
+  | {
+      /**
+       * An MCP server's live tools differ from its stored annotations in a
+       * way that changes what policy evaluates
+       * (`trusted-process/schema-drift.ts`): calls carrying unannotated
+       * arguments are denied and conditional roles may fall back to their
+       * defaults until the server is re-annotated. Emitted while the session
+       * initializes, once per such server
+       * (`session/annotation-drift-diagnostics.ts`).
+       */
+      readonly kind: 'annotation_drift';
+      readonly serverName: string;
+      /** One-line summary of what drifted (tool and argument names). */
+      readonly message: string;
+      /** The `annotate-tools` command that refreshes the server's annotations. */
+      readonly hint: string;
+    }
+  | {
+      /**
+       * The compaction summarizer failed. The turn continued with the
+       * uncompacted history; the next attempt waits `retryAfterTurns` turns.
+       */
+      readonly kind: 'message_compaction_failed';
+      /** One-line error description (may carry provider error text). */
+      readonly reason: string;
+      readonly retryAfterTurns: number;
+    }
+  | {
+      /**
+       * An MCP server of the session could not be started (its relay failed
+       * to connect or to list its tools; see `Sandbox.getUnavailableServers`).
+       * The session runs without it, so the agent cannot use its tools.
+       * Emitted while the session initializes, once per such server.
+       */
+      readonly kind: 'mcp_server_unavailable';
+      readonly serverName: string;
+      /** One line of error text (may carry server-provided text). */
+      readonly reason: string;
+    }
+  | {
+      /**
+       * A host-side model the session uses has no credentials
+       * (`session/host-model-roles.ts`), so the session changed course:
+       * `agent_model` summarizes with the agent's model instead, `disabled`
+       * turns the feature off for this session, `degraded` runs it without
+       * the model (memory without LLM summarization). Emitted while the
+       * session initializes.
+       */
+      readonly kind: 'host_model_fallback';
+      readonly role: HostModelNoticeRole;
+      readonly action: HostModelNoticeAction;
+      /** What happened and how to fix the configuration. */
+      readonly message: string;
+    }
+  | {
+      /**
+       * The compiled policy the session enforces may be stale: it records no
+       * provenance, comes from another policy compiler or engine version, or
+       * was compiled against other tool annotations, or it has rules without
+       * a server condition (`config/policy-provenance-check.ts`). Under
+       * `policy.onStale: "warn"` (the default) the session runs with it.
+       * Emitted while the session initializes, once per warning.
+       */
+      readonly kind: 'policy_stale';
+      /**
+       * The warning with the rebuild command: display-sanitized and bounded
+       * (`startup-notices.ts`); line feeds separate its reasons.
+       */
+      readonly message: string;
+    }
+  | {
+      /**
+       * The host-mount privilege scan (`docker/host-mount-privilege-scan.ts`,
+       * Docker daemons where container root is host root) found setuid/setgid
+       * or root-owned entries in the agent container's read-write host
+       * mounts. Emitted after an agent turn for what no earlier scan of the
+       * bundle reported (or what came back after it was removed), and at
+       * session end for everything left; never for a scan that found nothing.
+       */
+      readonly kind: 'host_privileged_files';
+      /** When the scan ran: `after agent turn` or `session end`. */
+      readonly when: string;
+      /** setuid/setgid files the scan neutralized (it removed the bits). */
+      readonly stripped: number;
+      /** setuid/setgid files it could not change: owned by root or another user. */
+      readonly unstripped: number;
+      /** Other root-owned entries. */
+      readonly rootOwned: number;
+      /** Findings beyond the scan's listing cap, counted but not named in the counts above. */
+      readonly unlisted: number;
+      /** The first host paths among them, unneutralized files first; display-sanitized. */
+      readonly paths: readonly string[];
+      /** The scan could not list everything (entry limit, unreadable directories). */
+      readonly incomplete: boolean;
+      /** What the user should do about them. */
+      readonly hint: string;
     };
+
+/** Host-model roles a session checks for credentials (see `host_model_fallback`). */
+export type HostModelNoticeRole = 'summary' | 'autoApprove' | 'memory';
+
+/** What a session did about a role without credentials (see `host_model_fallback`). */
+export type HostModelNoticeAction = 'agent_model' | 'disabled' | 'degraded';
+
+/**
+ * How a session's cost figures were obtained.
+ * - `observed`: every LLM exchange observed for the session carried a cost
+ *   (gateway-reported, or the host's list-price estimate).
+ * - `reported`: the agent's own cumulative report (or OpenRouter's summed
+ *   `usage.cost` from the token stream).
+ * - `partial`: a lower bound: the observed exchanges that carried a cost.
+ * - `unknown`: nothing reported a cost. The amount reads 0; renderers show
+ *   "unknown", never "$0.00".
+ */
+export type BudgetCostSource = 'observed' | 'reported' | 'partial' | 'unknown';
+
+/**
+ * What the MITM budget gate of a Docker bundle has charged so far
+ * (`docker/budget-gate.ts`): every completion request the bundle's proxy
+ * forwarded, whatever metrics lease it carried, at its measured tokens or a
+ * conservative estimate when usage could not be measured, priced at list
+ * prices (or the gateway's reported cost). Bundle-wide: the charges of a
+ * shared workflow bundle cover every session that borrows it.
+ */
+export interface BudgetGateCharges {
+  readonly bundleId: string;
+  readonly totalTokens: number;
+  readonly costUsd: number;
+}
 
 /**
  * Budget status: current consumption snapshot plus configured limits.
  * Exposed to transports for the /budget command and end-of-session summary.
+ *
+ * For builtin sessions the top-level consumption fields describe the turn in
+ * progress and read zero between turns (limits are per turn). Anything that
+ * reports after a turn has ended -- cron run records, web DTOs, Signal
+ * summaries -- reads `cumulative` (session totals) or `lastTurn`.
  */
 export interface BudgetStatus {
   readonly totalInputTokens: number;
@@ -269,8 +436,36 @@ export interface BudgetStatus {
   readonly stepCount: number;
   readonly elapsedSeconds: number;
   readonly estimatedCostUsd: number;
+  /**
+   * Where the cost figures (`estimatedCostUsd`, `cumulative` and `lastTurn`)
+   * come from. Absent for a session that prices every step itself (the
+   * builtin agent), whose cost is always known.
+   */
+  readonly costSource?: BudgetCostSource;
   readonly limits: ResolvedResourceBudgetConfig;
+  /** The most recently completed turn; null until the first turn ends. */
+  readonly lastTurn: TurnBudgetSnapshot | null;
   readonly cumulative: CumulativeBudgetSnapshot;
+
+  /**
+   * Cumulative cost from host-observed sources only (MITM/gateway usage
+   * records). Docker sessions always set it, because their
+   * `cumulative.estimatedCostUsd` falls back to the agent CLI's own
+   * `total_cost_usd` self-report, which is display-only and must never drive
+   * a decision (a compromised agent prints whatever it likes). Absent on
+   * builtin sessions, whose `estimatedCostUsd` is itself host-computed.
+   * Budget admission uses this when present, else `cumulative.estimatedCostUsd`.
+   */
+  readonly hostObservedCostUsd?: number;
+
+  /**
+   * The charges of the budget gate of the Docker bundle the session runs in
+   * (its own, or the workflow bundle it borrows). The gate counts every
+   * completion, attributed or not and whether or not statistics are on, so a
+   * workflow's run-wide ceiling counts it too (`workflow/workflow-usage.ts`).
+   * Absent for builtin sessions and for a bundle without a gate.
+   */
+  readonly budgetGate?: BudgetGateCharges;
 
   /** False for Docker sessions where token usage is not observable. */
   readonly tokenTrackingAvailable: boolean;
@@ -278,6 +473,8 @@ export interface BudgetStatus {
   readonly tokenTrackingStatus?: 'complete' | 'partial' | 'unavailable';
   readonly observedExchanges?: number;
   readonly incompleteExchanges?: number;
+  /** Exchanges whose usage is entirely unknown; budget logic must not read them as zero usage. */
+  readonly unmeasuredExchanges?: number;
 }
 
 /**
@@ -294,9 +491,11 @@ export interface SessionInfo {
 /**
  * Factory function for creating sandbox instances.
  * The default creates a real Sandbox wrapping UTCP Code Mode's V8 isolate.
- * Tests provide a factory returning a mock.
+ * Tests provide a factory returning a mock. `options` carries the
+ * session's coordinator hooks (today only a workflow state's
+ * `workflowCommit` target); it is absent for ordinary sessions.
  */
-export type SandboxFactory = (config: IronCurtainConfig) => Promise<Sandbox>;
+export type SandboxFactory = (config: IronCurtainConfig, options?: SandboxInitOptions) => Promise<Sandbox>;
 
 /**
  * Escalation request data surfaced to the transport.
@@ -311,8 +510,65 @@ export interface EscalationRequest {
   readonly arguments: Record<string, unknown>;
   readonly reason: string;
   readonly context?: Readonly<Record<string, string>>;
+  /**
+   * When the trusted process raised the request (ISO 8601), as written into
+   * the request file. The escalation watcher surfaces several pending
+   * requests of one session oldest first by it. Absent for a request that
+   * did not come from a request file, or from one that carries none.
+   */
+  readonly createdAt?: string;
   /** Whitelist candidates for display. Present when the proxy supports whitelisting. */
   readonly whitelistCandidates?: readonly WhitelistCandidateIpc[];
+  /**
+   * The call must be approved by a human, one escalation at a time (see
+   * `EvaluationResult.humanOnly`): the auto-approver was not consulted, no
+   * whitelist candidate exists, and bulk commands such as `/approve all`
+   * must skip it so an operator approves it knowingly. Absent otherwise.
+   */
+  readonly humanOnly?: boolean;
+  /**
+   * TRUSTED: the human's most recent message to the session, as the trusted
+   * host recorded it (the session for its own turns, the mux or web UI
+   * trusted-input bar for a PTY session), with the time it was sent. The
+   * pipeline reads it like the auto-approver does but also shows a stale
+   * one, with its time. Absent when there is none: no message yet, a turn
+   * IronCurtain generated, or a PTY session whose trusted-input bar was not
+   * used. See trusted-process/escalation-context.ts.
+   */
+  readonly lastTrustedUserMessage?: TrustedUserMessage;
+  /**
+   * TRUSTED: the task the session was started with, its first human message
+   * (an `ironcurtain start` task, a cron job's task description), attached by
+   * the session (escalation/escalation-review.ts) or by the workflow
+   * orchestrator (the workflow's task). Absent for PTY sessions.
+   */
+  readonly taskSummary?: string;
+  /**
+   * UNTRUSTED: the agent's own explanation, the `justification` it passed to
+   * the `execute_code` chain that issued the call. Written by the agent and
+   * attacker-controlled under the threat model: front-ends show it escaped,
+   * set apart and labelled as the agent's; the auto-approver never sees it
+   * and it authorizes nothing.
+   */
+  readonly agentJustification?: string;
+}
+
+/**
+ * Where a message handed to `Session.sendMessage()` comes from.
+ *
+ * - `user`: typed or sent by the human (the default). The session records it
+ *   as the trusted user context the auto-approver matches escalations against.
+ * - `system`: generated by IronCurtain itself from content an agent may have
+ *   written (the memory auto-save prompt replays the agent's own replies; a
+ *   workflow state's prompt embeds the previous states' output). The session
+ *   clears the trusted user context for the turn instead, so an escalation
+ *   raised while the turn runs always reaches a human.
+ */
+export type MessageOrigin = 'user' | 'system';
+
+export interface SendMessageOptions {
+  /** Defaults to `'user'`. */
+  readonly origin?: MessageOrigin;
 }
 
 /**
@@ -354,6 +610,10 @@ export interface WorkflowBorrowOptions {
    * state owns its own bundle) still pass workflow-bundled skills
    * through this record — they have no infrastructure to borrow but
    * still need the rest of the workflow context.
+   *
+   * The bundle's MCP servers were fixed when it was minted, and it runs
+   * no memory server, so a borrowing session has memory off whatever its
+   * persona says (`borrowedBundle` in `isMemoryEnabledFor`).
    */
   readonly infrastructure?: DockerInfrastructure;
 
@@ -406,6 +666,27 @@ export interface WorkflowBorrowOptions {
    * is true, those fields are ignored and the resolver returns `[]`.
    */
   readonly disableAllSkills?: boolean;
+
+  /**
+   * Target of the coordinator-owned `workflow_commit` tool for a workflow
+   * state that builds its own coordinator (builtin mode, or a Docker state
+   * that owns its container): the session's coordinator offers the tool and
+   * dispatches every call to this handler (see
+   * `src/trusted-process/workflow-commit-tool.ts`). Ignored when
+   * `infrastructure` is set: a borrowed bundle's coordinator was built with
+   * the bundle's own handler.
+   */
+  readonly workflowCommit?: WorkflowCommitHandler;
+
+  /**
+   * Runs the session on a read-only workspace whose agent may change only
+   * `writablePaths` (a `workspaceAccess: read-only` workflow state): see
+   * `applyReadOnlyWorkspace` in `src/config/read-only-workspace.ts`. Only for
+   * a session that builds its own environment. A borrowed bundle
+   * (`infrastructure`) got its scope's workspace access when it was minted,
+   * so `buildSessionConfig` refuses the two together.
+   */
+  readonly readOnlyWorkspace?: ReadOnlyWorkspace;
 }
 
 /**
@@ -425,7 +706,20 @@ export interface SessionOptions {
   /** Exact Docker image prepared by the CLI preflight for this session. */
   preparedDockerImageResolution?: AgentImageResolution;
 
-  /** If provided, reuses the sandbox from this previous session via symlink. */
+  /**
+   * Aborts standalone Docker session setup (Ctrl-C during startup): container
+   * readiness waits end early and the partially created infrastructure is torn
+   * down before the factory rejects. Ignored once the session exists; close it
+   * instead.
+   */
+  abortSignal?: AbortSignal;
+
+  /**
+   * If provided, resumes this previous session: its directory tree, its
+   * workspace and the settings recorded in its metadata. A builtin session
+   * also keeps this ID, continues the conversation saved in its
+   * `messages.jsonl`, and is refused while another process runs it.
+   */
   resumeSessionId?: string;
 
   /**
@@ -451,10 +745,12 @@ export interface SessionOptions {
   onEscalation?: (request: EscalationRequest) => void;
 
   /**
-   * Callback invoked when a pending escalation expires (proxy timed out).
-   * The transport uses this to clear the escalation banner and notify the user.
+   * Callback invoked when a pending escalation expires (proxy timed out),
+   * with its ID. Several escalations can be pending at once, each expiring
+   * on its own. The transport uses this to clear that escalation's banner
+   * and notify the user.
    */
-  onEscalationExpired?: () => void;
+  onEscalationExpired?: (escalationId: string) => void;
 
   /**
    * Callback invoked when a pending escalation is resolved (approved or denied).
@@ -467,13 +763,22 @@ export interface SessionOptions {
    * Callback invoked during message processing with diagnostic events.
    * Transports use this to display progress (e.g., tool call previews).
    * If not provided, diagnostics are silently dropped.
+   *
+   * A caller that passes one shows the user the session's notices
+   * (`isSessionNotice` in `startup-notices.ts`): the start-up notices,
+   * emitted while the session initializes (a stale policy among them), and
+   * host-mount findings after turns and at the end. Without one, a stale-policy
+   * warning is written to stderr when the session's policy is loaded.
    */
   onDiagnostic?: (event: DiagnosticEvent) => void;
 
   /**
    * Validated workspace path. When provided, this existing directory replaces
    * the session sandbox as the agent's working area (allowedDirectory).
-   * Must be validated via validateWorkspacePath() before passing here.
+   * A user-supplied path must be validated via validateWorkspacePath() and
+   * passed in the canonical form it returns. Only directories IronCurtain
+   * derives itself (a persona workspace, a workflow run's default workspace)
+   * may skip that step.
    */
   workspacePath?: string;
 
@@ -494,6 +799,19 @@ export interface SessionOptions {
    * Used by cron sessions to load task-scoped policy.
    */
   policyDir?: string;
+
+  /**
+   * Task scope (`--task-scoped`): a published task-scope directory (see
+   * `config/task-scope-policy.ts`) compiled from this session's task text
+   * by the CLI entry point. Its policy is intersected with the session
+   * policy (global, persona or `policyDir`) rather than replacing it: a
+   * call must be allowed by both, a call outside the task scope escalates,
+   * and the most restrictive decision wins. Validated by
+   * `buildSessionConfig`; a directory that does not validate refuses the
+   * session. Persisted in the session metadata for resume. Never set by
+   * default: task scoping is opt-in only.
+   */
+  taskPolicyDir?: string;
 
   /**
    * Additional content appended to the system prompt.
@@ -518,21 +836,44 @@ export interface SessionOptions {
   persona?: string;
 
   /**
+   * Explicit user override: run the persona (or resume the cron job session)
+   * even though its compiled policy no longer matches its constitution (the
+   * session log records a warning). Without it a stale persona, or a resumed
+   * job session whose job policy is stale, is refused. Only interactive entry
+   * points set this (`ironcurtain start --allow-stale-policy`); unattended
+   * sessions (cron jobs, workflows) never do.
+   */
+  allowStalePolicy?: boolean;
+
+  /**
    * Cron job ID. When set (and no persona), the memory server uses
    * a job-specific database at ~/.ironcurtain/jobs/{jobId}/memory.db.
    */
   jobId?: string;
 
   /**
-   * Partial overrides for the resolved resource budget config.
-   * Applied on top of the global defaults and user config.
-   * Workflows use this to apply their saved effective resource limits.
+   * Resource limits the caller sets explicitly for this session: a
+   * workflow's `settings.resourceBudget`, a cron job's `budgetOverrides`.
+   * They take precedence over the persona's `resourceBudget`, which in turn
+   * takes precedence over {@link resourceBudgetBaseline} and the config's
+   * `resourceBudget` (see src/session/model-budget-precedence.ts).
    */
   resourceBudgetOverrides?: Partial<ResolvedResourceBudgetConfig>;
 
   /**
-   * Qualified model ID ("provider:model-name") for this session only.
-   * Takes precedence over `config.agentModelId` when set.
+   * The caller's own default limits for this session, below the persona's
+   * `resourceBudget` and above the config's `resourceBudget`: the
+   * global/default limits a workflow run saved when it started, the cron
+   * defaults for a job run.
+   */
+  resourceBudgetBaseline?: Partial<ResolvedResourceBudgetConfig>;
+
+  /**
+   * Qualified model ID ("provider:model-name") for this session only:
+   * `--model` on the command line, or a workflow state's or workflow's
+   * `model`. Takes precedence over the persona's `agentModelId`, which takes
+   * precedence over `config.agentModelId` (see
+   * src/session/model-budget-precedence.ts).
    */
   agentModelOverride?: string;
 
@@ -659,10 +1000,15 @@ export interface Session {
    * stalls and retry with a fresh conversation id), call
    * `sendMessageDetailed()` when it exists.
    *
+   * `options.origin` says where the message comes from (see
+   * {@link MessageOrigin}); a `'system'` turn never becomes the trusted
+   * user context the auto-approver reads.
+   *
    * @throws {SessionNotReadyError} if status is not 'ready'
-   * @throws {SessionClosedError} if session has been closed
+   * @throws {SessionClosedError} if session has been closed, including by a
+   *   `close()` while this turn was running
    */
-  sendMessage(userMessage: string): Promise<string>;
+  sendMessage(userMessage: string, options?: SendMessageOptions): Promise<string>;
 
   /**
    * Sends a user message and returns the response text plus turn
@@ -679,7 +1025,7 @@ export interface Session {
    * @throws {SessionNotReadyError} if status is not 'ready'
    * @throws {SessionClosedError} if session has been closed
    */
-  sendMessageDetailed?(userMessage: string): Promise<AgentTurnResult>;
+  sendMessageDetailed?(userMessage: string, options?: SendMessageOptions): Promise<AgentTurnResult>;
 
   /**
    * Starts a fresh agent conversation and returns its freshly-minted id.
@@ -703,14 +1049,31 @@ export interface Session {
   rotateAgentConversationId?(): AgentConversationId;
 
   /**
-   * Returns the conversation history as turn summaries.
+   * Diagnostic accessor: streams the complete log of the session's agent
+   * container into `sink` (left open for the caller to end), through the
+   * container runtime the session's infrastructure was built with (Docker
+   * bound to its captured endpoint, or Apple `container`) and the
+   * container's real id, never a guessed name or a hard-coded CLI.
+   *
+   * Optional because only container-backed sessions have a container. Call
+   * it before `close()`, which removes a container the session owns.
+   * `workflow run-state` uses it to capture `container-logs.txt`.
+   */
+  streamContainerLogs?(sink: NodeJS.WritableStream): Promise<void>;
+
+  /**
+   * Returns the conversation history as turn summaries: the most recent
+   * `SESSION_TURN_HISTORY_LIMIT` turns (`session/bounded-log.ts`), oldest
+   * first. `getInfo().turnCount` and each turn's `turnNumber` count every
+   * turn, dropped ones included.
    * Does not expose raw ModelMessage[] to avoid coupling
    * callers to the AI SDK's internal message format.
    */
   getHistory(): readonly ConversationTurn[];
 
   /**
-   * Returns accumulated diagnostic events from all turns.
+   * Returns the diagnostic events of the session: the most recent
+   * `SESSION_DIAGNOSTIC_LOG_LIMIT` of them, oldest first.
    * Transports can use this for a /logs command or similar.
    */
   getDiagnosticLog(): readonly DiagnosticEvent[];
@@ -723,6 +1086,10 @@ export interface Session {
    * proxy process can pick it up and continue.
    *
    * @throws {Error} if no escalation with this ID is pending
+   * @throws {EscalationExpiredError} (code `ESCALATION_EXPIRED`) if the
+   *   proxy had already timed the request out: the response came too late
+   *   and the tool call was denied, so the caller must not report the
+   *   decision as applied
    */
   resolveEscalation(
     escalationId: string,
@@ -731,9 +1098,11 @@ export interface Session {
   ): Promise<void>;
 
   /**
-   * Returns any currently pending escalation, or undefined.
+   * Returns every escalation currently pending, oldest first (empty when
+   * none is). Several can be pending at once: the agent's parallel tool
+   * calls each wait for their own decision.
    */
-  getPendingEscalation(): EscalationRequest | undefined;
+  getPendingEscalations(): readonly EscalationRequest[];
 
   /**
    * Returns current resource budget consumption and configured limits.
@@ -742,9 +1111,21 @@ export interface Session {
   getBudgetStatus(): BudgetStatus;
 
   /**
+   * Redaction for the transcript a transport writes for this session
+   * (`interactions.jsonl`), from the session's configuration: the audit
+   * redactor's patterns plus the known credential values, or null when
+   * `auditRedaction.enabled` is false. Optional so test doubles need not
+   * implement it; a transport then applies the audit redactor's patterns.
+   */
+  getLogRedaction?(): LogRedaction | null;
+
+  /**
    * Releases all session resources: sandbox, MCP connections,
    * audit log, escalation directory. Idempotent -- safe to call
-   * multiple times. After close(), status becomes 'closed'.
+   * multiple times. After close(), status becomes 'closed' and stays
+   * 'closed'. A turn in flight is aborted: it makes no further model
+   * call, its running tool calls are cancelled (pending escalations are
+   * withdrawn), and its `sendMessage()` rejects with `SessionClosedError`.
    */
   close(): Promise<void>;
 }

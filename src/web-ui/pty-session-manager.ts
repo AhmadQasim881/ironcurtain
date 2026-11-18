@@ -16,13 +16,24 @@
  * requested for termination by explicit `sessions.end` or the idle-TTL
  * backstop ({@link PTY_IDLE_TTL_MS}), or shut down by `close()`.
  *
+ * Idle-TTL semantics: the countdown is armed once when a session loses its
+ * last subscriber (or is created with none) and is NOT restarted by unrelated
+ * client churn -- a disconnecting client only touches sessions it was actually
+ * attached to, and an already-armed timer is left alone, so abandoned
+ * containers are reaped on schedule. Input, prompt or resize from a client
+ * that is not attached (its socket dropped and it has not re-attached yet) is
+ * real activity and restarts the countdown for that session.
+ *
  * Escalation bridging (Phase 4): once `bridge.onSessionDiscovered` yields an
  * `escalationDir`, an {@link EscalationWatcher} (the same file-watch primitive
  * mux uses) is started for the session. Detected requests are re-emitted as
  * `escalation.created` DTOs (`sessionSource: { kind: 'web-pty' }`) onto the
  * {@link WebEventBus}, so the existing structured Escalations UI works on top
  * of the terminal. `resolveEscalation` writes the response file and emits
- * `escalation.resolved` so the UI clears the card.
+ * `escalation.resolved` when the proxy accepted it, or `escalation.expired`
+ * (and an `ESCALATION_EXPIRED` RPC error) when the request had already timed
+ * out. Escalations still pending when the child exits are emitted as expired
+ * before `session.ended`, so no card outlives its session.
  */
 
 import type { WebSocket as WsWebSocket } from 'ws';
@@ -32,9 +43,13 @@ import type { SessionMode, EscalationRequest } from '../session/types.js';
 import type { WebEventBus } from './web-event-bus.js';
 import { createPtyBridge, PTY_KILL_GRACE_MS, type PtyBridge, type PtyBridgeOptions } from '../pty/pty-bridge.js';
 import { resolveIroncurtainBin } from '../pty/resolve-ironcurtain-bin.js';
+import { loadNodePty } from '../pty/node-pty-loader.js';
 import { createEscalationWatcher, type EscalationWatcher } from '../escalation/escalation-watcher.js';
 import { writeTrustedUserContext } from '../escalation/trusted-input.js';
+import { escalationDisplayFields } from '../escalation/escalation-review.js';
+import { assertEscalationReviewable } from './escalation-wire.js';
 import { RpcError, SessionNotFoundError, type EscalationDto } from './web-ui-types.js';
+import { WS_EVENT_BACKPRESSURE_BYTES } from './ws-backpressure.js';
 import * as logger from '../logger.js';
 // Runtime edge is one-directional (this module -> dispatch/types.ts); the
 // back-reference from types.ts to PtyWebSession/PtySessionManager is type-only.
@@ -69,8 +84,12 @@ const PTY_COALESCE_MS = 16;
 const PTY_DRAIN_POLL_MS = 150;
 const PTY_COALESCE_MAX_BYTES = 32 * 1024;
 
-/** Backpressure threshold: above this `bufferedAmount`, skip deltas + resync on drain. */
-const PTY_BACKPRESSURE_BYTES = 4 * 1024 * 1024;
+/**
+ * Backpressure threshold: above this `bufferedAmount`, skip deltas + resync on
+ * drain. It is the threshold `WebUiServer.sendToSubscribers` applies to every
+ * event frame, so a replay sent once a client has drained is never skipped.
+ */
+const PTY_BACKPRESSURE_BYTES = WS_EVENT_BACKPRESSURE_BYTES;
 
 /** Replayed scrollback tail cap (§11 Q2): keeps a pty_replay frame under maxPayload. */
 const PTY_REPLAY_SCROLLBACK = 1000;
@@ -119,6 +138,7 @@ function buildPtyEscalationDto(request: EscalationRequest, label: number): Escal
     reason: request.reason,
     context: request.context,
     whitelistCandidates: request.whitelistCandidates,
+    ...escalationDisplayFields(request),
     receivedAt: new Date().toISOString(),
   };
 }
@@ -162,6 +182,13 @@ export interface PtySessionManagerOptions {
   readonly preflight?: () => Promise<void>;
   /** Idle-TTL override for tests; defaults to {@link PTY_IDLE_TTL_MS}. */
   readonly idleTtlMs?: number;
+  /**
+   * Returns the one-line OS-sandbox warning for new sessions (MCP servers
+   * that will be refused or run unconfined), or `undefined` when none.
+   * Evaluated per create so installing the missing tools takes effect
+   * without a daemon restart. Errors are treated as "no warning".
+   */
+  readonly osSandboxNotice?: () => string | undefined;
 }
 
 interface FreshPtySessionOptions {
@@ -199,6 +226,8 @@ export class PtyWebSession {
   escalationWatcher: EscalationWatcher | null = null;
   /** ISO timestamp of the most recent browser attach (surfaced in the DTO). */
   lastAttachedAt: string | null = null;
+  /** OS-sandbox warning captured at create (surfaced in the DTO). */
+  osSandboxWarning: string | undefined = undefined;
   readonly createdAt: string = new Date().toISOString();
 
   /** Escalation DTOs currently pending for this session, keyed by id. */
@@ -273,10 +302,19 @@ export class PtyWebSession {
     this.lastAttachedAt = new Date().toISOString();
   }
 
-  /** Removes a client from the subscriber + desync sets. */
-  removeSubscriber(client: WsWebSocket): void {
-    this.subscribers.delete(client);
+  /**
+   * Removes a client from the subscriber + desync sets. Returns whether the
+   * client was actually subscribed, so callers only re-arm the idle timer for
+   * sessions this client was attached to.
+   */
+  removeSubscriber(client: WsWebSocket): boolean {
+    const wasSubscriber = this.subscribers.delete(client);
     this.desynced.delete(client);
+    return wasSubscriber;
+  }
+
+  isSubscriber(client: WsWebSocket): boolean {
+    return this.subscribers.has(client);
   }
 
   /** Wired to `bridge.onData`: accumulate + flush on timer or at the byte cap. */
@@ -430,6 +468,7 @@ export class PtySessionManager {
   private readonly createBridge: CreateBridge;
   private readonly runPreflight: () => Promise<void>;
   private readonly idleTtlMs: number;
+  private readonly osSandboxNotice: (() => string | undefined) | undefined;
   private preflightPromise: Promise<void> | undefined;
   private pendingCreates = 0;
   private closing = false;
@@ -446,6 +485,22 @@ export class PtySessionManager {
     this.createBridge = options.createBridge ?? createPtyBridge;
     this.runPreflight = options.preflight ?? defaultPreflight;
     this.idleTtlMs = options.idleTtlMs ?? PTY_IDLE_TTL_MS;
+    this.osSandboxNotice = options.osSandboxNotice;
+  }
+
+  /**
+   * The OS-sandbox warning for a session being created. Observational: a
+   * failing probe must not block session creation, so errors read as "no
+   * warning" (the child still prints its own notice into the terminal).
+   */
+  private currentOsSandboxNotice(): string | undefined {
+    if (!this.osSandboxNotice) return undefined;
+    try {
+      return this.osSandboxNotice();
+    } catch (error) {
+      logger.warn(`[WebUI] OS sandbox check failed: ${error instanceof Error ? error.message : String(error)}`);
+      return undefined;
+    }
   }
 
   /** Number of live PTY sessions (for the status DTO + create cap, §11 D4). */
@@ -508,6 +563,9 @@ export class PtySessionManager {
         captureTraces,
         muxId: this.ownerId,
         muxPid: this.ownerPid,
+        // The browser's xterm answers terminal queries through the input
+        // path; a reply from the headless terminal too would arrive twice.
+        answerTerminalQueries: false,
       });
 
       if (this.isClosing()) {
@@ -520,6 +578,7 @@ export class PtySessionManager {
 
       const persona = options.resume?.persona ?? options.persona;
       const session = new PtyWebSession(label, bridge, this.sender, persona, resumeSessionId);
+      session.osSandboxWarning = this.currentOsSandboxNotice();
 
       // Register + announce the session BEFORE wiring the bridge handlers. A child
       // that already exited by now makes `bridge.onExit` fire its callback
@@ -576,26 +635,38 @@ export class PtySessionManager {
     this.clearIdleTimer(label);
   }
 
-  /** Detaches a client; starts the idle-TTL timer if the session is now empty. */
+  /**
+   * Detaches a client; arms the idle-TTL timer if the session lost its last
+   * subscriber. A detach from a client that was never attached changes nothing
+   * (in particular it does not restart an already-running countdown).
+   */
   detach(label: number, client: WsWebSocket): void {
     const session = this.sessions.get(label);
     if (!session) return;
-    session.removeSubscriber(client);
-    if (!session.hasSubscribers()) this.startIdleTimer(label);
+    if (session.removeSubscriber(client) && !session.hasSubscribers()) this.startIdleTimer(label);
   }
 
-  /** Removes a disconnecting client from every session (mirrors the token bridge). */
+  /**
+   * Removes a disconnecting client from every session it was attached to
+   * (mirrors the token bridge). Only those sessions can lose their last
+   * subscriber here, so only they get the idle timer armed; the countdown of
+   * an unrelated abandoned session is untouched by other clients' churn.
+   */
   removeAllForClient(client: WsWebSocket): void {
     for (const [label, session] of this.sessions) {
-      session.removeSubscriber(client);
-      if (!session.hasSubscribers()) this.startIdleTimer(label);
+      if (session.removeSubscriber(client) && !session.hasSubscribers()) this.startIdleTimer(label);
     }
   }
 
-  /** Forwards decoded keystroke bytes to the child PTY stdin. */
-  input(label: number, dataB64: string): void {
+  /**
+   * Forwards decoded keystroke bytes to the child PTY stdin. Input from a
+   * client that is not attached counts as activity (see
+   * {@link noteUnattachedActivity}).
+   */
+  input(label: number, dataB64: string, client?: WsWebSocket): void {
     const session = this.requireSession(label);
     if (session.ending) return;
+    this.noteUnattachedActivity(label, session, client);
     session.bridge.write(decodeBytes(dataB64));
   }
 
@@ -609,9 +680,10 @@ export class PtySessionManager {
    * yielded the escalation dir, the message is still injected but is NOT trusted
    * (a warning is logged); the user simply gets an escalation instead.
    */
-  sendPrompt(label: number, text: string): void {
+  sendPrompt(label: number, text: string, client?: WsWebSocket): void {
     const session = this.requireSession(label);
     if (session.ending || !session.bridge.alive) return;
+    this.noteUnattachedActivity(label, session, client);
     if (session.escalationDir) {
       try {
         writeTrustedUserContext(session.escalationDir, text);
@@ -636,9 +708,13 @@ export class PtySessionManager {
     }, PTY_ENTER_DELAY_MS);
   }
 
-  /** Resizes the child PTY (browser xterm is just another resize source). */
-  resize(label: number, cols: number, rows: number): void {
+  /**
+   * Resizes the child PTY (browser xterm is just another resize source). The
+   * dispatch schema bounds the size and `PtyBridge.resize` clamps it again.
+   */
+  resize(label: number, cols: number, rows: number, client?: WsWebSocket): void {
     const session = this.requireSession(label);
+    if (!session.ending) this.noteUnattachedActivity(label, session, client);
     session.bridge.resize(cols, rows);
   }
 
@@ -665,6 +741,8 @@ export class PtySessionManager {
       (session) =>
         new Promise<void>((resolve) => {
           session.bridge.onExit(() => resolve());
+          // Nothing can answer these once the daemon is going down.
+          this.expirePendingEscalations(session);
           session.dispose();
           session.bridge.kill();
         }),
@@ -705,22 +783,35 @@ export class PtySessionManager {
   }
 
   /**
-   * Resolves a PTY escalation: writes the response file, drops the pending
-   * entry, and emits `escalation.resolved` so the UI clears the card (§11 D3).
-   * Returns whether the response was accepted (false if it had already expired).
+   * Resolves a PTY escalation: writes the response file and drops the pending
+   * entry. When the proxy still had the request, emits `escalation.resolved`
+   * so the UI clears the card (§11 D3). When the request had already expired
+   * (the proxy timed out and removed it before the watcher's next poll), the
+   * response was too late and the tool call was denied: emits
+   * `escalation.expired` instead and throws `ESCALATION_EXPIRED`, so the
+   * caller is never told a denied call was approved.
    */
   resolveEscalation(
     escalationId: string,
     decision: 'approved' | 'denied',
     options?: { whitelistSelection?: number },
-  ): boolean {
+  ): void {
     const session = this.findEscalationOwner(escalationId);
     if (!session) {
       throw new RpcError('ESCALATION_NOT_FOUND', `No pending PTY escalation: ${escalationId}`);
     }
+    if (decision === 'approved') {
+      assertEscalationReviewable(session.listEscalationDtos().find((item) => item.escalationId === escalationId));
+    }
     const accepted = session.resolveEscalation(escalationId, decision, options);
+    if (!accepted) {
+      this.eventBus.emit('escalation.expired', { escalationId, sessionLabel: session.label });
+      throw new RpcError(
+        'ESCALATION_EXPIRED',
+        `Escalation ${escalationId} expired before the response arrived; the tool call was denied`,
+      );
+    }
     this.eventBus.emit('escalation.resolved', { escalationId, decision });
-    return accepted;
   }
 
   /** All escalations pending across live PTY sessions, for the list union. */
@@ -767,6 +858,43 @@ export class PtySessionManager {
     return session;
   }
 
+  /**
+   * Emits `escalation.expired` for every escalation still pending on a session
+   * that is going away (child exit or daemon shutdown). Without this the cards
+   * and badge outlive the session until the next reconnect, and approving one
+   * fails with ESCALATION_NOT_FOUND. Emitted before `session.ended`.
+   *
+   * Observational, like `session.created` in {@link create}: callers run this
+   * in the middle of a teardown (before `dispose()`, `session.ended` and, on
+   * shutdown, the child kill), so a failing subscriber is logged rather than
+   * allowed to abort that teardown and leave a live child behind.
+   */
+  private expirePendingEscalations(session: PtyWebSession): void {
+    for (const dto of session.listEscalationDtos()) {
+      session.removePendingEscalation(dto.escalationId);
+      try {
+        this.eventBus.emit('escalation.expired', { escalationId: dto.escalationId, sessionLabel: session.label });
+      } catch (error) {
+        logger.error(
+          `[WebUI] PTY session #${session.label}: escalation.expired delivery failed (${error instanceof Error ? error.message : String(error)})`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Input, prompt or resize from a client that is not attached to the session
+   * is activity: the client's socket dropped (or it never attached) and it is
+   * still driving the agent. Restart the idle countdown so the TTL measures
+   * real idleness, but only when nobody is attached -- an attached subscriber
+   * already keeps the session alive (attach clears the timer) and the timer
+   * must not be re-armed while a subscriber is present.
+   */
+  private noteUnattachedActivity(label: number, session: PtyWebSession, client: WsWebSocket | undefined): void {
+    if (client === undefined || session.isSubscriber(client) || session.hasSubscribers()) return;
+    this.restartIdleTimer(label);
+  }
+
   private handleExit(label: number): void {
     // This fires for a child that exited on its own (agent quit / crash) or
     // after a requested termination. In both cases, onExit is the truthful
@@ -776,6 +904,7 @@ export class PtySessionManager {
     this.sessions.delete(label);
     if (session.resumeSessionId) this.activeResumeIds.delete(session.resumeSessionId);
     this.clearIdleTimer(label);
+    this.expirePendingEscalations(session);
     session.dispose();
     const reason = session.endReason ?? 'pty_exited';
     logger.info(
@@ -808,9 +937,19 @@ export class PtySessionManager {
     if (!session.bridge.alive) this.handleExit(label);
   }
 
+  /**
+   * Arms the idle-TTL countdown for a session with no subscribers. Arm-once: an
+   * already-running countdown is left alone, so repeated disconnects (every
+   * `workflow status/await` CLI call, a reconnect loop, a stale-client
+   * termination) cannot push the reaping deadline out indefinitely. The timer
+   * is cleared by attach, by a termination request and by exit, and the
+   * callback deletes its own entry before reaping.
+   */
   private startIdleTimer(label: number): void {
     if (this.idleTtlMs <= 0) return; // disabled
-    this.clearIdleTimer(label);
+    if (this.idleTimers.has(label)) return; // arm-once
+    const session = this.sessions.get(label);
+    if (!session || session.ending) return; // termination already requested
     this.idleTimers.set(
       label,
       setTimeout(() => {
@@ -818,6 +957,12 @@ export class PtySessionManager {
         this.endInternal(label, 'idle_reaped');
       }, this.idleTtlMs),
     );
+  }
+
+  /** Restarts the countdown from now (activity from an unattached client). */
+  private restartIdleTimer(label: number): void {
+    this.clearIdleTimer(label);
+    this.startIdleTimer(label);
   }
 
   private clearIdleTimer(label: number): void {
@@ -873,8 +1018,12 @@ export class PtySessionManager {
   }
 }
 
-/** Default runtime probe: node-pty must load and the serialize addon must exist. */
+/**
+ * Default runtime probe: node-pty must load and the serialize addon must
+ * exist. loadNodePty also makes node-pty's macOS spawn-helper executable (as
+ * the mux does), and its error says how to rebuild a missing node-pty.
+ */
 async function defaultPreflight(): Promise<void> {
-  await import('node-pty');
+  await loadNodePty({ purpose: 'Web UI terminal sessions' });
   await import('@xterm/addon-serialize');
 }

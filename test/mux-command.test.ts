@@ -20,13 +20,16 @@
  * optional packages.
  */
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { IronCurtainConfig } from '../src/config/types.js';
 import type { PreflightOptions, PreflightResult } from '../src/session/preflight.js';
 import { PreflightError } from '../src/session/preflight.js';
 import type { MuxApp, MuxAppOptions } from '../src/mux/mux-app.js';
+import type { AgentId } from '../src/docker/agent-adapter.js';
+import { testUserConfig } from './helpers/user-config.js';
 
 // --- Module mocks (hoisted) ---
 // `loadConfig()` is mocked so the test does not require a real
@@ -41,36 +44,11 @@ const mockConfig: IronCurtainConfig = {
   constitutionPath: join(tmpdir(), 'mux-test-constitution.md'),
   agentModelId: 'anthropic:claude-sonnet-4-6',
   escalationTimeoutSeconds: 300,
-  userConfig: {
-    agentModelId: 'anthropic:claude-sonnet-4-6',
-    policyModelId: 'anthropic:claude-sonnet-4-6',
+  userConfig: testUserConfig({
     anthropicApiKey: 'test-api-key',
-    googleApiKey: '',
-    openaiApiKey: '',
-    escalationTimeoutSeconds: 300,
-    resourceBudget: {
-      maxTotalTokens: 1_000_000,
-      maxSteps: 200,
-      maxSessionSeconds: 1800,
-      maxEstimatedCostUsd: 5.0,
-      warnThresholdPercent: 80,
-    },
-    autoCompact: {
-      enabled: false,
-      thresholdTokens: 80_000,
-      keepRecentMessages: 10,
-      summaryModelId: 'anthropic:claude-haiku-4-5',
-    },
-    autoApprove: { enabled: false, modelId: 'anthropic:claude-haiku-4-5' },
-    auditRedaction: { enabled: true },
-    serverCredentials: {},
     // Native-only registry: the /new profile-picker step is skipped (G13 §9.7).
     modelProviders: { default: 'native', profiles: { native: { type: 'native' } } },
-    gooseProvider: 'anthropic',
-    gooseModel: 'claude-sonnet-4-20250514',
-    preferredDockerAgent: 'claude-code',
-    preferredMode: 'container',
-  },
+  }),
 };
 
 vi.mock('../src/config/index.js', async (importActual) => {
@@ -81,13 +59,26 @@ vi.mock('../src/config/index.js', async (importActual) => {
   };
 });
 
+// The first-start setup state is read from config.json, which `loadConfig()`
+// (mocked) would have created: default "completed", so only the tests that
+// set it see the setup note and the pause before fullscreen.
+const setupState = vi.hoisted(() => ({
+  read: vi.fn((): 'pending' | 'completed' | 'unrecorded' => 'completed'),
+}));
+vi.mock('../src/config/setup-state.js', async (importActual) => ({
+  ...(await importActual<typeof import('../src/config/setup-state.js')>()),
+  readFirstStartSetupState: () => setupState.read(),
+}));
+
 // Point the PTY registry into a temp dir so the `mkdirSync(registryDir, ...)`
-// call doesn't touch the user's real `~/.ironcurtain/`.
+// call doesn't touch the user's real `~/.ironcurtain/`. The directory is made
+// in beforeAll and removed in afterAll (below).
+const ptyRegistry = vi.hoisted(() => ({ dir: '' }));
 vi.mock('../src/config/paths.js', async (importActual) => {
   const actual = await importActual<Record<string, unknown>>();
   return {
     ...actual,
-    getPtyRegistryDir: vi.fn(() => join(tmpdir(), `mux-test-registry-${process.pid}`)),
+    getPtyRegistryDir: vi.fn(() => ptyRegistry.dir),
   };
 });
 
@@ -100,7 +91,7 @@ import { resolveDockerWorkloadConfig } from '../src/docker-workload/config.js';
 
 function makePreflightSuccess(agent: 'claude-code' | 'goose' = 'claude-code'): PreflightResult {
   return {
-    mode: { kind: 'docker', agent, authKind: 'apikey' },
+    mode: { kind: 'docker', agent: agent as AgentId, authKind: 'apikey' },
     reason: `${agent} (API key)`,
   };
 }
@@ -148,12 +139,21 @@ describe('ironcurtain mux preflight integration', () => {
   let stderr: ReturnType<typeof captureStderr>;
   let exitStub: ReturnType<typeof stubProcessExit>;
 
+  beforeAll(() => {
+    ptyRegistry.dir = mkdtempSync(join(tmpdir(), 'mux-test-registry-'));
+  });
+
+  afterAll(() => {
+    rmSync(ptyRegistry.dir, { recursive: true, force: true });
+  });
+
   beforeEach(async () => {
     stderr = captureStderr();
     exitStub = stubProcessExit();
     // Reset the loadConfig mock so tests that override it don't leak.
     const configModule = await import('../src/config/index.js');
     vi.mocked(configModule.loadConfig).mockReturnValue(mockConfig);
+    setupState.read.mockReturnValue('completed');
   });
 
   afterEach(() => {
@@ -202,7 +202,7 @@ describe('ironcurtain mux preflight integration', () => {
 
   it('--capture-traces forwards captureTraces: true to the MuxApp', async () => {
     const resolveSessionMode = vi.fn().mockResolvedValue(makePreflightSuccess('claude-code'));
-    const createMuxApp = vi.fn(() => makeFakeMuxApp());
+    const createMuxApp = vi.fn<(options: MuxAppOptions) => MuxApp>(() => makeFakeMuxApp());
 
     await muxMain(['--capture-traces'], {
       resolveSessionMode,
@@ -211,13 +211,13 @@ describe('ironcurtain mux preflight integration', () => {
     });
 
     expect(createMuxApp).toHaveBeenCalledOnce();
-    const appOptions = createMuxApp.mock.calls[0][0] as MuxAppOptions;
+    const appOptions = createMuxApp.mock.calls[0][0];
     expect(appOptions.captureTraces).toBe(true);
   });
 
   it('without --capture-traces, captureTraces is undefined (child falls through to config)', async () => {
     const resolveSessionMode = vi.fn().mockResolvedValue(makePreflightSuccess('claude-code'));
-    const createMuxApp = vi.fn(() => makeFakeMuxApp());
+    const createMuxApp = vi.fn<(options: MuxAppOptions) => MuxApp>(() => makeFakeMuxApp());
 
     await muxMain([], {
       resolveSessionMode,
@@ -226,7 +226,7 @@ describe('ironcurtain mux preflight integration', () => {
     });
 
     expect(createMuxApp).toHaveBeenCalledOnce();
-    const appOptions = createMuxApp.mock.calls[0][0] as MuxAppOptions;
+    const appOptions = createMuxApp.mock.calls[0][0];
     expect(appOptions.captureTraces).toBeUndefined();
   });
 
@@ -314,6 +314,48 @@ describe('ironcurtain mux preflight integration', () => {
     // circuits before the autoApprove warning block runs.
     expect(sleep).not.toHaveBeenCalled();
     expect(createMuxApp).not.toHaveBeenCalled();
+  });
+
+  it('points out a setup that never ran and pauses so the note is read before fullscreen', async () => {
+    // As after `doctor` or `mux` was the first command: the wizard is pending.
+    setupState.read.mockReturnValue('pending');
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const order: string[] = [];
+    sleep.mockImplementation(async () => {
+      order.push('sleep');
+    });
+    const fakeApp = makeFakeMuxApp();
+    vi.mocked(fakeApp.start).mockImplementation(async () => {
+      order.push('fullscreen');
+    });
+
+    await muxMain([], {
+      resolveSessionMode: vi.fn().mockResolvedValue(makePreflightSuccess('claude-code')),
+      createMuxApp: vi.fn(() => fakeApp),
+      skipNativeProbes: true,
+      sleep,
+    });
+
+    const stderrText = stderr.lines.join('');
+    expect(stderrText).toContain('first-start setup has not been run');
+    expect(stderrText).toContain('Run `ironcurtain setup` in a terminal');
+    expect(sleep).toHaveBeenCalledWith(3000);
+    expect(order).toEqual(['sleep', 'fullscreen']);
+  });
+
+  it.each(['completed', 'unrecorded'] as const)('says nothing about setup when it is %s', async (state) => {
+    setupState.read.mockReturnValue(state);
+    const sleep = vi.fn().mockResolvedValue(undefined);
+
+    await muxMain([], {
+      resolveSessionMode: vi.fn().mockResolvedValue(makePreflightSuccess('claude-code')),
+      createMuxApp: vi.fn(() => makeFakeMuxApp()),
+      skipNativeProbes: true,
+      sleep,
+    });
+
+    expect(stderr.lines.join('')).not.toContain('first-start setup');
+    expect(sleep).not.toHaveBeenCalled();
   });
 
   it('builtin mode is rejected with a clean error (mux requires container agent mode)', async () => {

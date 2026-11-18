@@ -13,6 +13,7 @@ import { type ExecFileFn } from '../src/docker/docker-manager.js';
 import type { SpawnFn } from '../src/docker/spawn-with-idle-timeout.js';
 import type { DockerContainerConfig } from '../src/docker/types.js';
 import type { DockerAvailability } from '../src/docker/docker-probe.js';
+import type { HostPtyProcess, HostPtySpawn, HostTerminalStreams } from '../src/docker/pty-host-terminal.js';
 import type { ChildProcess, SpawnOptions } from 'node:child_process';
 
 type ExecCall = {
@@ -97,6 +98,72 @@ interface MockSpawn {
  * configured code, optionally emitting a stderr chunk first. Enough to
  * exercise the streamed pull/build paths without real processes.
  */
+/** node-pty stand-in: records spawns, input, resizes and kills; scripted output and exit. */
+function createFakeHostPty() {
+  const dataListeners: ((data: string) => void)[] = [];
+  const exitListeners: ((event: { exitCode: number }) => void)[] = [];
+  const calls: { file: string; args: string[]; options: Parameters<HostPtySpawn>[2] }[] = [];
+  const written: (string | Buffer)[] = [];
+  const resized: [number, number][] = [];
+  const killed: (string | undefined)[] = [];
+  const child: HostPtyProcess = {
+    onData(listener) {
+      dataListeners.push(listener);
+      return { dispose: () => dataListeners.splice(dataListeners.indexOf(listener), 1) };
+    },
+    onExit(listener) {
+      exitListeners.push(listener);
+      return { dispose: () => exitListeners.splice(exitListeners.indexOf(listener), 1) };
+    },
+    write: (data) => written.push(data),
+    resize: (columns, rows) => resized.push([columns, rows]),
+    kill: (signal) => killed.push(signal),
+    pause: () => {},
+    resume: () => {},
+  };
+  return {
+    spawn: ((file, args, options) => {
+      calls.push({ file, args, options });
+      return child;
+    }) satisfies HostPtySpawn,
+    calls,
+    written,
+    resized,
+    killed,
+    emitData: (data: string) => {
+      for (const listener of [...dataListeners]) listener(data);
+    },
+    exit: (exitCode: number) => {
+      for (const listener of [...exitListeners]) listener({ exitCode });
+    },
+  };
+}
+
+/** The user's terminal: an input emitter with raw mode and an output that records writes. */
+function createFakeTerminal(options: { tty: boolean }) {
+  const writes: string[] = [];
+  const input = Object.assign(new EventEmitter(), {
+    isTTY: options.tty,
+    isRaw: false,
+    setRawMode(mode: boolean) {
+      input.isRaw = mode;
+      return input;
+    },
+    resume: () => input,
+    pause: () => input,
+  });
+  const output = Object.assign(new EventEmitter(), {
+    isTTY: options.tty,
+    columns: 120,
+    rows: 40,
+    write: (chunk: string) => {
+      writes.push(chunk);
+      return true;
+    },
+  });
+  return { input, output, writes, streams: { input, output } as unknown as HostTerminalStreams };
+}
+
 function createMockSpawn(): MockSpawn {
   const calls: MockSpawn['calls'] = [];
   let nextExit: { code: number; stderrChunk?: string } = { code: 0 };
@@ -513,19 +580,95 @@ describe('AppleContainerManager', () => {
       expect(result).toEqual({ exitCode: 3, stdout: 'partial', stderr: 'boom' });
     });
 
-    it('attaches runtime-native PTY exec to the host terminal', async () => {
-      const spawned = createMockSpawn();
-      spawned.exitNext(7);
-      const runtime = createAppleContainerManager(mock.mockExec, availableProbe, { spawn: spawned.spawn });
+    // DINF-8: same deadline contract as the Docker manager (exec-deadline.ts).
+    it('reports a container exec client that Node killed as timedOut, whatever it exited with', async () => {
+      const killedCleanExit: ExecFileFn = async () => ({ stdout: 'started\n', stderr: '', killed: true });
+      await expect(
+        createAppleContainerManager(killedCleanExit, availableProbe).exec('c1', ['claude', '-p', 'x'], 2_000),
+      ).resolves.toEqual({ exitCode: 124, stdout: 'started\n', stderr: '', timedOut: true });
 
-      await expect(runtime.execPty?.('c1', ['/etc/ironcurtain/start-claude.sh'])).resolves.toBe(7);
-      expect(spawned.calls).toEqual([
+      mock.setSequence([{ error: true, code: 143, killed: true, stdout: 'partial' }]);
+      await expect(manager().exec('c1', ['claude'], 2_000)).resolves.toEqual({
+        exitCode: 124,
+        stdout: 'partial',
+        stderr: '',
+        timedOut: true,
+      });
+    });
+
+    it('never reports a finished exec as timed out because the wall clock jumped (host sleep)', async () => {
+      // An exec implementation that cannot report `killed`, during which the
+      // host slept for an hour: only monotonic time may decide the fallback.
+      let wallClock: { mockRestore(): void } | undefined;
+      const sleepsThroughWallClock: ExecFileFn = async () => {
+        const now = Date.now();
+        wallClock = vi.spyOn(Date, 'now').mockReturnValue(now + 3_600_000);
+        return { stdout: 'done', stderr: '' };
+      };
+      try {
+        await expect(
+          createAppleContainerManager(sleepsThroughWallClock, availableProbe).exec('c1', ['claude'], 5_000),
+        ).resolves.toEqual({ exitCode: 0, stdout: 'done', stderr: '' });
+      } finally {
+        wallClock?.mockRestore();
+      }
+    });
+
+    it('runs runtime-native PTY exec under a host PTY and filters its output', async () => {
+      const pty = createFakeHostPty();
+      const terminal = createFakeTerminal({ tty: true });
+      const runtime = createAppleContainerManager(mock.mockExec, availableProbe, {
+        spawnPty: pty.spawn,
+        terminal: terminal.streams,
+      });
+
+      const exited = runtime.execPty?.('c1', ['/etc/ironcurtain/start-claude.sh']);
+      // Untrusted agent output: a clipboard write and a title change around real text.
+      pty.emitData('hello\x1b]52;c;cm0gLXJmIH4=\x07 \x1b]0;fake title\x07wor');
+      pty.emitData('ld\x1b[?1049h\x1b[?2004h');
+      terminal.input.emit('data', Buffer.from('ls\r'));
+      terminal.output.columns = 100;
+      terminal.output.emit('resize');
+      pty.exit(7);
+
+      await expect(exited).resolves.toBe(7);
+      expect(pty.calls).toEqual([
         {
-          cmd: 'container',
+          file: 'container',
           args: ['exec', '--interactive', '--tty', '--user', 'codespace', 'c1', '/etc/ironcurtain/start-claude.sh'],
-          options: { stdio: 'inherit' },
+          options: expect.objectContaining({ cols: 120, rows: 40 }),
         },
       ]);
+      const written = terminal.writes.join('');
+      expect(written.startsWith('hello world\x1b[?1049h\x1b[?2004h')).toBe(true);
+      expect(written).not.toContain(']52;');
+      expect(written).not.toContain(']0;');
+      // Teardown leaves the alternate screen and turns bracketed paste off again.
+      expect(written).toContain('\x1b[?1049l');
+      expect(written).toContain('\x1b[?2004l');
+      expect(pty.written).toEqual([Buffer.from('ls\r')]);
+      expect(pty.resized).toEqual([[100, 40]]);
+      expect(terminal.input.isRaw).toBe(false);
+    });
+
+    it('terminates the interposed exec on abort and on the Ctrl-\\ detach key', async () => {
+      for (const trigger of ['abort', 'detach'] as const) {
+        const pty = createFakeHostPty();
+        const terminal = createFakeTerminal({ tty: false });
+        const controller = new AbortController();
+        const runtime = createAppleContainerManager(mock.mockExec, availableProbe, {
+          spawnPty: pty.spawn,
+          terminal: terminal.streams,
+        });
+
+        const exited = runtime.execPty?.('c1', ['/start.sh'], controller.signal);
+        if (trigger === 'abort') controller.abort();
+        else terminal.input.emit('data', Buffer.from([0x1c]));
+        expect(pty.killed).toEqual(['SIGTERM']);
+        pty.exit(143);
+
+        await expect(exited).resolves.toBe(0);
+      }
     });
   });
 
@@ -904,6 +1047,29 @@ describe('AppleContainerManager', () => {
       ]);
     });
 
+    it('builds without the layer cache when asked', async () => {
+      const spawn = createMockSpawn();
+      const m = createAppleContainerManager(mock.mockExec, availableProbe, {
+        spawn: spawn.spawn,
+        stdoutSink: nullSink(),
+        stderrSink: nullSink(),
+      });
+      await m.buildImage('img:build-0123456789abcdef', '/ctx/Dockerfile', '/ctx', undefined, undefined, {
+        noCache: true,
+      });
+      expect(spawn.calls[0]?.args).toEqual([
+        'build',
+        '--progress',
+        'plain',
+        '-t',
+        'img:build-0123456789abcdef',
+        '-f',
+        '/ctx/Dockerfile',
+        '--no-cache',
+        '/ctx',
+      ]);
+    });
+
     it('loads only from the explicit verified OCI archive path', async () => {
       const spawn = createMockSpawn();
       const m = createAppleContainerManager(mock.mockExec, availableProbe, {
@@ -933,6 +1099,32 @@ describe('AppleContainerManager', () => {
         '/trusted/artifact/apple.oci.tar',
         'ironcurtain-claude-code:latest',
       ]);
+    });
+
+    it('streams a container log through `container logs` into the given sink', async () => {
+      const spawn = createMockSpawn();
+      spawn.exitNext(0, 'entrypoint: ready\n');
+      const m = createAppleContainerManager(mock.mockExec, availableProbe, { spawn: spawn.spawn });
+      const sink = new PassThrough();
+      let text = '';
+      sink.on('data', (chunk: Buffer) => (text += chunk.toString('utf8')));
+
+      await m.streamContainerLogs?.('ironcurtain-abc123', sink);
+
+      expect(spawn.calls[0]?.cmd).toBe('container');
+      expect(spawn.calls[0]?.args).toEqual(['logs', 'ironcurtain-abc123']);
+      expect(text).toBe('entrypoint: ready\n');
+      expect(mock.calls).toEqual([]);
+    });
+
+    it('rejects when `container logs` fails', async () => {
+      const spawn = createMockSpawn();
+      spawn.exitNext(1, 'Error: notFound: "container ghost not found"');
+      const m = createAppleContainerManager(mock.mockExec, availableProbe, { spawn: spawn.spawn });
+
+      await expect(m.streamContainerLogs?.('ghost', nullSink())).rejects.toThrow(
+        'container logs exited with code 1: Error: notFound',
+      );
     });
 
     it('surfaces the Rosetta remediation hint on builder bootstrap failures', async () => {

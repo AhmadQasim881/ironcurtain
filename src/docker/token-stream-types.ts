@@ -1,8 +1,9 @@
 /**
  * Types for LLM token stream extraction from the MITM proxy.
  *
- * These types define the structured events emitted by the SSE
- * extractor and consumed by the TokenStreamBus and its listeners.
+ * These types define the structured events emitted by the token-stream
+ * extractor (a passive response-observation consumer, see `sse-extractor.ts`)
+ * and consumed by the TokenStreamBus and its listeners.
  */
 
 import type { SessionId } from '../session/types.js';
@@ -91,8 +92,9 @@ export type TokenStreamListener = (sessionId: SessionId, event: TokenStreamEvent
 export type SseProvider = 'anthropic' | 'openai' | 'unknown';
 
 /**
- * Callback invoked by the SseExtractorTransform for each parsed event.
- * Unlike TokenStreamListener, this does not include a sessionId --
- * the extractor operates on a single stream and the bus handles routing.
+ * Callback invoked by the token-stream extractor (`sse-extractor.ts`) for
+ * each parsed event. Unlike TokenStreamListener, this does not include a
+ * sessionId -- the extractor operates on a single response and the bus
+ * handles routing.
  */
 export type SseEventCallback = (event: TokenStreamEvent) => void;

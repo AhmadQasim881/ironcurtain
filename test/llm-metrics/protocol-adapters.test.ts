@@ -184,6 +184,493 @@ describe('Anthropic Messages metrics adapter', () => {
   });
 });
 
+describe('Anthropic Messages cumulative and itemized usage', () => {
+  function stream(...usages: readonly [Record<string, unknown>, Record<string, unknown>]) {
+    const accumulator = new AnthropicMessagesAdapter().createAccumulator();
+    accumulator.observeStreamEvent({
+      data: { type: 'message_start', message: { id: 'msg_1', model: 'claude-opus-5-5', usage: usages[0] } },
+    });
+    accumulator.observeStreamEvent({
+      data: { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: usages[1] },
+    });
+    accumulator.observeStreamEvent({ data: { type: 'message_stop' } });
+    return accumulator.snapshot();
+  }
+
+  it('treats message_delta input and cache counters as cumulative finals, without conflict flags', () => {
+    const result = stream(
+      { input_tokens: 100, output_tokens: 1 },
+      {
+        input_tokens: 5100,
+        cache_read_input_tokens: 20000,
+        cache_creation_input_tokens: 3000,
+        output_tokens: 900,
+      },
+    );
+    expect(result.usage).toMatchObject({
+      inputTokensReported: 5100,
+      inputTokensUncached: 5100,
+      cacheReadInputTokens: 20000,
+      cacheWriteInputTokens: 3000,
+      inputTokensTotal: 28100,
+      outputTokensTotal: 900,
+      canonicalTotalTokens: 29000,
+      usageCompleteness: 'complete',
+    });
+    expect(result.qualityFlags.filter((flag) => flag.startsWith('conflicting_usage'))).toEqual([]);
+  });
+
+  it('reads cache counters that only message_delta reports (OpenRouter Anthropic skin)', () => {
+    const result = stream(
+      { input_tokens: 1024, output_tokens: 0 },
+      { input_tokens: 1024, output_tokens: 128, cache_read_input_tokens: 900 },
+    );
+    // No cache_creation counter at all: without a gateway contract it stays unknown.
+    expect(result.usage).toMatchObject({
+      cacheReadInputTokens: 900,
+      cacheWriteInputTokens: null,
+      inputTokensTotal: null,
+      usageCompleteness: 'partial',
+    });
+  });
+
+  it('counts an absent cache counter as zero, with a flag, only under a gateway contract', () => {
+    const accumulator = new AnthropicMessagesAdapter().createAccumulator({ absentCacheCountsAreZero: true });
+    accumulator.observeStreamEvent({
+      data: { type: 'message_start', message: { usage: { input_tokens: 1024, output_tokens: 0 } } },
+    });
+    accumulator.observeStreamEvent({
+      data: {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn' },
+        usage: { input_tokens: 1024, output_tokens: 128, cache_read_input_tokens: 900 },
+      },
+    });
+    const result = accumulator.snapshot();
+    expect(result.usage).toMatchObject({
+      cacheReadInputTokens: 900,
+      cacheWriteInputTokens: 0,
+      inputTokensTotal: 1924,
+      canonicalTotalTokens: 2052,
+      usageCompleteness: 'complete',
+    });
+    expect(result.usage.qualityFlags).toContain('absent_usage_assumed_zero:cache_creation_input_tokens');
+    expect(result.usage.qualityFlags).not.toContain('absent_usage_assumed_zero:cache_read_input_tokens');
+
+    const invalid = new AnthropicMessagesAdapter().createAccumulator({ absentCacheCountsAreZero: true });
+    invalid.observeJsonResponse({
+      usage: { input_tokens: 5, cache_read_input_tokens: -1, cache_creation_input_tokens: 0, output_tokens: 1 },
+    });
+    // An invalid counter is never assumed to be zero.
+    expect(invalid.snapshot().usage).toMatchObject({ cacheReadInputTokens: null, inputTokensTotal: null });
+
+    // A real OpenRouter usage object sends the missing counter as null.
+    const nulled = new AnthropicMessagesAdapter().createAccumulator({ absentCacheCountsAreZero: true });
+    nulled.observeJsonResponse({
+      usage: {
+        input_tokens: 34,
+        output_tokens: 13,
+        output_tokens_details: { thinking_tokens: 10 },
+        cache_creation_input_tokens: null,
+        cache_read_input_tokens: 192,
+        cache_creation: null,
+        cost: 0.00015472,
+      },
+    });
+    expect(nulled.snapshot().usage).toMatchObject({
+      cacheWriteInputTokens: 0,
+      inputTokensTotal: 226,
+      canonicalTotalTokens: 239,
+      thinkingTokens: 10,
+      usageCompleteness: 'complete',
+    });
+    expect(nulled.snapshot().usage.cacheWrite5mInputTokens).toBeUndefined();
+  });
+
+  it('keeps the larger value when a later cumulative counter regresses, and flags it', () => {
+    const result = stream(
+      { input_tokens: 1024, cache_read_input_tokens: 10, cache_creation_input_tokens: 0, output_tokens: 1 },
+      { input_tokens: 0, cache_read_input_tokens: 10, cache_creation_input_tokens: 0, output_tokens: 50 },
+    );
+    expect(result.usage).toMatchObject({ inputTokensUncached: 1024, inputTokensTotal: 1034 });
+    expect(result.qualityFlags).toContain('regressing_cumulative_usage:input');
+  });
+
+  it('assumes an absent cache counter is zero only after the final usage report', () => {
+    // OpenRouter reports cache_read_input_tokens in message_delta alone, so a
+    // stream cut before it has not reported its cache counters yet.
+    const accumulator = new AnthropicMessagesAdapter().createAccumulator({ absentCacheCountsAreZero: true });
+    accumulator.observeStreamEvent({
+      data: { type: 'message_start', message: { usage: { input_tokens: 1024, output_tokens: 0 } } },
+    });
+    const cut = accumulator.snapshot();
+    expect(cut.usage).toMatchObject({
+      inputTokensUncached: 1024,
+      cacheReadInputTokens: null,
+      cacheWriteInputTokens: null,
+      inputTokensTotal: null,
+      inputTokensAccuracy: 'unknown',
+      usageCompleteness: 'partial',
+    });
+    expect(cut.qualityFlags.filter((flag) => flag.startsWith('absent_usage_assumed_zero'))).toEqual([]);
+  });
+
+  it('reads only the final top-level report once iterations itemize the exchange', () => {
+    // message_start counts the context before compaction; the final
+    // top-level usage covers only the executor iteration after it.
+    const result = stream(
+      { input_tokens: 180000, cache_read_input_tokens: 150000, cache_creation_input_tokens: 2000, output_tokens: 1 },
+      {
+        input_tokens: 23000,
+        cache_read_input_tokens: 4000,
+        cache_creation_input_tokens: 1200,
+        output_tokens: 1000,
+        iterations: [
+          {
+            type: 'compaction',
+            input_tokens: 180000,
+            output_tokens: 3500,
+            cache_read_input_tokens: 150000,
+            cache_creation_input_tokens: 2000,
+          },
+          // The executor iteration omits its cache counters. It is the
+          // top-level attempt, so it takes the final top-level ones.
+          { type: 'message', input_tokens: 23000, output_tokens: 1000 },
+        ],
+      },
+    );
+    expect(result.usage).toMatchObject({
+      inputTokensReported: 23000,
+      inputTokensUncached: 203000,
+      cacheReadInputTokens: 154000,
+      cacheWriteInputTokens: 3200,
+      inputTokensTotal: 360200,
+      outputTokensReported: 1000,
+      outputTokensTotal: 4500,
+      canonicalTotalTokens: 364700,
+      usageCompleteness: 'complete',
+    });
+    expect(result.usage.iterations?.[1]).toMatchObject({ cacheReadInputTokens: 4000, cacheWriteInputTokens: 1200 });
+    expect(result.qualityFlags.filter((flag) => flag.startsWith('regressing_cumulative_usage'))).toEqual([]);
+  });
+
+  it('never lets the final attempt borrow a counter from the declined attempt', () => {
+    const result = stream(
+      { input_tokens: 1500, cache_read_input_tokens: 2048, cache_creation_input_tokens: 512, output_tokens: 1 },
+      {
+        // The final top-level report omits cache_creation_input_tokens.
+        input_tokens: 1520,
+        cache_read_input_tokens: 0,
+        output_tokens: 310,
+        iterations: [
+          {
+            type: 'message',
+            model: 'claude-fable-5-1',
+            input_tokens: 1500,
+            output_tokens: 120,
+            cache_read_input_tokens: 2048,
+            cache_creation_input_tokens: 512,
+          },
+          { type: 'fallback_message', model: 'claude-opus-4-8', input_tokens: 1520, output_tokens: 310 },
+        ],
+      },
+    );
+    // The fallback attempt's cache write is unknown; the declined attempt's
+    // 512 (reported in message_start) is not counted a second time.
+    expect(result.usage).toMatchObject({
+      inputTokensUncached: 3020,
+      cacheReadInputTokens: 2048,
+      cacheWriteInputTokens: null,
+      inputTokensTotal: null,
+      outputTokensTotal: 430,
+      usageCompleteness: 'partial',
+    });
+    expect(result.usage.iterations?.[1]).toMatchObject({ cacheReadInputTokens: 0, cacheWriteInputTokens: null });
+  });
+
+  it('lets the final attempt of a streamed refusal fallback supersede the declined attempt it replaced', () => {
+    // message_start describes the declined attempt; message_delta's top-level
+    // usage describes only the fallback attempt that produced the message.
+    const result = stream(
+      { input_tokens: 1500, cache_read_input_tokens: 2048, cache_creation_input_tokens: 0, output_tokens: 1 },
+      {
+        input_tokens: 1520,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 2048,
+        output_tokens: 310,
+        iterations: [
+          {
+            type: 'message',
+            model: 'claude-fable-5-1',
+            input_tokens: 1500,
+            output_tokens: 120,
+            cache_read_input_tokens: 2048,
+            cache_creation_input_tokens: 0,
+          },
+          { type: 'fallback_message', model: 'claude-opus-4-8', input_tokens: 1520, output_tokens: 310 },
+        ],
+      },
+    );
+    expect(result.usage).toMatchObject({
+      inputTokensReported: 1520,
+      inputTokensUncached: 3020,
+      cacheReadInputTokens: 2048,
+      cacheWriteInputTokens: 2048,
+      inputTokensTotal: 7116,
+      outputTokensTotal: 430,
+      usageCompleteness: 'complete',
+    });
+    expect(result.usage.iterations?.[1]).toMatchObject({ cacheReadInputTokens: 0, cacheWriteInputTokens: 2048 });
+    expect(result.qualityFlags).toContain('fallback_served');
+    expect(result.qualityFlags.filter((flag) => flag.startsWith('regressing_cumulative_usage'))).toEqual([]);
+  });
+
+  it('sums compaction and executor iterations instead of reading the top-level attempt alone', () => {
+    const result = stream(
+      { input_tokens: 23000, cache_read_input_tokens: 4000, cache_creation_input_tokens: 0, output_tokens: 1 },
+      {
+        input_tokens: 23000,
+        cache_read_input_tokens: 4000,
+        cache_creation_input_tokens: 0,
+        output_tokens: 1000,
+        output_tokens_details: { thinking_tokens: 200 },
+        iterations: [
+          { type: 'compaction', input_tokens: 180000, output_tokens: 3500, cache_read_input_tokens: 0 },
+          {
+            type: 'message',
+            input_tokens: 23000,
+            output_tokens: 1000,
+            cache_read_input_tokens: 4000,
+            cache_creation_input_tokens: 0,
+          },
+        ],
+      },
+    );
+    // The compaction iteration omits cache_creation_input_tokens: unknown, so
+    // the input total is not claimed; the known parts remain.
+    expect(result.usage).toMatchObject({
+      inputTokensReported: 23000,
+      inputTokensUncached: 203000,
+      cacheReadInputTokens: 4000,
+      cacheWriteInputTokens: null,
+      inputTokensTotal: null,
+      outputTokensReported: 1000,
+      outputTokensTotal: 4500,
+      thinkingTokens: null,
+      usageSource: 'anthropic_usage_iterations',
+      usageCompleteness: 'partial',
+    });
+    expect(result.usage.qualityFlags).toEqual(
+      expect.arrayContaining([
+        'usage_iterations_summed',
+        'usage_iteration:compaction',
+        'thinking_breakdown_unavailable:usage_iterations',
+      ]),
+    );
+    expect(result.usage.iterations?.map((iteration) => iteration.kind)).toEqual(['compaction', 'message']);
+  });
+
+  it('attributes advisor sub-inferences to their own model and never adds top-level usage on top', () => {
+    const accumulator = new AnthropicMessagesAdapter().createAccumulator();
+    accumulator.observeJsonResponse({
+      model: 'claude-sonnet-5-5',
+      stop_reason: 'end_turn',
+      usage: {
+        input_tokens: 900,
+        output_tokens: 80,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        iterations: [
+          {
+            type: 'message',
+            input_tokens: 400,
+            output_tokens: 30,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+          {
+            type: 'advisor_message',
+            model: 'claude-opus-5-5',
+            input_tokens: 2000,
+            output_tokens: 150,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+          {
+            type: 'message',
+            input_tokens: 500,
+            output_tokens: 50,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+        ],
+      },
+    });
+    const result = accumulator.snapshot();
+    expect(result.usage).toMatchObject({
+      inputTokensTotal: 2900,
+      outputTokensTotal: 230,
+      canonicalTotalTokens: 3130,
+      usageCompleteness: 'complete',
+    });
+    expect(result.usage.iterations).toEqual([
+      expect.objectContaining({ kind: 'message', model: null }),
+      expect.objectContaining({ kind: 'advisor_message', model: 'claude-opus-5-5', inputTokensUncached: 2000 }),
+      expect.objectContaining({ kind: 'message', model: null }),
+    ]);
+    expect(result.usage.qualityFlags).toContain('usage_iteration:advisor_message');
+  });
+
+  it('captures the cache-write TTL split and server-tool request counts', () => {
+    const accumulator = new AnthropicMessagesAdapter().createAccumulator();
+    accumulator.observeJsonResponse({
+      stop_reason: 'end_turn',
+      usage: {
+        input_tokens: 10,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 3000,
+        cache_creation: { ephemeral_5m_input_tokens: 2000, ephemeral_1h_input_tokens: 1000 },
+        output_tokens: 5,
+        server_tool_use: { web_search_requests: 2, web_fetch_requests: 1, [CONTENT_CANARY]: 7 },
+      },
+    });
+    const result = accumulator.snapshot();
+    expect(result.usage).toMatchObject({
+      cacheWriteInputTokens: 3000,
+      cacheWrite5mInputTokens: 2000,
+      cacheWrite1hInputTokens: 1000,
+      serverToolRequests: { webSearchRequests: 2, webFetchRequests: 1 },
+    });
+    expectContentFree(result);
+
+    const contradictory = new AnthropicMessagesAdapter().createAccumulator();
+    contradictory.observeJsonResponse({
+      usage: {
+        input_tokens: 10,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 3000,
+        cache_creation: { ephemeral_5m_input_tokens: 2000, ephemeral_1h_input_tokens: 2000 },
+        output_tokens: 5,
+      },
+    });
+    expect(contradictory.snapshot().usage).toMatchObject({
+      cacheWrite5mInputTokens: null,
+      cacheWrite1hInputTokens: null,
+      qualityFlags: expect.arrayContaining(['contradictory_usage:cache_creation_split']),
+    });
+  });
+
+  it('reads the speed the response was served at (usage.speed), for fast-mode pricing', () => {
+    const fast = new AnthropicMessagesAdapter().createAccumulator();
+    fast.observeStreamEvent({
+      eventType: 'message_delta',
+      data: { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 3, speed: 'fast' } },
+    });
+    expect(fast.snapshot().actualSpeedMode).toBe('fast');
+
+    const unknown = new AnthropicMessagesAdapter().createAccumulator();
+    unknown.observeJsonResponse({ usage: { input_tokens: 1, output_tokens: 1, speed: 'ludicrous' } });
+    expect(unknown.snapshot()).toMatchObject({
+      actualSpeedMode: null,
+      qualityFlags: expect.arrayContaining(['unknown_response_speed_mode']),
+    });
+  });
+
+  it('reads the service tier from usage, where the Messages API reports it, and flags an unknown one', () => {
+    const streamed = new AnthropicMessagesAdapter().createAccumulator();
+    streamed.observeStreamEvent({
+      eventType: 'message_start',
+      data: {
+        type: 'message_start',
+        message: { id: 'msg_tier', model: 'claude-opus-5-5', usage: { input_tokens: 1, service_tier: 'priority' } },
+      },
+    });
+    expect(streamed.snapshot().actualServiceTier).toBe('priority');
+
+    const json = new AnthropicMessagesAdapter().createAccumulator();
+    json.observeJsonResponse({ usage: { input_tokens: 1, output_tokens: 1, service_tier: 'standard' } });
+    expect(json.snapshot().actualServiceTier).toBe('standard');
+
+    const unknown = new AnthropicMessagesAdapter().createAccumulator();
+    unknown.observeJsonResponse({ usage: { input_tokens: 1, output_tokens: 1, service_tier: 'overnight' } });
+    expect(unknown.snapshot()).toMatchObject({
+      actualServiceTier: null,
+      qualityFlags: expect.arrayContaining(['unknown_response_service_tier']),
+    });
+  });
+
+  it('flags a response service tier the OpenAI adapters do not recognize', () => {
+    const responses = new OpenAiResponsesAdapter().createAccumulator();
+    responses.observeJsonResponse({ id: 'resp_1', model: 'gpt-5.2', service_tier: 'overnight', status: 'completed' });
+    expect(responses.snapshot()).toMatchObject({
+      actualServiceTier: null,
+      qualityFlags: expect.arrayContaining(['unknown_response_service_tier']),
+    });
+
+    const chat = new OpenAiChatCompletionsAdapter().createAccumulator();
+    chat.observeJsonResponse({ id: 'chat_1', model: 'gpt-5.2', service_tier: 'overnight', choices: [] });
+    expect(chat.snapshot()).toMatchObject({
+      actualServiceTier: null,
+      qualityFlags: expect.arrayContaining(['unknown_response_service_tier']),
+    });
+
+    const known = new OpenAiResponsesAdapter().createAccumulator();
+    known.observeJsonResponse({ id: 'resp_2', model: 'gpt-5.2', service_tier: 'flex', status: 'completed' });
+    expect(known.snapshot().actualServiceTier).toBe('flex');
+    expect(known.snapshot().qualityFlags).not.toContain('unknown_response_service_tier');
+  });
+
+  it('leaves totals unknown when iterations cannot be read, keeping the top-level parts', () => {
+    const accumulator = new AnthropicMessagesAdapter().createAccumulator();
+    accumulator.observeJsonResponse({
+      usage: {
+        input_tokens: 100,
+        cache_read_input_tokens: 50,
+        cache_creation_input_tokens: 0,
+        output_tokens: 10,
+        iterations: { type: 'message' },
+      },
+    });
+    const result = accumulator.snapshot();
+    expect(result.usage).toMatchObject({
+      inputTokensUncached: 100,
+      cacheReadInputTokens: 50,
+      inputTokensTotal: null,
+      outputTokensReported: 10,
+      outputTokensTotal: null,
+      canonicalTotalTokens: null,
+      usageCompleteness: 'partial',
+    });
+    expect(result.qualityFlags).toContain('invalid_usage_iterations');
+  });
+
+  it('keeps iteration models bounded and identifier-shaped', () => {
+    const accumulator = new AnthropicMessagesAdapter().createAccumulator();
+    accumulator.observeJsonResponse({
+      usage: {
+        input_tokens: 1,
+        output_tokens: 1,
+        iterations: [
+          {
+            type: 'future_kind',
+            model: `${CONTENT_CANARY} with spaces`,
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+        ],
+      },
+    });
+    const result = accumulator.snapshot();
+    expect(result.usage.iterations).toEqual([expect.objectContaining({ kind: 'other', model: null })]);
+    expect(result.qualityFlags).toEqual(
+      expect.arrayContaining(['unknown_usage_iteration_type', 'invalid_identifier:model']),
+    );
+    expectContentFree(result);
+  });
+});
+
 describe('OpenAI Responses metrics adapter', () => {
   it('captures the top-level reasoning_effort request dimension', () => {
     expect(

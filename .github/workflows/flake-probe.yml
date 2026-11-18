@@ -7,6 +7,11 @@
 #
 # Measured baseline (issue #363): ~10.2% of macOS root-suite attempts, 0% on
 # Linux. At that rate ~40 attempts distinguishes "fixed" from "unchanged".
+#
+# Each attempt also writes the run ledger scripts/test.sh uses and runs the same
+# classifier, so worker deaths that lost test results (a crash mid-file or
+# while importing, which test.sh fails on its final attempt) are counted apart
+# from the benign ones where every test finished.
 name: Flake probe
 
 on:
@@ -31,6 +36,9 @@ on:
         default: macos-latest
         options: [macos-latest, ubuntu-latest]
 
+permissions:
+  contents: read
+
 jobs:
   probe:
     runs-on: ${{ inputs.os }}
@@ -46,6 +54,11 @@ jobs:
         run: |
           echo "isolate dispose-race patch applied: $(grep -c 'await Promise.allSettled(\[runPromise\])' node_modules/@utcp/code-mode/dist/index.js || echo 0)"
       - name: Loop and count worker deaths
+        env:
+          TARGET: ${{ inputs.target }}
+          ITERATIONS: ${{ inputs.iterations }}
+          RUNNER_OS_INPUT: ${{ inputs.os }}
+          NODE_VERSION_INPUT: ${{ inputs.node-version }}
         run: |
           # NOTE: GitHub runs `run:` steps under `bash -e`. A non-zero vitest
           # exit -- the very event this loop exists to count -- would abort the
@@ -53,19 +66,34 @@ jobs:
           # errexit) and its status captured explicitly.
           set -uo pipefail
           ISOLATED_VM_FILES="test/workflow-policy-cycling.integration.test.ts test/help-integration.test.ts test/docker-code-mode.integration.test.ts test/sandbox-tool-errors.integration.test.ts"
-          case "${{ inputs.target }}" in
+          case "$TARGET" in
             isolated-vm)         ARGS="$ISOLATED_VM_FILES" ;;
             exclude-isolated-vm) ARGS=""; for f in $ISOLATED_VM_FILES; do ARGS="$ARGS --exclude $f"; done ;;
             full)                ARGS="" ;;
+            *)                   echo "::error::unknown target $TARGET"; exit 1 ;;
           esac
+          if ! printf '%s' "$ITERATIONS" | grep -Eq '^[0-9]+$'; then
+            echo "::error::iterations must be a number, got '$ITERATIONS'"
+            exit 1
+          fi
           SIG='Worker exited unexpectedly|prevents Vite server from exiting|close timed out after [0-9]+ms'
-          hits=0; testfails=0; other=0; n=${{ inputs.iterations }}
+          hits=0; lost=0; testfails=0; other=0; n=$ITERATIONS
           for i in $(seq 1 "$n"); do
-            if out="$(npx vitest run $ARGS 2>&1 | perl -pe 's/\x1b\[[0-9;]*m//g')"; then ec=0; else ec=$?; fi
+            log="$RUNNER_TEMP/attempt-$i.log"
+            ledger="$RUNNER_TEMP/attempt-$i.ledger.json"
+            if IC_VITEST_LEDGER="$ledger" npx vitest run --reporter=default --reporter=./scripts/vitest-run-ledger.ts $ARGS >"$log" 2>&1; then ec=0; else ec=$?; fi
+            out="$(perl -pe 's/\x1b\[[0-9;]*m//g' "$log")"
+            verdict=pass
+            if [ "$ec" -ne 0 ]; then
+              verdict="$(npx tsx scripts/classify-vitest-run.ts --exit-code "$ec" --ledger "$ledger" --log "$log" 2>/dev/null)" || verdict=fail
+            fi
             tag="ok"
             if printf '%s\n' "$out" | grep -qE "$SIG"; then
               hits=$((hits+1)); tag="WORKER-DEATH"
-              echo "::warning::attempt $i/$n: worker death"
+              if [ "$verdict" = incomplete ]; then
+                lost=$((lost+1)); tag="WORKER-DEATH-LOST-RESULTS"
+              fi
+              echo "::warning::attempt $i/$n: worker death ($verdict)"
               printf '%s\n' "$out" | grep -E "$SIG" | head -2
             elif printf '%s\n' "$out" | grep -qE '(Test Files|Tests)[[:space:]]+[0-9]+ failed'; then
               testfails=$((testfails+1)); tag="TEST-FAILURE"
@@ -76,19 +104,20 @@ jobs:
               printf '%s\n' "$out" | tail -15
             fi
             summary="$(printf '%s\n' "$out" | grep -E '^ *(Test Files|Tests) ' | tr '\n' ' ' | sed 's/  */ /g')"
-            echo "attempt $i/$n [$tag] ec=$ec | $summary"
-            echo "  running totals: worker-deaths=$hits test-failures=$testfails other=$other"
+            echo "attempt $i/$n [$tag] ec=$ec verdict=$verdict | $summary"
+            echo "  running totals: worker-deaths=$hits (lost-results=$lost) test-failures=$testfails other=$other"
           done
           {
             echo "### Flake probe result"
             echo ""
             echo "| field | value |"
             echo "| --- | --- |"
-            echo "| target | ${{ inputs.target }} |"
-            echo "| runner / node | ${{ inputs.os }} / ${{ inputs.node-version }} |"
+            echo "| target | $TARGET |"
+            echo "| runner / node | $RUNNER_OS_INPUT / $NODE_VERSION_INPUT |"
             echo "| attempts | $n |"
             echo "| worker deaths | $hits |"
+            echo "| worker deaths that lost test results | $lost |"
             echo "| real test failures | $testfails |"
             echo "| other non-zero exits | $other |"
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "RESULT worker-deaths=$hits test-failures=$testfails other=$other out of $n attempts"
+          echo "RESULT worker-deaths=$hits lost-results=$lost test-failures=$testfails other=$other out of $n attempts"

@@ -15,7 +15,7 @@ for (const adapter of ['claude-code', 'goose', 'codex']) {
   describe.skipIf(!dockerAvailable || !isDockerImageAvailable(image))(`${adapter} non-1000 startup handoff`, () => {
     it('waits for the real entrypoint before named-user exec and the writable-storage probe', async () => {
       const docker = createDockerManager();
-      const startup = prepareDockerAgentStartup(['sleep', 'infinity'], true);
+      const startup = prepareDockerAgentStartup(['sleep', 'infinity'], '0:0');
       const trustDirectory = mkdtempSync(join(tmpdir(), 'ic-startup-trust-'));
       let id: string | undefined;
       try {

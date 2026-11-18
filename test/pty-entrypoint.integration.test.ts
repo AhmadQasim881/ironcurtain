@@ -1,3 +1,5 @@
+import { testUserConfig } from './helpers/user-config.js';
+import { USER_CONFIG_DEFAULTS } from '../src/config/user-config.js';
 /**
  * Integration test: PTY container entrypoint UDS→TCP bridge, driven through
  * the real `runPtySession` code path.
@@ -53,6 +55,7 @@ import type { IronCurtainConfig } from '../src/config/types.js';
 import { useTcpTransport } from '../src/docker/platform.js';
 import { isDockerAvailable, isDockerImageAvailable } from './helpers/docker-available.js';
 import { testCompiledPolicy, testToolAnnotations } from './fixtures/test-policy.js';
+import type { AgentId } from '../src/docker/agent-adapter.js';
 
 const execFile = promisify(execFileCb);
 
@@ -174,13 +177,11 @@ describe.skipIf(!dockerReady)('PTY container entrypoint UDS→TCP bridge (via ru
       constitutionPath: join(homeDir, 'constitution.md'),
       agentModelId: 'anthropic:claude-sonnet-4-6',
       escalationTimeoutSeconds: 300,
-      userConfig: {
+      userConfig: testUserConfig({
         agentModelId: 'anthropic:claude-sonnet-4-6',
         policyModelId: 'anthropic:claude-sonnet-4-6',
         anthropicApiKey: 'sk-ant-api03-fake-test-key-for-pty-integration',
-        googleApiKey: '',
-        openaiApiKey: '',
-        escalationTimeoutSeconds: 300,
+        anthropicBaseUrl: `http://127.0.0.1:${upstream.port}`,
         resourceBudget: {
           maxTotalTokens: 1_000_000,
           maxSteps: 200,
@@ -188,26 +189,9 @@ describe.skipIf(!dockerReady)('PTY container entrypoint UDS→TCP bridge (via ru
           maxEstimatedCostUsd: 5.0,
           warnThresholdPercent: 80,
         },
-        autoCompact: {
-          enabled: false,
-          thresholdTokens: 80_000,
-          keepRecentMessages: 10,
-          summaryModelId: 'anthropic:claude-haiku-4-5',
-        },
-        autoApprove: { enabled: false, modelId: 'anthropic:claude-haiku-4-5' },
-        auditRedaction: { enabled: true },
-        modelProviders: { default: 'native', profiles: { native: { type: 'native' } } },
-        statistics: { enabled: false, retentionDays: null },
-        memory: { enabled: false, llmBaseUrl: undefined, llmApiKey: undefined },
-        packageInstall: {
-          enabled: false,
-          quarantineDays: 2,
-          allowedPackages: [],
-          deniedPackages: [],
-        },
-        serverCredentials: {},
-        dockerResources: { memoryMb: null, cpus: null },
-      },
+        dockerResources: { ...USER_CONFIG_DEFAULTS.dockerResources, memoryMb: null, cpus: null },
+        containerRuntime: 'docker',
+      }),
     } as unknown as IronCurtainConfig;
 
     // The attach stub runs inside runPtySession after the container is up.
@@ -222,6 +206,12 @@ describe.skipIf(!dockerReady)('PTY container entrypoint UDS→TCP bridge (via ru
       const procs = await dockerExec(containerId, 'sh', '-c', 'pgrep -af "TCP-LISTEN:18080" || true');
       observations.bridgeProcs = procs.stdout;
 
+      // This is the container's synthetic sentinel, never a host credential.
+      // The proxy authenticates it before forwarding the settings request.
+      const sentinel = await dockerExec(containerId, 'printenv', 'IRONCURTAIN_API_KEY');
+      expect(sentinel.exitCode).toBe(0);
+      expect(sentinel.stdout.trim()).toMatch(/^sk-ant-/u);
+
       // GET /api/claude_code/settings is in the Anthropic provider allowlist.
       // `-k` skips client-side cert verification (the IronCurtain CA in the
       // image trust store is irrelevant either way), so the TLS handshake
@@ -231,6 +221,8 @@ describe.skipIf(!dockerReady)('PTY container entrypoint UDS→TCP bridge (via ru
         containerId,
         'curl',
         '-ksS',
+        '-H',
+        `x-api-key: ${sentinel.stdout.trim()}`,
         '--max-time',
         '10',
         '--proxy',
@@ -249,7 +241,7 @@ describe.skipIf(!dockerReady)('PTY container entrypoint UDS→TCP bridge (via ru
 
     await runPtySession({
       config,
-      mode: { kind: 'docker', agent: 'claude-code' },
+      mode: { kind: 'docker', agent: 'claude-code' as AgentId },
       workspacePath: workspaceDir,
       attach,
     });

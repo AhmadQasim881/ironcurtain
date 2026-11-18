@@ -2,6 +2,8 @@
 
 # Review: `asi-evolve-native-workflow.md`
 
+**Status (2026-11-14):** Historical: the pre-implementation review of `asi-evolve-native-workflow.md`. Its must-fix corrections were folded into that design, which has shipped.
+
 **Date:** 2026-06-15
 **Scope:** Ground-truth review of `docs/designs/asi-evolve-native-workflow.md` against (a) the
 IronCurtain FSM workflow runtime (`src/workflow/`, `WORKFLOWS.md`, the real

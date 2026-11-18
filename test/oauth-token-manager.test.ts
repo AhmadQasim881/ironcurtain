@@ -1,6 +1,13 @@
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { OAuthTokenManager, type TokenManagerDeps } from '../src/docker/oauth-token-manager.js';
-import type { OAuthCredentials } from '../src/docker/oauth-credentials.js';
+import {
+  loadCredentialsFromFile,
+  saveOAuthCredentials,
+  type OAuthCredentials,
+} from '../src/docker/oauth-credentials.js';
 
 function validCreds(overrides?: Partial<OAuthCredentials>): OAuthCredentials {
   return {
@@ -64,7 +71,9 @@ describe('OAuthTokenManager', () => {
       const token = await manager.getValidAccessToken();
       expect(token).toBe('access-token-refreshed');
       expect(deps.refreshToken).toHaveBeenCalledWith('refresh-token-expiring', undefined);
-      expect(deps.saveCredentials).toHaveBeenCalledWith(newCreds, '/fake/.credentials.json');
+      expect(deps.saveCredentials).toHaveBeenCalledWith(newCreds, '/fake/.credentials.json', {
+        refreshedFrom: 'refresh-token-expiring',
+      });
     });
 
     it('refreshes with the client kind of the credentials being refreshed', async () => {
@@ -419,7 +428,9 @@ describe('OAuthTokenManager', () => {
 
       const token = await manager.getValidAccessToken();
       expect(token).toBe('access-token-refreshed');
-      expect(deps.saveCredentials).toHaveBeenCalledWith(newCreds, '/fake/.credentials.json');
+      expect(deps.saveCredentials).toHaveBeenCalledWith(newCreds, '/fake/.credentials.json', {
+        refreshedFrom: 'refresh-token-expiring',
+      });
     });
 
     it('continues when Keychain write throws', async () => {
@@ -438,5 +449,65 @@ describe('OAuthTokenManager', () => {
       expect(token).toBe('access-token-refreshed');
       expect(manager.accessToken).toBe('access-token-refreshed');
     });
+  });
+});
+
+describe('OAuthTokenManager refresh write-back to the real credentials file', () => {
+  let dir: string;
+  let credPath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'oauth-token-manager-file-'));
+    credPath = join(dir, '.credentials.json');
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function writeCredentialsFile(oauth: OAuthCredentials): void {
+    writeFileSync(credPath, JSON.stringify({ claudeAiOauth: oauth, mcpOAuth: { keep: true } }), { mode: 0o600 });
+  }
+
+  function fileDeps(refreshToken: TokenManagerDeps['refreshToken']): Partial<TokenManagerDeps> {
+    return {
+      loadCredentials: loadCredentialsFromFile,
+      loadFromKeychain: () => null,
+      saveCredentials: saveOAuthCredentials,
+      credentialsFilePath: credPath,
+      refreshToken,
+    };
+  }
+
+  it('keeps and adopts a token the host stored while our refresh grant was in flight', async () => {
+    const expired = { accessToken: 'expired-at', refreshToken: 'rt-0', expiresAt: Date.now() - 1_000 };
+    writeCredentialsFile(expired);
+    const host = { accessToken: 'host-at', refreshToken: 'host-rt-1', expiresAt: Date.now() + 8 * 3_600_000 };
+    const manager = new OAuthTokenManager(
+      expired,
+      undefined,
+      fileDeps(async () => {
+        // The host CLI refreshes and rewrites the file before our grant returns.
+        writeCredentialsFile(host);
+        return { accessToken: 'ours-at', refreshToken: 'ours-rt', expiresAt: Date.now() + 3_600_000 };
+      }),
+    );
+
+    expect(await manager.getValidAccessToken()).toBe('host-at');
+    expect(JSON.parse(readFileSync(credPath, 'utf-8'))).toEqual({ claudeAiOauth: host, mcpOAuth: { keep: true } });
+    expect(manager.accessToken).toBe('host-at');
+  });
+
+  it('writes its refreshed token when the file still holds the token it refreshed from', async () => {
+    const expired = { accessToken: 'expired-at', refreshToken: 'rt-0', expiresAt: Date.now() - 1_000 };
+    writeCredentialsFile(expired);
+    const ours = { accessToken: 'ours-at', refreshToken: 'ours-rt', expiresAt: Date.now() + 3_600_000 };
+    const refresh = vi.fn(async () => ours);
+    const manager = new OAuthTokenManager(expired, undefined, fileDeps(refresh));
+
+    expect(await manager.getValidAccessToken()).toBe('ours-at');
+    expect(refresh).toHaveBeenCalledWith('rt-0', undefined);
+    expect(JSON.parse(readFileSync(credPath, 'utf-8'))).toEqual({ claudeAiOauth: ours, mcpOAuth: { keep: true } });
+    expect(statSync(credPath).mode & 0o777).toBe(0o600);
   });
 });

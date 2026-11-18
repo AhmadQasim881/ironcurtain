@@ -12,6 +12,7 @@ import {
   DESKTOP_RELAY_PROFILE,
   DESKTOP_RELAY_UPLINK_NETWORK,
   FIXED_RELAY_UNIX_TARGET,
+  FIXED_RELAY_AUTHORIZATION_ENV,
   type CreateDesktopRelayExposureOptions,
   type DesktopRelayCreateAuthority,
   type DesktopRelayConfig,
@@ -39,6 +40,15 @@ const unixConfig: DesktopRelayConfig = {
 };
 
 describe('Unix fixed relay boundary', () => {
+  it('keeps the private hop credential out of process command arguments', () => {
+    for (const selected of [config, unixConfig]) {
+      const args = buildDesktopRelayCreateArgs(selected);
+      expect(args.join(' ')).not.toContain(REQUIRED_PROXY_AUTHORIZATION);
+      expect(args).not.toContain('--proxy-authorization');
+      expect(args).toContain('IRONCURTAIN_FIXED_RELAY_PROXY_AUTHORIZATION');
+    }
+  });
+
   it('mounts only the fixed socket, using the explicit non-root identity and no uplink or host alias', () => {
     const args = buildDesktopRelayCreateArgs(unixConfig);
     expect(args).toContain('type=bind,source=/tmp/ic-relay/policy.sock,target=/run/ironcurtain-upstream.sock,readonly');
@@ -98,6 +108,29 @@ describe('Unix fixed relay boundary', () => {
   );
 });
 
+/** The `HostConfig` of {@link containerInspect}, for tests that change one of its fields. */
+function containerHostConfig(relayConfig: DesktopRelayConfig = config): Record<string, unknown> {
+  return {
+    ReadonlyRootfs: true,
+    Privileged: false,
+    CapDrop: ['ALL'],
+    CapAdd: null,
+    SecurityOpt: ['no-new-privileges:true'],
+    Memory: DESKTOP_RELAY_PROFILE.memoryBytes,
+    NanoCpus: DESKTOP_RELAY_PROFILE.nanoCpus,
+    PidsLimit: DESKTOP_RELAY_PROFILE.pidsLimit,
+    NetworkMode: relayConfig.isolatedNetworkName,
+    ExtraHosts:
+      relayConfig.upstream.kind === 'tcp' && relayConfig.upstream.host === 'host.docker.internal'
+        ? ['host.docker.internal:host-gateway']
+        : null,
+    Binds: null,
+    PortBindings: {},
+    LogConfig: { Type: 'local', Config: { 'max-size': '1m', 'max-file': '1', compress: 'false' } },
+    Ulimits: [{ Name: 'nofile', Soft: 128, Hard: 128 }],
+  };
+}
+
 function containerInspect(
   overrides: Record<string, unknown> = {},
   relayConfig: DesktopRelayConfig = config,
@@ -115,7 +148,10 @@ function containerInspect(
           : '65532:65532',
       Entrypoint: ['/ironcurtain-fixed-relay'],
       Cmd: command,
-      Env: ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'],
+      Env: [
+        'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+        `${FIXED_RELAY_AUTHORIZATION_ENV}=${relayConfig.requiredProxyAuthorization}`,
+      ],
       WorkingDir: '/',
       Labels: {
         'com.ironcurtain.docker-workload.role': 'fixed-relay',
@@ -124,25 +160,7 @@ function containerInspect(
       },
       ExposedPorts: null,
     },
-    HostConfig: {
-      ReadonlyRootfs: true,
-      Privileged: false,
-      CapDrop: ['ALL'],
-      CapAdd: null,
-      SecurityOpt: ['no-new-privileges:true'],
-      Memory: DESKTOP_RELAY_PROFILE.memoryBytes,
-      NanoCpus: DESKTOP_RELAY_PROFILE.nanoCpus,
-      PidsLimit: DESKTOP_RELAY_PROFILE.pidsLimit,
-      NetworkMode: relayConfig.isolatedNetworkName,
-      ExtraHosts:
-        relayConfig.upstream.kind === 'tcp' && relayConfig.upstream.host === 'host.docker.internal'
-          ? ['host.docker.internal:host-gateway']
-          : null,
-      Binds: null,
-      PortBindings: {},
-      LogConfig: { Type: 'local', Config: { 'max-size': '1m', 'max-file': '1', compress: 'false' } },
-      Ulimits: [{ Name: 'nofile', Soft: 128, Hard: 128 }],
-    },
+    HostConfig: containerHostConfig(relayConfig),
     Mounts:
       relayConfig.upstream.kind === 'unix'
         ? [
@@ -286,7 +304,7 @@ describe('Desktop fixed relay profile', () => {
     expect(() =>
       assertDesktopRelayContainerInspect(
         containerInspect(
-          { HostConfig: { ...containerInspect({}, hostGatewayConfig).HostConfig, ExtraHosts: ['other:host-gateway'] } },
+          { HostConfig: { ...containerHostConfig(hostGatewayConfig), ExtraHosts: ['other:host-gateway'] } },
           hostGatewayConfig,
         ),
         hostGatewayConfig,
@@ -295,7 +313,7 @@ describe('Desktop fixed relay profile', () => {
   });
 
   it.each([
-    { HostConfig: { ...containerInspect().HostConfig, Privileged: true } },
+    { HostConfig: { ...containerHostConfig(), Privileged: true } },
     { Mounts: [{ Source: '/workspace' }] },
     {
       NetworkSettings: {
@@ -414,10 +432,13 @@ function fakeRelayExec(
         ] as const)),
   ]);
   let creates = 0;
-  return async (_command, args) => {
+  return async (_command, args, execution) => {
     calls.push([...args]);
     if (args[0] === 'network' && args[1] === 'create') return { stdout: networkId, stderr: '' };
     if (args[0] === 'container' && args[1] === 'create') {
+      expect(execution.env?.[FIXED_RELAY_AUTHORIZATION_ENV]).toBe(REQUIRED_PROXY_AUTHORIZATION);
+      expect(execution.env?.ANTHROPIC_API_KEY).toBeUndefined();
+      expect(args.join(' ')).not.toContain(REQUIRED_PROXY_AUTHORIZATION);
       creates += 1;
       return { stdout: creates === 1 ? registryId : packageId, stderr: '' };
     }

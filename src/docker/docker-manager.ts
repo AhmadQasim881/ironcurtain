@@ -14,11 +14,10 @@ import {
  */
 
 import { execFile as execFileCb } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { hostname, tmpdir } from 'node:os';
 import { isIPv4 } from 'node:net';
-import { join } from 'node:path';
-import { promisify } from 'node:util';
+import { isAbsolute, join } from 'node:path';
 import type {
   ContainerRuntime,
   DockerContainerConfig,
@@ -27,13 +26,15 @@ import type {
   DockerImageInfo,
   DockerNetworkCreateOptions,
   DockerNetworkInfo,
+  DockerUlimit,
   DockerVolumeCreateOptions,
   DockerVolumeInfo,
+  ImageBuildOptions,
 } from './types.js';
 import { parseDockerImageInfo } from './docker-image-inspect.js';
 import * as logger from '../logger.js';
 import { checkDockerAvailable, type DockerAvailability } from './docker-probe.js';
-import { isExecError, isExecTimeout } from '../utils/exec-error.js';
+import { isExecError } from '../utils/exec-error.js';
 import { spawnWithIdleTimeout, type SpawnFn, type SpawnWithIdleTimeoutOptions } from './spawn-with-idle-timeout.js';
 import {
   createDockerProgressSink,
@@ -42,25 +43,59 @@ import {
   type DockerProgressOperation,
 } from './docker-progress-sink.js';
 import { buildContainerExecEnvironmentArgs } from './container-exec-environment.js';
+import { inheritedEnv } from '../trusted-process/child-env.js';
 import { boundedLogTail } from './bounded-log-tail.js';
+import { rejectedExecResult, resolvedExecResult, type ExecFileOutcome } from './exec-deadline.js';
+import { relayHostPty, type HostPtySpawn, type HostTerminalStreams } from './pty-host-terminal.js';
+import { clampPtySize } from '../pty/pty-size.js';
+import { loadNodePty } from '../pty/node-pty-loader.js';
 
-/** Async exec function signature matching promisified execFile. */
+/**
+ * Async exec function signature matching promisified execFile, plus an
+ * optional `killed` flag on the resolved value. Node's own promisified
+ * `execFile` resolves a SIGTERM-ed child that exited 0 as a plain success
+ * (the Docker CLI does exactly that on a timeout), so `defaultExecFile`
+ * reports the child's `killed` state and the runtime managers treat it as a
+ * deadline hit. Implementations that cannot observe it may omit the flag;
+ * the managers then fall back to elapsed-time detection.
+ */
 export type ExecFileFn = (
   cmd: string,
   args: readonly string[],
   opts: { timeout?: number; maxBuffer?: number; env?: NodeJS.ProcessEnv },
-) => Promise<{ stdout: string; stderr: string }>;
+) => Promise<ExecFileOutcome>;
 
-export const defaultExecFile: ExecFileFn = async (cmd, args, opts) => {
-  const execFileAsync = promisify(execFileCb);
-  return execFileAsync(cmd, [...args], opts);
-};
+export const defaultExecFile: ExecFileFn = (cmd, args, opts) =>
+  new Promise((resolve, reject) => {
+    const child = execFileCb(cmd, [...args], { ...opts, encoding: 'utf8' }, (error, stdout, stderr) => {
+      if (error) {
+        // Mirror util.promisify(execFile): the rejection carries the captured
+        // output so `isExecError` consumers keep working unchanged.
+        const failure: Error = error;
+        reject(Object.assign(failure, { stdout, stderr }));
+        return;
+      }
+      resolve({ stdout, stderr, killed: child.killed });
+    });
+  });
 
 /** Default timeout for docker exec commands (10 minutes). */
 export const DEFAULT_EXEC_TIMEOUT_MS = 600_000;
 
-/** Default timeout for docker commit. Large writable layers can legitimately take minutes. */
+/** Default bound on `containerSize` (`container inspect --size` walks the writable layer). */
+const CONTAINER_SIZE_TIMEOUT_MS = 60_000;
+/** Upper bound on `localDataRoot` (`docker info` answers quickly from a healthy engine). */
+const DATA_ROOT_PROBE_TIMEOUT_MS = 10_000;
+
+/**
+ * Default timeout for docker commit. Large writable layers can legitimately
+ * take minutes. It bounds the whole commit: a flattened commit's inspect,
+ * export and import share it (see `commit()`).
+ */
 export const DEFAULT_COMMIT_TIMEOUT_MS = 600_000;
+
+/** Upper bound for the `docker container inspect` that precedes a flattened commit. */
+const COMMIT_CONFIG_INSPECT_TIMEOUT_MS = 10_000;
 
 /**
  * Idle (no-stdout/stderr) timeout for `docker pull`. The Docker daemon
@@ -78,6 +113,13 @@ export const PULL_IDLE_TIMEOUT_MS = 120_000;
  * `--progress=plain`, BuildKit will still emit per-step progress.
  */
 export const BUILD_IDLE_TIMEOUT_MS = 300_000;
+
+/**
+ * Idle timeout for a streamed log read (`streamContainerLogs`). Without
+ * `--follow` the runtime prints the stored log and exits, so this much
+ * silence means a hung daemon rather than a quiet container.
+ */
+export const LOGS_IDLE_TIMEOUT_MS = 60_000;
 
 /** Grace period for docker stop before SIGKILL. */
 const STOP_TIMEOUT_SECONDS = 10;
@@ -98,7 +140,27 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+/**
+ * Most objects one `docker <kind> inspect` names. Chunking bounds each argv,
+ * and with it the size of an exec error message, which repeats the argv.
+ */
+export const DOCKER_INSPECT_CHUNK_SIZE = 100;
+
 async function inspectDockerObjects(
+  exec: ExecFileFn,
+  kind: 'network' | 'container' | 'volume',
+  ids: readonly string[],
+): Promise<readonly Record<string, unknown>[]> {
+  const inspected: Record<string, unknown>[] = [];
+  for (let start = 0; start < ids.length; start += DOCKER_INSPECT_CHUNK_SIZE) {
+    inspected.push(
+      ...(await inspectDockerObjectChunk(exec, kind, ids.slice(start, start + DOCKER_INSPECT_CHUNK_SIZE))),
+    );
+  }
+  return inspected;
+}
+
+async function inspectDockerObjectChunk(
   exec: ExecFileFn,
   kind: 'network' | 'container' | 'volume',
   ids: readonly string[],
@@ -122,10 +184,40 @@ async function inspectDockerObjects(
     // failed batch to retain every object that still exists without masking
     // unrelated daemon/permission failures.
     const middle = Math.ceil(ids.length / 2);
-    const left = await inspectDockerObjects(exec, kind, ids.slice(0, middle));
-    const right = await inspectDockerObjects(exec, kind, ids.slice(middle));
+    const left = await inspectDockerObjectChunk(exec, kind, ids.slice(0, middle));
+    const right = await inspectDockerObjectChunk(exec, kind, ids.slice(middle));
     return [...left, ...right];
   }
+}
+
+function parseDockerContainerInfo(entry: Record<string, unknown>): DockerContainerInfo {
+  const config = isRecord(entry.Config) ? entry.Config : {};
+  const state = isRecord(entry.State) ? entry.State : {};
+  const rawName = typeof entry.Name === 'string' ? entry.Name : '';
+  return {
+    id: typeof entry.Id === 'string' ? entry.Id : '',
+    name: rawName.startsWith('/') ? rawName.slice(1) : rawName,
+    created: typeof entry.Created === 'string' ? entry.Created : '',
+    running: state.Running === true,
+    labels: stringRecord(config.Labels),
+  };
+}
+
+function parseDockerNetworkInfo(entry: Record<string, unknown>): DockerNetworkInfo {
+  const ipam = isRecord(entry.IPAM) && Array.isArray(entry.IPAM.Config) ? entry.IPAM.Config : [];
+  const subnets = ipam
+    .filter(isRecord)
+    .map((config) => config.Subnet)
+    .filter((subnet): subnet is string => typeof subnet === 'string');
+  const containers = isRecord(entry.Containers) ? entry.Containers : {};
+  return {
+    id: typeof entry.Id === 'string' ? entry.Id : '',
+    name: typeof entry.Name === 'string' ? entry.Name : '',
+    created: typeof entry.Created === 'string' ? entry.Created : '',
+    labels: stringRecord(entry.Labels),
+    subnets,
+    containerIds: Object.keys(containers),
+  };
 }
 
 function parseDockerImageId(stdout: string): string {
@@ -139,6 +231,53 @@ function parseDockerImageId(stdout: string): string {
 
 function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
+}
+
+/** Decimal units the Docker CLI's `units.HumanSize` emits, in order. */
+const HUMAN_SIZE_UNITS = ['B', 'kB', 'MB', 'GB', 'TB', 'PB', 'EB'] as const;
+const HUMAN_SIZE = /^(\d{1,4}(?:\.\d{1,4})?)(B|kB|MB|GB|TB|PB|EB)$/u;
+const MAX_MEASURED_VOLUMES = 16_384;
+
+/**
+ * Parse `docker system df --verbose --format '{{json .Volumes}}'`: one JSON
+ * array whose `Size` strings come from `units.HumanSize` (four significant
+ * digits, decimal units) or read `N/A` when the Engine could not size the
+ * volume. Anything else fails closed instead of guessing a size.
+ */
+export function parseDockerVolumeUsage(stdout: string): ReadonlyMap<string, number | null> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout.trim() === '' ? 'null' : stdout) as unknown;
+  } catch (error) {
+    throw new Error('docker volume usage is not valid JSON', { cause: error });
+  }
+  // A Desktop VM with no volumes renders the nil slice as `null`.
+  if (parsed === null) return new Map();
+  if (!Array.isArray(parsed) || parsed.length > MAX_MEASURED_VOLUMES) {
+    throw new Error('docker volume usage must be a bounded JSON array');
+  }
+  const sizes = new Map<string, number | null>();
+  for (const entry of parsed as readonly unknown[]) {
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error('docker volume usage entry must be an object');
+    }
+    const { Name: name, Size: size } = entry as Readonly<Record<string, unknown>>;
+    if (typeof name !== 'string' || name === '' || typeof size !== 'string') {
+      throw new Error('docker volume usage entry is missing its name or size');
+    }
+    if (sizes.has(name)) throw new Error(`docker volume usage lists ${name} twice`);
+    sizes.set(name, size === 'N/A' ? null : parseHumanSize(size));
+  }
+  return sizes;
+}
+
+function parseHumanSize(text: string): number {
+  const match = HUMAN_SIZE.exec(text);
+  if (match === null) throw new Error(`docker volume usage has an unrecognized size: ${text.slice(0, 32)}`);
+  const exponent = HUMAN_SIZE_UNITS.indexOf(match[2] as (typeof HUMAN_SIZE_UNITS)[number]);
+  const bytes = Math.round(Number(match[1]) * 1000 ** exponent);
+  if (!Number.isSafeInteger(bytes)) throw new Error(`docker volume usage size is out of range: ${text}`);
+  return bytes;
 }
 
 function parseDockerVolumeInfo(entry: Record<string, unknown>): DockerVolumeInfo {
@@ -163,6 +302,15 @@ function quoteDockerfileValue(value: string): string {
   return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
+/** Bundle/turn admission is restaged at create or exec, never baked into an image. */
+const SNAPSHOT_TRANSIENT_ENV_NAMES: ReadonlySet<string> = new Set([
+  'IRONCURTAIN_MCP_TCP_TOKEN',
+  'IRONCURTAIN_HTTP_PROXY_AUTHORIZATION',
+  'IRONCURTAIN_FIXED_RELAY_PROXY_AUTHORIZATION',
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+]);
+
 /**
  * Reads a container's effective Config (ENTRYPOINT/CMD/WORKDIR/USER/ENV) and
  * renders it as Dockerfile `--change` directives. `docker export | docker
@@ -170,17 +318,19 @@ function quoteDockerfileValue(value: string): string {
  * Config; re-baking it keeps a flattened snapshot behaving like its source on
  * resume (the baked ENTRYPOINT runs the UID-remap + proxy bridge, and ENV
  * carries the base-image PATH that container creation intentionally never
- * re-supplies). **Throws** when the config cannot be read or parsed, so the
+ * re-supplies). Transient transport/proxy credentials are excluded before
+ * rendering argv; each new bundle or invocation restages its own admission.
+ * **Throws** when the config cannot be read or parsed, so the
  * flattened commit fails rather than shipping a config-less image that would
  * resume broken; callers treat a snapshot failure as fall-back-to-fresh. (A
  * successful read that genuinely yields no directives is fine and proceeds.)
  */
-async function readContainerConfigChanges(exec: ExecFileFn, containerId: string): Promise<string[]> {
+async function readContainerConfigChanges(exec: ExecFileFn, containerId: string, timeoutMs: number): Promise<string[]> {
   // Let an inspect failure propagate (do NOT swallow): a flattened snapshot with
   // no re-baked ENTRYPOINT/PATH resumes broken, so failing the snapshot is safer
   // than producing a config-less image.
   const { stdout } = await exec('docker', ['container', 'inspect', '--format', '{{json .Config}}', containerId], {
-    timeout: 10_000,
+    timeout: timeoutMs,
     maxBuffer: 10 * 1024 * 1024,
   });
   let parsed: unknown;
@@ -208,6 +358,7 @@ async function readContainerConfigChanges(exec: ExecFileFn, containerId: string)
     const eq = entry.indexOf('=');
     if (eq <= 0) continue;
     const key = entry.slice(0, eq);
+    if (SNAPSHOT_TRANSIENT_ENV_NAMES.has(key.toUpperCase())) continue;
     const value = entry.slice(eq + 1);
     // A single ENV directive can't carry a newline; such values are dynamic
     // (re-supplied at create) so dropping them from the snapshot is safe.
@@ -292,6 +443,10 @@ export function buildCreateArgs(config: DockerContainerConfig): string[] {
 
   if (config.resources?.memoryMb) {
     args.push('--memory', `${config.resources.memoryMb}m`);
+    // `--memory-swap` equal to `--memory` means "no swap": a bounded container
+    // must not be able to push the host into swap by exceeding its memory
+    // ceiling (audit finding DINF-11).
+    args.push('--memory-swap', `${config.resources.memoryMb}m`);
   }
   if (config.resources?.cpus) {
     args.push('--cpus', String(config.resources.cpus));
@@ -345,10 +500,19 @@ export function buildCreateArgs(config: DockerContainerConfig): string[] {
     }
     args.push('--pids-limit', String(trusted.pidsLimit));
   }
+  for (const ulimit of trusted?.ulimits ?? []) {
+    args.push('--ulimit', formatUlimit(ulimit));
+  }
 
   for (const [key, value] of Object.entries(config.env)) {
     args.push('-e', `${key}=${value}`);
   }
+  for (const [key, value] of Object.entries(config.privateEnv ?? {})) {
+    if (key in config.env || typeof value !== 'string') {
+      throw new Error('Private container environment must contain distinct string-valued keys');
+    }
+  }
+  args.push(...buildContainerExecEnvironmentArgs(config.privateEnv));
 
   if (config.entrypoint !== undefined) {
     args.push('--entrypoint', config.entrypoint);
@@ -372,9 +536,42 @@ export function buildCreateArgs(config: DockerContainerConfig): string[] {
   return args;
 }
 
+/** `--ulimit` names the trusted create options may set (see `DockerUlimit`). */
+const SUPPORTED_ULIMIT_NAMES: ReadonlySet<string> = new Set(['nofile']);
+
+/**
+ * Renders one `--ulimit` value. Soft and hard are positive safe integers with
+ * soft <= hard; `-1` (unlimited) is deliberately rejected because these flags
+ * exist to bound the container, never to lift a daemon default.
+ */
+function formatUlimit(ulimit: DockerUlimit): string {
+  if (!SUPPORTED_ULIMIT_NAMES.has(ulimit.name)) {
+    throw new Error(`unsupported ulimit name: ${ulimit.name}`);
+  }
+  for (const value of [ulimit.soft, ulimit.hard]) {
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new Error(`ulimit ${ulimit.name} requires positive safe integers`);
+    }
+  }
+  if (ulimit.soft > ulimit.hard) {
+    throw new Error(`ulimit ${ulimit.name} soft limit exceeds its hard limit`);
+  }
+  return `${ulimit.name}=${ulimit.soft}:${ulimit.hard}`;
+}
+
 /** Test seams for the streaming spawn path used by pull/build. */
 export interface CreateDockerManagerOptions {
   endpoint?: DockerEndpoint;
+  /**
+   * `docker exec --user` for calls that pass no `execUser` (default
+   * `codespace`). A sudo-off agent bundle sets its numeric agent UID here, so
+   * no exec depends on the image mapping an account name to a non-root UID
+   * (see `agent-privileges.ts`).
+   */
+  defaultExecUser?: string;
+  /** Interactive exec uses the same filtered host terminal relay as Apple. */
+  readonly spawnPty?: HostPtySpawn;
+  readonly terminal?: HostTerminalStreams;
   spawn?: SpawnFn;
   stdoutSink?: NodeJS.WritableStream;
   stderrSink?: NodeJS.WritableStream;
@@ -441,6 +638,7 @@ export function createDockerManager(
 ): ContainerRuntime {
   const endpoint =
     spawnOpts?.endpoint === undefined ? undefined : Object.freeze(dockerEndpointSchema.parse(spawnOpts.endpoint));
+  const defaultExecUser = spawnOpts?.defaultExecUser ?? 'codespace';
   const exec =
     endpoint === undefined
       ? (execFileFn ?? defaultExecFile)
@@ -485,7 +683,10 @@ export function createDockerManager(
 
     async create(config: DockerContainerConfig): Promise<string> {
       const args = buildCreateArgs(config);
-      const { stdout } = await exec('docker', args, { timeout: 30_000 });
+      const { stdout } = await exec('docker', args, {
+        timeout: 30_000,
+        ...(config.privateEnv ? { env: { ...inheritedEnv(), ...config.privateEnv } } : {}),
+      });
       return stdout.trim();
     },
 
@@ -509,6 +710,22 @@ export function createDockerManager(
       }
     },
 
+    streamContainerLogs(nameOrId: string, sink: NodeJS.WritableStream): Promise<void> {
+      // Bound to the captured endpoint like every other docker call: an
+      // explicit --host and no inherited routing overrides.
+      const args = ['logs', nameOrId];
+      return spawnWithIdleTimeout('docker', endpoint === undefined ? args : ['--host', endpoint.host, ...args], {
+        idleTimeoutMs: LOGS_IDLE_TIMEOUT_MS,
+        operation: 'docker logs',
+        ...(endpoint === undefined
+          ? {}
+          : { env: dockerEndpointEnvironment(endpoint, process.env), envMode: 'replace' as const }),
+        spawn: streamOpts.spawn,
+        stdoutSink: sink,
+        stderrSink: sink,
+      });
+    },
+
     async probeImageVersion(image: string, command: readonly string[]): Promise<string | undefined> {
       const [entrypoint, ...rest] = command;
       if (!entrypoint) return undefined;
@@ -530,6 +747,38 @@ export function createDockerManager(
       }
     },
 
+    async execPty(
+      nameOrId: string,
+      command: readonly string[],
+      signal?: AbortSignal,
+      execUser?: string | null,
+    ): Promise<number> {
+      if (signal?.aborted) return 0;
+      const user = execUser === undefined ? defaultExecUser : execUser;
+      const args = [
+        ...(endpoint === undefined ? [] : ['--host', endpoint.host]),
+        'exec',
+        '--interactive',
+        '--tty',
+        ...(user === null ? [] : ['--user', user]),
+        nameOrId,
+        ...command,
+      ];
+      const terminal = spawnOpts?.terminal;
+      const output = terminal?.output ?? process.stdout;
+      const size = clampPtySize(output.columns ?? 80, output.rows ?? 24);
+      const spawnPty = spawnOpts?.spawnPty ?? (await loadNodePty({ purpose: 'Docker interactive sessions' })).spawn;
+      if (signal?.aborted) return 0;
+      const child = spawnPty('docker', args, {
+        name: process.env.TERM ?? 'xterm-256color',
+        cols: size.cols,
+        rows: size.rows,
+        cwd: process.cwd(),
+        env: endpoint === undefined ? inheritedEnv() : dockerEndpointEnvironment(endpoint, inheritedEnv()),
+      });
+      return relayHostPty(child, { signal, terminal });
+    },
+
     async exec(
       nameOrId: string,
       command: readonly string[],
@@ -540,7 +789,9 @@ export function createDockerManager(
     ): Promise<DockerExecResult> {
       const timeout = timeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS;
       // Resolve the `--user` flag (see ContainerRuntime.exec JSDoc):
-      //   undefined → 'codespace' (default for agent containers)
+      //   undefined → the manager's default exec user: 'codespace' for
+      //               agent containers, the numeric agent UID for a
+      //               sudo-off bundle (`defaultExecUser`)
       //   string    → override
       //   null      → skip the flag entirely (non-agent containers
       //               without a codespace account, e.g. signal-cli)
@@ -551,7 +802,7 @@ export function createDockerManager(
       // expects. On macOS, `--user 0:0` is not passed and the
       // Dockerfile `USER codespace` directive already takes effect,
       // but re-asserting `codespace` is a harmless no-op.
-      const resolvedUser = execUser === undefined ? 'codespace' : execUser;
+      const resolvedUser = execUser === undefined ? defaultExecUser : execUser;
       const userArgs = resolvedUser === null ? [] : (['--user', resolvedUser] as const);
       const workdirArgs = workdir === undefined ? [] : (['--workdir', workdir] as const);
       const environmentArgs = buildContainerExecEnvironmentArgs(environment);
@@ -565,33 +816,35 @@ export function createDockerManager(
           if (index !== -1) environmentArgs[index] = `${key}=${environment[key]}`;
         }
       }
+      // The deadline is classified from the killed child, never from the
+      // CLI's exit code: `docker exec` exits 0 when Node SIGTERMs it, which
+      // used to make a timed-out turn look like a completed one. Elapsed
+      // time is a fallback only, and monotonic so a host suspend is never
+      // counted as exec time (see exec-deadline.ts).
+      const startedAt = performance.now();
+      let result: DockerExecResult;
       try {
-        const { stdout, stderr } = await exec(
+        const outcome = await exec(
           'docker',
           ['exec', ...userArgs, ...workdirArgs, ...environmentArgs, nameOrId, ...command],
           {
             timeout,
             maxBuffer: 50 * 1024 * 1024,
-            ...(environment ? { env: { ...process.env, ...environment } } : {}),
+            ...(environment ? { env: { ...inheritedEnv(), ...environment } } : {}),
           },
         );
-        return { exitCode: 0, stdout, stderr };
+        result = resolvedExecResult(outcome, timeout, performance.now() - startedAt);
       } catch (err: unknown) {
-        if (isExecError(err)) {
-          if (isExecTimeout(err)) {
-            logger.warn(
-              `[docker-manager] exec timed out after ${timeout}ms (killed=${String(err.killed)}, ` +
-                `signal=${err.signal ?? 'none'}): docker exec ${nameOrId} ${command[0] ?? ''}`,
-            );
-          }
-          return {
-            exitCode: typeof err.code === 'number' ? err.code : 1,
-            stdout: err.stdout,
-            stderr: err.stderr,
-          };
-        }
-        throw err;
+        if (!isExecError(err)) throw err;
+        result = rejectedExecResult(err, timeout, performance.now() - startedAt);
       }
+      if (result.timedOut === true) {
+        logger.warn(
+          `[docker-manager] exec timed out after ${timeout}ms (elapsed ${Math.round(performance.now() - startedAt)}ms): ` +
+            `docker exec ${nameOrId} ${command[0] ?? ''}; the in-container process may still be running`,
+        );
+      }
+      return result;
     },
 
     async stop(nameOrId: string): Promise<void> {
@@ -638,15 +891,33 @@ export function createDockerManager(
     },
 
     async commit(containerId: string, options = {}): Promise<string> {
+      const timeoutMs = options.timeoutMs ?? DEFAULT_COMMIT_TIMEOUT_MS;
       if (options.flatten === true) {
+        // `timeoutMs` bounds the whole flattened commit, not each docker call:
+        // the inspect, the export and the import share one deadline, so a
+        // caller that must be done by a deadline (a shutdown's snapshot budget)
+        // can rely on it. Zero keeps its "no timeout" meaning.
+        const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : undefined;
+        const stepTimeoutMs = (cap = Number.POSITIVE_INFINITY): number => {
+          if (deadline === undefined) return Number.isFinite(cap) ? cap : 0;
+          const left = deadline - Date.now();
+          if (left <= 0) {
+            throw new Error(`docker commit of ${containerId} did not finish within its ${timeoutMs} ms timeout`);
+          }
+          return Math.min(cap, left);
+        };
         // Re-bake the image Config that export/import drops. Read it BEFORE
         // export so a still-running container reports its live ENTRYPOINT/ENV.
-        const configChanges = await readContainerConfigChanges(exec, containerId);
+        const configChanges = await readContainerConfigChanges(
+          exec,
+          containerId,
+          stepTimeoutMs(COMMIT_CONFIG_INSPECT_TIMEOUT_MS),
+        );
         const dir = mkdtempSync(join(tmpdir(), 'ironcurtain-snapshot-'));
         const tarPath = join(dir, 'container.tar');
         try {
           await exec('docker', ['export', '--output', tarPath, containerId], {
-            timeout: options.timeoutMs ?? DEFAULT_COMMIT_TIMEOUT_MS,
+            timeout: stepTimeoutMs(),
             maxBuffer: 1024 * 1024,
           });
           const args = ['import'];
@@ -659,7 +930,7 @@ export function createDockerManager(
             args.push(options.tag);
           }
           const { stdout } = await exec('docker', args, {
-            timeout: options.timeoutMs ?? DEFAULT_COMMIT_TIMEOUT_MS,
+            timeout: stepTimeoutMs(),
             maxBuffer: 1024 * 1024,
           });
           return parseDockerImageId(stdout);
@@ -680,7 +951,7 @@ export function createDockerManager(
         args.push(options.tag);
       }
       const { stdout } = await exec('docker', args, {
-        timeout: options.timeoutMs ?? DEFAULT_COMMIT_TIMEOUT_MS,
+        timeout: timeoutMs,
         maxBuffer: 1024 * 1024,
       });
       return parseDockerImageId(stdout);
@@ -748,6 +1019,39 @@ export function createDockerManager(
       }
     },
 
+    async containerSize(nameOrId: string, timeoutMs = CONTAINER_SIZE_TIMEOUT_MS): Promise<number | undefined> {
+      try {
+        // `--size` makes the engine total the writable layer, which can take
+        // a while on a large container: always bounded.
+        const { stdout } = await exec(
+          'docker',
+          ['container', 'inspect', '--size', '--format', '{{json .SizeRootFs}}', nameOrId],
+          { timeout: Math.max(1, timeoutMs), maxBuffer: 64 * 1024 },
+        );
+        const size = JSON.parse(stdout.trim()) as unknown;
+        return typeof size === 'number' && Number.isSafeInteger(size) && size >= 0 ? size : undefined;
+      } catch {
+        return undefined;
+      }
+    },
+
+    async localDataRoot(timeoutMs = DATA_ROOT_PROBE_TIMEOUT_MS): Promise<string | undefined> {
+      try {
+        const { stdout } = await exec('docker', ['info', '--format', '{{json .}}'], {
+          timeout: Math.max(1, Math.min(DATA_ROOT_PROBE_TIMEOUT_MS, timeoutMs)),
+          maxBuffer: 4 * 1024 * 1024,
+        });
+        const info = JSON.parse(stdout) as { DockerRootDir?: unknown; Name?: unknown };
+        const root = info.DockerRootDir;
+        // An engine in a VM (Docker Desktop, colima) or on another host reports
+        // its own hostname and a path that is not on this filesystem.
+        if (typeof root !== 'string' || !isAbsolute(root) || info.Name !== hostname()) return undefined;
+        return existsSync(root) ? root : undefined;
+      } catch {
+        return undefined;
+      }
+    },
+
     async tagImage(sourceRef: string, targetRef: string): Promise<void> {
       await exec('docker', ['image', 'tag', sourceRef, targetRef], { timeout: 30_000 });
     },
@@ -773,6 +1077,7 @@ export function createDockerManager(
       contextDir: string,
       labels?: Record<string, string>,
       buildArgs?: Readonly<Record<string, string>>,
+      options?: ImageBuildOptions,
     ): Promise<void> {
       // `--progress=plain` plus BuildKit gives line-oriented streamed output,
       // which (a) makes the user-visible "what's happening" question
@@ -789,6 +1094,7 @@ export function createDockerManager(
         '-f',
         dockerfilePath,
       ];
+      if (options?.noCache === true) args.push('--no-cache');
       if (labels) {
         for (const [key, value] of Object.entries(labels)) {
           args.push('--label', `${key}=${value}`);
@@ -851,8 +1157,10 @@ export function createDockerManager(
       }
     },
 
-    async listNetworks(): Promise<readonly DockerNetworkInfo[]> {
-      const { stdout: idsOut } = await exec('docker', ['network', 'ls', '--no-trunc', '--quiet'], {
+    async listNetworks(options?: { readonly labelFilter?: string }): Promise<readonly DockerNetworkInfo[]> {
+      const args = ['network', 'ls', '--no-trunc', '--quiet'];
+      if (options?.labelFilter) args.push('--filter', `label=${options.labelFilter}`);
+      const { stdout: idsOut } = await exec('docker', args, {
         timeout: 10_000,
         maxBuffer: 10 * 1024 * 1024,
       });
@@ -862,22 +1170,7 @@ export function createDockerManager(
         .filter(Boolean);
       if (ids.length === 0) return [];
       const inspected = await inspectDockerObjects(exec, 'network', ids);
-      return inspected.map((entry): DockerNetworkInfo => {
-        const ipam = isRecord(entry.IPAM) && Array.isArray(entry.IPAM.Config) ? entry.IPAM.Config : [];
-        const subnets = ipam
-          .filter(isRecord)
-          .map((config) => config.Subnet)
-          .filter((subnet): subnet is string => typeof subnet === 'string');
-        const containers = isRecord(entry.Containers) ? entry.Containers : {};
-        return {
-          id: typeof entry.Id === 'string' ? entry.Id : '',
-          name: typeof entry.Name === 'string' ? entry.Name : '',
-          created: typeof entry.Created === 'string' ? entry.Created : '',
-          labels: stringRecord(entry.Labels),
-          subnets,
-          containerIds: Object.keys(containers),
-        };
-      });
+      return inspected.map(parseDockerNetworkInfo);
     },
 
     async listContainers(options?: { readonly labelFilter?: string }): Promise<readonly DockerContainerInfo[]> {
@@ -893,18 +1186,17 @@ export function createDockerManager(
         .filter(Boolean);
       if (ids.length === 0) return [];
       const inspected = await inspectDockerObjects(exec, 'container', ids);
-      return inspected.map((entry): DockerContainerInfo => {
-        const config = isRecord(entry.Config) ? entry.Config : {};
-        const state = isRecord(entry.State) ? entry.State : {};
-        const rawName = typeof entry.Name === 'string' ? entry.Name : '';
-        return {
-          id: typeof entry.Id === 'string' ? entry.Id : '',
-          name: rawName.startsWith('/') ? rawName.slice(1) : rawName,
-          created: typeof entry.Created === 'string' ? entry.Created : '',
-          running: state.Running === true,
-          labels: stringRecord(config.Labels),
-        };
-      });
+      return inspected.map(parseDockerContainerInfo);
+    },
+
+    async inspectContainer(nameOrId: string): Promise<DockerContainerInfo | undefined> {
+      const entry = (await inspectDockerObjects(exec, 'container', [nameOrId])).at(0);
+      return entry === undefined ? undefined : parseDockerContainerInfo(entry);
+    },
+
+    async inspectNetwork(nameOrId: string): Promise<DockerNetworkInfo | undefined> {
+      const entry = (await inspectDockerObjects(exec, 'network', [nameOrId])).at(0);
+      return entry === undefined ? undefined : parseDockerNetworkInfo(entry);
     },
 
     async inspectContainerRaw(nameOrId: string): Promise<Readonly<Record<string, unknown>> | undefined> {
@@ -985,6 +1277,14 @@ export function createDockerManager(
       ];
       const inspected = await inspectDockerObjects(exec, 'volume', names);
       return inspected.map(parseDockerVolumeInfo);
+    },
+
+    async measureVolumeUsage(timeoutMs: number): Promise<ReadonlyMap<string, number | null>> {
+      const { stdout } = await exec('docker', ['system', 'df', '--verbose', '--format', '{{json .Volumes}}'], {
+        timeout: timeoutMs,
+        maxBuffer: 16 * 1024 * 1024,
+      });
+      return parseDockerVolumeUsage(stdout);
     },
 
     async removeVolume(name: string): Promise<void> {

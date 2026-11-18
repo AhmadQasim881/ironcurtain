@@ -5,11 +5,28 @@
  * - `http_fetch` (GET-only) retrieves web content, converting HTML to markdown by default.
  * - `web_search` queries a configured search provider (Brave, Tavily, or SerpAPI).
  *
- * Security:
- * - SSRF protection is handled by the policy engine (IP addresses blocked structurally)
+ * Security (this process runs on the host without an OS sandbox, see
+ * `mcp-servers.json`):
+ * - The policy engine evaluates only the requested URL; it does not resolve
+ *   names, and an IP-literal URL is matched by compiled rules like any other.
+ *   The SSRF defence is therefore here, in `guarded-fetch.ts`: every
+ *   connection is screened at connect time (names must resolve to public
+ *   addresses only, IP literals are screened before the request, local and
+ *   metadata names are refused), so loopback, private, link-local and
+ *   metadata destinations are unreachable, DNS rebinding included. The host
+ *   can admit private destinations named literally in the URL with the
+ *   `fetch.allowPrivateNetworks` config flag (see `fetch-env.ts`); metadata
+ *   destinations and private DNS answers stay blocked even then.
+ * - Redirects are handled manually: same-origin redirects are followed (at
+ *   most 5, each re-validated); a cross-origin redirect is returned to the
+ *   agent unfollowed, so the next hop is a new policy-evaluated, audited
+ *   `http_fetch` call and agent-supplied headers never leave the evaluated
+ *   origin. Results report the final URL and the redirects followed.
  * - User-Agent header is always injected and cannot be overridden by the agent
- * - Redirects are followed (up to 5 hops) without per-hop policy re-evaluation
- * - Responses are capped at 10 MB; requests time out after 30 seconds
+ * - Bodies are decoded by their declared or embedded charset; binary content
+ *   is reported as metadata, never returned as text
+ * - Responses are capped at 10 MB; a call times out after 30 seconds by
+ *   default (the agent may choose 1-60), covering every hop and the body
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -18,15 +35,33 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { Readability, isProbablyReaderable } from '@mozilla/readability';
 import { JSDOM } from 'jsdom';
 import TurndownService from 'turndown';
+import type { Headers } from 'undici';
 import { VERSION } from '../version.js';
 import { createSearchProvider, formatSearchResults } from './search-providers.js';
 import { guardStdioStreamErrors } from '../utils/stdio-guard.js';
+import { classifyContentType, decodeTextBody, looksBinary, parseContentType } from './fetch-content.js';
+import { isPrivateNetworkFetchEnabled } from './fetch-env.js';
+import {
+  GuardedFetchError,
+  MAX_SAME_ORIGIN_REDIRECTS,
+  guardedFetch,
+  type GuardedFetchResult,
+} from './guarded-fetch.js';
 
 const USER_AGENT = `IronCurtain/${VERSION} (AI Agent Runtime)`;
 const MAX_RESPONSE_BYTES = 10 * 1024 * 1024; // 10 MB
-const REQUEST_TIMEOUT_MS = 30_000; // 30 seconds
-const MAX_REDIRECTS = 5;
+const REQUEST_TIMEOUT_SECONDS = 30;
 const DEFAULT_MAX_LENGTH = 5000;
+/** Response headers copied into the result. */
+const RESULT_HEADERS = ['content-type', 'content-length', 'last-modified', 'etag', 'location'] as const;
+
+/**
+ * Host opt-in for private destinations named literally in a URL. Read once
+ * from the environment the host spawned this process with; no tool argument
+ * can change it.
+ */
+const ALLOW_PRIVATE_NETWORKS = isPrivateNetworkFetchEnabled(process.env);
+
 const MAX_READABILITY_BYTES = 1_000_000; // 1 MB — skip DOM parsing above this
 const MAX_READABILITY_ELEMS = 10_000; // bail if document has too many elements
 
@@ -48,73 +83,33 @@ turndown.remove([...BOILERPLATE_TAGS]);
 
 const searchProvider = createSearchProvider(process.env);
 
-/**
- * Performs the actual HTTP GET request with redirect following,
- * timeout, and response size limits.
- */
-async function doFetch(
-  url: string,
-  headers: Record<string, string>,
-  timeoutMs: number = REQUEST_TIMEOUT_MS,
-): Promise<{ status: number; headers: Record<string, string>; body: string }> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: {
-        ...headers,
-        'User-Agent': USER_AGENT, // Injected last — agent cannot override
-      },
-      signal: controller.signal,
-      redirect: 'follow',
-      // @ts-expect-error -- undici-specific option for redirect limit
-      maxRedirections: MAX_REDIRECTS,
-    });
-
-    // Read response body with size limit
-    const chunks: Uint8Array[] = [];
-    let totalBytes = 0;
-    const reader = response.body?.getReader();
-
-    if (reader) {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        totalBytes += value.byteLength;
-        if (totalBytes > MAX_RESPONSE_BYTES) {
-          void reader.cancel();
-          throw new Error(`Response exceeds ${MAX_RESPONSE_BYTES} byte limit`);
-        }
-        chunks.push(value);
-      }
-    }
-
-    const body = new TextDecoder().decode(chunks.length === 1 ? chunks[0] : concatUint8Arrays(chunks));
-
-    // Extract selected response headers
-    const responseHeaders: Record<string, string> = {};
-    for (const key of ['content-type', 'content-length', 'last-modified', 'etag']) {
-      const value = response.headers.get(key);
-      if (value) responseHeaders[key] = value;
-    }
-
-    return { status: response.status, headers: responseHeaders, body };
-  } finally {
-    clearTimeout(timeout);
+/** Copies the response headers the result reports. */
+function selectResponseHeaders(headers: Headers): Record<string, string> {
+  const selected: Record<string, string> = {};
+  for (const key of RESULT_HEADERS) {
+    const value = headers.get(key);
+    if (value) selected[key] = value;
   }
+  return selected;
 }
 
-function concatUint8Arrays(arrays: Uint8Array[]): Uint8Array {
-  const total = arrays.reduce((acc, a) => acc + a.byteLength, 0);
-  const result = new Uint8Array(total);
-  let offset = 0;
-  for (const a of arrays) {
-    result.set(a, offset);
-    offset += a.byteLength;
-  }
-  return result;
+/** The declared `Content-Length`, when it is a plain non-negative integer. */
+function declaredContentLength(headers: Headers): number | null {
+  const value = headers.get('content-length')?.trim();
+  if (value === undefined || !/^\d{1,15}$/u.test(value)) return null;
+  return Number(value);
+}
+
+/**
+ * Validates the agent's `headers` argument: absent, or an object whose values
+ * are all strings. Returns undefined when it is anything else.
+ */
+function parseRequestHeaders(value: unknown): Record<string, string> | undefined {
+  if (value === undefined || value === null) return {};
+  if (typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (!entries.every((entry): entry is [string, string] => typeof entry[1] === 'string')) return undefined;
+  return Object.fromEntries(entries);
 }
 
 /**
@@ -256,7 +251,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'http_fetch',
       description:
-        'Fetch content from a URL via HTTP GET. Returns JSON: { status, headers, body, truncated }. On error, returns JSON: { error }.',
+        'Fetch content from a URL via HTTP GET. Returns JSON: { status, url, redirects, headers, body, truncated }. ' +
+        `Same-origin redirects are followed (at most ${MAX_SAME_ORIGIN_REDIRECTS}) and listed in redirects; ` +
+        'url is the URL whose response is returned. A redirect to a different origin is not followed: the result ' +
+        'has the 3xx status, an empty body and redirect: { location }; call http_fetch with that location to ' +
+        'continue. Non-text responses (images, PDFs, archives) return binary: { contentType, size } and no body. ' +
+        'Link-local and cloud-metadata destinations are always refused; private and loopback destinations are ' +
+        'refused unless the operator has allowed private networks. On error, returns JSON: { error, code }.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -319,18 +320,84 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 });
 
-async function handleHttpFetch(
-  args: Record<string, unknown> | undefined,
-): Promise<{ content: { type: string; text: string }[]; isError?: boolean }> {
-  const url = args?.url as string | undefined;
-  if (!url || typeof url !== 'string') {
+/**
+ * Shapes a guarded fetch into the tool's JSON result: status, final URL,
+ * followed redirects and selected headers always; then either the
+ * unfollowed cross-origin redirect, binary metadata, or the decoded and
+ * formatted body.
+ */
+function buildFetchResult(
+  result: GuardedFetchResult,
+  format: OutputFormat,
+  maxLength: number,
+): Record<string, unknown> {
+  const base = {
+    status: result.status,
+    url: result.url,
+    redirects: result.redirects,
+    headers: selectResponseHeaders(result.headers),
+  };
+  if (result.kind === 'cross-origin-redirect') {
     return {
-      content: [{ type: 'text', text: JSON.stringify({ error: 'Missing required parameter: url' }) }],
-      isError: true,
+      ...base,
+      body: '',
+      truncated: false,
+      redirect: { location: result.location, followed: false, reason: 'cross-origin' },
     };
   }
 
-  const requestHeaders = (args?.headers ?? {}) as Record<string, string>;
+  const contentType = parseContentType(result.headers.get('content-type'));
+  const kind = classifyContentType(contentType.essence);
+  const body = result.body;
+  if (body === undefined || kind === 'binary' || (kind === 'unknown' && looksBinary(body))) {
+    return {
+      ...base,
+      body: '',
+      truncated: false,
+      binary: {
+        contentType: contentType.essence === '' ? null : contentType.essence,
+        size: body === undefined ? declaredContentLength(result.headers) : body.byteLength,
+      },
+    };
+  }
+
+  const text = decodeTextBody(body, contentType);
+  const processedBody = formatResponseBody(text, kind === 'html', format, result.url);
+  const truncated = processedBody.length > maxLength;
+  const finalBody = truncated ? processedBody.slice(0, maxLength) + '\n\n[Truncated]' : processedBody;
+  return { ...base, body: finalBody, truncated };
+}
+
+/** The tool's JSON error: message and code, plus where the call was when it failed. */
+function buildFetchError(err: unknown): Record<string, unknown> {
+  if (!(err instanceof GuardedFetchError)) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+  return {
+    error: err.message,
+    code: err.code,
+    ...(err.url !== undefined ? { url: err.url } : {}),
+    ...(err.redirects.length > 0 ? { redirects: err.redirects } : {}),
+    ...(err.location !== undefined ? { location: err.location } : {}),
+  };
+}
+
+function fetchError(error: Record<string, unknown>): { content: { type: string; text: string }[]; isError: true } {
+  return { content: [{ type: 'text', text: JSON.stringify(error) }], isError: true };
+}
+
+async function handleHttpFetch(
+  args: Record<string, unknown> | undefined,
+): Promise<{ content: { type: string; text: string }[]; isError?: boolean }> {
+  const url = args?.url;
+  if (typeof url !== 'string' || url === '') {
+    return fetchError({ error: 'Missing required parameter: url' });
+  }
+
+  const requestHeaders = parseRequestHeaders(args?.headers);
+  if (requestHeaders === undefined) {
+    return fetchError({ error: 'Invalid headers: expected an object whose values are strings' });
+  }
   const rawMaxLength = args?.max_length;
   const maxLength =
     typeof rawMaxLength === 'number' && Number.isFinite(rawMaxLength)
@@ -352,32 +419,27 @@ async function handleHttpFetch(
   }
   const format: OutputFormat = rawFormat ?? 'markdown';
   const timeoutSec =
-    typeof args?.timeout === 'number' && Number.isFinite(args.timeout) ? Math.min(60, Math.max(1, args.timeout)) : 30;
+    typeof args?.timeout === 'number' && Number.isFinite(args.timeout)
+      ? Math.min(60, Math.max(1, args.timeout))
+      : REQUEST_TIMEOUT_SECONDS;
 
   try {
-    const { status, headers, body } = await doFetch(url, requestHeaders, timeoutSec * 1000);
-
-    const contentType = headers['content-type'] ?? '';
-    const isHtml = contentType.includes('text/html');
-
-    const processedBody = formatResponseBody(body, isHtml, format, url);
-
-    // Truncate to max_length
-    const truncated = processedBody.length > maxLength;
-    const finalBody = truncated ? processedBody.slice(0, maxLength) + '\n\n[Truncated]' : processedBody;
+    const result = await guardedFetch(url, {
+      headers: requestHeaders,
+      userAgent: USER_AGENT,
+      timeoutMs: timeoutSec * 1000,
+      maxBodyBytes: MAX_RESPONSE_BYTES,
+      allowPrivateLiterals: ALLOW_PRIVATE_NETWORKS,
+      // Binary bodies are reported as metadata, so do not download them.
+      readBody: (contentType) => classifyContentType(parseContentType(contentType).essence) !== 'binary',
+    });
 
     // Return structured JSON so agents can access status, headers, and body
     // as parsed fields. MCP requires text content, so we JSON.stringify the
     // result — UTCP extracts the text and the agent can JSON.parse() it.
-    const result = JSON.stringify({ status, headers, body: finalBody, truncated });
-
-    return { content: [{ type: 'text', text: result }] };
+    return { content: [{ type: 'text', text: JSON.stringify(buildFetchResult(result, format, maxLength)) }] };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return {
-      content: [{ type: 'text', text: JSON.stringify({ error: message }) }],
-      isError: true,
-    };
+    return fetchError(buildFetchError(err));
   }
 }
 
@@ -426,5 +488,12 @@ async function handleWebSearch(
 }
 
 guardStdioStreamErrors();
+if (ALLOW_PRIVATE_NETWORKS) {
+  // stderr reaches the session log through the proxy.
+  process.stderr.write(
+    '[fetch] fetch.allowPrivateNetworks is enabled: http_fetch may reach private and loopback ' +
+      'addresses named literally in a requested URL\n',
+  );
+}
 const transport = new StdioServerTransport();
 await server.connect(transport);

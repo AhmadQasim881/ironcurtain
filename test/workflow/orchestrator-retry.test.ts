@@ -21,7 +21,10 @@ import { tmpdir } from 'node:os';
 import type { WorkflowDefinition } from '../../src/workflow/types.js';
 import { WorkflowOrchestrator, type WorkflowLifecycleEvent } from '../../src/workflow/orchestrator.js';
 import { isCheckpointResumable } from '../../src/workflow/checkpoint.js';
+import type { BudgetStatus } from '../../src/session/types.js';
+import { BudgetExhaustedError } from '../../src/types/errors.js';
 import {
+  resolveActiveGate,
   MockSession,
   approvedResponse,
   rejectedResponse,
@@ -170,6 +173,42 @@ const statusRoutedNoGateDef: WorkflowDefinition = {
 
 const HARD_FAILURE_TEXT = 'Agent exited with code 143.\n\nOutput:\n';
 
+/** A session budget status with generous defaults and the given overrides. */
+function budgetStatus(overrides: {
+  readonly limits?: Partial<BudgetStatus['limits']>;
+  readonly cumulative?: Partial<BudgetStatus['cumulative']>;
+  readonly hostObservedCostUsd?: number;
+}): BudgetStatus {
+  return {
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+    totalTokens: 0,
+    stepCount: 0,
+    elapsedSeconds: 0,
+    estimatedCostUsd: 0,
+    tokenTrackingAvailable: true,
+    limits: {
+      maxTotalTokens: 100_000,
+      maxSteps: 1_000,
+      maxSessionSeconds: 100,
+      maxEstimatedCostUsd: 100,
+      warnThresholdPercent: 80,
+      ...overrides.limits,
+    },
+    lastTurn: null,
+    cumulative: {
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalTokens: 0,
+      stepCount: 0,
+      activeSeconds: 0,
+      estimatedCostUsd: 0,
+      ...overrides.cumulative,
+    },
+    ...(overrides.hostObservedCostUsd === undefined ? {} : { hostObservedCostUsd: overrides.hostObservedCostUsd }),
+  };
+}
+
 describe('WorkflowOrchestrator retry loop', () => {
   let tmpDir: string;
   let activeOrchestrator: WorkflowOrchestrator | undefined;
@@ -194,9 +233,6 @@ describe('WorkflowOrchestrator retry loop', () => {
     }
     cleanupPersonas?.();
     rmSync(tmpDir, { recursive: true, force: true });
-    const baseName = resolve(tmpDir).split('/').pop()!;
-    const ckptDir = resolve(tmpDir, '..', `${baseName}-ckpt`);
-    rmSync(ckptDir, { recursive: true, force: true });
   });
 
   it('recovers when the first turn hard-fails and the retry succeeds', async () => {
@@ -435,30 +471,11 @@ describe('WorkflowOrchestrator retry loop', () => {
     const defPath = writeDefinitionFile(tmpDir, simpleAgentDef);
     const lifecycleEvents: { kind: string; error?: string }[] = [];
     const session = new MockSession({ responses: [noStatusResponse()] });
-    vi.spyOn(session, 'getBudgetStatus').mockReturnValue({
-      totalInputTokens: 0,
-      totalOutputTokens: 0,
-      totalTokens: 0,
-      stepCount: 0,
-      elapsedSeconds: 0,
-      estimatedCostUsd: 0,
-      tokenTrackingAvailable: true,
-      limits: {
-        maxTotalTokens: 100,
-        maxSteps: 1,
-        maxSessionSeconds: 100,
-        maxEstimatedCostUsd: 10,
-        warnThresholdPercent: 80,
-      },
-      cumulative: {
-        totalInputTokens: 1,
-        totalOutputTokens: 1,
-        totalTokens: 2,
-        stepCount: 1,
-        activeSeconds: 1,
-        estimatedCostUsd: 0,
-      },
-    });
+    // The primary turn is admitted (nothing used yet); the completed turn
+    // then exhausts the step budget before the recovery turn.
+    vi.spyOn(session, 'getBudgetStatus').mockImplementation(() =>
+      budgetStatus({ limits: { maxSteps: 1 }, cumulative: { stepCount: session.sentMessages.length } }),
+    );
 
     const orchestrator = new WorkflowOrchestrator(createDeps(tmpDir, { createSession: vi.fn(async () => session) }));
     activeOrchestrator = orchestrator;
@@ -474,19 +491,24 @@ describe('WorkflowOrchestrator retry loop', () => {
   });
 
   it.each([5, null])('honors a %s cost limit when recovering a malformed final status', async (costLimit) => {
-    const defPath = writeDefinitionFile(tmpDir, {
+    const limitedDef: WorkflowDefinition = {
       ...statusRoutedNoGateDef,
       settings: { mode: 'builtin', resourceBudget: { maxEstimatedCostUsd: costLimit } },
-    });
+    };
+    const defPath = writeDefinitionFile(tmpDir, limitedDef);
     const session = new MockSession({
       responses: ['```yaml\nagent_status:\n  verdict: approved\n  notes: summary: detail\n```', approvedResponse()],
     });
     const status = session.getBudgetStatus();
-    vi.spyOn(session, 'getBudgetStatus').mockReturnValue({
-      ...status,
-      estimatedCostUsd: 7.12,
-      limits: { ...status.limits, maxEstimatedCostUsd: costLimit },
-      cumulative: { ...status.cumulative, estimatedCostUsd: 7.12 },
+    // Nothing is spent before the primary turn; the first turn costs $7.12.
+    vi.spyOn(session, 'getBudgetStatus').mockImplementation(() => {
+      const spent = session.sentMessages.length === 0 ? 0 : 7.12;
+      return {
+        ...status,
+        estimatedCostUsd: spent,
+        limits: { ...status.limits, maxEstimatedCostUsd: costLimit },
+        cumulative: { ...status.cumulative, estimatedCostUsd: spent },
+      };
     });
     const lifecycleEvents: WorkflowLifecycleEvent[] = [];
     const orchestrator = new WorkflowOrchestrator(createDeps(tmpDir, { createSession: vi.fn(async () => session) }));
@@ -505,6 +527,152 @@ describe('WorkflowOrchestrator retry loop', () => {
       });
     }
   });
+
+  it("refuses a state's primary turn when the session budget is already exhausted", async () => {
+    const defPath = writeDefinitionFile(tmpDir, simpleAgentDef);
+    const lifecycleEvents: WorkflowLifecycleEvent[] = [];
+    const session = new MockSession({ responses: [approvedResponse()] });
+    vi.spyOn(session, 'getBudgetStatus').mockReturnValue(
+      budgetStatus({ limits: { maxTotalTokens: 100 }, cumulative: { totalTokens: 250 } }),
+    );
+
+    const orchestrator = new WorkflowOrchestrator(createDeps(tmpDir, { createSession: vi.fn(async () => session) }));
+    activeOrchestrator = orchestrator;
+    orchestrator.onEvent((event) => lifecycleEvents.push(event));
+
+    const workflowId = await orchestrator.start(defPath, 'write code');
+    await waitForCompletion(orchestrator, workflowId);
+
+    expect(session.sentMessages).toHaveLength(0);
+    expect(lifecycleEvents.find((event) => event.kind === 'failed')).toMatchObject({
+      error: expect.stringContaining('Cannot start agent turn for "implement": token budget exhausted (250/100)'),
+    });
+  });
+
+  it.each([
+    { label: 'a large', estimatedCostUsd: 7.12 },
+    { label: 'a negative', estimatedCostUsd: -1 },
+  ])('decides on host-observed cost, never on $label agent-reported cost', async ({ estimatedCostUsd }) => {
+    const defPath = writeDefinitionFile(tmpDir, simpleAgentDef);
+    let callCount = 0;
+    const session = new MockSession({
+      responses: () => {
+        callCount++;
+        if (callCount === 1) {
+          simulateArtifacts(findWorkflowDir(tmpDir), ['code']);
+          return noStatusResponse();
+        }
+        return approvedResponse('recovered');
+      },
+    });
+    // Container sessions put the agent CLI's own total_cost_usd in
+    // estimatedCostUsd for display; hostObservedCostUsd is what counts.
+    vi.spyOn(session, 'getBudgetStatus').mockImplementation(() =>
+      budgetStatus({
+        limits: { maxEstimatedCostUsd: 5 },
+        cumulative: { estimatedCostUsd },
+        hostObservedCostUsd: 0,
+      }),
+    );
+
+    const orchestrator = new WorkflowOrchestrator(createDeps(tmpDir, { createSession: vi.fn(async () => session) }));
+    activeOrchestrator = orchestrator;
+    const workflowId = await orchestrator.start(defPath, 'write code');
+    await waitForCompletion(orchestrator, workflowId);
+
+    expect(session.sentMessages).toHaveLength(2);
+    expect(orchestrator.getStatus(workflowId)?.phase).toBe('completed');
+  });
+
+  it('stops recovery on host-observed cost even when the agent reports a negative cost', async () => {
+    const defPath = writeDefinitionFile(tmpDir, simpleAgentDef);
+    const lifecycleEvents: WorkflowLifecycleEvent[] = [];
+    const session = new MockSession({ responses: [noStatusResponse()] });
+    vi.spyOn(session, 'getBudgetStatus').mockImplementation(() =>
+      budgetStatus({
+        limits: { maxEstimatedCostUsd: 5 },
+        cumulative: { estimatedCostUsd: -1 },
+        hostObservedCostUsd: session.sentMessages.length === 0 ? 0 : 6.5,
+      }),
+    );
+
+    const orchestrator = new WorkflowOrchestrator(createDeps(tmpDir, { createSession: vi.fn(async () => session) }));
+    activeOrchestrator = orchestrator;
+    orchestrator.onEvent((event) => lifecycleEvents.push(event));
+    const workflowId = await orchestrator.start(defPath, 'write code');
+    await waitForCompletion(orchestrator, workflowId);
+
+    expect(session.sentMessages).toHaveLength(1);
+    expect(lifecycleEvents.find((event) => event.kind === 'failed')).toMatchObject({
+      error: expect.stringContaining('cost budget exhausted ($6.50/$5.00)'),
+    });
+  });
+
+  it('never retries a turn stopped at its wall-clock limit and persists a fresh conversation id', async () => {
+    // agentThenGateDef routes the agent error to a human gate, so the
+    // workflow rests there and the checkpoint carries the error-path context.
+    const checkpointStore = createCheckpointStore(tmpDir);
+    const session = new MockSession({
+      responses: () => {
+        throw new BudgetExhaustedError(
+          'wall_clock',
+          'Time budget exhausted: turn ran 31s / 30s per-turn limit; the agent was stopped inside the container',
+        );
+      },
+    });
+    const raiseGate = vi.fn();
+    const orchestrator = new WorkflowOrchestrator(
+      createDeps(tmpDir, { createSession: vi.fn(async () => session), checkpointStore, raiseGate }),
+    );
+    activeOrchestrator = orchestrator;
+
+    const workflowId = await orchestrator.start(writeDefinitionFile(tmpDir, agentThenGateDef), 'write code');
+    await waitForGate(raiseGate, 1);
+
+    // Not retried: the host itself stopped the turn.
+    expect(session.sentMessages).toHaveLength(1);
+    expect(session.rotatedIds).toHaveLength(1);
+    // A later freshSession:false visit must not resume the killed turn's
+    // partial transcript.
+    const checkpoint = checkpointStore.load(workflowId);
+    expect(checkpoint?.context.agentConversationsByState['implement']).toBe(session.rotatedIds[0]);
+    expect(checkpoint?.context.lastError).toContain('Time budget exhausted');
+  });
+
+  it.each([
+    ['stopped by the MITM budget gate mid-turn', true, 1],
+    ['refused before it started', false, 0],
+  ] as const)(
+    'persists a fresh conversation id only for a turn the host stopped (token budget %s)',
+    async (_label, turnStopped, rotations) => {
+      const checkpointStore = createCheckpointStore(tmpDir);
+      const session = new MockSession({
+        responses: () => {
+          throw new BudgetExhaustedError(
+            'tokens',
+            'Token budget exhausted: 1,000,200 of 1,000,000 tokens charged to this agent container',
+            turnStopped,
+          );
+        },
+      });
+      const raiseGate = vi.fn();
+      const orchestrator = new WorkflowOrchestrator(
+        createDeps(tmpDir, { createSession: vi.fn(async () => session), checkpointStore, raiseGate }),
+      );
+      activeOrchestrator = orchestrator;
+
+      const workflowId = await orchestrator.start(writeDefinitionFile(tmpDir, agentThenGateDef), 'write code');
+      await waitForGate(raiseGate, 1);
+
+      expect(session.sentMessages).toHaveLength(1);
+      expect(session.rotatedIds).toHaveLength(rotations);
+      const checkpoint = checkpointStore.load(workflowId);
+      if (rotations > 0) {
+        expect(checkpoint?.context.agentConversationsByState['implement']).toBe(session.rotatedIds[0]);
+      }
+      expect(checkpoint?.context.lastError).toContain('Token budget exhausted');
+    },
+  );
 
   // Regression: `maxSessionSeconds` is a PER-TURN limit. Summing every turn's
   // active time against it turned it into a ceiling on the state's total
@@ -541,6 +709,7 @@ describe('WorkflowOrchestrator retry loop', () => {
         maxEstimatedCostUsd: 100,
         warnThresholdPercent: 80,
       },
+      lastTurn: null,
       cumulative: {
         totalInputTokens: 1,
         totalOutputTokens: 1,
@@ -618,7 +787,7 @@ describe('WorkflowOrchestrator retry loop', () => {
     expect(gate.stateName).toBe('review_gate');
     expect(gate.summary).toContain('missing final agent_status block');
 
-    orchestrator.resolveGate(workflowId, { type: 'ABORT' });
+    resolveActiveGate(orchestrator, workflowId, { type: 'ABORT' });
     await waitForCompletion(orchestrator, workflowId);
 
     expect(orchestrator.getStatus(workflowId)?.phase).toBe('aborted');

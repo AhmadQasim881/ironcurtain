@@ -1,5 +1,7 @@
 # Annotation Batching for Large MCP Servers
 
+**Status (2026-11-14):** Implemented: `annotate-tools` sends a server's tools to the model in batches of `ANNOTATION_BATCH_SIZE` (25) (`src/pipeline/tool-annotator.ts`).
+
 ## Problem
 
 The tool annotator (`src/pipeline/tool-annotator.ts`) sends all of a server's tools in a single LLM call. This breaks for servers with 100+ tools because:
@@ -24,9 +26,9 @@ Split tool lists into fixed-size batches before calling the LLM. Each batch prod
 
 5. **Simple concatenation, no deduplication.** Each batch contains disjoint tools (partitioned, not overlapping). Results are concatenated. The existing post-annotation check (missing tools validation) catches any tools dropped by the LLM.
 
-6. **Per-server caching preserved unchanged.** The `inputHash` in `annotate.ts` is computed over `(serverName, JSON.stringify(tools), prompt)`. The prompt is built from all tools, so adding/removing a single tool invalidates the cache for the entire server. This is correct: if the tool list changes, all annotations should be regenerated (a tool's role classification can depend on what other tools exist on the server, though in practice the LLM treats each independently). Batching is invisible to the cache layer.
+6. **Per-server caching preserved, with per-tool reuse below it.** The `inputHash` in `annotate.ts` is computed over `(serverName, JSON.stringify(tools), prompt)`. The prompt is built from all tools, so adding/removing a single tool invalidates the whole-server cache. Since WP-88 that no longer re-annotates every tool: each annotation records `annotationKey`, the sha256 of the tool's name, description and input schema plus the server's prompt and role-registry version (`computeToolAnnotationKey` / `annotationPromptVersion` in `tool-annotator.ts`). `annotateServerTools` reuses the roles and comment of every previous annotation (the reviewed package entry first, then the user's own entry; the other way round when the user's entry is pinned) whose key matches the live tool and which still passes the response schema, and batches only the remaining tools. In practice the LLM classifies each tool from its own schema and description (see "Prompt Considerations"), so a tool that did not change keeps its reviewed roles and a refresh produces a review diff of only the changed tools (`annotate-tools --diff`). The description is part of the key, so a change of meaning without a schema change (e.g. "now also accepts local paths") still re-annotates the tool. Annotation calls use temperature 0.
 
-7. **Batching is internal to `annotateTools()`.** The function signature does not change. Callers pass all tools; the function decides whether to batch. This keeps the `annotate.ts` orchestration layer clean.
+7. **Batching is internal to `annotateTools()`.** The function signature does not change. Callers pass all tools; the function decides whether to batch. This keeps the `annotate.ts` orchestration layer clean. (Since WP-88 the batching lives in `annotateServerTools()`, which `annotate.ts` calls with the previous annotations it may reuse; `annotateTools()` is a wrapper without them.)
 
 ## Interface Changes
 
@@ -122,10 +124,12 @@ When `tools.length <= ANNOTATION_BATCH_SIZE`, `chunk()` returns a single batch. 
 
 ### Error Handling
 
-If any batch fails (LLM error, repair exhaustion, or schema validation), the error propagates immediately. There is no partial-result recovery -- the entire server annotation fails. This matches current behavior and is appropriate because:
+If any batch fails (LLM error, repair exhaustion, schema validation, or output truncated even under the larger retry cap), the error propagates immediately. There is no partial-result recovery within a server -- the entire server annotation fails. This is appropriate because:
 - Annotations are developer-facing, cached aggressively, and rerun manually.
 - Partial annotations would fail the heuristic validator anyway (missing tools).
 - The cache ensures previously successful servers are not re-annotated on retry.
+
+Across servers, `annotate-tools --all` catches the failure (`updateAnnotationOverlay` in `annotation-overlay.ts`): the failed server keeps the annotations in effect for it, the other servers are still annotated, the overlay is written after each server, and the run exits 1 naming the failed servers. A server that lists a tool twice fails before any LLM call.
 
 ### Prompt Considerations
 
@@ -146,4 +150,4 @@ No integration test changes needed -- the existing annotation pipeline tests use
 
 - **Parallelism**: Batches could run concurrently with `Promise.all()` for faster annotation of very large servers. Not worth doing now -- sequential execution is simpler, rate-limit friendly, and annotation is a rare developer task. If added later, the `onProgress` callback would need batch-aware multiplexing.
 - **Adaptive batch sizing**: If we encounter tools with extremely large schemas (>1000 tokens each), we could estimate input token count and reduce batch size. Not needed until we see it in practice.
-- **Per-batch caching**: We could cache individual batch results to avoid re-annotating unchanged batches when a single tool is added. This would require stable batch assignment (e.g., sorted by name) and per-batch hashes. Over-engineering for now -- the per-server cache already prevents unnecessary LLM calls in the common case.
+- **Per-batch caching**: superseded by the per-tool cache (decision 6), which needs no stable batch assignment: unchanged tools are reused individually and only the new and changed tools are batched.

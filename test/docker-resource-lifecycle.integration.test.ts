@@ -16,6 +16,7 @@ const enabled = process.env.INTEGRATION_TEST === '1';
 describe.skipIf(!enabled)('Docker resource lifecycle integration', () => {
   const docker = createDockerManager();
   let networkName: string | undefined;
+  const extraNetworks: string[] = [];
   let child: ChildProcess | undefined;
   let home: string;
   let previousHome: string | undefined;
@@ -29,6 +30,7 @@ describe.skipIf(!enabled)('Docker resource lifecycle integration', () => {
   afterEach(async () => {
     child?.kill('SIGKILL');
     if (networkName) await docker.removeNetwork(networkName);
+    for (const name of extraNetworks.splice(0)) await docker.removeNetwork(name);
     if (previousHome === undefined) delete process.env.IRONCURTAIN_HOME;
     else process.env.IRONCURTAIN_HOME = previousHome;
     rmSync(home, { recursive: true, force: true });
@@ -43,12 +45,32 @@ describe.skipIf(!enabled)('Docker resource lifecycle integration', () => {
     expect(allocated.subnet).not.toMatch(/^192\.168\./);
     await expect(docker.networkExists?.(networkName)).resolves.toBe(true);
 
-    releaseManagedResourceLease(bundleId);
+    // This process stays alive: the released tombstone authorizes the reclaim.
+    expect(releaseManagedResourceLease(bundleId)).toBe('released');
     const result = await reconcileIronCurtainDockerResources(docker);
 
     expect(result.removedNetworks).toContain(networkName);
     await expect(docker.networkExists?.(networkName)).resolves.toBe(false);
     networkName = undefined;
+  });
+
+  it('never reclaims either of two concurrently live bundles in one home', async () => {
+    const first = randomUUID();
+    const second = randomUUID();
+    const names = [first, second].map((id) => `ironcurtain-${id.replace(/-/g, '').slice(0, 12)}`);
+    extraNetworks.push(...names);
+    await createIronCurtainInternalNetwork(docker, names[0], first);
+    await createIronCurtainInternalNetwork(docker, names[1], second);
+
+    // The second session's startup reconciliation.
+    const result = await reconcileIronCurtainDockerResources(docker);
+
+    expect(result.removedNetworks).not.toContain(names[0]);
+    expect(result.removedNetworks).not.toContain(names[1]);
+    await expect(docker.networkExists?.(names[0])).resolves.toBe(true);
+    await expect(docker.networkExists?.(names[1])).resolves.toBe(true);
+    releaseManagedResourceLease(first);
+    releaseManagedResourceLease(second);
   });
 
   it('reclaims a network after its real owner process is killed with SIGKILL', async () => {

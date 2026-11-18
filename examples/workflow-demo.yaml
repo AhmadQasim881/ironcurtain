@@ -81,6 +81,10 @@ states:
   validate:
     type: deterministic
     description: Runs automated test validation
+    # Builtin mode has no container, so this runs on the host, which needs the
+    # explicit acknowledgement. `echo` reads nothing from the agent-writable
+    # workspace; a host `npm test` or `pytest` would run code agents wrote.
+    host: true
     run:
       - - echo
         - 3 tests passed

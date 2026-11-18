@@ -1,6 +1,7 @@
 # Structured Deterministic Result Contract
 
-Status: Design (ready to implement)
+**Status (2026-11-14):** Implemented (PR #299): `resultFile`, `when: { verdict }` routing on deterministic states and the reserved `result_file_error` verdict (`src/workflow/`).
+
 Audience: IronCurtain workflow-runtime engineers
 Predecessor: `docs/designs/deterministic-in-container-execution.md` (PR #292, merged). This
 document fills the explicit seam that doc left open in its §1 ("What did NOT ship → The
@@ -155,6 +156,11 @@ mount aligning the two paths, so a host helper's result file and `applyResultFil
 reason the result contract is container-only** (enforced in §7.3; host-side verdict routing is
 deferred — §13). `WORKFLOW_ARTIFACT_DIR = '.workflow'` (`src/workflow/types.ts:12`) is the existing
 convention for runtime-written workspace artifacts.
+
+> **Update (WP-47).** Host deterministic states now need an explicit `host: true`, and they run with
+> `cwd: instance.workspacePath` (see `docs/designs/deterministic-in-container-execution.md` §4.4).
+> The path mismatch described above is gone for them. The result contract nevertheless stays
+> container-only: §7.3 still rejects `resultFile` without `container: true`.
 
 ---
 
@@ -359,6 +365,11 @@ config.resultFile`.
 - Resume replay (`src/workflow/orchestrator.ts:1457`, the `replayInvokeForRestoredState` det
   branch): add `resultFile: stateDef.resultFile`.
 
+_As built later:_ the two sites drifted (the machine lane-templates `run` and `resultFile`, the
+replay passed them raw, so a top-level state using `{laneDir}` got the literal placeholder on
+resume). Both now call one exported builder, `buildDeterministicInvokeInput` in
+`machine-builder.ts`, so a replayed state receives exactly what a normal entry does.
+
 `DeterministicStateDefinition` (`src/workflow/types.ts:251-275`) gains `readonly resultFile?:
 string;`.
 
@@ -476,6 +487,17 @@ forbids `resultFile` on host states; host-side verdict routing is deferred (§13
 `resolve(workspace, …)` containment is safe; as defense-in-depth, `applyResultFile` re-checks that
 the resolved path is still under `workspace` and treats an escape as `result_file_error` (mirrors
 the §7 static check at runtime).
+
+> **Current behavior (hardened read).** The container owns every entry under `/workspace`, so the
+> `existsSync` + `readFileSync` above is not what ships: a FIFO there would block the daemon's event
+> loop and a symlink to `/dev/zero` would exhaust its memory. The read goes through
+> `readUntrustedRegularFileBelow(instance.workspacePath, input.resultFile, { maxBytes: 1 MiB })`
+> (`src/hardened-fs.ts`): directory components are realpath-contained in the workspace, the file is
+> opened `O_NOFOLLOW | O_NONBLOCK` and must `fstat` as a regular file, the opened descriptor is
+> re-located inside the workspace (closing the check-then-read race), and at most 1 MiB is read. A
+> missing file is still "not found"; an escape (including a directory swapped for a symlink after
+> the check), a symlink at the result path, a FIFO or other special file, and an oversized file each
+> map to a descriptive `result_file_error`.
 
 ### 5.3 Why not in the reducer
 
@@ -735,8 +757,8 @@ A `test/workflow/orchestrator-deterministic.test.ts` case asserts that with `res
   live in the workspace dir, which already survives resume (the workspace is re-mounted from the
   persisted run dir, PR #292 §7). No new checkpoint field is needed for the file itself.
 - **Deterministic states are replayed on resume** via `replayInvokeForRestoredState`
-  (`orchestrator.ts:1448-1457`); the replay path constructs `DeterministicInvokeInput` and must
-  include `resultFile: stateDef.resultFile` (§5.1) so a re-run reads the file the same way. The
+  (`orchestrator.ts:1448-1457`); the replay path builds its `DeterministicInvokeInput` with the
+  machine's own `buildDeterministicInvokeInput` (§5.1) so a re-run reads the file the same way. The
   re-run **re-executes the commands**, which **re-write** the result file (helpers are expected
   idempotent, matching the existing replay assumption for the command array). The orchestrator reads
   the freshly-written file, so a stale file from a prior partial run is overwritten — no special

@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer, type Server } from 'node:net';
@@ -22,6 +22,14 @@ import {
 import { APPLE_VM_SELECTED_AGENT_ARTIFACT_DIR } from '../../src/docker-workload/apple-private-docker.js';
 import { resolveDockerWorkloadConfig } from '../../src/docker-workload/config.js';
 import { dockerWorkloadSessionMetadata } from '../../src/docker/docker-infrastructure.js';
+import {
+  computeTransportSidecarBuildHash,
+  TRANSPORT_SIDECAR_BUILD_HASH_LABEL,
+  TRANSPORT_SIDECAR_COMPONENT,
+  TRANSPORT_SIDECAR_COMPONENT_LABEL,
+  TRANSPORT_SIDECAR_IMAGE,
+  transportSidecarContextDir,
+} from '../../src/docker/transport-sidecar-image.js';
 import { updateSessionMetadata } from '../../src/session/session-metadata.js';
 
 const state = vi.hoisted<{
@@ -34,6 +42,7 @@ const state = vi.hoisted<{
   transportLedgerRoles: string[];
   destroyedResources: unknown;
   prepareOptions: unknown;
+  onTeardown: (() => void) | undefined;
 }>(() => ({
   infrastructure: undefined,
   startAppleVmDockerWorkload: vi.fn<(options: unknown) => Promise<void>>(),
@@ -44,6 +53,7 @@ const state = vi.hoisted<{
   transportLedgerRoles: [],
   destroyedResources: undefined,
   prepareOptions: undefined,
+  onTeardown: undefined,
 }));
 
 vi.mock('ora', () => ({
@@ -58,14 +68,19 @@ vi.mock('ora', () => ({
 }));
 
 vi.mock('../../src/session/index.js', () => ({
-  buildSessionConfig: (config: unknown, sessionId: string) => ({
-    config,
-    sandboxDir: `${process.env.IRONCURTAIN_HOME}/sessions/${sessionId}/sandbox`,
-    escalationDir: `${process.env.IRONCURTAIN_HOME}/sessions/${sessionId}/escalations`,
-    systemPromptAugmentation: '',
-    resolvedSkills: [],
-    memoryEnabled: false,
-  }),
+  // Like the real one, creates the session directory (the session claims it).
+  buildSessionConfig: (config: unknown, sessionId: string) => {
+    mkdirSync(`${process.env.IRONCURTAIN_HOME}/sessions/${sessionId}`, { recursive: true });
+    return {
+      config,
+      sandboxDir: `${process.env.IRONCURTAIN_HOME}/sessions/${sessionId}/sandbox`,
+      escalationDir: `${process.env.IRONCURTAIN_HOME}/sessions/${sessionId}/escalations`,
+      systemPromptAugmentation: '',
+      resolvedSkills: [],
+      memoryEnabled: false,
+      hostModelNotices: [],
+    };
+  },
 }));
 
 vi.mock('../../src/session/session-metadata.js', () => ({ updateSessionMetadata: vi.fn() }));
@@ -96,6 +111,8 @@ vi.mock('../../src/docker/docker-infrastructure.js', async (importOriginal) => (
   },
   buildAgentUidRemap: () => ({}),
   buildDockerOwnershipLabels: (options: { bundleId: string }) => ({ bundleLabel: options.bundleId }),
+  tcpSidecarProxyUrl: (await importOriginal<typeof import('../../src/docker/docker-infrastructure.js')>())
+    .tcpSidecarProxyUrl,
   buildDockerDesktopTransportCreateLimits: () => ({}),
   buildDockerAgentTrustedCreateOptions: (
     await importOriginal<typeof import('../../src/docker/docker-infrastructure.js')>()
@@ -252,6 +269,7 @@ vi.mock('../../src/docker/docker-infrastructure.js', async (importOriginal) => (
 vi.mock('../../src/docker/container-lifecycle.js', () => ({
   destroyBundleOuterResources: async (options: { dockerWorkload?: { teardown(): Promise<void> } }) => {
     state.destroyedResources = options;
+    state.onTeardown?.();
     await options.dockerWorkload?.teardown();
   },
 }));
@@ -261,7 +279,8 @@ vi.mock('../../src/docker-workload/session-daemon.js', async (importOriginal) =>
   return { ...actual, startAppleVmDockerWorkload: state.startAppleVmDockerWorkload };
 });
 
-import { runPtySession, type PtyAttachFn } from '../../src/docker/pty-session.js';
+import { acquireResumeSessionLock, runPtySession, type PtyAttachFn } from '../../src/docker/pty-session.js';
+import type { AgentId } from '../../src/docker/agent-adapter.js';
 
 const EXPECTED_PTY_COMMAND = [
   'socat',
@@ -289,6 +308,7 @@ describe('Apple nested Docker PTY startup ordering', () => {
     state.lifecycleEvents.length = 0;
     state.transportLedgerRoles.length = 0;
     state.destroyedResources = undefined;
+    state.onTeardown = undefined;
     state.startAppleVmDockerWorkload.mockReset();
     state.execPty.mockReset();
     state.execPty.mockResolvedValue(0);
@@ -349,6 +369,27 @@ describe('Apple nested Docker PTY startup ordering', () => {
       execPty: state.execPty,
       imageExists: vi.fn(async () => true),
       pullImage: vi.fn(async () => {}),
+      // The locally built transport sidecar image, cached from an earlier
+      // build of the current Dockerfile (src/docker/transport-sidecar-image.ts).
+      buildImage: vi.fn(async () => {}),
+      getImageLabel: vi.fn(async (image: string, label: string) =>
+        image === TRANSPORT_SIDECAR_IMAGE && label === TRANSPORT_SIDECAR_BUILD_HASH_LABEL
+          ? computeTransportSidecarBuildHash(transportSidecarContextDir())
+          : undefined,
+      ),
+      inspectImage: vi.fn(async (ref: string) =>
+        ref === TRANSPORT_SIDECAR_IMAGE
+          ? {
+              id: `sha256:${'5'.repeat(64)}`,
+              repoTags: [ref],
+              labels: {
+                [TRANSPORT_SIDECAR_BUILD_HASH_LABEL]: computeTransportSidecarBuildHash(transportSidecarContextDir()),
+                [TRANSPORT_SIDECAR_COMPONENT_LABEL]: TRANSPORT_SIDECAR_COMPONENT,
+              },
+              created: '',
+            }
+          : undefined,
+      ),
       createNetwork: vi.fn(async () => {}),
       removeNetwork: vi.fn(async () => {}),
       networkExists: vi.fn(async () => false),
@@ -359,7 +400,7 @@ describe('Apple nested Docker PTY startup ordering', () => {
           throw new Error('scripted agent egress attachment failure');
         }
       }),
-      getContainerIp: vi.fn(async () => '172.31.44.6'),
+      getContainerIp: vi.fn(async () => '172.31.44.2'),
     };
     state.infrastructure = {
       docker,
@@ -493,6 +534,16 @@ describe('Apple nested Docker PTY startup ordering', () => {
       useTcp: runtimeKind === 'docker',
       runtimeKind,
       topology: runtimeKind === 'docker' ? 'tcp-sidecar' : 'uds',
+      ...(runtimeKind === 'docker'
+        ? {
+            tcpTransport: {
+              mcpToken: '1'.repeat(64),
+              proxyAuthorization: {
+                header: `Basic ${Buffer.from(`ironcurtain:${'2'.repeat(43)}`).toString('base64')}`,
+              },
+            },
+          }
+        : {}),
       setTokenSessionId: vi.fn(),
       beginCaptureSession: vi.fn(),
       endCaptureSession: vi.fn(async () => {}),
@@ -528,7 +579,7 @@ describe('Apple nested Docker PTY startup ordering', () => {
 
     await runPtySession({
       config: config(resolveDockerWorkloadConfig({ enabled: false })),
-      mode: { kind: 'docker', agent: 'claude-code' },
+      mode: { kind: 'docker', agent: 'claude-code' as AgentId },
       workspacePath: homeDir,
       attach: async () => 0,
     });
@@ -536,9 +587,66 @@ describe('Apple nested Docker PTY startup ordering', () => {
     expect(state.createdConfigs).toHaveLength(2);
     const [, agent] = state.createdConfigs;
     expect(agent.env).not.toHaveProperty('DOCKER_HOST');
+    // The registry proxy is read-only, so npm must not try its audit POSTs.
+    expect(agent.env.NPM_CONFIG_AUDIT).toBe('false');
+    expect(agent.env.NPM_CONFIG_FUND).toBe('false');
+    // PTY agents carry the same default process and descriptor bounds as
+    // batch agents (DINF-11): the shipped pids ceiling and AGENT_OPEN_FILES_LIMIT.
     expect(agent.trustedCreateOptions).toEqual({
       tmpfs: ['/var/lib/docker:ro,nosuid,nodev,noexec,size=1m'],
+      pidsLimit: 4096,
+      ulimits: [{ name: 'nofile', soft: 65_536, hard: 65_536 }],
     });
+  });
+
+  it('holds the resume.lock of a fresh session from setup until its teardown has run', async () => {
+    // A fresh PTY session claims its directory (src/session/session-lock.ts)
+    // as a resumed one does, so a `--resume` of it while it runs is refused
+    // and prune sees it as live.
+    installInfrastructure(undefined, { runtimeKind: 'docker' });
+    const sessionsDir = join(homeDir, 'sessions');
+    const lockPath = (): string => {
+      const [sessionId] = readdirSync(sessionsDir);
+      return join(sessionsDir, sessionId, 'resume.lock');
+    };
+    let heldWhileAttached: boolean | undefined;
+    let resumeWhileAttached: unknown;
+    let heldAtTeardown: boolean | undefined;
+    state.onTeardown = () => {
+      heldAtTeardown = existsSync(lockPath());
+    };
+    state.execPty.mockImplementationOnce(async () => {
+      heldWhileAttached = existsSync(lockPath());
+      try {
+        acquireResumeSessionLock(readdirSync(sessionsDir)[0]).release();
+      } catch (error) {
+        resumeWhileAttached = error;
+      }
+      return 0;
+    });
+
+    await runPtySession({
+      config: config(resolveDockerWorkloadConfig({ enabled: false })),
+      mode: { kind: 'docker', agent: 'claude-code' as AgentId },
+      workspacePath: homeDir,
+      attach: async () => {
+        heldWhileAttached = existsSync(lockPath());
+        try {
+          acquireResumeSessionLock(readdirSync(sessionsDir)[0]).release();
+        } catch (error) {
+          resumeWhileAttached = error;
+        }
+        return 0;
+      },
+    });
+
+    expect(heldWhileAttached).toBe(true);
+    expect(resumeWhileAttached).toMatchObject({
+      code: 'SESSION_INIT_FAILED',
+      message: expect.stringContaining('already in use by a running session'),
+    });
+    expect(heldAtTeardown).toBe(true);
+    expect(existsSync(lockPath())).toBe(false);
   });
 
   it('waits for Linux UID-remap handoff before the storage check and PTY attach', async () => {
@@ -576,7 +684,7 @@ describe('Apple nested Docker PTY startup ordering', () => {
     });
     await runPtySession({
       config: config(resolveDockerWorkloadConfig({ enabled: false })),
-      mode: { kind: 'docker', agent: 'claude-code' },
+      mode: { kind: 'docker', agent: 'claude-code' as AgentId },
       workspacePath: homeDir,
       attach: async () => {
         expect(ready).toBe(true);
@@ -585,6 +693,58 @@ describe('Apple nested Docker PTY startup ordering', () => {
     });
     expect(state.createdConfigs[0].command).toContain('ironcurtain-agent-startup');
   });
+
+  it.skipIf(process.platform !== 'linux')(
+    'sweeps the agent host mounts once the PTY container is gone, on a host-root daemon (DINF-3)',
+    async () => {
+      installInfrastructure(undefined, { runtimeKind: 'docker' });
+      const infra = state.infrastructure as {
+        useTcp: boolean;
+        topology: string;
+        containerRootIsHostRoot?: boolean;
+        docker: { start: ReturnType<typeof vi.fn<ContainerRuntime['start']>> };
+      };
+      infra.useTcp = false;
+      infra.topology = 'uds';
+      infra.containerRootIsHostRoot = true;
+      await new Promise<void>((resolve) => ptyServer.close(() => resolve()));
+      let planted = '';
+      infra.docker.start.mockImplementation(async () => {
+        // The agent leaves a setuid copy of a shell in its workspace.
+        const workspace = state.createdConfigs.at(-1)?.mounts.find((mount) => mount.target === '/workspace')?.source;
+        if (workspace === undefined) throw new Error('the PTY agent has no workspace mount');
+        planted = join(workspace, 'planted');
+        writeFileSync(planted, '#!/bin/sh\n');
+        chmodSync(planted, 0o4755);
+        await new Promise<void>((resolve, reject) => {
+          ptyServer.once('error', reject);
+          ptyServer.listen(join(socketsDir, 'pty.sock'), () => resolve());
+        });
+      });
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      let modeDuringSession: number | undefined;
+      try {
+        await runPtySession({
+          config: config(resolveDockerWorkloadConfig({ enabled: false })),
+          mode: { kind: 'docker', agent: 'claude-code' as AgentId },
+          workspacePath: homeDir,
+          attach: async () => {
+            modeDuringSession = statSync(planted).mode & 0o7777;
+            return 0;
+          },
+        });
+
+        expect(modeDuringSession).toBe(0o4755);
+        expect(state.destroyedResources).toBeDefined();
+        expect(statSync(planted).mode & 0o7777).toBe(0o755);
+        expect(stderr.mock.calls.some(([chunk]) => String(chunk).includes('setuid/setgid or root-owned files'))).toBe(
+          true,
+        );
+      } finally {
+        stderr.mockRestore();
+      }
+    },
+  );
 
   it('uses runtime-native exec and attaches only after workload activation completes', async () => {
     const events: string[] = [];
@@ -609,7 +769,7 @@ describe('Apple nested Docker PTY startup ordering', () => {
 
     const session = runPtySession({
       config: config(),
-      mode: { kind: 'docker', agent: 'claude-code' },
+      mode: { kind: 'docker', agent: 'claude-code' as AgentId },
       workspacePath: homeDir,
       attach,
     });
@@ -624,6 +784,8 @@ describe('Apple nested Docker PTY startup ordering', () => {
     expect(state.createdConfigs[0].tty).toBe(false);
     expect(state.createdConfigs[0].env.DOCKER_HOST).toBe('unix:///run/ironcurtain-docker/docker.sock');
     expect(state.createdConfigs[0].env.IRONCURTAIN_DOCKER_NETWORK).toBe('ironcurtain');
+    expect(state.createdConfigs[0].env.NPM_CONFIG_AUDIT).toBe('false');
+    expect(state.createdConfigs[0].env.NPM_CONFIG_FUND).toBe('false');
     expect(state.createdConfigs[0].trustedCreateOptions).toBeUndefined();
     expect(state.execPty).toHaveBeenCalledWith(
       'apple-container-id',
@@ -657,7 +819,7 @@ describe('Apple nested Docker PTY startup ordering', () => {
     await expect(
       runPtySession({
         config: config(),
-        mode: { kind: 'docker', agent: 'claude-code' },
+        mode: { kind: 'docker', agent: 'claude-code' as AgentId },
         workspacePath: homeDir,
         attach,
       }),
@@ -674,7 +836,7 @@ describe('Apple nested Docker PTY startup ordering', () => {
     await expect(
       runPtySession({
         config: config(),
-        mode: { kind: 'docker', agent: 'claude-code' },
+        mode: { kind: 'docker', agent: 'claude-code' as AgentId },
         workspacePath: homeDir,
         attach: async () => 0,
       }),
@@ -706,7 +868,7 @@ describe('Apple nested Docker PTY startup ordering', () => {
 
     await runPtySession({
       config: config(),
-      mode: { kind: 'docker', agent: 'claude-code' },
+      mode: { kind: 'docker', agent: 'claude-code' as AgentId },
       workspacePath: homeDir,
       attach: async () => 0,
     });
@@ -774,7 +936,7 @@ describe('Apple nested Docker PTY startup ordering', () => {
 
     await runPtySession({
       config: config(),
-      mode: { kind: 'docker', agent: 'claude-code' },
+      mode: { kind: 'docker', agent: 'claude-code' as AgentId },
       workspacePath: homeDir,
       attach: async () => 0,
     });
@@ -807,7 +969,7 @@ describe('Apple nested Docker PTY startup ordering', () => {
 
     await runPtySession({
       config: config(),
-      mode: { kind: 'docker', agent: 'claude-code' },
+      mode: { kind: 'docker', agent: 'claude-code' as AgentId },
       workspacePath: homeDir,
       attach,
     });
@@ -826,9 +988,12 @@ describe('Apple nested Docker PTY startup ordering', () => {
       ],
       tmpfs: ['/var/lib/docker:ro,nosuid,nodev,noexec,size=1m'],
       pidsLimit: 128,
+      ulimits: [{ name: 'nofile', soft: 65_536, hard: 65_536 }],
     });
     const ordinaryNetwork = agent.network;
-    expect(transport.network).toBe('bridge');
+    expect(transport.network).toBe(ordinaryNetwork);
+    expect(transport.ipv4Address).toBe('172.31.44.2');
+    expect(transport.ports).toBeUndefined();
     expect(state.transportLedgerRoles).toEqual(['network', 'proxy']);
     expect(transport.labels).toEqual({
       'com.ironcurtain.docker-workload.generation': 'generation-pty-ordering',
@@ -836,25 +1001,21 @@ describe('Apple nested Docker PTY startup ordering', () => {
     expect(transport.labels).not.toHaveProperty('ironcurtain.managed');
     expect(ordinaryNetwork).toMatch(/^ironcurtain-/u);
     expect(state.networkConnections).toEqual([
-      { networkName: ordinaryNetwork, containerId: 'container-1' },
+      { networkName: 'bridge', containerId: 'container-1' },
       { networkName: 'ic-dw-egress-pty', containerId: 'container-2' },
     ]);
     expect(state.lifecycleEvents).toEqual([
       expect.stringMatching(/^create:ironcurtain-sidecar-/u),
+      `connect:container-1:bridge`,
       `start:container-1`,
-      `connect:container-1:${ordinaryNetwork}`,
       expect.stringMatching(/^create:ironcurtain-pty-/u),
       `connect:container-2:ic-dw-egress-pty`,
       `start:container-2`,
       'activate',
     ]);
-    expect(transport.command.join(' ').replaceAll('\\', '')).toContain(`TCP:${agent.name}:19000`);
-    expect(attach).toHaveBeenCalledWith(
-      expect.objectContaining({
-        containerId: 'container-2',
-        target: { host: 'localhost', port: expect.any(Number) },
-      }),
-    );
+    expect(transport.command.join(' ').replaceAll('\\', '')).not.toContain('TCP-LISTEN:19000');
+    expect(attach).not.toHaveBeenCalled();
+    expect(state.execPty).toHaveBeenCalledWith('container-2', expect.any(Array), expect.any(AbortSignal));
     expect(state.destroyedResources).toEqual(
       expect.objectContaining({
         containerId: 'container-2',
@@ -875,7 +1036,7 @@ describe('Apple nested Docker PTY startup ordering', () => {
     await expect(
       runPtySession({
         config: config(),
-        mode: { kind: 'docker', agent: 'claude-code' },
+        mode: { kind: 'docker', agent: 'claude-code' as AgentId },
         workspacePath: homeDir,
         attach: async () => 0,
       }),

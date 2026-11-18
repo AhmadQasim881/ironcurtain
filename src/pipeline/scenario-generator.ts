@@ -7,8 +7,8 @@
  *
  * Large servers (100+ tools) are handled via batching: annotations are
  * split into batches of SCENARIO_BATCH_SIZE, each batch gets its own
- * scoped system prompt and Zod schema, and results are deduplicated
- * across batches.
+ * scoped system prompt and Zod schema, the batches run concurrently, and
+ * results are deduplicated across batches in batch order.
  */
 
 import type { LanguageModel, SystemModelMessage } from 'ai';
@@ -20,6 +20,9 @@ import { isConditionalRoles } from '../types/argument-roles.js';
 import { buildScenarioArgsSuperRefine, buildToolArgNamesMap, formatToolArgNames } from './scenario-schema-validator.js';
 
 export const SCENARIO_BATCH_SIZE = 25;
+
+/** Output-token cap of one scenario batch (a truncated batch is retried once with a larger cap). */
+const SCENARIO_MAX_OUTPUT_TOKENS = 16384;
 
 function buildGeneratorResponseSchema(
   serverNames: [string, ...string[]],
@@ -48,9 +51,16 @@ function buildGeneratorResponseSchema(
 const MAX_LIST_PREVIEW_VALUES = 5;
 
 /**
- * Formats a ## Dynamic List Values section for inclusion in prompts.
+ * Formats a ## Dynamic List Values section for inclusion in prompts (the
+ * scenario generator's and the verifier judge's).
  * Shows up to {@link MAX_LIST_PREVIEW_VALUES} example values per list.
  * Returns an empty string when no lists are available.
+ *
+ * The values were resolved for the policy under test, so they are part of
+ * what verification checks: the section never tells the model to expect
+ * "allow" for a value because it is on a list (a list full of bad hosts would
+ * otherwise turn into scenarios that confirm it). Expectations come from the
+ * constitution.
  */
 export function formatDynamicListsSection(dynamicLists?: DynamicListsFile): string {
   if (!dynamicLists || Object.keys(dynamicLists.lists).length === 0) return '';
@@ -66,10 +76,31 @@ export function formatDynamicListsSection(dynamicLists?: DynamicListsFile): stri
   return `
 ## Dynamic List Values
 
-Rules reference these symbolic @list-name references, resolved to:
+The rules under test reference these symbolic @list-name references, resolved to:
 ${entries}
 
-For list-based scenarios, use values FROM these lists for positive/allow cases and obviously unrelated values (e.g., a random unrelated domain or identifier) for negative/deny/escalate cases.
+These values were resolved for the policy under test and may be wrong: being on a list does not make a value permitted. For list-based scenarios, use values from these lists and obviously unrelated values (e.g., a random unrelated domain or identifier), and decide every expected decision from the constitution: expect "allow" for a list value only when the constitution permits that value.
+`;
+}
+
+/**
+ * Formats the directories the compiled rules under test name in path
+ * conditions (`paths.within`) for the scenario generator. They give the
+ * generator the concrete paths of directories the constitution names in
+ * prose ("my Downloads folder"), but they come from the policy being
+ * verified, allow and escalate rules alike. The section therefore labels them
+ * as referenced by that policy and never as permitted: an over-broad rule
+ * (`within: "/"`, a home directory) must not turn into "allow" expectations
+ * that confirm it. Returns an empty string when no rule has a path condition.
+ */
+export function formatRuleDirectoriesSection(ruleDirectories?: readonly string[]): string {
+  if (!ruleDirectories || ruleDirectories.length === 0) return '';
+  return `
+## Directories Referenced by the Policy Under Test
+
+The compiled rules being verified name these directories in path conditions. Use them as the concrete paths of the directories the constitution refers to, but do NOT assume a directory is permitted because it is listed here: the rules may be wrong. Decide every expected decision from the constitution, and test paths inside each directory as well as just outside it.
+
+${ruleDirectories.map((p) => `- ${p}`).join('\n')}
 `;
 }
 
@@ -117,12 +148,19 @@ function formatAnnotationForPrompt(annotation: StoredToolAnnotation): string {
  * Builds the stable system prompt portion for the scenario generator.
  * Contains: role preamble, constitution, annotations, system config, and instructions.
  * This is the cacheable part.
+ *
+ * The scenarios are the verification oracle for the compiled rules, so every
+ * expectation must follow from the constitution. `ruleDirectories` (the
+ * directories the rules under test name) and `dynamicLists` (their resolved
+ * lists) come from the policy being verified; they are shown only so that
+ * scenarios use concrete paths and values, and the prompt says so (see
+ * formatRuleDirectoriesSection and formatDynamicListsSection).
  */
 export function buildGeneratorSystemPrompt(
   constitutionText: string,
   annotations: StoredToolAnnotation[],
   sandboxDirectory: string,
-  permittedDirectories?: string[],
+  ruleDirectories?: readonly string[],
   dynamicLists?: DynamicListsFile,
 ): string {
   const annotationsSummary = annotations.map(formatAnnotationForPrompt).join('\n');
@@ -141,24 +179,14 @@ ${annotations.length > 0 ? `## Valid Tool Arguments (from MCP input schemas)\n\n
 ## System Configuration
 
 - Sandbox directory: ${sandboxDirectory}
-${
-  permittedDirectories && permittedDirectories.length > 0
-    ? `
-## Permitted Directories (from compiled policy rules)
-
-The compiled rules reference these specific directories. Use these EXACT paths in your scenarios:
-
-${permittedDirectories.map((p) => `- ${p}`).join('\n')}
-`
-    : ''
-}
+${formatRuleDirectoriesSection(ruleDirectories)}
 ${formatDynamicListsSection(dynamicLists)}
 ## Instructions
 
 Generate diverse test scenarios covering:
-1. **Positive cases**: operations that SHOULD be allowed (within sandbox or permitted directories per constitution)
+1. **Positive cases**: operations that SHOULD be allowed (inside the sandbox, or where the constitution grants access)
 2. **Negative cases**: operations that SHOULD be denied (categorically forbidden by the constitution, e.g., deletes outside sandbox)
-3. **Escalation cases**: operations outside the sandbox and permitted directories that are NOT categorically forbidden — these require human approval
+3. **Escalation cases**: operations outside the sandbox and the areas the constitution grants that are NOT categorically forbidden — these require human approval
 4. **Edge cases**: path traversal attacks, boundary conditions
 5. **Read-only tools**: tools where all arguments have \`none\`-role (no resource-identifier arguments) — these should typically be allowed
 6. **Move operations**: all moves involve a delete-path role on the source argument
@@ -184,9 +212,10 @@ For each scenario provide:
 - reasoning: why this decision follows from the constitution
 
 IMPORTANT:
-- Use the EXACT permitted directory paths listed above (not generic paths like "/home/user/Downloads").
+- Base every expectedDecision on the constitution, never on the compiled rules: the directories and list values above come from the policy under test, and these scenarios exist to catch its mistakes.
+- Where the constitution names a directory, use its EXACT concrete path from the directories listed above (not generic paths like "/home/user/Downloads").
 - Use concrete paths based on the sandbox directory "${sandboxDirectory}".
-- For paths outside all permitted areas, use paths like "/etc/passwd", "/var/log/syslog", etc.
+- For paths outside every area the constitution grants, use paths like "/etc/passwd", "/var/log/syslog", etc.
 - Generate at least 10 scenarios with good coverage across all three decision types (allow, deny, escalate).
 - **Always include explicit URL values for git-remote-url arguments** (e.g., "https://github.com/org/repo.git" or "git@github.com:org/repo.git"). Never omit them. The policy engine resolves the default git remote from the filesystem at runtime, but that resolution does not run during policy verification — an absent git-remote-url arg means zero URL args are extracted, so domain-constrained compiled rules cannot match and will appear to fail incorrectly.
 
@@ -230,6 +259,12 @@ Generate test scenarios following the instructions above.`;
  * Generates test scenarios by batching annotations into groups of
  * SCENARIO_BATCH_SIZE, running generateObjectWithRepair per batch with
  * scoped system prompts and Zod schemas, then deduplicating results.
+ *
+ * The batches are independent and run concurrently. The caller bounds the
+ * number of LLM calls in flight through `llm` (the pipeline runner passes a
+ * model throttled by its shared semaphore). Results are concatenated in batch
+ * order whatever order the calls finish in, so deduplication (first
+ * occurrence wins) is deterministic. When a batch fails, the call fails.
  */
 export async function generateScenarios(
   constitutionText: string,
@@ -237,7 +272,7 @@ export async function generateScenarios(
   handwrittenScenarios: TestScenario[],
   sandboxDirectory: string,
   llm: LanguageModel,
-  permittedDirectories?: string[],
+  ruleDirectories?: readonly string[],
   onProgress?: (message: string) => void,
   dynamicLists?: DynamicListsFile,
   wrapSystemPrompt?: (prompt: string) => string | SystemModelMessage,
@@ -245,14 +280,12 @@ export async function generateScenarios(
   if (annotations.length === 0) return [...handwrittenScenarios];
 
   const batches = chunk(annotations, SCENARIO_BATCH_SIZE);
-  const allGenerated: TestScenario[] = [];
+  let batchesDone = 0;
+  if (batches.length > 1) {
+    onProgress?.(`${batches.length} batches of up to ${SCENARIO_BATCH_SIZE} tools`);
+  }
 
-  for (let i = 0; i < batches.length; i++) {
-    const batch = batches[i];
-    if (batches.length > 1) {
-      onProgress?.(`Batch ${i + 1}/${batches.length} (${batch.length} tools)`);
-    }
-
+  const generateBatch = async (batch: StoredToolAnnotation[], i: number): Promise<TestScenario[]> => {
     // Scoped schema: only this batch's server/tool names
     const serverNames = [...new Set(batch.map((a) => a.serverName))] as [string, ...string[]];
     const toolNames = [...new Set(batch.map((a) => a.toolName))] as [string, ...string[]];
@@ -266,7 +299,7 @@ export async function generateScenarios(
       constitutionText,
       batch,
       sandboxDirectory,
-      permittedDirectories,
+      ruleDirectories,
       dynamicLists,
     );
 
@@ -284,17 +317,22 @@ export async function generateScenarios(
       schema,
       system: batchSystem,
       prompt: buildBatchPrompt(batchHandwritten),
-      maxOutputTokens: 16384,
+      maxOutputTokens: SCENARIO_MAX_OUTPUT_TOKENS,
       onProgress: batches.length > 1 ? (msg) => onProgress?.(`Batch ${i + 1}/${batches.length}: ${msg}`) : onProgress,
     });
 
-    allGenerated.push(
-      ...output.scenarios.map((s) => ({
-        ...s,
-        source: 'generated' as const,
-      })),
-    );
-  }
+    batchesDone++;
+    if (batches.length > 1) {
+      onProgress?.(`${batchesDone}/${batches.length} batches done`);
+    }
+    return output.scenarios.map((s) => ({
+      ...s,
+      source: 'generated' as const,
+    }));
+  };
+
+  // Promise.all keeps the batch order of its input in its result.
+  const allGenerated = (await Promise.all(batches.map(generateBatch))).flat();
 
   // Deduplicate generated against handwritten AND across batches
   const seen = new Set<string>();
@@ -320,7 +358,7 @@ export async function repairScenarios(
   annotations: StoredToolAnnotation[],
   sandboxDirectory: string,
   llm: LanguageModel,
-  permittedDirectories?: string[],
+  ruleDirectories?: readonly string[],
   dynamicLists?: DynamicListsFile,
   onProgress?: (message: string) => void,
 ): Promise<TestScenario[]> {
@@ -347,7 +385,7 @@ Generate one replacement scenario per discarded scenario.`;
     constitutionText,
     annotations,
     sandboxDirectory,
-    permittedDirectories,
+    ruleDirectories,
     dynamicLists,
   );
 

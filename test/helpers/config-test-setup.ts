@@ -66,6 +66,7 @@ export interface ConfigOnDisk {
   };
   resourceBudget?: Record<string, unknown>;
   autoCompact?: Record<string, unknown>;
+  serverCredentials?: Partial<Record<string, Record<string, string>>>;
   [key: string]: unknown;
 }
 

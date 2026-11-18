@@ -40,6 +40,19 @@ describe('Claude Code Adapter', () => {
     expect(servers.ironcurtain.args).toContain('UNIX-CONNECT:/run/ironcurtain/proxy.sock');
   });
 
+  it('uses the authenticated TCP bridge with value-free credential forwarding', () => {
+    const files = claudeCodeAdapter.generateMcpConfig('host.docker.internal:12345', {} as IronCurtainConfig);
+    const config = JSON.parse(files[0].content) as {
+      mcpServers: { ironcurtain: { command: string; args: string[]; env: Record<string, string> } };
+    };
+    expect(config.mcpServers.ironcurtain.command).toBe('node');
+    expect(config.mcpServers.ironcurtain.args).toEqual([
+      '/usr/local/bin/ironcurtain-mcp-bridge.mjs',
+      'host.docker.internal:12345',
+    ]);
+    expect(config.mcpServers.ironcurtain.env.IRONCURTAIN_MCP_TCP_TOKEN).toBe('${IRONCURTAIN_MCP_TCP_TOKEN:-}');
+  });
+
   it('pins a fresh session id on the first turn via --session-id', () => {
     const sessionId = '11111111-2222-3333-4444-555555555555';
     const cmd = claudeCodeAdapter.buildCommand('Fix the bug', 'You are sandboxed', {
@@ -106,23 +119,58 @@ describe('Claude Code Adapter', () => {
     expect(cmd).not.toContain('--model');
   });
 
-  it('per-turn modelOverride wins over the adapter default model', () => {
-    const adapter = createClaudeCodeAdapter({
-      agentModelId: 'anthropic:claude-sonnet-4-6',
-    } as unknown as Parameters<typeof createClaudeCodeAdapter>[0]);
+  it('caps agentic turns with --max-turns from the step budget, before the prompt', () => {
+    const cmd = claudeCodeAdapter.buildCommand('Fix the bug', 'You are sandboxed', {
+      sessionId: '11111111-2222-3333-4444-555555555555',
+      firstTurn: true,
+      maxAgentTurns: 200,
+    });
+    const capIdx = cmd.indexOf('--max-turns');
+    expect(cmd[capIdx + 1]).toBe('200');
+    expect(capIdx).toBeLessThan(cmd.indexOf('-p'));
+    expect(cmd.slice(-2)).toEqual(['-p', 'Fix the bug']);
+  });
 
+  it('passes no --max-turns without a step budget and rejects a malformed cap', () => {
+    const base = { sessionId: '11111111-2222-3333-4444-555555555555', firstTurn: true } as const;
+    expect(claudeCodeAdapter.buildCommand('m', 'p', base)).not.toContain('--max-turns');
+    for (const bad of [0, -3, 1.5, Number.NaN]) {
+      expect(() => claudeCodeAdapter.buildCommand('m', 'p', { ...base, maxAgentTurns: bad })).toThrow(
+        /maxAgentTurns must be a positive integer/,
+      );
+    }
+  });
+
+  it("per-turn modelOverride wins over the session's configured agent model", () => {
+    // The session default arrives per call (agentModelId), never through the
+    // factory: one adapter instance serves every session of a process.
     const sessionId = '11111111-2222-3333-4444-555555555555';
-    const defaultCmd = adapter.buildCommand('msg', 'prompt', { sessionId, firstTurn: true });
+    const defaultCmd = claudeCodeAdapter.buildCommand('msg', 'prompt', {
+      sessionId,
+      firstTurn: true,
+      agentModelId: 'anthropic:claude-sonnet-4-6',
+    });
     const defaultIdx = defaultCmd.indexOf('--model');
     expect(defaultCmd[defaultIdx + 1]).toBe('claude-sonnet-4-6');
 
-    const overrideCmd = adapter.buildCommand('msg', 'prompt', {
+    const overrideCmd = claudeCodeAdapter.buildCommand('msg', 'prompt', {
       sessionId,
       firstTurn: true,
+      agentModelId: 'anthropic:claude-sonnet-4-6',
       modelOverride: 'anthropic:claude-haiku-4-5',
     });
     const overrideIdx = overrideCmd.indexOf('--model');
     expect(overrideCmd[overrideIdx + 1]).toBe('claude-haiku-4-5');
+  });
+
+  it('takes the PTY model from the per-session config', () => {
+    expect(createClaudeCodeAdapter.length).toBe(0);
+    const fakeKeys = new Map([['api.anthropic.com', 'sk-fake']]);
+    const env = (agentModelId?: string) =>
+      claudeCodeAdapter.buildEnv({ ...(agentModelId ? { agentModelId } : {}) } as IronCurtainConfig, fakeKeys);
+    expect(env('anthropic:claude-opus-4-6').IRONCURTAIN_MODEL).toBe('claude-opus-4-6');
+    expect(env('anthropic:claude-sonnet-4-6').IRONCURTAIN_MODEL).toBe('claude-sonnet-4-6');
+    expect(env()).not.toHaveProperty('IRONCURTAIN_MODEL');
   });
 
   it('builds system prompt with Code Mode + Docker layers', () => {
@@ -141,6 +189,16 @@ describe('Claude Code Adapter', () => {
     expect(prompt).toContain('### External operations');
     expect(prompt).toContain('### Policy');
     expect(prompt).not.toContain('IRONCURTAIN_DOCKER_NETWORK');
+  });
+
+  it('tells a read-only workspace session that its tools only read /workspace (WP-131)', () => {
+    const prompt = claudeCodeAdapter.buildSystemPrompt({ ...sampleContext, workspaceReadOnly: true });
+    expect(prompt).toContain('### Workspace (read-only)');
+    expect(prompt).toContain('mounted read-only in this session');
+    expect(prompt).toContain('`filesystem.write_file` through `execute_code`');
+    expect(prompt).not.toContain('Clone repositories into');
+    // The default wording is unchanged for ordinary sessions.
+    expect(claudeCodeAdapter.buildSystemPrompt(sampleContext)).not.toContain('read-only');
   });
 
   it('orients admitted nested-Docker sessions to the managed network', () => {
@@ -654,6 +712,7 @@ describe('Claude Code Adapter', () => {
     expect(config.hostDirName).toBe('claude-state');
     expect(config.containerMountPath).toBe('/home/codespace/.claude/');
     expect(config.resumeFlags).toEqual(['--continue']);
+    expect(config.transcriptLayout).toBe('claude-projects');
     expect(config.seed.length).toBeGreaterThanOrEqual(1);
 
     // Verify projects/ seed is a directory entry
@@ -729,6 +788,7 @@ describe('prepareSession', () => {
 
     const { systemPrompt } = prepareSession(claudeCodeAdapter, sampleServerListings, sessionDir, config, undefined, {
       networkName: 'ironcurtain',
+      networkAccess: 'offline',
     });
 
     expect(systemPrompt).toContain('IRONCURTAIN_DOCKER_NETWORK');

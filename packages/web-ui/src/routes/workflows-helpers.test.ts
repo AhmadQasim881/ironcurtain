@@ -10,6 +10,7 @@ import {
   formatConfidence,
   formatDurationMs,
   formatRelativeTime,
+  synthesizeSummaryFromPastRun,
 } from './workflows-helpers.js';
 import type { PastRunDto, WorkflowSummaryDto, PastRunPhase, LiveWorkflowPhase } from '$lib/types.js';
 
@@ -146,8 +147,18 @@ describe('workflows-helpers', () => {
         expect(isResumablePhase(p)).toBe(true);
       }
     });
-    it('rejects only completed', () => {
+    it('rejects completed, and a run that is running in another process', () => {
       expect(isResumablePhase('completed')).toBe(false);
+      expect(isResumablePhase('running_elsewhere')).toBe(false);
+    });
+  });
+
+  describe('synthesizeSummaryFromPastRun', () => {
+    it('shows a run that is live in another process as running', () => {
+      const summary = synthesizeSummaryFromPastRun(
+        makePastRun({ workflowId: 'elsewhere', phase: 'running_elsewhere' }),
+      );
+      expect(summary.phase).toBe('running' as LiveWorkflowPhase);
     });
   });
 
@@ -159,10 +170,15 @@ describe('workflows-helpers', () => {
       makePastRun({ workflowId: '4', phase: 'aborted' }),
       makePastRun({ workflowId: '5', phase: 'interrupted' }),
       makePastRun({ workflowId: '6', phase: 'waiting_human' }),
+      makePastRun({ workflowId: '7', phase: 'running_elsewhere' }),
     ];
 
     it('all returns everything', () => {
-      expect(filterPastRuns(rows, 'all')).toHaveLength(6);
+      expect(filterPastRuns(rows, 'all')).toHaveLength(7);
+    });
+
+    it('filters runs that are running in another process', () => {
+      expect(filterPastRuns(rows, 'running_elsewhere').map((r) => r.workflowId)).toEqual(['7']);
     });
 
     it('failed returns only failed rows', () => {
@@ -173,7 +189,8 @@ describe('workflows-helpers', () => {
 
     it('counts each phase plus the total', () => {
       const counts = countByPhase(rows);
-      expect(counts.all).toBe(6);
+      expect(counts.all).toBe(7);
+      expect(counts.running_elsewhere).toBe(1);
       expect(counts.completed).toBe(2);
       expect(counts.failed).toBe(1);
       expect(counts.aborted).toBe(1);

@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { redactString, redactObject } from '../src/trusted-process/audit-redactor.js';
+import {
+  MIN_SECRET_LENGTH,
+  REDACTED_SECRET,
+  prepareRedactionSecrets,
+  redactObject,
+  redactString,
+} from '../src/trusted-process/audit-redactor.js';
 
 // ── redactString ───────────────────────────────────────────────────────
 
@@ -38,10 +44,20 @@ describe('redactString', () => {
     expect(redacted).not.toContain('123-45');
   });
 
-  it('redacts a valid SSN without dashes', () => {
-    const { redacted, changed } = redactString('ssn 123456789');
-    expect(changed).toBe(true);
-    expect(redacted).toContain('***-**-6789');
+  it('leaves a bare 9-digit identifier intact (an SSN is recognised by its separators)', () => {
+    // Issue numbers, order ids and timestamps are 9-digit runs far more
+    // often than SSNs; redacting them corrupted legitimate audit data.
+    for (const text of ['issue 123456789', 'ssn 123456789', 'order 987654321 shipped']) {
+      const { redacted, changed } = redactString(text);
+      expect(changed).toBe(false);
+      expect(redacted).toBe(text);
+    }
+  });
+
+  it('does not treat a space-separated digit run as an SSN', () => {
+    const { redacted, changed } = redactString('rooms 123 45 6789');
+    expect(changed).toBe(false);
+    expect(redacted).toBe('rooms 123 45 6789');
   });
 
   it('does not redact SSN with area 000', () => {
@@ -108,6 +124,111 @@ describe('redactString', () => {
     expect(redacted).not.toContain(token);
   });
 
+  // Key formats of the providers IronCurtain itself handles. Every sample
+  // is assembled at runtime so secret scanners never see a key-shaped
+  // literal; `keep` is the prefix the mask preserves for diagnosability.
+  const providerKeys: ReadonlyArray<{ name: string; key: string; keep: string }> = [
+    {
+      name: 'Anthropic API key',
+      key: 'sk-ant-api03-' + 'Ab1'.repeat(30) + '_-' + 'Zz9'.repeat(5) + 'AA',
+      keep: 'sk-a',
+    },
+    { name: 'Anthropic OAuth token', key: 'sk-ant-oat01-' + 'Qq2'.repeat(30), keep: 'sk-a' },
+    { name: 'OpenAI project key', key: 'sk-proj-' + 'Rr3'.repeat(20) + '_' + 'Ss4'.repeat(10), keep: 'sk-p' },
+    { name: 'OpenAI service-account key', key: 'sk-svcacct-' + 'Tt5'.repeat(20), keep: 'sk-s' },
+    { name: 'OpenAI user key', key: 'sk-None-' + 'Uu6'.repeat(16), keep: 'sk-N' },
+    { name: 'OpenRouter key', key: 'sk-or-v1-' + '0123456789abcdef'.repeat(4), keep: 'sk-o' },
+    {
+      name: 'GitHub fine-grained PAT',
+      key: 'github_pat_' + 'A1b2C3d4E5f6G7h8I9j0K1' + '_' + 'x'.repeat(59),
+      keep: 'gith',
+    },
+    { name: 'GitHub OAuth token', key: 'gho_' + 'abcdefghijklmnopqrstuvwxyz0123456789', keep: 'gho_' },
+    { name: 'GitHub user-to-server token', key: 'ghu_' + 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', keep: 'ghu_' },
+    { name: 'GitHub refresh token', key: 'ghr_' + 'a1'.repeat(38), keep: 'ghr_' },
+    { name: 'Google API key', key: 'AIza' + 'SyD-abcdefghijklmnopqrstuvwxyz01234', keep: 'AIza' },
+    // 39 characters ending in '-' (one Google key in 64 does): a trailing
+    // word boundary would leave it unredacted.
+    { name: 'Google API key ending in a dash', key: 'AIza' + 'SyD_abcdefghijklmnopqrstuvwxyz0123-', keep: 'AIza' },
+    { name: 'Google OAuth access token', key: 'ya29.' + 'a0AfH6SMB'.repeat(6), keep: 'ya29' },
+    { name: 'Slack app token', key: 'xapp-1-A0123456789-1234567890123-' + 'abcdef0123456789abcdef', keep: 'xapp' },
+    { name: 'Slack rotating token', key: 'xoxe-1-' + 'My0'.repeat(12), keep: 'xoxe' },
+    { name: 'AWS temporary access key', key: 'ASIA' + 'IOSFODNN7EXAMPLE', keep: 'ASIA' },
+  ];
+  for (const { name, key, keep } of providerKeys) {
+    it(`redacts a ${name}`, () => {
+      const { redacted, changed } = redactString(`token: ${key} (copied from .env)`);
+      expect(changed).toBe(true);
+      expect(redacted).not.toContain(key);
+      expect(redacted).toContain(keep);
+      expect(redacted).toContain('(copied from .env)');
+    });
+  }
+
+  it('redacts a JSON Web Token', () => {
+    const jwt = [
+      'eyJ' + 'hbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9',
+      'eyJ' + 'zdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4ifQ',
+      'SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c',
+    ].join('.');
+    const { redacted, changed } = redactString(`id_token=${jwt}`);
+    expect(changed).toBe(true);
+    expect(redacted).not.toContain(jwt);
+    expect(redacted).toContain('id_token=eyJ');
+  });
+
+  it('redacts any bearer credential and keeps the scheme keyword', () => {
+    const token = 'bearer-token-' + 'opaque0123456789'.repeat(2);
+    const { redacted, changed } = redactString(`Authorization: Bearer ${token}`);
+    expect(changed).toBe(true);
+    expect(redacted).not.toContain(token);
+    expect(redacted).toMatch(/^Authorization: Bearer bear\.\.\./);
+  });
+
+  it('matches the bearer scheme in any case (HTTP auth schemes are case-insensitive)', () => {
+    const token = 'opaque0123456789'.repeat(2);
+    for (const scheme of ['bearer', 'BEARER', 'BeArEr']) {
+      const { redacted, changed } = redactString(`authorization: ${scheme} ${token}`);
+      expect(changed).toBe(true);
+      expect(redacted).not.toContain(token);
+      expect(redacted).toBe(`authorization: ${scheme} opaq...6789`);
+    }
+  });
+
+  it('masks a whole token even when a digit run inside it passes the card check', () => {
+    // A Slack bot token's 13-digit segment, and a digit run inside an
+    // Anthropic key, that the Luhn check accepts. Masking that run as a
+    // card first split the token and wrote the rest of it in clear.
+    const luhnValid13 = '1000000000009';
+    const cardShaped = redactString(`card ${luhnValid13}`);
+    expect(cardShaped.changed).toBe(true);
+
+    const slackSecret = 'abcdefghijklmnopqrstuvwx';
+    const slack = ['xoxb', '1234567890', luhnValid13, slackSecret].join('-');
+    const anthropicTail = 'Zz9'.repeat(14);
+    const anthropic = 'sk-ant-api03-' + '4111111111111111-' + anthropicTail;
+
+    const { redacted } = redactString(
+      `SLACK_BOT_TOKEN=${slack}\nANTHROPIC_API_KEY=${anthropic}\ncard 4111111111111111`,
+    );
+    expect(redacted).toBe('SLACK_BOT_TOKEN=xoxb...uvwx\nANTHROPIC_API_KEY=sk-a...9Zz9\ncard 4111 ******** 1111');
+    expect(redacted).not.toContain(slackSecret.slice(0, 20));
+    expect(redacted).not.toContain(anthropicTail.slice(0, 20));
+  });
+
+  it('leaves ordinary hyphenated and underscored identifiers alone', () => {
+    for (const text of [
+      'task-list-item-with-many-hyphenated-segments-in-it',
+      'desk-top-background-image-selection-helper-v2',
+      'ghostscript_printing_queue_default_settings_file',
+      'see https://example.com/sk-learn-based-pipelines-and-more-content',
+    ]) {
+      const { redacted, changed } = redactString(text);
+      expect(changed).toBe(false);
+      expect(redacted).toBe(text);
+    }
+  });
+
   // No matches
   it('returns unchanged text when no patterns match', () => {
     const { redacted, changed } = redactString('hello world, nothing sensitive here');
@@ -127,6 +248,52 @@ describe('redactString', () => {
     expect(changed).toBe(true);
     expect(redacted).toContain('***-**-6789');
     expect(redacted).not.toContain('4111111111111111');
+  });
+});
+
+// ── Known credential values ────────────────────────────────────────────
+
+describe('known credential values', () => {
+  // Deliberately matches none of the format patterns: only the exact
+  // value tells the redactor this is a credential.
+  const secret = 'not-a-known-format-' + 'c0nf1gured-secret-value';
+
+  it('prepareRedactionSecrets drops short, empty and duplicate values and orders longest first', () => {
+    expect('short'.length).toBeLessThan(MIN_SECRET_LENGTH);
+    const prepared = prepareRedactionSecrets([
+      'short',
+      '',
+      undefined,
+      null,
+      'abcdefgh',
+      secret,
+      secret,
+      'abcdefgh-longer',
+    ]);
+    expect(prepared).toEqual([secret, 'abcdefgh-longer', 'abcdefgh']);
+  });
+
+  it('redacts an exact configured credential whatever its format', () => {
+    const { redacted, changed } = redactString(`GITHUB_TOKEN=${secret}\n`, prepareRedactionSecrets([secret]));
+    expect(changed).toBe(true);
+    expect(redacted).toBe(`GITHUB_TOKEN=${REDACTED_SECRET}\n`);
+  });
+
+  it('redacts every occurrence, in nested structures too', () => {
+    const result = redactObject(
+      { content: `${secret} and again ${secret}`, nested: [{ note: secret }], count: 3 },
+      prepareRedactionSecrets([secret]),
+    );
+    expect(JSON.stringify(result)).not.toContain(secret);
+    expect(result.content).toBe(`${REDACTED_SECRET} and again ${REDACTED_SECRET}`);
+    expect(result.nested[0].note).toBe(REDACTED_SECRET);
+    expect(result.count).toBe(3);
+  });
+
+  it('leaves text without a known value unchanged', () => {
+    const { redacted, changed } = redactString('nothing to see here', prepareRedactionSecrets([secret]));
+    expect(changed).toBe(false);
+    expect(redacted).toBe('nothing to see here');
   });
 });
 
@@ -237,6 +404,59 @@ describe('AuditLog with redaction', () => {
     const written = readFileSync(tmpPath, 'utf-8');
     expect(written).toContain('123-45-6789');
     expect(written).toContain('4111111111111111');
+    unlinkSync(tmpPath);
+  });
+
+  it('redacts configured credential values when enabled', async () => {
+    const { AuditLog } = await import('../src/trusted-process/audit-log.js');
+    const secret = 'configured-credential-' + 'value-0123456789';
+    const tmpPath = `/tmp/audit-secret-test-${Date.now()}.jsonl`;
+    const log = new AuditLog(tmpPath, { redact: true, secrets: [secret, 'short', undefined] });
+
+    log.log({
+      timestamp: '2026-01-01T00:00:00.000Z',
+      requestId: 'r1',
+      serverName: 'fs',
+      toolName: 'write_file',
+      arguments: { path: '/workspace/.env', content: `GITHUB_TOKEN=${secret}` },
+      policyDecision: { status: 'allow' as const, rule: 'r', reason: 'r' },
+      result: { status: 'error', error: `backend rejected ${secret}` },
+      durationMs: 10,
+    });
+    await log.close();
+
+    const { readFileSync, unlinkSync } = await import('node:fs');
+    const written = readFileSync(tmpPath, 'utf-8');
+    expect(written).not.toContain(secret);
+    expect(written).toContain(`GITHUB_TOKEN=${REDACTED_SECRET}`);
+    expect(written).toContain(`backend rejected ${REDACTED_SECRET}`);
+    // Metadata is untouched.
+    expect(written).toContain('"path":"/workspace/.env"');
+    unlinkSync(tmpPath);
+  });
+
+  it('writes configured credential values in clear when redaction is disabled', async () => {
+    // `auditRedaction.enabled: false` means full forensic logging; the
+    // known-value list is part of redaction and follows the same switch.
+    const { AuditLog } = await import('../src/trusted-process/audit-log.js');
+    const secret = 'configured-credential-' + 'value-0123456789';
+    const tmpPath = `/tmp/audit-secret-off-test-${Date.now()}.jsonl`;
+    const log = new AuditLog(tmpPath, { redact: false, secrets: [secret] });
+
+    log.log({
+      timestamp: '2026-01-01T00:00:00.000Z',
+      requestId: 'r1',
+      serverName: 'fs',
+      toolName: 'write_file',
+      arguments: { content: secret },
+      policyDecision: { status: 'allow' as const, rule: 'r', reason: 'r' },
+      result: { status: 'success' },
+      durationMs: 10,
+    });
+    await log.close();
+
+    const { readFileSync, unlinkSync } = await import('node:fs');
+    expect(readFileSync(tmpPath, 'utf-8')).toContain(secret);
     unlinkSync(tmpPath);
   });
 

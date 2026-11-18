@@ -46,7 +46,9 @@ import { loadSessionMetadata } from '../src/session/session-metadata.js';
 import { getSessionMetadataPath } from '../src/config/paths.js';
 import type { Sandbox } from '../src/sandbox/index.js';
 import type { IronCurtainConfig } from '../src/config/types.js';
-import type { SessionOptions } from '../src/session/types.js';
+import type { BuiltinSessionOptions } from '../src/session/types.js';
+import { writePersonaPolicy } from './fixtures/scoped-policy.js';
+import { testUserConfig } from './helpers/user-config.js';
 
 const mockGenerateText = generateText as unknown as MockInstance;
 
@@ -73,30 +75,7 @@ function createTestConfig(): IronCurtainConfig {
     constitutionPath: `${REAL_TMP}/test-constitution.md`,
     agentModelId: 'anthropic:claude-sonnet-4-6',
     escalationTimeoutSeconds: 300,
-    userConfig: {
-      agentModelId: 'anthropic:claude-sonnet-4-6',
-      policyModelId: 'anthropic:claude-sonnet-4-6',
-      anthropicApiKey: 'test-api-key',
-      googleApiKey: '',
-      openaiApiKey: '',
-      escalationTimeoutSeconds: 300,
-      resourceBudget: {
-        maxTotalTokens: 1_000_000,
-        maxSteps: 200,
-        maxSessionSeconds: 1800,
-        maxEstimatedCostUsd: 5.0,
-        warnThresholdPercent: 80,
-      },
-      autoCompact: {
-        enabled: false,
-        thresholdTokens: 80_000,
-        keepRecentMessages: 10,
-        summaryModelId: 'anthropic:claude-haiku-4-5',
-      },
-      autoApprove: { enabled: false, modelId: 'anthropic:claude-haiku-4-5' },
-      auditRedaction: { enabled: true },
-      memory: { enabled: false, llmBaseUrl: undefined, llmApiKey: undefined },
-    },
+    userConfig: testUserConfig({ anthropicApiKey: 'test-api-key' }),
   };
 }
 
@@ -156,27 +135,26 @@ function createTestPersonaOnDisk(
   };
   writeFileSync(resolve(personaDir, 'persona.json'), JSON.stringify(definition));
   // Synthesized policy must reference every server in test config, else the
-  // policy-derived filter drops them all before the test runs.
+  // policy-derived filter drops them all before the test runs. The rules
+  // escalate: unconditioned `allow` rules would grant broad access, which
+  // `resolvePersona` refuses for a persona without the broad-policy opt-in.
   const policyServers = opts.policyServers ?? ['filesystem', 'github', 'gmail'];
-  writeFileSync(
-    resolve(generatedDir, 'compiled-policy.json'),
-    JSON.stringify({
-      rules: policyServers.map((server) => ({
-        name: `test-${server}`,
-        description: 'test',
-        principle: 'test',
-        if: { server: [server] },
-        then: 'allow',
-        reason: 'test',
-      })),
-    }),
-  );
+  writePersonaPolicy(personaDir, {
+    rules: policyServers.map((server) => ({
+      name: `test-${server}`,
+      description: 'test',
+      principle: 'test',
+      if: { server: [server] },
+      then: 'escalate',
+      reason: 'test',
+    })),
+  });
 
   return generatedDir;
 }
 
 /** Creates a session with sensible test defaults and the given overrides. */
-async function createTestSession(overrides: Partial<SessionOptions> = {}) {
+async function createTestSession(overrides: Partial<BuiltinSessionOptions> = {}) {
   return createSession({
     config: createTestConfig(),
     sandboxFactory: createMockSandboxFactory(),
@@ -461,6 +439,55 @@ describe('buildSessionConfig with persona', () => {
     } finally {
       await session.close();
     }
+  });
+});
+
+describe('stale persona policies', () => {
+  /** Edits the persona's constitution after its policy was compiled. */
+  function editConstitution(name: string): void {
+    writeFileSync(resolve(TEST_HOME, 'personas', name, 'constitution.md'), 'Only read files.\n');
+  }
+
+  it('refuses a persona whose constitution changed after compile, before creating any session state', async () => {
+    createTestPersonaOnDisk('coder');
+    editConstitution('coder');
+    const sandboxFactory = vi.fn();
+
+    await expect(createTestSession({ persona: 'coder', sandboxFactory })).rejects.toMatchObject({
+      code: 'POLICY_STALE',
+      message: expect.stringMatching(/^Persona "coder" has a stale compiled policy/),
+    });
+    expect(sandboxFactory).not.toHaveBeenCalled();
+    expect(existsSync(resolve(TEST_HOME, 'sessions'))).toBe(false);
+  });
+
+  it('runs a stale persona only on the explicit override, and logs the override', async () => {
+    createTestPersonaOnDisk('coder');
+    editConstitution('coder');
+    const warnSpy = vi.spyOn(loggerModule, 'warn');
+    const sandboxFactory = vi.fn().mockImplementation(async () => createMockSandbox());
+
+    const session = await createTestSession({ persona: 'coder', allowStalePolicy: true, sandboxFactory });
+    try {
+      expect(sandboxFactory).toHaveBeenCalledOnce();
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringMatching(/Persona "coder" has a stale compiled policy .*stale-policy override was given/),
+      );
+    } finally {
+      await session.close();
+    }
+  });
+
+  it('refuses to resume a persona session once its policy went stale', async () => {
+    createTestPersonaOnDisk('coder');
+    const firstSession = await createTestSession({ persona: 'coder' });
+    const firstSessionId = firstSession.getInfo().id;
+    await firstSession.close();
+    editConstitution('coder');
+
+    await expect(createTestSession({ resumeSessionId: firstSessionId })).rejects.toMatchObject({
+      code: 'POLICY_STALE',
+    });
   });
 });
 

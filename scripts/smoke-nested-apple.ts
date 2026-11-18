@@ -158,7 +158,7 @@ async function main(
 
       const runtime = createContainerRuntime(
         runtimeKind,
-        active.lease.schemaVersion === 2 ? active.lease.dockerEndpoint : undefined,
+        active.lease.schemaVersion === 1 ? undefined : active.lease.dockerEndpoint,
       );
       await verifyAgentDockerEnvironment(runtime, outerId);
       const selectedImageId = await verifyPrivateDockerBaseline(
@@ -640,7 +640,7 @@ async function mainPty(mode: 'pty' | 'docker-desktop-pty', target: SmokeTarget):
     if (supervisorIdentity === undefined) throw new Error('watchdog supervisor is not alive at PTY activation');
     const runtime = createContainerRuntime(
       runtimeKind,
-      active.lease.schemaVersion === 2 ? active.lease.dockerEndpoint : undefined,
+      active.lease.schemaVersion === 1 ? undefined : active.lease.dockerEndpoint,
     );
     closedBundleOptions = {
       runtime,
@@ -905,7 +905,7 @@ async function verifyPostCrashReadmission(options: {
     await verifyClosedBundle({
       runtime: createContainerRuntime(
         'docker',
-        active.lease.schemaVersion === 2 ? active.lease.dockerEndpoint : undefined,
+        active.lease.schemaVersion === 1 ? undefined : active.lease.dockerEndpoint,
       ),
       active,
       outerId,

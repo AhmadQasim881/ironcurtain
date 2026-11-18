@@ -1,7 +1,9 @@
-import { dirname } from 'node:path';
+import { lstatSync } from 'node:fs';
+import { dirname, isAbsolute, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { CompiledPolicyFile } from '../pipeline/types.js';
 import { RESERVED_SERVER_NAMES } from '../types/reserved-servers.js';
-import { resolveRealPath } from '../types/argument-roles.js';
+import { expandTilde, resolveRealPath } from '../types/argument-roles.js';
 
 /**
  * Root entry for the MCP Roots protocol.
@@ -27,8 +29,9 @@ export interface PolicyRoot {
  *
  * Catch-all rules without `paths.within` (like
  * `escalate-read-outside-permitted-areas`) are also excluded from
- * initial roots. Those are handled dynamically: when a human approves
- * an escalation, the target directory is added as a root at that time.
+ * initial roots. Those are handled dynamically: when an escalation is
+ * approved, the directory each escalated path needs is added as a root
+ * at that time (see `roots-expansion.ts`).
  *
  * @param compiledPolicy - The loaded compiled policy artifact.
  * @param allowedDirectory - The sandbox directory (always included).
@@ -62,7 +65,7 @@ export function extractPolicyRoots(compiledPolicy: CompiledPolicyFile, allowedDi
  * policy. Reserved virtual servers (registered in-process, not spawned
  * from `mcp-servers.json`) are excluded.
  */
-export function extractRequiredServers(policy: CompiledPolicyFile): Set<string> {
+export function extractRequiredServers(policy: Pick<CompiledPolicyFile, 'rules'>): Set<string> {
   const servers = new Set<string>();
   for (const rule of policy.rules) {
     if (!rule.if.server) continue;
@@ -81,23 +84,81 @@ export function extractRequiredServers(policy: CompiledPolicyFile): Set<string> 
  */
 export function toMcpRoots(policyRoots: PolicyRoot[]): Array<{ uri: string; name: string }> {
   return policyRoots.map((r) => ({
-    uri: `file://${r.path}`,
+    uri: rootUriForPath(r.path),
     name: r.name,
   }));
 }
 
 /**
- * Extracts the containing directory for a filesystem path.
- * Used to derive the root directory when a human approves an
- * escalation -- the approved path's parent directory becomes a root
- * so the filesystem server will accept the forwarded call.
+ * Converts an absolute directory path to the `file://` URI advertised as
+ * an MCP root.
  *
- * If the path ends with a trailing slash, it is treated as a directory
- * and returned as-is (without the trailing slash) after resolution.
- * Otherwise dirname is used to get the containing directory.
+ * Uses `pathToFileURL` so characters with URL syntax (`#`, `?`, `%`,
+ * spaces, control characters) are percent-encoded. A plain
+ * `file://${path}` would make a directory named `/home/u/x#y` reach the
+ * server as `/home/u/x` (the rest parses as a URL fragment): a different
+ * directory from the one that was approved.
  */
-export function directoryForPath(filePath: string): string {
-  // Check for trailing slash before resolving, since resolveRealPath() strips it.
-  if (filePath.endsWith('/')) return resolveRealPath(filePath);
-  return dirname(resolveRealPath(filePath));
+export function rootUriForPath(directory: string): string {
+  return pathToFileURL(directory).href;
+}
+
+/**
+ * Inverse of {@link rootUriForPath}: the absolute path a root URI names,
+ * or `undefined` when the URI is not a well-formed local `file:` URI.
+ */
+export function pathForRootUri(uri: string): string | undefined {
+  try {
+    return fileURLToPath(uri);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Resolves an approved path argument to an absolute canonical path
+ * (symlinks resolved). A relative path resolves against `baseDirectory`
+ * (the session sandbox), the base the policy engine uses for relative
+ * paths, never against the process working directory. Returns
+ * `undefined` for a relative path when no base directory is known.
+ */
+export function resolveApprovedPath(filePath: string, baseDirectory?: string): string | undefined {
+  const expanded = expandTilde(filePath);
+  if (isAbsolute(expanded)) return resolveRealPath(expanded);
+  if (baseDirectory === undefined) return undefined;
+  return resolveRealPath(resolve(baseDirectory, expanded));
+}
+
+/**
+ * Returns the directory a canonical approved path needs as an MCP root:
+ * the path itself when it names an existing directory, otherwise its
+ * parent (a file, or a path the call is about to create).
+ *
+ * The final component is inspected with `lstat`, so a path that has
+ * become a symlink since it was canonicalized is not treated as a
+ * directory. Callers re-canonicalize the path to detect such a swap.
+ */
+export function rootDirectoryForCanonicalPath(canonicalPath: string): string {
+  let isDirectory = false;
+  try {
+    isDirectory = lstatSync(canonicalPath).isDirectory();
+  } catch {
+    // Missing or unreadable: the call creates or reads an entry in the parent.
+  }
+  return isDirectory ? canonicalPath : dirname(canonicalPath);
+}
+
+/**
+ * Returns the directory to use as an MCP root for an approved path: the
+ * canonical path itself when it is an existing directory, otherwise its
+ * canonical parent directory. Approving `list_directory ~/Downloads`
+ * therefore yields `~/Downloads`, not the whole home directory.
+ *
+ * Relative paths resolve against `baseDirectory` (the sandbox). Without
+ * a base directory a relative path has no approved location, so the
+ * result is `undefined` and no root may be derived from it.
+ */
+export function directoryForPath(filePath: string, baseDirectory?: string): string | undefined {
+  const canonical = resolveApprovedPath(filePath, baseDirectory);
+  return canonical === undefined ? undefined : rootDirectoryForCanonicalPath(canonical);
 }

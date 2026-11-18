@@ -7,13 +7,13 @@
  *
  * Lifecycle notes that aren't obvious from the code:
  *   - `captureContainerLogs` MUST run BEFORE `session.close()`: the
- *     container is force-removed on close, after which `docker logs`
- *     returns "no such container".
+ *     container is force-removed on close, after which the runtime's
+ *     `logs` reports "no such container".
  *   - `captureConversationLogs` runs AFTER `session.close()`: the
  *     bundle teardown only removes the runtime sockets dir, not the
  *     bind-mounted `claude-state/` tree under the session dir.
  *
- * Both are best-effort: missing/empty inputs and Docker-side failures are
+ * Both are best-effort: missing/empty inputs and runtime-side failures are
  * logged to stderr but never propagated. The agent run's success/failure
  * is reported through the existing `agent-output.md` + verdict path.
  *
@@ -23,71 +23,61 @@
  * boundaries.
  */
 
-import { spawn } from 'node:child_process';
 import { createWriteStream, existsSync, readdirSync, cpSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { getSessionDir } from '../config/paths.js';
-import { getBundleShortId, type BundleId } from '../session/types.js';
+import type { BundleId, Session } from '../session/types.js';
+import { toDisplayText } from '../terminal/display-sanitize.js';
 
 export interface RunStateCapturePaths {
   readonly containerLogsPath: string;
   readonly claudeLogsDir: string;
   readonly claudeProjectsSrc: string;
-  readonly containerName: string;
 }
 
 export function resolveCapturePaths(bundleId: BundleId, outputDir: string): RunStateCapturePaths {
-  const bundleSlug = getBundleShortId(bundleId);
   return {
     containerLogsPath: resolve(outputDir, 'container-logs.txt'),
     claudeLogsDir: resolve(outputDir, 'claude-session-logs'),
     claudeProjectsSrc: resolve(getSessionDir(bundleId), 'claude-state', 'projects'),
-    containerName: `ironcurtain-${bundleSlug}`,
   };
 }
 
 /**
- * Streams `docker logs <container>` (combined stdout/stderr) to the
- * capture path. Streaming avoids the 10 MB `maxBuffer` data-loss failure
- * mode of `execFile` -- crashlooping/OOM containers, the very ones we
- * want to diagnose, are exactly the ones likely to overflow.
+ * Writes the agent container's complete log (combined stdout/stderr) to the
+ * capture path. The session streams it through the runtime its
+ * infrastructure was built with and the container's real id
+ * (`Session.streamContainerLogs`), so the Apple `container` runtime and a
+ * captured Docker endpoint work like plain Docker. Streaming avoids the
+ * 10 MB `maxBuffer` data-loss failure mode of `execFile` -- crashlooping/OOM
+ * containers, the very ones we want to diagnose, are exactly the ones
+ * likely to overflow.
  */
-export async function captureContainerLogs(paths: RunStateCapturePaths): Promise<void> {
+export async function captureContainerLogs(
+  session: Pick<Session, 'streamContainerLogs'>,
+  paths: RunStateCapturePaths,
+): Promise<void> {
+  if (session.streamContainerLogs === undefined) {
+    process.stderr.write('[run-state] this session has no container to capture logs from\n');
+    return;
+  }
   const out = createWriteStream(paths.containerLogsPath);
-  const proc = spawn('docker', ['logs', paths.containerName], {
-    stdio: ['ignore', 'pipe', 'pipe'],
+  // 'close' follows both a flushed end() and a failed open or write.
+  const closed = new Promise<void>((resolveClosed) => out.once('close', resolveClosed));
+  out.on('error', (err) => {
+    process.stderr.write(`[run-state] container-log write failed: ${err.message}\n`);
   });
-  proc.stdout.pipe(out, { end: false });
-  proc.stderr.pipe(out, { end: false });
-  await new Promise<void>((res) => {
-    let resolved = false;
-    const done = () => {
-      if (resolved) return;
-      resolved = true;
-      res();
-    };
-    // Resolve only after the file write stream has flushed to disk.
-    // `out.on('finish')` fires after `out.end()` has drained the buffer.
-    out.on('finish', done);
-    out.on('error', (err) => {
-      process.stderr.write(`[run-state] container-log write failed: ${err.message}\n`);
-      proc.kill();
-      done();
-    });
-    // `close` (vs. `exit`) waits for the child's stdio to fully drain,
-    // so any data still piping into `out` has been written by the time
-    // we call `out.end()`. Resolving on `exit` could truncate large logs.
-    proc.on('close', (code, signal) => {
-      if (code !== 0) {
-        process.stderr.write(`[run-state] docker logs ${paths.containerName} exited ${code ?? signal}\n`);
-      }
-      out.end();
-    });
-    proc.on('error', (err) => {
-      process.stderr.write(`[run-state] docker logs failed: ${err.message}\n`);
-      out.end();
-    });
-  });
+  try {
+    await session.streamContainerLogs(out);
+  } catch (err) {
+    // The runtime's error quotes its stderr tail, which carries the
+    // container's own stderr output: escape it for the terminal.
+    const message = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`[run-state] container log capture failed: ${toDisplayText(message, { multiline: true })}\n`);
+  } finally {
+    out.end();
+    await closed;
+  }
 }
 
 export function captureConversationLogs(paths: RunStateCapturePaths): void {

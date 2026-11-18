@@ -8,6 +8,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from 'node:fs';
@@ -120,6 +121,49 @@ describe('selected agent artifact', () => {
     expect(removed).toEqual([tagged[0]?.[1]]);
     expect(existsSync(stalePreparation)).toBe(false);
     await expect(verifySelectedAgentArtifactArchive(first)).resolves.toBeUndefined();
+  });
+
+  it('keeps its default cache at the real location below a symlinked IronCurtain home', async () => {
+    const logicalName = 'ironcurtain-claude-code:latest';
+    const buildHash = '7'.repeat(64);
+    const fixtureDirectory = mkdtempSync(join(directory, 'fixture-'));
+    const fixture = writeOciArchiveFixture({
+      directory: fixtureDirectory,
+      logicalName,
+      buildHash,
+      architecture: 'arm64',
+      fixtureId: 'artifact-symlinked-home-test',
+      runtimeImageIdKind: 'index',
+    });
+    const realHome = join(directory, 'data', 'home');
+    mkdirSync(realHome, { recursive: true, mode: 0o700 });
+    const linkedHome = join(directory, 'home-link');
+    symlinkSync(realHome, linkedHome);
+    const runtime = {
+      listImages: async () => [],
+      inspectImage: async () => ({
+        id: fixture.runtimeImageId,
+        repoTags: [logicalName],
+        labels: { 'ironcurtain.build-hash': buildHash },
+        created: '2026-08-15T00:00:00.000Z',
+      }),
+      tagImage: async () => {},
+      saveImageArchive: async (_ref: string, archivePath: string) => {
+        copyFileSync(join(fixtureDirectory, fixture.archive.fileName), archivePath);
+      },
+      removeImage: async () => true,
+    };
+    const previousHome = process.env.IRONCURTAIN_HOME;
+    process.env.IRONCURTAIN_HOME = linkedHome;
+    try {
+      const artifact = await prepareSelectedAgentArtifact({ runtime, logicalName, buildHash, architecture: 'arm64' });
+      // The archive is later hard-linked into lease staging and bind-mounted:
+      // both need the canonical path, not the symlinked one.
+      expect(artifact.archivePath.startsWith(join(realHome, 'docker-workload', 'agent-artifacts'))).toBe(true);
+    } finally {
+      if (previousHome === undefined) delete process.env.IRONCURTAIN_HOME;
+      else process.env.IRONCURTAIN_HOME = previousHome;
+    }
   });
 
   it('reconciles a stale crashed-process alias on restart without touching active or fresh captures', async () => {

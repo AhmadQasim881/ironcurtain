@@ -7,6 +7,7 @@ import { SqliteLlmMetricsRepository } from './persistence/sqlite-repository.js';
 import { LlmStatisticsQueryService, type LlmStatisticsReader } from './query-service.js';
 import { createPersistenceIdentityProtector, protectLlmMetricsRepository } from './identity-protector.js';
 import { BOUNDED_STATISTICS_DELETE_OPTIONS } from './persistence/delete-policy.js';
+import { createStatisticsLabelResolver, type StatisticsLabelCandidatesSource } from './statistics-labels.js';
 
 export interface LlmMetricsRuntimeLease {
   readonly repository: LlmMetricsRepository;
@@ -18,6 +19,12 @@ export interface LlmMetricsRuntimeOptions {
   readonly databasePath?: string;
   /** Null disables pruning unless another active lease requests a finite window. */
   readonly retentionDays?: number | null;
+  /**
+   * Configured names the reader maps pseudonymized persona, profile and agent
+   * values back to. Defaults to this host's persona directories, provider
+   * profiles and built-in agents. Used only by the lease that creates the runtime.
+   */
+  readonly labelCandidates?: StatisticsLabelCandidatesSource;
 }
 
 const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1_000;
@@ -54,7 +61,10 @@ function serializeLifecycle<T>(operation: () => T | Promise<T>): Promise<T> {
   return result;
 }
 
-async function createSharedRuntime(databasePath: string): Promise<SharedRuntime> {
+async function createSharedRuntime(
+  databasePath: string,
+  labelCandidates: StatisticsLabelCandidatesSource | undefined,
+): Promise<SharedRuntime> {
   const statisticsDir = dirname(databasePath);
   const identityProtector = createPersistenceIdentityProtector(statisticsDir);
   const durableRepository = await SqliteLlmMetricsRepository.open({ databasePath });
@@ -65,7 +75,9 @@ async function createSharedRuntime(databasePath: string): Promise<SharedRuntime>
   return {
     databasePath,
     repository,
-    reader: new LlmStatisticsQueryService(repository),
+    reader: new LlmStatisticsQueryService(repository, {
+      labels: createStatisticsLabelResolver(identityProtector, labelCandidates),
+    }),
     unsubscribe,
     retentionByLease: new Map(),
     references: 0,
@@ -192,7 +204,7 @@ export async function acquireLlmMetricsRuntime(
     if (sharedRuntime !== undefined && sharedRuntime.databasePath !== databasePath) {
       throw new Error('LLM metrics runtime is already active for a different database path');
     }
-    sharedRuntime ??= await createSharedRuntime(databasePath);
+    sharedRuntime ??= await createSharedRuntime(databasePath, options.labelCandidates);
     sharedRuntime.references += 1;
     if (options.retentionDays !== undefined) sharedRuntime.retentionByLease.set(leaseId, options.retentionDays);
     updateRetentionScheduling(sharedRuntime);

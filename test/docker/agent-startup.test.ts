@@ -17,7 +17,7 @@ function runtime() {
 describe('Docker agent startup handoff', () => {
   it('leaves non-remapped runtimes untouched', async () => {
     const command = ['sleep', 'infinity'];
-    const startup = prepareDockerAgentStartup(command, false);
+    const startup = prepareDockerAgentStartup(command, undefined);
     const docker = runtime();
     expect(startup.command).toBe(command);
     await startup.waitUntilReady(docker, 'agent');
@@ -29,11 +29,11 @@ describe('Docker agent startup handoff', () => {
     () => {
       const startup = prepareDockerAgentStartup(
         ['/bin/sh', '-c', 'printf "%s\\n" "$1"; umask', 'test', 'literal $value; *'],
-        true,
+        '0:0',
       );
       const marker = startup.command[4];
       expect(existsSync(marker)).toBe(false);
-      expect(prepareDockerAgentStartup(['true'], true).command[4]).not.toBe(marker);
+      expect(prepareDockerAgentStartup(['true'], '0:0').command[4]).not.toBe(marker);
       try {
         const output = execFileSync(startup.command[0], [...startup.command.slice(1)], { encoding: 'utf8' });
         expect(output.trim().split('\n')).toEqual(['literal $value; *', process.umask().toString(8).padStart(4, '0')]);
@@ -46,8 +46,17 @@ describe('Docker agent startup handoff', () => {
     },
   );
 
+  it('probes a sudo-off container as the numeric agent UID that owns the marker (no root exists there)', async () => {
+    const startup = prepareDockerAgentStartup(['sleep', 'infinity'], '1000');
+    const docker = runtime();
+    await startup.waitUntilReady(docker, 'agent', { pollIntervalMs: 1 });
+    expect(docker.exec).toHaveBeenCalledTimes(1);
+    expect(docker.exec.mock.calls[0]?.[3]).toBe('1000');
+    expect(startup.command[0]).toBe('/bin/sh');
+  });
+
   it('waits as numeric root, never resolving codespace while its account is changing', async () => {
-    const startup = prepareDockerAgentStartup(['sleep', 'infinity'], true);
+    const startup = prepareDockerAgentStartup(['sleep', 'infinity'], '0:0');
     const docker = runtime();
     docker.exec.mockResolvedValueOnce({ exitCode: 1, stdout: '', stderr: '' });
     await startup.waitUntilReady(docker, 'agent', { pollIntervalMs: 1 });
@@ -72,7 +81,7 @@ describe('Docker agent startup handoff', () => {
   it.skipIf(process.platform !== 'linux')(
     'rejects a stale marker until the recorded CMD publishes this init identity',
     async () => {
-      const startup = prepareDockerAgentStartup(['true'], true);
+      const startup = prepareDockerAgentStartup(['true'], '0:0');
       const docker = runtime();
       docker.exec.mockImplementation(async (_id, command) => {
         try {
@@ -97,8 +106,37 @@ describe('Docker agent startup handoff', () => {
     const docker = runtime();
     docker.exec.mockResolvedValueOnce({ exitCode: 1, stdout: '', stderr: '' });
     docker.isRunning.mockRejectedValueOnce(new Error('docker inspect timed out'));
-    await prepareDockerAgentStartup(['true'], true).waitUntilReady(docker, 'agent', { pollIntervalMs: 1 });
+    await prepareDockerAgentStartup(['true'], '0:0').waitUntilReady(docker, 'agent', { pollIntervalMs: 1 });
     expect(docker.exec).toHaveBeenCalledTimes(2);
+  });
+
+  it('allows a slow home ownership remap beyond 90 seconds but keeps the default wait bounded', async () => {
+    let now = 0;
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const docker = runtime();
+    docker.exec
+      .mockImplementationOnce(async () => {
+        now = 100_000;
+        return { exitCode: 1, stdout: '', stderr: '' };
+      })
+      .mockResolvedValueOnce({ exitCode: 0, stdout: '', stderr: '' });
+    try {
+      await expect(
+        prepareDockerAgentStartup(['true'], '0:0').waitUntilReady(docker, 'agent', { pollIntervalMs: 1 }),
+      ).resolves.toBeUndefined();
+      expect(docker.exec).toHaveBeenCalledTimes(2);
+
+      now = 0;
+      docker.exec.mockImplementation(async () => {
+        now = 180_000;
+        return { exitCode: 1, stdout: '', stderr: '' };
+      });
+      await expect(prepareDockerAgentStartup(['true'], '0:0').waitUntilReady(docker, 'agent')).rejects.toThrow(
+        'did not become ready within 180000ms',
+      );
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it('reports timeout, not container exit, when inspection remains unavailable', async () => {
@@ -106,7 +144,7 @@ describe('Docker agent startup handoff', () => {
     docker.exec.mockResolvedValue({ exitCode: 1, stdout: '', stderr: '' });
     docker.isRunning.mockRejectedValue(new Error('docker inspect timed out'));
     await expect(
-      prepareDockerAgentStartup(['true'], true).waitUntilReady(docker, 'agent', { timeoutMs: 0 }),
+      prepareDockerAgentStartup(['true'], '0:0').waitUntilReady(docker, 'agent', { timeoutMs: 0 }),
     ).rejects.toThrow('did not become ready within 0ms');
   });
 
@@ -118,7 +156,7 @@ describe('Docker agent startup handoff', () => {
     docker.exec.mockResolvedValue({ exitCode: 1, stdout: '', stderr: '' });
     const runtimeWithLogs = { ...docker, readContainerLogTail: tail === undefined ? undefined : async () => tail };
     await expect(
-      prepareDockerAgentStartup(['true'], true).waitUntilReady(runtimeWithLogs, 'agent', { timeoutMs: 0 }),
+      prepareDockerAgentStartup(['true'], '0:0').waitUntilReady(runtimeWithLogs, 'agent', { timeoutMs: 0 }),
     ).rejects.toThrow(expected);
   });
 
@@ -126,7 +164,7 @@ describe('Docker agent startup handoff', () => {
     const docker = runtime();
     docker.exec.mockResolvedValue({ exitCode: 1, stdout: '', stderr: '' });
     docker.isRunning.mockResolvedValue(running);
-    const startup = prepareDockerAgentStartup(['sleep', 'infinity'], true);
+    const startup = prepareDockerAgentStartup(['sleep', 'infinity'], '0:0');
     await expect(startup.waitUntilReady(docker, 'agent', { timeoutMs: 0 })).rejects.toThrow(
       running
         ? /did not become ready within 0ms[\s\S]*entrypoint failed/

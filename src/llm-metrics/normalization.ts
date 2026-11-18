@@ -1,4 +1,11 @@
-import type { NormalizedUsage, OutputTokenSemantics, TokenMeasurementAccuracy, UsageCompleteness } from './types.js';
+import type {
+  NormalizedUsage,
+  OutputTokenSemantics,
+  ServerToolRequests,
+  TokenMeasurementAccuracy,
+  UsageCompleteness,
+  UsageIteration,
+} from './types.js';
 
 export type UnknownRecord = Record<string, unknown>;
 
@@ -86,10 +93,29 @@ export interface NormalizedUsageInput {
   readonly usageSource?: string | null;
   readonly usageCompleteness?: UsageCompleteness;
   readonly qualityFlags?: readonly string[];
+  readonly cacheWrite5mInputTokens?: number | null;
+  readonly cacheWrite1hInputTokens?: number | null;
+  readonly serverToolRequests?: ServerToolRequests;
+  readonly iterations?: readonly UsageIteration[];
+}
+
+/** Optional breakdowns appear only when an adapter itemizes them, keeping other records unchanged. */
+function optionalBreakdowns(input: NormalizedUsageInput): Partial<NormalizedUsage> {
+  return {
+    ...(input.cacheWrite5mInputTokens !== undefined ? { cacheWrite5mInputTokens: input.cacheWrite5mInputTokens } : {}),
+    ...(input.cacheWrite1hInputTokens !== undefined ? { cacheWrite1hInputTokens: input.cacheWrite1hInputTokens } : {}),
+    ...(input.serverToolRequests !== undefined
+      ? { serverToolRequests: Object.freeze({ ...input.serverToolRequests }) }
+      : {}),
+    ...(input.iterations !== undefined
+      ? { iterations: Object.freeze(input.iterations.map((iteration) => Object.freeze({ ...iteration }))) }
+      : {}),
+  };
 }
 
 export function makeNormalizedUsage(input: NormalizedUsageInput = {}): NormalizedUsage {
   return {
+    ...optionalBreakdowns(input),
     inputTokensReported: input.inputTokensReported ?? null,
     inputTokensTotal: input.inputTokensTotal ?? null,
     inputTokensAccuracy: input.inputTokensAccuracy ?? 'unknown',

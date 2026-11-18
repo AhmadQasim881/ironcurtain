@@ -2,7 +2,24 @@
   "generatedAt": "2026-03-21T23:50:39.484Z",
   "servers": {
     "filesystem": {
-      "inputHash": "2bc9fa2b22cc85187f4530684be6e6f098dd9e377737a1ab7b5f9f409326d357",
+      "inputHash": "d83b5eb8f1f322743d94a6012105de422c7fbf82daafdfedcf4caebf689e6165",
+      "contentDigest": "068f105632402f13dfa2cbc202b8c603ba9d47fabc4f2440562d2efa4e32e4af",
+      "source": "package",
+      "producerVersion": "0.9.0",
+      "supersededDigests": [
+        "35aec87d9e4037dd94bad2261c176d76d8b1db634c5fcf6a6ec463b82ae73a67",
+        "4eb87a909825ca6a9b66c83581716970dc95ee6aae8da4bddd9f29eed5617994",
+        "838ab48ce97078ca7e7ad99916b1e042ce4810be957a1a069687f378df063b8f",
+        "44ebcd1706fba8c9d7215bcf711144beb8bca288a4ad63b4f6aa769652e114d5",
+        "8240d6f93d07c9afe42617456dc2ba83ea2f0803e995d7f9a2d290e77e91249c",
+        "c58cba944eee64c24b23ed60a3d78263bcd803d8cfd4c21c3eae2f08aae5d9de",
+        "ca576dc2781b95b177ef3bc40d0155b9e5e09146d0e37a24f1d160d69763c94c",
+        "4c6a2571b15a6f37fb8d26972902688e698e0f6b044b6d6f9466f26d27ace8b1"
+      ],
+      "serverInfo": {
+        "name": "secure-filesystem-server",
+        "version": "0.2.0"
+      },
       "tools": [
         {
           "toolName": "read_file",
@@ -437,7 +454,25 @@
       ]
     },
     "git": {
-      "inputHash": "e3288e2ac0143829365488f0e61bb4413c999812318978f7783535ee82ae7b71",
+      "inputHash": "75ff801707686517eece7e94ef66b0ba140f928f3301849228f11ea2d29a422a",
+      "contentDigest": "42eaeeff2739369a7ec8d2dc6782396b4443980f167ef28f2b80cac20c28d207",
+      "source": "package",
+      "producerVersion": "0.14.0",
+      "supersededDigests": [
+        "860913a74e1973dfaae274ec68fd962ab92245011b8f4e2f85ebd6591602ec8c",
+        "8e4473093059c7174e8350de6569f50c83be28ec3f46ef8e3b2222bbff02de3d",
+        "9270a2358719399048639d223db70774683e390b37286ec94bd36209e8075826",
+        "41b0240470ca96f31e5e1602846fb1a8fe9c723b21f729fec491721256b9f5a8",
+        "c3623e1afea76523f79e1a3a04999d0aece06fe9412c00ea65e3ea1524e95694",
+        "56e245624f9f2452f704fb979237e1645e69021cc17f95149df7bbe2b06e5db7",
+        "4c75bc02fb7b493d430f524d30045a1c4d6653c67a2268504876bd76a59f8b83",
+        "7642db1b260b8ff84ae13c4f93b1498c322a6fc516afce8615ea892405b4262c",
+        "a646b2b53e5ac7611711b0e934287868c9fbe18acdecb612838fa20f02f18655"
+      ],
+      "serverInfo": {
+        "name": "@cyanheads/git-mcp-server",
+        "version": "2.15.3"
+      },
       "tools": [
         {
           "toolName": "git_add",
@@ -447,7 +482,7 @@
               "read-path",
               "write-history"
             ],
-            "files": [
+            "paths": [
               "none"
             ],
             "update": [
@@ -469,13 +504,15 @@
                 "description": "Path to the Git repository. Defaults to session working directory set via git_set_working_dir.",
                 "type": "string"
               },
-              "files": {
-                "minItems": 1,
+              "paths": {
+                "default": [],
+                "description": "Array of file or directory paths to stage (relative to repository root). Use [\".\"] to stage all changes. Paths must not start with \"-\" — use \"./-name\" for filenames starting with a dash. Can be omitted when all or update is true.",
                 "type": "array",
                 "items": {
-                  "type": "string"
-                },
-                "description": "Array of file paths to stage (relative to repository root). Use [\".\"] to stage all changes."
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "File path (must not start with \"-\")."
+                }
               },
               "update": {
                 "default": false,
@@ -493,10 +530,8 @@
                 "type": "boolean"
               }
             },
-            "required": [
-              "files"
-            ],
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
@@ -506,7 +541,7 @@
             "path": [
               "read-path"
             ],
-            "file": [
+            "filePath": [
               "none"
             ],
             "startLine": [
@@ -528,10 +563,10 @@
                 "description": "Path to the Git repository. Defaults to session working directory set via git_set_working_dir.",
                 "type": "string"
               },
-              "file": {
+              "filePath": {
                 "type": "string",
                 "minLength": 1,
-                "description": "Path to the file to blame (relative to repository root)."
+                "description": "Path to the file to blame (relative to repository root). Must not start with \"-\"."
               },
               "startLine": {
                 "description": "Start line number (1-indexed).",
@@ -552,9 +587,10 @@
               }
             },
             "required": [
-              "file"
+              "filePath"
             ],
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
@@ -570,7 +606,7 @@
               "when": [
                 {
                   "condition": {
-                    "arg": "operation",
+                    "arg": "mode",
                     "in": [
                       "list",
                       "show-current"
@@ -582,7 +618,7 @@
                 },
                 {
                   "condition": {
-                    "arg": "operation",
+                    "arg": "mode",
                     "in": [
                       "create",
                       "rename"
@@ -595,7 +631,7 @@
                 },
                 {
                   "condition": {
-                    "arg": "operation",
+                    "arg": "mode",
                     "equals": "delete"
                   },
                   "roles": [
@@ -605,13 +641,13 @@
                 }
               ]
             },
-            "operation": [
+            "mode": [
               "none"
             ],
-            "name": [
+            "branchName": [
               "branch-name"
             ],
-            "newName": [
+            "newBranchName": [
               "branch-name"
             ],
             "startPoint": [
@@ -631,6 +667,9 @@
             ],
             "noMerged": [
               "none"
+            ],
+            "limit": [
+              "none"
             ]
           },
           "serverName": "git",
@@ -642,7 +681,7 @@
                 "description": "Path to the Git repository. Defaults to session working directory set via git_set_working_dir.",
                 "type": "string"
               },
-              "operation": {
+              "mode": {
                 "default": "list",
                 "description": "The branch operation to perform.",
                 "type": "string",
@@ -654,19 +693,17 @@
                   "show-current"
                 ]
               },
-              "name": {
+              "branchName": {
                 "description": "Branch name for create/delete/rename operations.",
                 "type": "string",
                 "minLength": 1,
-                "maxLength": 255,
-                "pattern": "^[^~^:?*\\[\\\\]+$"
+                "maxLength": 255
               },
-              "newName": {
+              "newBranchName": {
                 "description": "New branch name for rename operation.",
                 "type": "string",
                 "minLength": 1,
-                "maxLength": 255,
-                "pattern": "^[^~^:?*\\[\\\\]+$"
+                "maxLength": 255
               },
               "startPoint": {
                 "description": "Starting point (commit/branch) for new branch creation.",
@@ -680,16 +717,16 @@
               },
               "all": {
                 "default": false,
-                "description": "For list operation: show both local and remote branches.",
+                "description": "For list mode: show both local and remote branches.",
                 "type": "boolean"
               },
               "remote": {
                 "default": false,
-                "description": "For list operation: show only remote branches.",
+                "description": "For list mode: show only remote branches.",
                 "type": "boolean"
               },
               "merged": {
-                "description": "For list operation: show only branches merged into HEAD (true) or specified commit (string).",
+                "description": "For list mode: show only branches merged into HEAD (true) or specified commit (string).",
                 "anyOf": [
                   {
                     "type": "boolean"
@@ -697,12 +734,12 @@
                   {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Commit reference: full/short hash, branch name, tag name, or relative ref (HEAD~1)."
+                    "description": "Commit reference: full/short hash, branch name, tag name, or relative ref (HEAD~1). Must not start with \"-\"."
                   }
                 ]
               },
               "noMerged": {
-                "description": "For list operation: show only branches not merged into HEAD (true) or specified commit (string).",
+                "description": "For list mode: show only branches not merged into HEAD (true) or specified commit (string).",
                 "anyOf": [
                   {
                     "type": "boolean"
@@ -710,12 +747,19 @@
                   {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Commit reference: full/short hash, branch name, tag name, or relative ref (HEAD~1)."
+                    "description": "Commit reference: full/short hash, branch name, tag name, or relative ref (HEAD~1). Must not start with \"-\"."
                   }
                 ]
+              },
+              "limit": {
+                "description": "For list mode: cap the number of branches returned (applied at the git command). Use on repos with many branches.",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000
               }
             },
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
@@ -729,6 +773,9 @@
               "none"
             ],
             "maxCommits": [
+              "none"
+            ],
+            "maxTags": [
               "none"
             ],
             "sinceTag": [
@@ -770,9 +817,17 @@
                 "minimum": 1,
                 "maximum": 1000
               },
+              "maxTags": {
+                "default": 100,
+                "description": "Maximum recent tags to fetch for release context (1-1000). Applied at the git command so large tag catalogs do not bloat the response.",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000
+              },
               "sinceTag": {
-                "description": "Only include git history since this tag (e.g., \"v1.2.0\"). Narrows the analysis window.",
-                "type": "string"
+                "description": "Only include git history since this tag (e.g., \"v1.2.0\"). Narrows the analysis window. Must not start with \"-\".",
+                "type": "string",
+                "minLength": 1
               },
               "branch": {
                 "description": "Branch to analyze (defaults to current branch).",
@@ -783,7 +838,8 @@
             "required": [
               "reviewTypes"
             ],
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
@@ -826,13 +882,12 @@
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 255,
-                    "pattern": "^[^~^:?*\\[\\\\]+$",
-                    "description": "Branch name (must follow git naming conventions)."
+                    "description": "Branch name (must follow git naming conventions, no leading \"-\")."
                   },
                   {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Commit reference: full/short hash, branch name, tag name, or relative ref (HEAD~1)."
+                    "description": "Commit reference: full/short hash, branch name, tag name, or relative ref (HEAD~1). Must not start with \"-\"."
                   }
                 ],
                 "description": "Branch name, commit hash, or tag to checkout."
@@ -848,10 +903,12 @@
                 "type": "boolean"
               },
               "paths": {
-                "description": "Specific file paths to checkout/restore (relative to repository root).",
+                "description": "Specific file paths to checkout/restore (relative to repository root). Entries must not start with \"-\".",
                 "type": "array",
                 "items": {
-                  "type": "string"
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "File path (must not start with \"-\")."
                 }
               },
               "track": {
@@ -862,7 +919,8 @@
             "required": [
               "target"
             ],
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
@@ -910,7 +968,7 @@
                 "items": {
                   "type": "string",
                   "minLength": 1,
-                  "description": "Commit reference: full/short hash, branch name, tag name, or relative ref (HEAD~1)."
+                  "description": "Commit reference: full/short hash, branch name, tag name, or relative ref (HEAD~1). Must not start with \"-\"."
                 },
                 "description": "Commit hashes to cherry-pick."
               },
@@ -955,7 +1013,8 @@
             "required": [
               "commits"
             ],
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
@@ -1022,7 +1081,8 @@
                 "type": "boolean"
               }
             },
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
@@ -1051,17 +1111,18 @@
             "required": [
               "confirm"
             ],
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
           "toolName": "git_clone",
-          "comment": "Clones a remote git repository to a local path, with support for shallow cloning and bare/mirror options.",
+          "comment": "Clones a git repository from a remote URL into a local destination path, with support for shallow cloning and bare/mirror options.",
           "args": {
             "url": [
               "git-remote-url"
             ],
-            "localPath": [
+            "path": [
               "write-path"
             ],
             "branch": [
@@ -1083,17 +1144,20 @@
             "properties": {
               "url": {
                 "type": "string",
-                "format": "uri",
-                "description": "Remote repository URL to clone from."
+                "minLength": 1,
+                "maxLength": 2048,
+                "description": "Git repository URL: HTTP(S), SSH (ssh://… or user@host:path), git://, file://, or an absolute filesystem path. Must not start with \"-\" and no segment may start with \"-\"."
               },
-              "localPath": {
+              "path": {
                 "type": "string",
                 "minLength": 1,
-                "description": "Local path where the repository should be cloned."
+                "description": "Destination path where the repository should be cloned. Must not start with \"-\"."
               },
               "branch": {
-                "description": "Specific branch to clone (defaults to remote HEAD).",
-                "type": "string"
+                "description": "Specific branch to clone (defaults to remote HEAD). Must not start with \"-\".",
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 255
               },
               "depth": {
                 "description": "Create a shallow clone with history truncated to N commits.",
@@ -1114,9 +1178,10 @@
             },
             "required": [
               "url",
-              "localPath"
+              "path"
             ],
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
@@ -1139,16 +1204,10 @@
             "allowEmpty": [
               "none"
             ],
-            "sign": [
-              "none"
-            ],
             "noVerify": [
               "none"
             ],
             "filesToStage": [
-              "none"
-            ],
-            "forceUnsignedOnFailure": [
               "none"
             ]
           },
@@ -1178,9 +1237,8 @@
                   },
                   "email": {
                     "type": "string",
-                    "format": "email",
-                    "pattern": "^(?!\\.)(?!.*\\.\\.)([A-Za-z0-9_'+\\-\\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$",
-                    "description": "Author's email address"
+                    "minLength": 1,
+                    "description": "Author's email address (e.g. user@example.com)."
                   }
                 },
                 "required": [
@@ -1198,32 +1256,26 @@
                 "description": "Allow creating a commit with no changes.",
                 "type": "boolean"
               },
-              "sign": {
-                "description": "Sign the commit/tag with GPG.",
-                "type": "boolean"
-              },
               "noVerify": {
                 "default": false,
                 "description": "Bypass pre-commit and commit-msg hooks.",
                 "type": "boolean"
               },
               "filesToStage": {
-                "description": "File paths to stage before committing (atomic stage+commit operation).",
+                "description": "File paths to stage before committing (atomic stage+commit operation). Entries must not start with \"-\".",
                 "type": "array",
                 "items": {
-                  "type": "string"
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "File path (must not start with \"-\")."
                 }
-              },
-              "forceUnsignedOnFailure": {
-                "default": false,
-                "description": "If GPG/SSH signing fails, retry the commit without signing instead of failing.",
-                "type": "boolean"
               }
             },
             "required": [
               "message"
             ],
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
@@ -1256,6 +1308,9 @@
             ],
             "contextLines": [
               "none"
+            ],
+            "autoExclude": [
+              "none"
             ]
           },
           "serverName": "git",
@@ -1278,10 +1333,12 @@
                 "minLength": 1
               },
               "paths": {
-                "description": "Limit diff to specific file paths (relative to repository root).",
+                "description": "Limit diff to specific file paths (relative to repository root). Entries must not start with \"-\".",
                 "type": "array",
                 "items": {
-                  "type": "string"
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "File path (must not start with \"-\")."
                 }
               },
               "staged": {
@@ -1310,9 +1367,15 @@
                 "type": "integer",
                 "minimum": 0,
                 "maximum": 100
+              },
+              "autoExclude": {
+                "default": true,
+                "description": "Automatically exclude lock files and other generated files (e.g., package-lock.json, yarn.lock, bun.lock, poetry.lock, go.sum) from diff output to reduce context bloat. Set to false if you need to inspect these files.",
+                "type": "boolean"
               }
             },
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
@@ -1350,7 +1413,7 @@
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 255,
-                "pattern": "^[a-zA-Z0-9._-]+$"
+                "pattern": "^[a-zA-Z0-9._]+(?:[-._a-zA-Z0-9]*)$"
               },
               "prune": {
                 "default": false,
@@ -1369,7 +1432,8 @@
                 "maximum": 9007199254740991
               }
             },
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
@@ -1405,7 +1469,8 @@
                 "type": "boolean"
               }
             },
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
@@ -1462,6 +1527,7 @@
                 "type": "string"
               },
               "maxCount": {
+                "default": 10,
                 "description": "Maximum number of items to return (1-1000).",
                 "type": "integer",
                 "minimum": 1,
@@ -1495,12 +1561,13 @@
                 "minLength": 1
               },
               "filePath": {
-                "description": "Show commits that affected a specific file path.",
-                "type": "string"
+                "description": "Show commits that affected a specific file path. Must not start with \"-\".",
+                "type": "string",
+                "minLength": 1
               },
               "oneline": {
                 "default": false,
-                "description": "Show each commit on a single line (abbreviated output).",
+                "description": "Abbreviated output: return only hash, shortHash, and subject per commit. Significantly reduces response size.",
                 "type": "boolean"
               },
               "stat": {
@@ -1519,7 +1586,8 @@
                 "type": "boolean"
               }
             },
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
@@ -1562,7 +1630,6 @@
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 255,
-                "pattern": "^[^~^:?*\\[\\\\]+$",
                 "description": "Branch to merge into current branch."
               },
               "strategy": {
@@ -1601,7 +1668,8 @@
             "required": [
               "branch"
             ],
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
@@ -1639,14 +1707,13 @@
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 255,
-                "pattern": "^[a-zA-Z0-9._-]+$"
+                "pattern": "^[a-zA-Z0-9._]+(?:[-._a-zA-Z0-9]*)$"
               },
               "branch": {
                 "description": "Branch name (default: current branch).",
                 "type": "string",
                 "minLength": 1,
-                "maxLength": 255,
-                "pattern": "^[^~^:?*\\[\\\\]+$"
+                "maxLength": 255
               },
               "rebase": {
                 "default": false,
@@ -1659,7 +1726,8 @@
                 "type": "boolean"
               }
             },
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
@@ -1714,14 +1782,13 @@
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 255,
-                "pattern": "^[a-zA-Z0-9._-]+$"
+                "pattern": "^[a-zA-Z0-9._]+(?:[-._a-zA-Z0-9]*)$"
               },
               "branch": {
                 "description": "Branch name (default: current branch).",
                 "type": "string",
                 "minLength": 1,
-                "maxLength": 255,
-                "pattern": "^[^~^:?*\\[\\\\]+$"
+                "maxLength": 255
               },
               "force": {
                 "default": false,
@@ -1757,8 +1824,7 @@
                 "description": "Remote branch name to push to (if different from local branch name).",
                 "type": "string",
                 "minLength": 1,
-                "maxLength": 255,
-                "pattern": "^[^~^:?*\\[\\\\]+$"
+                "maxLength": 255
               },
               "confirmed": {
                 "default": false,
@@ -1766,7 +1832,8 @@
                 "type": "boolean"
               }
             },
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
@@ -1842,7 +1909,8 @@
                 "type": "boolean"
               }
             },
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
@@ -1869,17 +1937,21 @@
                 "type": "string"
               },
               "ref": {
-                "description": "Show reflog for specific reference (default: HEAD).",
-                "type": "string"
+                "default": "HEAD",
+                "description": "Reference whose reflog to show. Defaults to HEAD. Must not start with \"-\".",
+                "type": "string",
+                "minLength": 1
               },
               "maxCount": {
+                "default": 25,
                 "description": "Maximum number of items to return (1-1000).",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 1000
               }
             },
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
@@ -1937,9 +2009,36 @@
             "name": [
               "none"
             ],
-            "url": [
-              "none"
-            ],
+            "url": {
+              "default": [
+                "git-remote-url"
+              ],
+              "when": [
+                {
+                  "condition": {
+                    "arg": "url",
+                    "is": "absent"
+                  },
+                  "roles": [
+                    "none"
+                  ]
+                },
+                {
+                  "condition": {
+                    "arg": "mode",
+                    "in": [
+                      "list",
+                      "get-url",
+                      "remove",
+                      "rename"
+                    ]
+                  },
+                  "roles": [
+                    "none"
+                  ]
+                }
+              ]
+            },
             "newName": [
               "none"
             ],
@@ -1974,19 +2073,20 @@
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 255,
-                "pattern": "^[a-zA-Z0-9._-]+$"
+                "pattern": "^[a-zA-Z0-9._]+(?:[-._a-zA-Z0-9]*)$"
               },
               "url": {
-                "description": "Remote URL for add/set-url operations.",
+                "description": "Remote URL for add/set-url operations. Accepts HTTP(S), SSH (ssh://… or user@host:path), git://, or file:// URLs. Must not start with \"-\".",
                 "type": "string",
-                "format": "uri"
+                "minLength": 1,
+                "maxLength": 2048
               },
               "newName": {
                 "description": "New remote name for rename operation.",
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 255,
-                "pattern": "^[a-zA-Z0-9._-]+$"
+                "pattern": "^[a-zA-Z0-9._]+(?:[-._a-zA-Z0-9]*)$"
               },
               "push": {
                 "default": false,
@@ -1994,7 +2094,8 @@
                 "type": "boolean"
               }
             },
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
@@ -2040,24 +2141,28 @@
                 ]
               },
               "target": {
-                "description": "Target commit to reset to (default: HEAD).",
+                "default": "HEAD",
+                "description": "Target commit to reset to. Defaults to HEAD.",
                 "type": "string",
                 "minLength": 1
               },
               "paths": {
-                "description": "Specific file paths to reset (leaves HEAD unchanged).",
+                "description": "Specific file paths to reset (leaves HEAD unchanged). Entries must not start with \"-\".",
                 "type": "array",
                 "items": {
-                  "type": "string"
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "File path (must not start with \"-\")."
                 }
               },
               "confirmed": {
                 "default": false,
-                "description": "Explicit confirmation required for hard reset on protected branches (main, master, production, etc.).",
+                "description": "Explicit confirmation required for hard, merge, and keep reset modes on protected branches (main, master, production, etc.).",
                 "type": "boolean"
               }
             },
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
@@ -2086,9 +2191,6 @@
             ],
             "initializeIfNotPresent": [
               "none"
-            ],
-            "includeMetadata": [
-              "none"
             ]
           },
           "serverName": "git",
@@ -2109,17 +2211,13 @@
                 "default": false,
                 "description": "If not a Git repository, initialize it with 'git init'.",
                 "type": "boolean"
-              },
-              "includeMetadata": {
-                "default": false,
-                "description": "Include repository metadata (status, branches, remotes, recent commits) in the response. Set to true for immediate repository context understanding. Defaults to false to minimize response size.",
-                "type": "boolean"
               }
             },
             "required": [
               "path"
             ],
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
@@ -2157,11 +2255,10 @@
                 "description": "Git object to show (commit hash, branch, tag, tree, or blob)."
               },
               "format": {
-                "description": "Output format for the git object.",
+                "description": "Output format for the git object. Use \"raw\" for unprocessed git output.",
                 "type": "string",
                 "enum": [
-                  "raw",
-                  "json"
+                  "raw"
                 ]
               },
               "stat": {
@@ -2170,14 +2267,16 @@
                 "type": "boolean"
               },
               "filePath": {
-                "description": "View specific file at a given commit reference. When provided, shows the file content from the specified object.",
-                "type": "string"
+                "description": "View specific file at a given commit reference. When provided, shows the file content from the specified object. Must not start with \"-\".",
+                "type": "string",
+                "minLength": 1
               }
             },
             "required": [
               "object"
             ],
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
@@ -2243,6 +2342,9 @@
             ],
             "keepIndex": [
               "none"
+            ],
+            "limit": [
+              "none"
             ]
           },
           "serverName": "git",
@@ -2255,8 +2357,8 @@
                 "type": "string"
               },
               "mode": {
-                "default": "list",
-                "description": "The stash operation to perform.",
+                "default": "push",
+                "description": "The stash operation to perform. Defaults to push (save current changes).",
                 "type": "string",
                 "enum": [
                   "list",
@@ -2272,8 +2374,9 @@
                 "type": "string"
               },
               "stashRef": {
-                "description": "Stash reference like stash@{0} (for pop/apply/drop operations).",
-                "type": "string"
+                "description": "Stash reference like stash@{0} (for pop/apply/drop operations). Must not start with \"-\".",
+                "type": "string",
+                "minLength": 1
               },
               "includeUntracked": {
                 "default": false,
@@ -2284,9 +2387,16 @@
                 "default": false,
                 "description": "Don't revert staged changes (for push operation).",
                 "type": "boolean"
+              },
+              "limit": {
+                "description": "For list mode: cap the number of stash entries returned (applied at the git command).",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000
               }
             },
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
@@ -2315,12 +2425,13 @@
                 "type": "boolean"
               }
             },
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
           "toolName": "git_tag",
-          "comment": "Manages git tags by listing all tags, creating a new tag, or deleting an existing tag at a specific commit.",
+          "comment": "Manages git tags by listing all tags, creating a new tag, deleting an existing tag, or verifying a signed tag.",
           "args": {
             "path": {
               "default": [
@@ -2332,7 +2443,10 @@
                 {
                   "condition": {
                     "arg": "mode",
-                    "equals": "list"
+                    "in": [
+                      "list",
+                      "verify"
+                    ]
                   },
                   "roles": [
                     "read-path"
@@ -2370,18 +2484,15 @@
               "none"
             ],
             "message": [
-              "none"
+              "commit-message"
             ],
             "annotated": [
               "none"
             ],
-            "sign": [
-              "none"
-            ],
-            "forceUnsignedOnFailure": [
-              "none"
-            ],
             "force": [
+              "none"
+            ],
+            "limit": [
               "none"
             ]
           },
@@ -2401,15 +2512,15 @@
                 "enum": [
                   "list",
                   "create",
-                  "delete"
+                  "delete",
+                  "verify"
                 ]
               },
               "tagName": {
-                "description": "Tag name for create/delete operations.",
+                "description": "Tag name for create/delete/verify operations.",
                 "type": "string",
                 "minLength": 1,
-                "maxLength": 255,
-                "pattern": "^[^~^:?*\\[\\\\]+$"
+                "maxLength": 255
               },
               "commit": {
                 "description": "Commit to tag (default: HEAD for create operation).",
@@ -2417,30 +2528,28 @@
                 "minLength": 1
               },
               "message": {
-                "description": "Tag message (creates annotated tag).",
+                "description": "Tag message. Providing a message always produces an annotated tag (git does not support messages on lightweight tags). For release tags, summarize notable changes.",
                 "type": "string"
               },
               "annotated": {
                 "default": false,
-                "description": "Create annotated tag with message.",
-                "type": "boolean"
-              },
-              "sign": {
-                "description": "Sign the commit/tag with GPG.",
-                "type": "boolean"
-              },
-              "forceUnsignedOnFailure": {
-                "default": false,
-                "description": "If GPG/SSH signing fails, retry the tag creation without signing instead of failing.",
+                "description": "Create an annotated tag with a default \"Tag <name>\" message. Only effective when no message is provided and signing is disabled — otherwise the tag is always annotated.",
                 "type": "boolean"
               },
               "force": {
                 "default": false,
-                "description": "Force tag creation/deletion (overwrite existing).",
+                "description": "Overwrite an existing tag (create mode only; has no effect on list or delete).",
                 "type": "boolean"
+              },
+              "limit": {
+                "description": "For list mode: cap the number of tags returned (applied at the git command via `--count=N`). Use on repos with many tags.",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000
               }
             },
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
@@ -2642,18 +2751,18 @@
                 ]
               },
               "worktreePath": {
-                "description": "Path for the new worktree (for add/move operations).",
-                "type": "string"
+                "description": "Path for the new worktree (for add/move operations). Must not start with \"-\".",
+                "type": "string",
+                "minLength": 1
               },
               "branch": {
-                "description": "Branch to checkout in the new worktree (for add operation).",
+                "description": "For add operation: create a NEW branch with this name in the new worktree. Fails if the branch already exists — use `commitish` to check out an existing branch instead.",
                 "type": "string",
                 "minLength": 1,
-                "maxLength": 255,
-                "pattern": "^[^~^:?*\\[\\\\]+$"
+                "maxLength": 255
               },
               "commitish": {
-                "description": "Commit/branch to base the worktree on (for add operation).",
+                "description": "For add operation: check out this existing branch/commit/tag in the new worktree (no new branch is created).",
                 "type": "string",
                 "minLength": 1
               },
@@ -2663,8 +2772,9 @@
                 "type": "boolean"
               },
               "newPath": {
-                "description": "New path for the worktree (for move operation).",
-                "type": "string"
+                "description": "New path for the worktree (for move operation). Must not start with \"-\".",
+                "type": "string",
+                "minLength": 1
               },
               "detach": {
                 "default": false,
@@ -2682,17 +2792,15 @@
                 "type": "boolean"
               }
             },
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         },
         {
           "toolName": "git_wrapup_instructions",
-          "comment": "Returns the user's configured Git wrap-up workflow instructions or default best practices for reviewing, documenting, and committing changes.",
+          "comment": "Reads the backend session repository snapshot. Requires trusted tracked working-directory context and fresh human approval for each admitted call.",
           "args": {
             "acknowledgement": [
-              "none"
-            ],
-            "updateAgentMetaFiles": [
               "none"
             ],
             "createTag": [
@@ -2713,31 +2821,32 @@
                 ],
                 "description": "Acknowledgement to initiate the wrap-up workflow."
               },
-              "updateAgentMetaFiles": {
-                "description": "Include an instruction to update agent-specific meta files.",
-                "type": "string",
-                "enum": [
-                  "Y",
-                  "y",
-                  "Yes",
-                  "yes"
-                ]
-              },
               "createTag": {
-                "description": "If true, instructs the agent to create a Git tag after committing all changes. Only set to true if given permission to do so.",
+                "description": "Controls whether the tag criterion appears in the emitted protocol. Omit or set `true` to include the tag step. Set `false` to omit it entirely — e.g., when tagging is deferred to a separate release step.",
                 "type": "boolean"
               }
             },
             "required": [
               "acknowledgement"
             ],
-            "$schema": "http://json-schema.org/draft-07/schema#"
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": false
           }
         }
       ]
     },
     "fetch": {
-      "inputHash": "eb60271871502bf92e36f337f91e10788b083e20e07b413f9ef3c41702fd7b47",
+      "inputHash": "90c15f8a24ac03e07fdb4774b6011221ed8e4507d4905355d88062144f7c5bc4",
+      "contentDigest": "1c71d646cff273da9f9c3c444e843946867ef333209bafeea8367e85a4bae4d6",
+      "source": "package",
+      "producerVersion": "0.9.0",
+      "supersededDigests": [
+        "8c99ca16146b6f2d694a406a06763013049d869c7801b92f21022173844f2119",
+        "96989681101156333bbf0535a0d7059c8afa8adb39c2864bb6279dd73b0f48cd",
+        "1fe125f78f651ea288b312ccd975bfa3af95eb1c347d1f4822ff47fd2bf1095c",
+        "ee3ad7df1f88118b89f0929e93465e82a654770804dfed4b73d67346336feeac",
+        "e843f4bf9c085a46d21be5cd1755151889ac9a7e3f0b60b8c3c1572621a04efb"
+      ],
       "tools": [
         {
           "toolName": "http_fetch",
@@ -2792,7 +2901,7 @@
               "timeout": {
                 "type": "number",
                 "default": 30,
-                "description": "Request timeout in seconds (1\u201360)"
+                "description": "Request timeout in seconds (1–60)"
               }
             },
             "required": [
@@ -2822,7 +2931,7 @@
               "max_results": {
                 "type": "number",
                 "default": 5,
-                "description": "Maximum number of results to return (1\u201320)"
+                "description": "Maximum number of results to return (1–20)"
               }
             },
             "required": [
@@ -2834,6 +2943,18 @@
     },
     "github": {
       "inputHash": "7a616b39d2916b94fa892d1407ac06078c87d48cfd1b1097ac6088fec6572d30",
+      "contentDigest": "f5f0308b6a1e8dc12e2ffaee2a873e1fb5c32e58c3fff77c81426226c66bf8de",
+      "source": "package",
+      "producerVersion": "0.14.0",
+      "supersededDigests": [
+        "5caa477024aa9a1869c164b6f02f09af681701e3fbaa770903535bc45ef74406",
+        "91800ebd77a970f97592bf06c7eb8aad0f41ee8f286409eb4730588b9834ad48",
+        "1fd98645f2f121896ffd01e01d2708386e9695e530e03cd3eb47707bd2e4491f",
+        "01e992d218817403eb64083a81a7c45466ee899c5b0ae8797c744f7f5065f8fd",
+        "e4c6633217ce7c4e36a676be85912acdfc88f2ab46369669021ca98a86afdef8",
+        "f750e29173d9a93017fa2dd4109b681d78886e2d8eaca4f68fa7a14a4da3887e",
+        "665d1bcaf3dd526bcf88e53d5ebb8ba575c18eeff63aaf98312ff706bca7fb83"
+      ],
       "tools": [
         {
           "toolName": "add_comment_to_pending_review",
@@ -2852,7 +2973,7 @@
               "none"
             ],
             "body": [
-              "none"
+              "outbound-text"
             ],
             "subjectType": [
               "none"
@@ -2951,7 +3072,7 @@
               "none"
             ],
             "body": [
-              "none"
+              "outbound-text"
             ]
           },
           "serverName": "github",
@@ -3000,7 +3121,7 @@
               "none"
             ],
             "body": [
-              "none"
+              "outbound-text"
             ]
           },
           "serverName": "github",
@@ -3054,7 +3175,7 @@
               "branch-name"
             ],
             "custom_instructions": [
-              "none"
+              "outbound-text"
             ]
           },
           "serverName": "github",
@@ -3151,7 +3272,7 @@
               "none"
             ],
             "message": [
-              "none"
+              "commit-message"
             ],
             "branch": [
               "branch-name"
@@ -3214,7 +3335,7 @@
               "github-repo"
             ],
             "title": [
-              "none"
+              "outbound-text"
             ],
             "head": [
               "branch-name"
@@ -3223,7 +3344,7 @@
               "branch-name"
             ],
             "body": [
-              "none"
+              "outbound-text"
             ],
             "draft": [
               "none"
@@ -3289,7 +3410,7 @@
               "github-owner"
             ],
             "description": [
-              "none"
+              "outbound-text"
             ],
             "private": [
               "none"
@@ -3342,7 +3463,7 @@
               "none"
             ],
             "message": [
-              "none"
+              "commit-message"
             ],
             "branch": [
               "branch-name"
@@ -3808,7 +3929,7 @@
         },
         {
           "toolName": "issue_write",
-          "comment": "Creates a new issue or updates an existing issue in a GitHub repository.",
+          "comment": "Creates a new issue or updates an existing issue in a GitHub repository; a new issue can be attached as a sub-issue of an issue in another repository (parent_owner/parent_repo).",
           "args": {
             "method": [
               "none"
@@ -3823,10 +3944,10 @@
               "none"
             ],
             "title": [
-              "none"
+              "outbound-text"
             ],
             "body": [
-              "none"
+              "outbound-text"
             ],
             "state": [
               "none"
@@ -3848,89 +3969,155 @@
             ],
             "type": [
               "none"
+            ],
+            "parent_owner": [
+              "github-owner"
+            ],
+            "parent_repo": [
+              "github-repo"
+            ],
+            "parent_issue_number": [
+              "none"
+            ],
+            "issue_fields": [
+              "none"
             ]
           },
           "serverName": "github",
           "inputSchema": {
-            "type": "object",
             "properties": {
               "assignees": {
-                "type": "array",
+                "description": "Usernames to assign to this issue",
                 "items": {
                   "type": "string"
                 },
-                "description": "Usernames to assign to this issue"
+                "type": "array"
               },
               "body": {
-                "type": "string",
-                "description": "Issue body content"
+                "description": "Issue body content",
+                "type": "string"
               },
               "duplicate_of": {
-                "type": "number",
-                "description": "Issue number that this issue is a duplicate of. Only used when state_reason is 'duplicate'."
+                "description": "Issue number that this issue is a duplicate of. Required when state_reason is 'duplicate'.",
+                "type": "number"
+              },
+              "issue_fields": {
+                "description": "Issue field values to set or clear. Each item requires 'field_name' and exactly one of 'value', 'field_option_name', or 'delete: true'.",
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "delete": {
+                      "description": "Set to true to clear this field's current value on the issue. When false or omitted, this property is ignored. Cannot be true when 'value' or 'field_option_name' is provided.",
+                      "type": "boolean"
+                    },
+                    "field_name": {
+                      "description": "Issue field name (case-insensitive). Must match a field returned by list_issue_fields for this repository or its organization.",
+                      "type": "string"
+                    },
+                    "field_option_name": {
+                      "description": "Option name for single-select fields. Validated against the field's options before the API call. Cannot be combined with 'value' or 'delete: true'.",
+                      "type": "string"
+                    },
+                    "value": {
+                      "description": "Value to set. Use for text, number, and date fields (date as YYYY-MM-DD). For single-select fields, prefer 'field_option_name' so the option is validated before the API call. Cannot be combined with 'field_option_name' or 'delete: true'.",
+                      "type": [
+                        "string",
+                        "number",
+                        "boolean"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "field_name"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
               },
               "issue_number": {
-                "type": "number",
-                "description": "Issue number to update"
+                "description": "Issue number to update",
+                "type": "number"
               },
               "labels": {
-                "type": "array",
+                "description": "Labels to apply to this issue",
                 "items": {
                   "type": "string"
                 },
-                "description": "Labels to apply to this issue"
+                "type": "array"
               },
               "method": {
-                "type": "string",
                 "description": "Write operation to perform on a single issue.\nOptions are:\n- 'create' - creates a new issue.\n- 'update' - updates an existing issue.\n",
                 "enum": [
                   "create",
                   "update"
-                ]
+                ],
+                "type": "string"
               },
               "milestone": {
-                "type": "number",
-                "description": "Milestone number"
+                "description": "Milestone number",
+                "type": "number"
               },
               "owner": {
-                "type": "string",
-                "description": "Repository owner"
+                "description": "Repository owner",
+                "type": "string"
+              },
+              "parent_issue_number": {
+                "description": "Issue number of the parent issue. Only used when method is 'create' and cannot be combined with issue_fields. The new issue is created and attached to this parent in the same operation.",
+                "minimum": 1,
+                "type": "number"
+              },
+              "parent_owner": {
+                "description": "Repository owner of the parent issue. Must be provided with parent_repo. Omit both to use owner and repo. Only used when method is 'create' and parent_issue_number is provided.",
+                "type": "string"
+              },
+              "parent_repo": {
+                "description": "Repository name of the parent issue. Must be provided with parent_owner. Omit both to use owner and repo. Only used when method is 'create' and parent_issue_number is provided.",
+                "type": "string"
               },
               "repo": {
-                "type": "string",
-                "description": "Repository name"
+                "description": "Repository name",
+                "type": "string"
               },
               "state": {
-                "type": "string",
                 "description": "New state",
                 "enum": [
                   "open",
                   "closed"
-                ]
+                ],
+                "type": "string"
               },
               "state_reason": {
-                "type": "string",
                 "description": "Reason for the state change. Ignored unless state is changed.",
                 "enum": [
                   "completed",
                   "not_planned",
                   "duplicate"
-                ]
+                ],
+                "type": "string"
               },
               "title": {
-                "type": "string",
-                "description": "Issue title"
+                "description": "Issue title",
+                "type": "string"
               },
               "type": {
-                "type": "string",
-                "description": "Type of this issue. Only use if the repository has issue types configured. Use list_issue_types tool to get valid type values for the organization. If the repository doesn't support issue types, omit this parameter."
+                "anyOf": [
+                  {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Type of this issue. For updates, pass null to remove the current type. Only use if issue types are enabled for this repository. Use list_issue_types to get valid type values for this repository or its owner organization. If the repository doesn't support issue types, omit this parameter."
               }
             },
             "required": [
               "method",
               "owner",
               "repo"
-            ]
+            ],
+            "type": "object"
           }
         },
         {
@@ -4365,10 +4552,10 @@
               "none"
             ],
             "commit_title": [
-              "none"
+              "commit-message"
             ],
             "commit_message": [
-              "none"
+              "commit-message"
             ],
             "merge_method": [
               "none"
@@ -4490,7 +4677,7 @@
         },
         {
           "toolName": "pull_request_review_write",
-          "comment": "Creates, submits, or deletes a review on a pull request in a GitHub repository.",
+          "comment": "Creates, submits, or deletes a review on a pull request in a GitHub repository, or resolves/unresolves a review thread addressed by its global node ID.",
           "args": {
             "method": [
               "none"
@@ -4505,56 +4692,81 @@
               "none"
             ],
             "body": [
-              "none"
+              "outbound-text"
             ],
             "commitID": [
               "none"
             ],
             "event": [
               "none"
-            ]
+            ],
+            "threadId": {
+              "default": [
+                "github-resource-id"
+              ],
+              "when": [
+                {
+                  "condition": {
+                    "arg": "method",
+                    "in": [
+                      "create",
+                      "submit_pending",
+                      "delete_pending"
+                    ]
+                  },
+                  "roles": [
+                    "none"
+                  ]
+                }
+              ]
+            }
           },
           "serverName": "github",
           "inputSchema": {
-            "type": "object",
             "properties": {
               "body": {
-                "type": "string",
-                "description": "Review comment text"
+                "description": "Review comment text",
+                "type": "string"
               },
               "commitID": {
-                "type": "string",
-                "description": "SHA of commit to review"
+                "description": "SHA of commit to review",
+                "type": "string"
               },
               "event": {
-                "type": "string",
                 "description": "Review action to perform.",
                 "enum": [
                   "APPROVE",
                   "REQUEST_CHANGES",
                   "COMMENT"
-                ]
+                ],
+                "type": "string"
               },
               "method": {
-                "type": "string",
                 "description": "The write operation to perform on pull request review.",
                 "enum": [
                   "create",
                   "submit_pending",
-                  "delete_pending"
-                ]
+                  "delete_pending",
+                  "resolve_thread",
+                  "unresolve_thread"
+                ],
+                "type": "string"
               },
               "owner": {
-                "type": "string",
-                "description": "Repository owner"
+                "description": "Repository owner",
+                "type": "string"
               },
               "pullNumber": {
-                "type": "number",
-                "description": "Pull request number"
+                "description": "Pull request number",
+                "type": "number"
               },
               "repo": {
-                "type": "string",
-                "description": "Repository name"
+                "description": "Repository name",
+                "type": "string"
+              },
+              "threadId": {
+                "description": "The node ID of the review thread (e.g., PRRT_kwDOxxx). Required for resolve_thread and unresolve_thread methods. Get thread IDs from pull_request_read with method get_review_comments.",
+                "type": "string"
               }
             },
             "required": [
@@ -4562,7 +4774,8 @@
               "owner",
               "repo",
               "pullNumber"
-            ]
+            ],
+            "type": "object"
           }
         },
         {
@@ -4582,7 +4795,7 @@
               "none"
             ],
             "message": [
-              "none"
+              "commit-message"
             ]
           },
           "serverName": "github",
@@ -5049,7 +5262,7 @@
               "none"
             ],
             "sub_issue_id": [
-              "none"
+              "github-resource-id"
             ],
             "after_id": [
               "none"
@@ -5063,39 +5276,38 @@
           },
           "serverName": "github",
           "inputSchema": {
-            "type": "object",
             "properties": {
               "after_id": {
-                "type": "number",
-                "description": "The ID of the sub-issue to be prioritized after (either after_id OR before_id should be specified)"
+                "description": "The ID of the sub-issue to be prioritized after (either after_id OR before_id should be specified)",
+                "type": "number"
               },
               "before_id": {
-                "type": "number",
-                "description": "The ID of the sub-issue to be prioritized before (either after_id OR before_id should be specified)"
+                "description": "The ID of the sub-issue to be prioritized before (either after_id OR before_id should be specified)",
+                "type": "number"
               },
               "issue_number": {
-                "type": "number",
-                "description": "The number of the parent issue"
+                "description": "The number of the parent issue",
+                "type": "number"
               },
               "method": {
-                "type": "string",
-                "description": "The action to perform on a single sub-issue\nOptions are:\n- 'add' - add a sub-issue to a parent issue in a GitHub repository.\n- 'remove' - remove a sub-issue from a parent issue in a GitHub repository.\n- 'reprioritize' - change the order of sub-issues within a parent issue in a GitHub repository. Use either 'after_id' or 'before_id' to specify the new position.\n\t\t\t\t"
+                "description": "The action to perform on a single sub-issue\nOptions are:\n- 'add' - add a sub-issue to a parent issue in a GitHub repository.\n- 'remove' - remove a sub-issue from a parent issue in a GitHub repository.\n- 'reprioritize' - change the order of sub-issues within a parent issue in a GitHub repository. Use either 'after_id' or 'before_id' to specify the new position.\nWrites issue hierarchy. To move a sub-issue to a new parent, use `add` with `replace_parent=true`; there is no writable parent field.\n",
+                "type": "string"
               },
               "owner": {
-                "type": "string",
-                "description": "Repository owner"
+                "description": "Repository owner",
+                "type": "string"
               },
               "replace_parent": {
-                "type": "boolean",
-                "description": "When true, replaces the sub-issue's current parent issue. Use with 'add' method only."
+                "description": "When true, replaces the sub-issue's current parent issue. Use with 'add' method only.",
+                "type": "boolean"
               },
               "repo": {
-                "type": "string",
-                "description": "Repository name"
+                "description": "Repository name",
+                "type": "string"
               },
               "sub_issue_id": {
-                "type": "number",
-                "description": "The ID of the sub-issue to add. ID is not the same as issue number"
+                "description": "The ID of the sub-issue to add. ID is not the same as issue number",
+                "type": "number"
               }
             },
             "required": [
@@ -5104,7 +5316,8 @@
               "repo",
               "issue_number",
               "sub_issue_id"
-            ]
+            ],
+            "type": "object"
           }
         },
         {
@@ -5121,10 +5334,10 @@
               "none"
             ],
             "title": [
-              "none"
+              "outbound-text"
             ],
             "body": [
-              "none"
+              "outbound-text"
             ],
             "state": [
               "none"
@@ -5250,6 +5463,12 @@
     },
     "google-workspace": {
       "inputHash": "f7ce4acb3ef13bc7a8a3c7a477075d35a47a1c2ec67d9a497b8105a1dddf4852",
+      "contentDigest": "2d1845afda53c40401df9ea94af347df854c6b6d5f50ac61b973e2cfd36e2af3",
+      "source": "package",
+      "producerVersion": "0.14.0",
+      "supersededDigests": [
+        "4df37ac27aad1f812f59e54466fed343dcc0e5b299f733e8f90662a5842ace79"
+      ],
       "tools": [
         {
           "toolName": "drive_search",
@@ -5831,7 +6050,7 @@
               "none"
             ],
             "emailMessage": [
-              "none"
+              "outbound-text"
             ]
           },
           "serverName": "google-workspace",
@@ -11346,7 +11565,7 @@
               "email-address"
             ],
             "subject": [
-              "none"
+              "outbound-text"
             ],
             "body": [
               "email-body"
@@ -11433,7 +11652,7 @@
           "comment": "Creates a draft email message in Gmail that is saved but not sent, supporting plain text or HTML and threading.",
           "args": {
             "subject": [
-              "none"
+              "outbound-text"
             ],
             "body": [
               "email-body"
@@ -11733,7 +11952,7 @@
               "none"
             ],
             "summary": [
-              "none"
+              "outbound-text"
             ],
             "startTime": [
               "none"
@@ -11745,7 +11964,7 @@
               "none"
             ],
             "description": [
-              "none"
+              "outbound-text"
             ],
             "attendees": [
               "email-address"
@@ -11819,7 +12038,7 @@
               "none"
             ],
             "summary": [
-              "none"
+              "outbound-text"
             ],
             "startTime": [
               "none"
@@ -11831,7 +12050,7 @@
               "none"
             ],
             "description": [
-              "none"
+              "outbound-text"
             ],
             "attendees": [
               "email-address"
@@ -12050,7 +12269,7 @@
               "none"
             ],
             "text": [
-              "none"
+              "outbound-text"
             ],
             "sendUpdates": [
               "none"

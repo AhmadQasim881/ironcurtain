@@ -75,6 +75,17 @@ describe('PTY store actions', () => {
     expect(mockRequest).toHaveBeenCalledWith('sessions.ptyInput', { label: 5, data: 'aGk=' });
   });
 
+  // The daemon rejects sizes outside cols 2..1000 / rows 1..500 (WEB-12). A
+  // zoomed-out or ultra-wide browser can fit more than that; clamping keeps
+  // the PTY at the largest supported size instead of a rejected frame leaving
+  // it at its previous size (80x24 when it is the first report).
+  it('sendPtyResize clamps an oversized browser terminal into the daemon-accepted range', async () => {
+    await sendPtyResize(5, 1800, 640);
+    expect(mockRequest).toHaveBeenCalledWith('sessions.ptyResize', { label: 5, cols: 1000, rows: 500 });
+    await sendPtyResize(5, 1, 0);
+    expect(mockRequest).toHaveBeenLastCalledWith('sessions.ptyResize', { label: 5, cols: 2, rows: 1 });
+  });
+
   it('sendPtyResize sends sessions.ptyResize with { label, cols, rows }', async () => {
     await sendPtyResize(5, 120, 40);
     expect(mockRequest).toHaveBeenCalledWith('sessions.ptyResize', { label: 5, cols: 120, rows: 40 });

@@ -1,5 +1,7 @@
 # Secure Nested Runtime Package Network
 
+**Status (2026-11-14):** Implemented: stages 1 to 6 of section 14 (the dedicated package proxy, CA delivery and runc wrapper, build shim and lifecycle). Preview qualification (stage 7) is open.
+
 **Purpose:** governing package-authority contract, not a platform-status or validation ledger.
 **Related:** [implementation design](linux-nested-docker-implementation-plan.md),
 [broader runtime design](secure-nested-runtime-implementation-plan.md).
@@ -316,11 +318,15 @@ substring checks. At minimum the initial grammars admit:
   `/debian-security/pool/updates/<component>/...deb` artifacts. Reject dot segments, encoded separators,
   arbitrary roots, query strings, uploads, and malformed `.deb` names. APT's GPG checks remain client
   behavior, not an IronCurtain integrity claim.
-  Within the version field of an otherwise canonical `.deb` filename, lowercase `%2b`, `%7e`, and `%3a`
-  for APT-quoted `+`, `~`, and the Debian epoch separator are the only admitted percent encodings. Those
-  characters must use that encoded spelling rather than a literal alias. The exact encoded path is retained
-  upstream and in the audit route while package identity uses the once-decoded version. Case variants,
-  double encoding, encoded dot/separator/delimiter bytes, and encoding outside the version field fail.
+  APT quotes `+` and `~` across the whole request URI, so `g++-12` arrives as `g%2b%2b-12_...deb` and the
+  pool directory of `libsigc++-2.0` as `libsigc%2b%2b-2.0`. In a `.deb` path, lowercase `%2b` and `%7e`
+  for those characters are admitted in the pool directory, the package name, and the version, and `%3a`
+  for the Debian epoch separator in the version only; these are the only admitted percent encodings.
+  Those characters must use that encoded spelling rather than a literal alias, so each artifact has one
+  accepted spelling. The exact encoded path is retained upstream and in the audit route while package
+  identity uses the once-decoded file name, whose name, version, and architecture must still match the
+  Debian grammars. Case variants, double encoding, encoded dot/separator/delimiter bytes, `%3a` outside
+  the version, and any encoding in the architecture field fail.
 - **Cargo:** sparse-index `config.json`, canonical sparse crate-index paths, exact
   `crates.io/api/v1/crates/<crate>/<version>/download` transitions, and matching
   `static.crates.io/crates/<crate>/<crate>-<version>.crate` files. Deny search, owners, readme, publish,
@@ -344,7 +350,26 @@ security metadata or artifact route.
 Host-internal metadata requests used to validate a package are exact source-constructed GETs to fixed
 host/path templates. They use the same address screen, destination-bound transport, time/byte/session
 ledger, and public-root TLS validation. Client headers, cookies, recognized credentials, and bodies are
-never copied into them. There is no generic redirect follower or parent CONNECT fallback.
+never copied into them. There is no generic redirect follower or parent CONNECT fallback. The one
+redirect a derived request follows is PyPI's JSON API redirect to the project's display-name spelling
+(`/pypi/django/json` to `/pypi/Django/json`): a 301, 302, 307, or 308 with a single `Location` that
+resolves to `https://pypi.org/pypi/<X>/json`, with no credentials, port, query, or fragment, where `X`
+normalizes to the same project name. Its body is never read; the redirect is audited as
+`derived-metadata-redirected` and the redirected document is read as the second derived request the
+per-client bound admits, under the same request deadline and ceilings. Any other redirect, and a second
+one, fails closed with 502.
+
+A derived metadata document is scanned as it streams and never buffered, so its size is bounded by the
+derived-metadata ceiling and the per-request and per-session ledger, not by memory: a 68 MB
+`@prisma/client` packument is read like a small one. The scan extracts only what the decision needs: for
+npm, whether `versions` lists the exact version and that version's `time` entry; for Cargo, the one
+sparse-index line for the version; for PyPI, the `upload_time_iso_8601` of the one file whose URL path is
+exactly the artifact's route path (a PEP 658/714 sidecar is gated with its file). PyPI is gated per file
+because a release can gain files long after it was published; its earliest upload is not the age of a
+wheel added later. A version or file the metadata does not list fails closed with 403, and a repeated
+member the decision reads is refused. When the package policy allows the artifact without metadata (an
+allowlisted package, or no quarantine), no derived request is made. A response over the ceiling fails
+closed with 413 and an audit reason that names the ceiling.
 
 ## 8. Address policy, bounds, and accounting
 
@@ -395,6 +420,7 @@ The first admitted constants are host-owned source values, not settings:
 | Established idle timeout                                |     60 seconds |
 | Bytes per request, both directions                      |          2 GiB |
 | Bytes per bundle session, both directions               |         16 GiB |
+| Derived metadata response (streamed, never buffered)    |        128 MiB |
 
 Every accepted UDS connection, including the exact bootstrap health request, consumes one nonrefundable
 attempt/token and a concurrency slot before parsing. Malformed, denied, failed, timed-out, and successful
@@ -1094,7 +1120,9 @@ package authority. No live success is recorded until exact reconciliation comple
 - **Generic end-to-end CONNECT/public mode:** admits arbitrary public destinations and opaque application
   traffic, far more authority than ordinary package installation needs.
 - **Standard `MitmProxy` package mode:** contains dynamic/wildcard passthrough and unknown-path forwarding,
-  provider/control complexity, and no package-specific ledger contract.
+  provider/control complexity, and no package-specific ledger contract. (2026-11: since WP-26 the standard
+  proxy no longer forwards unknown paths on registry hosts, which take an explicit GET/HEAD route
+  allowlist; wildcard and dynamic passthrough still exist for other hosts.)
 - **Build-only identity:** the daemon, outer shell, host-network containers, and mounted relay collude.
 - **Docker runtime selection as security policy:** the guest owns its daemon and may bypass/restart it;
   only the host proxy constrains egress.
@@ -1180,3 +1208,5 @@ backend 0C/G1-G10 or preview qualification; those open release gates are recorde
       layer/snapshot residue scans, and exact cleanup pass for developer admission. Docker Desktop's
       no-skip suite and feature-off/crash/offline/images/packages product-entrypoint gates pass; broader
       preview residue and multi-client reruns remain the separate §13/§14 work.
+
+The fixed relay receives its host-hop credential through `IRONCURTAIN_FIXED_RELAY_PROXY_AUTHORIZATION` in the Docker CLI's private allowlisted environment. The create arguments name the variable without its value; the relay reads and clears it before serving, and effective configuration inspection verifies the exact environment. Command arguments never contain the credential. Outer Docker administrators can still inspect that environment; it is never passed to the untrusted bundle. New relay source bytes require rebuilding the derived relay image (RV-29).

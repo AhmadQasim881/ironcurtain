@@ -16,6 +16,7 @@ import {
   type OpenRouterRewriterConfig,
 } from '../../src/docker/openrouter.js';
 import type { RequestBodyRewriter, RewriteResult } from '../../src/docker/provider-config.js';
+import { REQUEST_REJECTED } from '../../src/docker/request-sanitizers/index.js';
 import { DEFAULT_MODEL_MAP } from '../../src/config/user-config.js';
 
 const MESSAGES_PATH = '/api/v1/messages';
@@ -265,13 +266,20 @@ describe('makeOpenRouterRewriter — beta strip + cache_control preservation', (
   });
 });
 
-describe('makeOpenRouterRewriter — m7 no-ops', () => {
-  it('returns null when body.model is absent', () => {
-    expect(rewrite(makeOpenRouterRewriter(makeConfig()), {})).toBeNull();
+describe('makeOpenRouterRewriter — m7 no-ops and fail-closed model', () => {
+  // A request without a string model used to be forwarded unmapped, letting
+  // OpenRouter choose a model the profile never approved. It is now refused
+  // (the MITM answers a local 400 and never contacts the upstream).
+  it('rejects a body whose model is absent', () => {
+    expect(() => rewrite(makeOpenRouterRewriter(makeConfig()), {})).toThrow(
+      expect.objectContaining({ code: REQUEST_REJECTED, status: 400 }),
+    );
   });
 
-  it('returns null when body.model is not a string', () => {
-    expect(rewrite(makeOpenRouterRewriter(makeConfig()), { model: 42 })).toBeNull();
+  it('rejects a body whose model is not a string', () => {
+    expect(() => rewrite(makeOpenRouterRewriter(makeConfig()), { model: 42 })).toThrow(
+      expect.objectContaining({ code: REQUEST_REJECTED, status: 400 }),
+    );
   });
 
   it('returns null when nothing changed (non-glm passthrough, no beta, no provider)', () => {

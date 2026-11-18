@@ -22,7 +22,11 @@ import { join } from 'node:path';
 import type { BundleId } from '../../src/session/types.js';
 import type { WorkflowDefinition } from '../../src/workflow/types.js';
 import type { DockerInfrastructure } from '../../src/docker/docker-infrastructure.js';
-import { WorkflowOrchestrator, type CreateWorkflowInfrastructureInput } from '../../src/workflow/orchestrator.js';
+import {
+  WorkflowOrchestrator,
+  type CreateWorkflowInfrastructureInput,
+  type WorkflowOrchestratorDeps,
+} from '../../src/workflow/orchestrator.js';
 import { getBundleControlSocketPath } from '../../src/config/paths.js';
 import {
   approvedResponse,
@@ -32,6 +36,10 @@ import {
   waitForCompletion,
   stubPersonasForTest,
 } from './test-helpers.js';
+
+type StartControlServer = NonNullable<WorkflowOrchestratorDeps['startWorkflowControlServer']>;
+type LoadPolicyRpc = NonNullable<WorkflowOrchestratorDeps['loadPolicyRpc']>;
+type DestroyInfrastructure = NonNullable<WorkflowOrchestratorDeps['destroyWorkflowInfrastructure']>;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -125,9 +133,9 @@ describe('WorkflowOrchestrator bifurcated workflow (containerScope)', () => {
     const createInfra = vi.fn(async (input: CreateWorkflowInfrastructureInput) =>
       makeStubInfrastructure(input.workflowId, input.bundleId, input.scope),
     );
-    const destroyInfra = vi.fn(async () => {});
-    const startCtrl = vi.fn(async () => {});
-    const loadPolicy = vi.fn(async () => {});
+    const destroyInfra = vi.fn<DestroyInfrastructure>(async () => {});
+    const startCtrl = vi.fn<StartControlServer>(async () => {});
+    const loadPolicy = vi.fn<LoadPolicyRpc>(async () => {});
 
     const responses = [
       { text: approvedResponse('a-done'), artifacts: ['result_a'] },
@@ -167,7 +175,7 @@ describe('WorkflowOrchestrator bifurcated workflow (containerScope)', () => {
     const createInfra = vi.fn(async (input: CreateWorkflowInfrastructureInput) =>
       makeStubInfrastructure(input.workflowId, input.bundleId, input.scope),
     );
-    const startCtrl = vi.fn(async () => {});
+    const startCtrl = vi.fn<StartControlServer>(async () => {});
     const responses = [
       { text: approvedResponse('a-done'), artifacts: ['result_a'] },
       { text: approvedResponse('b-done'), artifacts: ['result_b'] },
@@ -214,7 +222,7 @@ describe('WorkflowOrchestrator bifurcated workflow (containerScope)', () => {
     const createInfra = vi.fn(async (input: CreateWorkflowInfrastructureInput) =>
       makeStubInfrastructure(input.workflowId, input.bundleId, input.scope),
     );
-    const loadPolicy = vi.fn(async () => {});
+    const loadPolicy = vi.fn<LoadPolicyRpc>(async () => {});
     const responses = [
       { text: approvedResponse('a-done'), artifacts: ['result_a'] },
       { text: approvedResponse('b-done'), artifacts: ['result_b'] },
@@ -298,7 +306,7 @@ describe('WorkflowOrchestrator bifurcated workflow (containerScope)', () => {
       bundlesCreated.push(bundle);
       return bundle;
     });
-    const destroyInfra = vi.fn(async () => {});
+    const destroyInfra = vi.fn<DestroyInfrastructure>(async () => {});
 
     const responses = [
       { text: approvedResponse('a-done'), artifacts: ['result_a'] },
@@ -362,7 +370,7 @@ describe('WorkflowOrchestrator bifurcated workflow (containerScope)', () => {
       factoryInput = input;
       return factoryGate;
     });
-    const destroyInfra = vi.fn(async () => {});
+    const destroyInfra = vi.fn<DestroyInfrastructure>(async () => {});
 
     // If the test is working, no session ever runs: abort races the
     // first state's bundle mint.

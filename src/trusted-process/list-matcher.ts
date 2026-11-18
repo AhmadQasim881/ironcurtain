@@ -3,7 +3,9 @@
  *
  * Used by the PolicyEngine when evaluating `ListCondition` rules: given a
  * `ListType`, returns a comparator that tests whether a tool-call argument
- * value matches an entry from the resolved allow list.
+ * value matches an entry from the resolved allow list. A `domains` list on a
+ * URL role is not matched here: the engine compares every destination the
+ * value resolves to, as for a `domains` condition, never the raw value.
  *
  * Lives in the trusted-process layer (not the offline pipeline) because it
  * runs on the policy hot path. The compile-time concerns (validators,

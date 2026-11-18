@@ -3,7 +3,12 @@ ARG IRONCURTAIN_DOCKER_SOURCE=docker:29.2.1-dind-rootless
 # The tiny runtime wrapper adds runc's --no-new-keyring option for ordinary
 # runs and integrated BuildKit RUN
 # without admitting the keyctl syscall to the outer sidecar profile.
-FROM golang:1.26.1 AS shim-build
+# Its Go toolchain is the relay's (docker/nested-relay/Dockerfile): one exact,
+# supported release, checked by scripts/check-go-toolchain.ts. Before a release
+# the stage must also be pinned by the verified digest of the multi-platform
+# golang index (`check:go-toolchain --strict` refuses an undigested golang
+# stage); never commit a placeholder digest, which no registry serves.
+FROM golang:1.26.11-bookworm@sha256:dc40a13b61304647ed7e5d581d246b86413dfc29d63c6d018310feb93cd98fc0 AS shim-build
 WORKDIR /src
 COPY runtime-shim/main.go ./main.go
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/runc ./main.go \

@@ -1,5 +1,5 @@
 name: evolve
-description: 'Evolve - multi-round evaluator-driven candidate search: a linear per-round pipeline (sample, researcher, evaluate, analyzer, record) with a round-boundary orchestrator enforcing budget and stop conditions.'
+description: 'Evolve - multi-round evaluator-driven candidate search: a linear per-round pipeline (sample, researcher, evaluate, analyzer, record), a deterministic stop check after every recorded round, and a round-boundary orchestrator deciding how to continue.'
 initial: provision
 
 settings:
@@ -16,10 +16,14 @@ settings:
   # back to orchestrator) may revisit evaluate/orchestrator, so a run with many
   # recoveries trips the backstop in fewer
   # rounds. It is set well above run_spec.budget.max_rounds either way, so a
-  # legitimate run is never capped before the orchestrator emits `complete`; the
-  # real round budget is enforced by the orchestrator against
-  # run_spec.budget.max_rounds.
+  # legitimate run is never capped before its stop condition; the real round
+  # budget (run_spec.budget.max_rounds, plus the target and patience stops) is
+  # enforced deterministically by the `stop_check` state after every recorded
+  # round, not by the orchestrator agent.
   maxRounds: 200
+  # A whole-run spend ceiling is opt-in: add settings.workflowBudget
+  # (maxTotalTokens / maxEstimatedCostUsd / maxWallClockSeconds) to stop the
+  # run, resumably, once every session and lane together reach it.
 
 states:
   provision:
@@ -306,22 +310,26 @@ states:
 
   orchestrator:
     type: agent
-    description: Round-boundary controller - after each recorded round (and at the start) it enforces the budget and stop conditions, routing to continue, complete, or escalate.
+    description: Round-boundary controller - at the start, after a recorded round that did not meet a stop condition, and after human review, it routes to continue, complete, or escalate.
     persona: global
     prompt: |
       You are the Evolve orchestrator - the round-boundary controller for a bounded
-      multi-round search. You are entered at the start of the run and again after each
-      round is durably recorded; you read the durable run state and emit exactly ONE
-      routing verdict in your agent_status block. You do not write candidates, run
-      evaluators, or record nodes. The per-round pipeline runs on its own - sample ->
-      researcher -> evaluate -> analyzer -> analysis_record - and returns here only
-      once the round is committed.
+      multi-round search. You are entered at the start of the run, after each durably
+      recorded round that did not meet a stop condition, and after a human review; you
+      read the durable run state and emit exactly ONE routing verdict in your
+      agent_status block. You do not write candidates, run evaluators, or record nodes.
+      The per-round pipeline runs on its own - sample -> researcher -> evaluate ->
+      analyzer -> analysis_record - and a deterministic stop check runs after every
+      recorded round: when stop_signals.json reports a stop_reason the run goes straight
+      to the final summary without asking you, so the round budget does not depend on
+      your verdict.
 
       Read these files first:
         - /workspace/.evolve_runs/main/run_spec.yaml - budget.max_rounds is N.
         - /workspace/.evolve_runs/main/current/stop_signals.json, if present. It
-          is written by analysis_record after the durable node record and is the
-          single source of truth for round accounting. Read its precomputed fields
+          is written after the durable node record (and rewritten by the stop
+          check) and is the single source of truth for round accounting. Read its
+          precomputed fields
           directly; do NOT count nodes.json or recompute anything yourself:
             * done_rounds = the number of GENERATIONS recorded so far. One fan-out
               batch of N lanes counts as ONE generation; at the workers:1 default
@@ -347,10 +355,10 @@ states:
       If a human directive in this message requests more rounds, that directive
       overrides any stop_reason for THIS turn only: emit design to start one more
       round instead of complete, even when stop_signals.json reports a stop. The
-      directive is present for a single turn; after that round records, route
-      normally on the freshly recomputed stop_signals.json — the human can request
-      another round at the next final_review gate. Do not rewrite run_spec.yaml;
-      extra rounds append new nodes to nodes.json like normal rounds.
+      directive is present for a single turn; after that round records, the stop
+      check decides again on the freshly recomputed stop_signals.json — the human can
+      request another round at the next final_review gate. Do not rewrite
+      run_spec.yaml; extra rounds append new nodes to nodes.json like normal rounds.
 
       Decide and emit one verdict:
         - complete  - if stop_signals.json exists and its stop_reason is non-null,
@@ -383,10 +391,39 @@ states:
     fanOut: { count: workers, join: barrier }
     segment: [sample, researcher, evaluate, analyzer, analysis_record]
     transitions:
-      - to: orchestrator
+      - to: stop_check
         when: { verdict: recorded }
       - to: human_escalation
         when: { verdict: escalate }
+      - to: failed
+        when: { verdict: result_file_error }
+      - to: failed
+
+  stop_check:
+    type: deterministic
+    description: >
+      Deterministic round-boundary stop: after every recorded round, recompute the
+      stop signals over the durable node database and end the search when a stop
+      condition holds (target_met, patience, max_rounds), whatever the orchestrator
+      agent would decide. An unreadable run state, or a run spec without a
+      positive budget.max_rounds, fails the run rather than continuing it.
+    container: true
+    resultFile: .evolve_runs/main/current/stop_check.json
+    run:
+      - [
+          '/opt/workflow-venv/bin/python',
+          '/workflow-scripts/evolve_result.py',
+          'stop_check',
+          '--run-dir',
+          '/workspace/.evolve_runs/main',
+          '--result-file',
+          '/workspace/.evolve_runs/main/current/stop_check.json',
+        ]
+    transitions:
+      - to: final_summary
+        when: { verdict: stop }
+      - to: orchestrator
+        when: { verdict: continue }
       - to: failed
         when: { verdict: result_file_error }
       - to: failed
@@ -451,7 +488,6 @@ states:
       Finish with the required agent_status block; your verdict is informational.
     inputs: []
     outputs: []
-    maxVisits: 3
     transitions:
       - to: evaluate
 
@@ -503,7 +539,6 @@ states:
       Finish with the required agent_status block; your verdict is informational.
     inputs: []
     outputs: []
-    maxVisits: 3
     transitions:
       - to: analysis_record
 
@@ -531,7 +566,7 @@ states:
           '/workspace/.evolve_runs/main/current/analysis_record.json',
         ]
     transitions:
-      - to: orchestrator
+      - to: stop_check
         when: { verdict: recorded }
       - to: failed
         when: { verdict: needs_repair }

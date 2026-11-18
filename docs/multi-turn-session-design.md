@@ -1,6 +1,7 @@
 # Design: Multi-Turn Session Architecture
 
-**Status:** Proposed (decisions finalized)
+**Status (2026-11-14):** Implemented (`src/session/`): sessions with their own sandbox, audit log and escalation directory, file-based escalation IPC, conversation history with compaction, and resume. Three details below are dated: the step limit is no longer the `MAX_AGENT_STEPS` constant but `resourceBudget.maxSteps` (or `STEP_SAFETY_CAP`, 1000, when that is null; `src/session/resource-budget-tracker.ts`); the in-process `EscalationHandler` (src/trusted-process/escalation.ts) the file table lists no longer exists; and the src/agent/ module this design moves the system prompt into no longer exists either: `buildSystemPrompt()` is in `src/session/prompts.ts`, and the deprecated `runAgent()` was removed: the builtin agent loop is `AgentSession` (`src/session/agent-session.ts`).
+
 **Date:** 2026-02-17
 
 ## Problem

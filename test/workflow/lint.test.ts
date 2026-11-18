@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -502,27 +502,6 @@ describe('WF008 — visit-cap transition ordering', () => {
   // routing), so they cannot reach lint in practice. The rule's
   // `isApprovalExitTransition` still treats them as loop-continuing for
   // defense-in-depth when multi-field `when` becomes a supported feature.
-
-  it('flags the vuln-discovery workflow (regression sample)', () => {
-    // Targeted check: the two bugs reported by the Copilot reviewer both
-    // fire and report the right states. Kept separate from the "bundled
-    // workflows lint clean" regression so that the intent of this check
-    // is discoverable by greppers.
-    const raw = parseYaml(
-      readFileSync(
-        resolve(__dirname, '..', '..', 'src', 'workflow', 'workflows', 'vuln-discovery', 'workflow.yaml'),
-        'utf-8',
-      ),
-      { maxAliasCount: 0 },
-    );
-    const def = validateDefinition(raw);
-    const diagnostics = lintWorkflow(def, stubCtx);
-    const wf008 = diagnostics.filter((d) => d.code === 'WF008').map((d) => d.stateId);
-    // After Step 3 reorders the YAML this list is empty; WF008 no longer
-    // fires. (The bundled-workflows regression below asserts the same
-    // thing more broadly.)
-    expect(wf008).toEqual([]);
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -824,7 +803,6 @@ describe('bundled workflows lint clean', () => {
   const bundledCtx: LintContext = { personaExists: () => false };
 
   for (const name of [
-    'vuln-discovery',
     'design-and-code',
     'test-email-summary',
     'deterministic-eval-smoke',
@@ -848,6 +826,29 @@ describe('bundled workflows lint clean', () => {
       expect(errors.length).toBe(0);
     });
   }
+
+  // Stronger than "zero errors": every bundled package (discovered, so a new
+  // one is covered automatically) lints with no diagnostics at all, apart
+  // from WF007, which depends on which personas the machine has installed.
+  // In particular none of them declares a field that validates but does
+  // nothing (WF016-WF018), such as evolve's former researcher/analyzer
+  // maxVisits that no transition checked.
+  it('every bundled package has no warnings except persona availability', () => {
+    const manifests = readdirSync(workflowsDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => resolve(workflowsDir, entry.name, 'workflow.yaml'))
+      .filter((manifestPath) => existsSync(manifestPath));
+    expect(manifests.length).toBeGreaterThanOrEqual(6);
+
+    for (const manifestPath of manifests) {
+      const def = validateDefinition(parseYaml(readFileSync(manifestPath, 'utf-8'), { maxAliasCount: 0 }));
+      const diagnostics = lintWorkflow(def, { ...bundledCtx, workflowFilePath: manifestPath });
+      expect(
+        diagnostics.filter((d) => d.code !== 'WF007').map((d) => `${d.code} ${d.stateId ?? ''}`),
+        manifestPath,
+      ).toEqual([]);
+    }
+  });
 });
 
 describe('WF011 — mixed agent/deterministic scope ordering', () => {
@@ -871,7 +872,7 @@ describe('WF011 — mixed agent/deterministic scope ordering', () => {
         check: {
           type: 'deterministic',
           description: 'check',
-          ...(opts.container ? { container: true } : {}),
+          ...(opts.container ? { container: true } : { host: true }),
           ...(opts.detScope !== undefined ? { containerScope: opts.detScope } : {}),
           run: [['echo', 'hi']],
           transitions: [{ to: 'done' }],
@@ -1020,6 +1021,141 @@ describe('WF012 — deterministic verdict edges without resultFile', () => {
 });
 
 // ---------------------------------------------------------------------------
+// WF015 — deterministic state runs workspace code on the host
+// ---------------------------------------------------------------------------
+
+describe('WF015 — host deterministic states', () => {
+  function hostWorkflow(
+    settings: Record<string, unknown>,
+    check: Record<string, unknown> = { host: true, run: [['npm', 'test']] },
+  ): WorkflowDefinition {
+    return validateDefinition({
+      name: 'wf015',
+      description: 'd',
+      initial: 'implement',
+      settings,
+      states: {
+        implement: {
+          type: 'agent',
+          description: 'implement',
+          persona: 'global',
+          prompt: 'p',
+          inputs: [],
+          outputs: ['code'],
+          transitions: [{ to: 'check' }],
+        },
+        check: {
+          type: 'deterministic',
+          description: 'check',
+          transitions: [{ to: 'done', guard: 'isPassed' }, { to: 'implement' }],
+          ...check,
+        },
+        done: { type: 'terminal', description: 'done', outputs: ['code'] },
+      },
+    });
+  }
+
+  it('warns on a host: true state and explains that host toolchains run workspace code', () => {
+    const result = lintWorkflow(
+      hostWorkflow({ mode: 'docker', dockerAgent: 'claude-code', sharedContainer: true }),
+      stubCtx,
+    );
+    const wf015 = result.filter((d) => d.code === 'WF015');
+
+    expect(wf015).toHaveLength(1);
+    expect(wf015[0]?.severity).toBe('warning');
+    expect(wf015[0]?.stateId).toBe('check');
+    expect(wf015[0]?.message).toContain('runs its commands on the host (host: true)');
+    expect(wf015[0]?.message).toContain(
+      'npm, pytest, make, cargo and git execute code and configuration from the workspace',
+    );
+    expect(wf015[0]?.hint).toContain('set container: true');
+  });
+
+  it('gives builtin workflows a hint that does not pretend a container exists', () => {
+    const wf015 = lintWorkflow(hostWorkflow({ mode: 'builtin' }), stubCtx).find((d) => d.code === 'WF015');
+
+    expect(wf015?.hint).toContain('Builtin mode has no container');
+  });
+
+  it('does not flag container states, fan-out drivers or states with nothing to run', () => {
+    const shared = { mode: 'docker', dockerAgent: 'claude-code', sharedContainer: true };
+    expect(
+      codes(lintWorkflow(hostWorkflow(shared, { container: true, run: [['npm', 'test']] }), stubCtx)),
+    ).not.toContain('WF015');
+    expect(codes(lintWorkflow(hostWorkflow(shared, { run: [] }), stubCtx))).not.toContain('WF015');
+    expect(codes(lintWorkflow(hostWorkflow(shared, { host: true, run: [[]] }), stubCtx))).not.toContain('WF015');
+  });
+
+  it('flags a fan-out driver that also runs as a segment member (its run executes in each lane)', () => {
+    const def = validateDefinition({
+      name: 'wf015-nested',
+      description: 'd',
+      initial: 'outer',
+      settings: { mode: 'builtin', workers: 2 },
+      states: {
+        outer: {
+          type: 'deterministic',
+          description: 'outer',
+          run: [],
+          fanOut: { count: 'workers', join: 'barrier' },
+          segment: ['inner'],
+          transitions: [{ to: 'done' }],
+        },
+        inner: {
+          type: 'deterministic',
+          description: 'inner',
+          host: true,
+          run: [['make', 'check']],
+          fanOut: { count: 'workers', join: 'barrier' },
+          segment: ['leaf'],
+          fanOutMember: true,
+          transitions: [{ to: 'done' }],
+        },
+        leaf: {
+          type: 'agent',
+          description: 'leaf',
+          persona: 'global',
+          prompt: 'p',
+          inputs: [],
+          outputs: [],
+          fanOutMember: true,
+          transitions: [{ to: 'done' }],
+        },
+        done: { type: 'terminal', description: 'done' },
+      },
+    });
+
+    const wf015 = lintWorkflow(def, stubCtx).filter((d) => d.code === 'WF015');
+    expect(wf015.map((d) => d.stateId)).toEqual(['inner']);
+  });
+
+  it('flags the example manifest, whose builtin validate state runs on the host', () => {
+    const manifestPath = resolve(__dirname, '..', '..', 'examples', 'workflow-demo.yaml');
+    const def = validateDefinition(parseYaml(readFileSync(manifestPath, 'utf-8'), { maxAliasCount: 0 }));
+    const wf015 = lintWorkflow(def, stubCtx).filter((d) => d.code === 'WF015');
+
+    expect(wf015.map((d) => d.stateId)).toEqual(['validate']);
+  });
+
+  it('bundled workflows run no deterministic state on the host', () => {
+    const workflowsDir = resolve(__dirname, '..', '..', 'src', 'workflow', 'workflows');
+    for (const name of [
+      'design-and-code',
+      'test-email-summary',
+      'deterministic-eval-smoke',
+      'deterministic-verdict-smoke',
+      'nested-docker-live-smoke',
+      'evolve',
+    ]) {
+      const manifestPath = resolve(workflowsDir, name, 'workflow.yaml');
+      const def = validateDefinition(parseYaml(readFileSync(manifestPath, 'utf-8'), { maxAliasCount: 0 }));
+      expect(codes(lintWorkflow(def, stubCtx)), name).not.toContain('WF015');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // WF013 (fan-out budget) / WF014 (fan-out child-bounds) diagnostics
 // ---------------------------------------------------------------------------
 
@@ -1098,14 +1234,41 @@ describe('WF013/WF014 — fan-out scaffolding diagnostics', () => {
     expect(wf014[0]?.message).toContain('no per-lane maxVisits');
   });
 
-  it('WF014 does not warn on child loops that have maxVisits', () => {
-    const result = lintWorkflow(fanOutWorkflow({ workerState: { maxVisits: 3 } }), stubCtx);
+  it('WF014 does not warn on child loops bounded by maxVisits and its isStateVisitLimitReached transition', () => {
+    const result = lintWorkflow(
+      fanOutWorkflow({
+        workerState: {
+          maxVisits: 3,
+          transitions: [
+            { to: 'done', guard: 'isStateVisitLimitReached' },
+            { to: 'worker', when: { verdict: 'retry' } },
+            { to: 'done' },
+          ],
+        },
+      }),
+      stubCtx,
+    );
 
     expect(result.filter((d) => d.code === 'WF014')).toHaveLength(0);
+    expect(result.filter((d) => d.code === 'WF016')).toHaveLength(0);
     // WF013 (budget) still fires on the fan-out state itself.
     const wf013 = result.filter((d) => d.code === 'WF013');
     expect(wf013).toHaveLength(1);
     expect(wf013[0]?.stateId).toBe('workers');
+  });
+
+  it('WF014 still warns when the child declares maxVisits but nothing checks it', () => {
+    // maxVisits without an isStateVisitLimitReached transition never fires, so
+    // it must not count as a per-lane bound (it used to silence WF014).
+    const result = lintWorkflow(fanOutWorkflow({ workerState: { maxVisits: 3 } }), stubCtx);
+
+    const wf014 = result.filter((d) => d.code === 'WF014');
+    expect(wf014).toHaveLength(1);
+    expect(wf014[0]?.stateId).toBe('worker');
+    expect(wf014[0]?.message).toContain('isStateVisitLimitReached');
+    const wf016 = result.filter((d) => d.code === 'WF016');
+    expect(wf016).toHaveLength(1);
+    expect(wf016[0]?.stateId).toBe('worker');
   });
 
   // A numeric `fanOut.count` override runs multiple lanes at runtime even at
@@ -1144,5 +1307,592 @@ describe('WF013/WF014 — fan-out scaffolding diagnostics', () => {
 
     expect(result.filter((d) => d.code === 'WF013')).toHaveLength(0);
     expect(result.filter((d) => d.code === 'WF014')).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WF016 / WF017 / WF018 — fields that validate but have no effect
+// ---------------------------------------------------------------------------
+
+describe('inert definition fields produce their lint codes', () => {
+  interface RawInertBase {
+    name: string;
+    description: string;
+    initial: string;
+    settings: Record<string, unknown>;
+    states: { work: Record<string, unknown>; done: Record<string, unknown> };
+  }
+
+  /** A one-agent workflow that lints with no diagnostics at all. */
+  function inertBase(): RawInertBase {
+    return {
+      name: 'inert-fields',
+      description: 'd',
+      initial: 'work',
+      settings: { mode: 'builtin' },
+      states: {
+        work: {
+          type: 'agent',
+          description: 'work',
+          persona: 'global',
+          prompt: 'p',
+          inputs: [],
+          outputs: [],
+          transitions: [{ to: 'done' }],
+        },
+        done: { type: 'terminal', description: 'done' },
+      },
+    };
+  }
+
+  const cases: ReadonlyArray<{
+    readonly field: string;
+    readonly code: string;
+    readonly stateId: string | undefined;
+    readonly apply: (raw: RawInertBase) => void;
+  }> = [
+    {
+      field: 'maxVisits',
+      code: 'WF016',
+      stateId: 'work',
+      apply: (raw) => {
+        raw.states.work.maxVisits = 2;
+      },
+    },
+    {
+      field: 'settings.gitRepoPath',
+      code: 'WF017',
+      stateId: undefined,
+      apply: (raw) => {
+        raw.settings.gitRepoPath = '/srv/repo';
+      },
+    },
+    {
+      field: 'worktree',
+      code: 'WF017',
+      stateId: 'work',
+      apply: (raw) => {
+        raw.states.work.worktree = true;
+      },
+    },
+    {
+      field: 'cleanup',
+      code: 'WF017',
+      stateId: 'done',
+      apply: (raw) => {
+        raw.states.done.cleanup = [['echo', 'bye']];
+      },
+    },
+    {
+      field: 'schedule.pool',
+      code: 'WF018',
+      stateId: 'work',
+      apply: (raw) => {
+        raw.states.work.schedule = { pool: 'agent' };
+      },
+    },
+    {
+      field: 'schedule.resources',
+      code: 'WF018',
+      stateId: 'work',
+      apply: (raw) => {
+        raw.states.work.schedule = { pool: 'agent', resources: { mem: '1g' } };
+      },
+    },
+  ];
+
+  it('the baseline has no diagnostics', () => {
+    expect(lintWorkflow(validateDefinition(inertBase()), stubCtx)).toEqual([]);
+  });
+
+  for (const { field, code, stateId, apply } of cases) {
+    it(`${field} -> ${code} warning`, () => {
+      const raw = inertBase();
+      apply(raw);
+      const matching = lintWorkflow(validateDefinition(raw), stubCtx).filter(
+        (d) => d.code === code && d.message.includes(field),
+      );
+      expect(matching).toHaveLength(1);
+      expect(matching[0].severity).toBe('warning');
+      expect(matching[0].stateId).toBe(stateId);
+    });
+  }
+});
+
+describe('WF016 — visit cap that is never checked', () => {
+  /** plan -> review loop; `review` merges the caller's fields over a capped default. */
+  function loopWorkflow(review: Record<string, unknown>): WorkflowDefinition {
+    return validateDefinition({
+      name: 'wf016',
+      description: 'd',
+      initial: 'plan',
+      states: {
+        // `plan` also reaches `escalated`, so it stays reachable when the
+        // test removes the cap-guarded edge from `review`.
+        plan: {
+          type: 'agent',
+          description: 'plan',
+          persona: 'global',
+          prompt: 'p',
+          inputs: [],
+          outputs: ['plan'],
+          transitions: [{ to: 'escalated', when: { verdict: 'escalate' } }, { to: 'review' }],
+        },
+        review: {
+          type: 'agent',
+          description: 'review',
+          persona: 'global',
+          prompt: 'p',
+          inputs: ['plan'],
+          outputs: ['review'],
+          maxVisits: 3,
+          transitions: [
+            { to: 'done', when: { verdict: 'approved' } },
+            { to: 'escalated', guard: 'isStateVisitLimitReached' },
+            { to: 'plan', when: { verdict: 'rejected' } },
+          ],
+          ...review,
+        },
+        done: { type: 'terminal', description: 'done' },
+        escalated: { type: 'terminal', description: 'escalated' },
+      },
+    });
+  }
+
+  const loopWithoutCapGuard = [
+    { to: 'done', when: { verdict: 'approved' } },
+    { to: 'plan', when: { verdict: 'rejected' } },
+  ];
+
+  it('stays silent when maxVisits is paired with its guard on the same state', () => {
+    expect(codes(lintWorkflow(loopWorkflow({}), stubCtx))).not.toContain('WF016');
+  });
+
+  it('warns about maxVisits that no isStateVisitLimitReached transition checks', () => {
+    const result = lintWorkflow(loopWorkflow({ transitions: loopWithoutCapGuard }), stubCtx);
+    const wf016 = result.filter((d) => d.code === 'WF016');
+    expect(wf016).toHaveLength(1);
+    expect(wf016[0].stateId).toBe('review');
+    expect(wf016[0].severity).toBe('warning');
+    expect(wf016[0].message).toContain('maxVisits=3');
+    expect(wf016[0].message).toContain('never checked');
+    // Not an ordering problem: WF008 stays out of it.
+    expect(codes(result)).not.toContain('WF008');
+  });
+
+  it('warns about an isStateVisitLimitReached transition on a state without maxVisits', () => {
+    const result = lintWorkflow(loopWorkflow({ maxVisits: undefined }), stubCtx);
+    const wf016 = result.filter((d) => d.code === 'WF016');
+    expect(wf016).toHaveLength(1);
+    expect(wf016[0].stateId).toBe('review');
+    expect(wf016[0].message).toContain('declares no maxVisits');
+    expect(wf016[0].hint).toContain('Add maxVisits');
+  });
+
+  it('warns about an isStateVisitLimitReached transition on a deterministic state', () => {
+    const def = validateDefinition({
+      name: 'wf016-det',
+      description: 'd',
+      initial: 'check',
+      states: {
+        check: {
+          type: 'deterministic',
+          description: 'check',
+          host: true,
+          run: [['true']],
+          transitions: [{ to: 'escalated', guard: 'isStateVisitLimitReached' }, { to: 'done' }],
+        },
+        done: { type: 'terminal', description: 'done' },
+        escalated: { type: 'terminal', description: 'escalated' },
+      },
+    });
+    const wf016 = lintWorkflow(def, stubCtx).filter((d) => d.code === 'WF016');
+    expect(wf016).toHaveLength(1);
+    expect(wf016[0].stateId).toBe('check');
+    expect(wf016[0].hint).toContain('Only plain agent states');
+  });
+
+  it('warns about maxVisits on a fan-out parent even with the guard', () => {
+    const def = validateDefinition({
+      name: 'wf016-fanout',
+      description: 'd',
+      initial: 'batch',
+      states: {
+        batch: {
+          type: 'agent',
+          description: 'fan-out parent',
+          persona: 'global',
+          prompt: 'p',
+          inputs: [],
+          outputs: [],
+          fanOut: { count: 'workers', join: 'barrier' },
+          segment: ['lane'],
+          maxVisits: 2,
+          transitions: [{ to: 'escalated', guard: 'isStateVisitLimitReached' }, { to: 'done' }],
+        },
+        lane: {
+          type: 'agent',
+          description: 'lane',
+          persona: 'global',
+          prompt: 'p',
+          inputs: [],
+          outputs: [],
+          fanOutMember: true,
+          transitions: [{ to: 'done' }],
+        },
+        done: { type: 'terminal', description: 'done' },
+        escalated: { type: 'terminal', description: 'escalated' },
+      },
+    });
+    const wf016 = lintWorkflow(def, stubCtx).filter((d) => d.code === 'WF016');
+    expect(wf016).toHaveLength(1);
+    expect(wf016[0].stateId).toBe('batch');
+    expect(wf016[0].message).toContain('fan-out states do not count visits');
+  });
+});
+
+describe('WF017 — legacy fields that are accepted but ignored', () => {
+  function legacyWorkflow(opts: {
+    gitRepoPath?: string;
+    worktree?: boolean;
+    cleanup?: string[][];
+  }): WorkflowDefinition {
+    return validateDefinition({
+      name: 'wf017',
+      description: 'd',
+      initial: 'work',
+      settings: { mode: 'builtin', ...(opts.gitRepoPath !== undefined ? { gitRepoPath: opts.gitRepoPath } : {}) },
+      states: {
+        work: {
+          type: 'agent',
+          description: 'work',
+          persona: 'global',
+          prompt: 'p',
+          inputs: [],
+          outputs: [],
+          ...(opts.worktree !== undefined ? { worktree: opts.worktree } : {}),
+          transitions: [{ to: 'done' }],
+        },
+        done: {
+          type: 'terminal',
+          description: 'done',
+          ...(opts.cleanup !== undefined ? { cleanup: opts.cleanup } : {}),
+        },
+      },
+    });
+  }
+
+  it('warns about settings.gitRepoPath without echoing the path', () => {
+    const wf017 = lintWorkflow(legacyWorkflow({ gitRepoPath: '/home/someone/secret-repo' }), stubCtx).filter(
+      (d) => d.code === 'WF017',
+    );
+    expect(wf017).toHaveLength(1);
+    expect(wf017[0].stateId).toBeUndefined();
+    expect(wf017[0].message).toContain('settings.gitRepoPath is ignored');
+    expect(wf017[0].message).not.toContain('secret-repo');
+  });
+
+  it('warns about worktree on an agent state, whichever value it has', () => {
+    for (const worktree of [true, false]) {
+      const wf017 = lintWorkflow(legacyWorkflow({ worktree }), stubCtx).filter((d) => d.code === 'WF017');
+      expect(wf017).toHaveLength(1);
+      expect(wf017[0].stateId).toBe('work');
+      expect(wf017[0].message).toContain(`worktree: ${worktree}`);
+      expect(wf017[0].message).toContain('no git worktree is created');
+    }
+  });
+
+  it('warns that terminal cleanup commands never run, without echoing them', () => {
+    const wf017 = lintWorkflow(legacyWorkflow({ cleanup: [['rm', '-rf', 'build-cache']] }), stubCtx).filter(
+      (d) => d.code === 'WF017',
+    );
+    expect(wf017).toHaveLength(1);
+    expect(wf017[0].stateId).toBe('done');
+    expect(wf017[0].message).toContain('never run');
+    expect(wf017[0].message).not.toContain('build-cache');
+  });
+
+  it('reports each legacy field separately', () => {
+    const wf017 = lintWorkflow(
+      legacyWorkflow({ gitRepoPath: '/repo', worktree: true, cleanup: [['true']] }),
+      stubCtx,
+    ).filter((d) => d.code === 'WF017');
+    expect(wf017.map((d) => d.stateId ?? '(settings)')).toEqual(['(settings)', 'work', 'done']);
+  });
+});
+
+describe('WF018 — lane scheduling metadata without a scheduler', () => {
+  function scheduledWorkflow(schedule: Record<string, unknown>): WorkflowDefinition {
+    return validateDefinition({
+      name: 'wf018',
+      description: 'd',
+      initial: 'workers',
+      states: {
+        workers: {
+          type: 'deterministic',
+          description: 'fan out',
+          run: [],
+          fanOut: { count: 'workers', join: 'barrier' },
+          segment: ['check'],
+          transitions: [{ to: 'done' }],
+        },
+        check: {
+          type: 'deterministic',
+          description: 'lane check',
+          host: true,
+          run: [['true']],
+          fanOutMember: true,
+          schedule,
+          transitions: [{ to: 'done' }],
+        },
+        done: { type: 'terminal', description: 'done' },
+      },
+    });
+  }
+
+  it('warns that the scheduling pool is ignored', () => {
+    const wf018 = lintWorkflow(scheduledWorkflow({ pool: 'eval' }), stubCtx).filter((d) => d.code === 'WF018');
+    expect(wf018).toHaveLength(1);
+    expect(wf018[0].stateId).toBe('check');
+    expect(wf018[0].severity).toBe('warning');
+    expect(wf018[0].message).toContain('schedule.pool "eval"');
+  });
+
+  it('separately warns that resource requests are not enforced, naming the fields but not the values', () => {
+    const wf018 = lintWorkflow(scheduledWorkflow({ pool: 'eval', resources: { cpu: 2, mem: '3g' } }), stubCtx).filter(
+      (d) => d.code === 'WF018',
+    );
+    expect(wf018).toHaveLength(2);
+    const resources = wf018.find((d) => d.message.includes('schedule.resources'));
+    expect(resources?.stateId).toBe('check');
+    expect(resources?.message).toContain('(cpu, mem)');
+    expect(resources?.message).toContain('not enforced');
+    expect(resources?.message).not.toContain('3g');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WF019 — fan-out wider than the default resource envelope
+// ---------------------------------------------------------------------------
+
+describe('WF019 — fan-out width', () => {
+  function widthWorkflow(settings: Record<string, unknown>, count: 'workers' | number = 'workers'): WorkflowDefinition {
+    return validateDefinition({
+      name: 'fanout-width',
+      description: 'd',
+      initial: 'workers',
+      settings,
+      states: {
+        workers: {
+          type: 'deterministic',
+          description: 'fan out',
+          run: [['true']],
+          fanOut: { count, join: 'barrier' },
+          segment: ['worker'],
+          transitions: [{ to: 'done' }],
+        },
+        worker: {
+          type: 'agent',
+          description: 'lane worker',
+          persona: 'global',
+          prompt: 'worker',
+          inputs: [],
+          outputs: [],
+          fanOutMember: true,
+          transitions: [{ to: 'done' }],
+        },
+        done: { type: 'terminal', description: 'done' },
+      },
+    });
+  }
+
+  const shared = { mode: 'docker', dockerAgent: 'claude-code', sharedContainer: true };
+
+  it('warns a shared-container fan-out wider than 4 lanes about the one container budget', () => {
+    const wf019 = lintWorkflow(widthWorkflow({ ...shared, workers: 8 }), stubCtx).filter((d) => d.code === 'WF019');
+    expect(wf019).toHaveLength(1);
+    expect(wf019[0]?.severity).toBe('warning');
+    expect(wf019[0]?.stateId).toBe('workers');
+    expect(wf019[0]?.message).toContain('8 concurrent lanes in one shared container');
+    expect(wf019[0]?.hint).toContain("Cap workers to the container's CPU and RAM budget");
+  });
+
+  it('warns a non-shared fan-out wider than 4 lanes about the agent concurrency cap', () => {
+    const wf019 = lintWorkflow(widthWorkflow({ mode: 'builtin', workers: 6 }), stubCtx).filter(
+      (d) => d.code === 'WF019',
+    );
+    expect(wf019).toHaveLength(1);
+    expect(wf019[0]?.message).toContain('maxConcurrentAgentSessions');
+  });
+
+  it('gates on the resolved lane count, including a numeric fanOut.count override', () => {
+    expect(codes(lintWorkflow(widthWorkflow({ ...shared, workers: 1 }, 5), stubCtx))).toContain('WF019');
+    expect(codes(lintWorkflow(widthWorkflow({ ...shared, workers: 4 }), stubCtx))).not.toContain('WF019');
+    expect(codes(lintWorkflow(widthWorkflow({ ...shared, workers: 9 }, 2), stubCtx))).not.toContain('WF019');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WF008 — a transition that leaves the loop through a visit reset
+// ---------------------------------------------------------------------------
+
+describe('WF008 — loop exits through a visit-count reset', () => {
+  /**
+   * planner -> design -> review (capped) with review able to hand control
+   * back to the planner (`replan`) ahead of its cap guard.
+   */
+  function replanWorkflow(options: { resetOnRedispatch: boolean; bypass?: boolean }): WorkflowDefinition {
+    const redispatch: Record<string, unknown> = { to: 'design', when: { verdict: 'design' } };
+    if (options.resetOnRedispatch) {
+      redispatch.actions = [{ type: 'resetVisitCounts', stateIds: ['design', 'review'] }];
+    }
+    const plannerTransitions: unknown[] = [redispatch, { to: 'done', when: { verdict: 'complete' } }];
+    // A second planner route back into design that does not reset review's count.
+    if (options.bypass === true) plannerTransitions.splice(1, 0, { to: 'design', when: { verdict: 'again' } });
+    return validateDefinition({
+      name: 'replan',
+      description: 'review can return a flawed directive to the planner',
+      initial: 'planner',
+      states: {
+        planner: {
+          type: 'agent',
+          description: 'planner',
+          persona: 'global',
+          prompt: 'p',
+          inputs: ['review?'],
+          outputs: ['plan'],
+          transitions: plannerTransitions,
+        },
+        design: {
+          type: 'agent',
+          description: 'design',
+          persona: 'global',
+          prompt: 'p',
+          inputs: ['plan'],
+          outputs: ['design'],
+          transitions: [{ to: 'review' }],
+        },
+        review: {
+          type: 'agent',
+          description: 'review',
+          persona: 'global',
+          prompt: 'p',
+          inputs: ['design'],
+          outputs: ['review'],
+          maxVisits: 3,
+          transitions: [
+            { to: 'done', when: { verdict: 'approved' } },
+            { to: 'planner', when: { verdict: 'replan' } },
+            { to: 'gate', guard: 'isStateVisitLimitReached' },
+            { to: 'design', when: { verdict: 'rejected' } },
+          ],
+        },
+        gate: {
+          type: 'human_gate',
+          description: 'cap reached',
+          acceptedEvents: ['APPROVE', 'FORCE_REVISION', 'ABORT'],
+          transitions: [
+            { to: 'done', event: 'APPROVE' },
+            { to: 'planner', event: 'FORCE_REVISION' },
+            { to: 'aborted', event: 'ABORT' },
+          ],
+        },
+        done: { type: 'terminal', description: 'done' },
+        aborted: { type: 'terminal', description: 'aborted' },
+      },
+    });
+  }
+
+  it('accepts a verdict ahead of the cap whose target re-enters the loop only through a reset of the capped state', () => {
+    expect(codes(lintWorkflow(replanWorkflow({ resetOnRedispatch: true }), stubCtx))).not.toContain('WF008');
+  });
+
+  it('still flags it when the way back into the loop keeps the visit count', () => {
+    const result = lintWorkflow(replanWorkflow({ resetOnRedispatch: false }), stubCtx);
+    const d = result.find((x) => x.code === 'WF008');
+    expect(d?.stateId).toBe('review');
+    expect(d?.message).toContain('replan');
+    expect(d?.message).toContain('position 2');
+  });
+
+  it('still flags it when any path back skips the reset', () => {
+    const result = lintWorkflow(replanWorkflow({ resetOnRedispatch: true, bypass: true }), stubCtx);
+    expect(codes(result)).toContain('WF008');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WF020 — model provider the state's harness does not call
+// ---------------------------------------------------------------------------
+
+describe('WF020 — model provider vs agent harness', () => {
+  function harnessWorkflow(settings: Record<string, unknown>, reviewer: Record<string, unknown>): WorkflowDefinition {
+    return validateDefinition({
+      name: 'harness-model',
+      description: 'coder on the default harness, reviewer overridden',
+      initial: 'coder',
+      settings,
+      states: {
+        coder: {
+          type: 'agent',
+          description: 'coder',
+          persona: 'global',
+          prompt: 'p',
+          inputs: [],
+          outputs: ['code'],
+          transitions: [{ to: 'reviewer' }],
+        },
+        reviewer: {
+          type: 'agent',
+          description: 'reviewer',
+          persona: 'global',
+          prompt: 'p',
+          inputs: ['code'],
+          outputs: ['review'],
+          transitions: [{ to: 'done' }],
+          ...reviewer,
+        },
+        done: { type: 'terminal', description: 'done' },
+      },
+    });
+  }
+
+  it('warns when a codex state inherits an anthropic settings.model', () => {
+    const result = lintWorkflow(
+      harnessWorkflow({ mode: 'docker', model: 'anthropic:claude-opus-4-8' }, { dockerAgent: 'codex' }),
+      stubCtx,
+    );
+    const wf020 = result.filter((d) => d.code === 'WF020');
+    expect(wf020).toHaveLength(1);
+    expect(wf020[0]).toMatchObject({ severity: 'warning', stateId: 'reviewer' });
+    expect(wf020[0]?.message).toContain('codex harness');
+    expect(wf020[0]?.message).toContain('inherited from settings.model');
+    expect(wf020[0]?.hint).toContain('"openai:" model');
+  });
+
+  it('warns when a claude-code state names an openai model', () => {
+    const result = lintWorkflow(harnessWorkflow({ mode: 'docker' }, { model: 'openai:gpt-5' }), stubCtx);
+    expect(result.filter((d) => d.code === 'WF020').map((d) => d.stateId)).toEqual(['reviewer']);
+  });
+
+  it('is silent for matching providers, bare model names, goose and builtin mode', () => {
+    const silent: Array<[string, WorkflowDefinition]> = [
+      [
+        'matching providers',
+        harnessWorkflow(
+          { mode: 'docker', model: 'anthropic:claude-opus-4-8' },
+          { dockerAgent: 'codex', model: 'openai:gpt-5' },
+        ),
+      ],
+      [
+        'bare model names',
+        harnessWorkflow({ mode: 'docker', model: 'claude-opus-4-8' }, { dockerAgent: 'codex', model: 'gpt-5' }),
+      ],
+      ['goose', harnessWorkflow({ mode: 'docker', dockerAgent: 'goose', model: 'google:gemini-2.5-pro' }, {})],
+      ['builtin', harnessWorkflow({ mode: 'builtin', model: 'openai:gpt-5' }, {})],
+    ];
+    for (const [label, def] of silent) {
+      expect(codes(lintWorkflow(def, stubCtx)), label).not.toContain('WF020');
+    }
   });
 });

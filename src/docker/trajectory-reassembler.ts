@@ -19,9 +19,23 @@ import { ZAI_HOST } from '../config/zai.js';
 import type { CaptureProvider, Reassembler, ReassemblyResult } from './trajectory-types.js';
 import { OPENROUTER_HOST } from '../config/user-config.js';
 import { openRouterWireForPath } from './openrouter.js';
-import { SseLineSplitter } from './llm-observation/sse-event-framer.js';
+import {
+  isSseFramingLimitError,
+  SseLineSplitter,
+  type SseEventFramerLimits,
+} from './llm-observation/sse-event-framer.js';
+import { TRAJECTORY_SSE_FRAMER_LIMITS } from './trajectory-limits.js';
 
 export { SseLineSplitter } from './llm-observation/sse-event-framer.js';
+
+export interface ReassemblerOptions {
+  /**
+   * Framing limits, merged over {@link TRAJECTORY_SSE_FRAMER_LIMITS}. Exceeding
+   * one makes `finalize()` throw the framer's `SseFramingError`, which the tap
+   * treats as an exchange-scoped drop.
+   */
+  readonly framerLimits?: Partial<SseEventFramerLimits>;
+}
 
 /** Errors thrown by the reassemblers when the stream is unrecoverable. */
 export class ReassemblyError extends Error {
@@ -115,79 +129,78 @@ export function findJsonStringEnd(data: string, start: number): number {
   return -1;
 }
 
+function isJsonWhitespace(ch: string | undefined): boolean {
+  return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r';
+}
+
 /**
- * Finds a top-level field by name in a JSON object and returns the raw
- * substring of its value. Returns `undefined` if not found.
- *
- * Naïve scan that respects string escapes; sufficient for the
- * well-formed Anthropic/OpenAI envelopes we capture.
+ * Index just past the `:` of the key `fieldName` among the keys of the
+ * outermost object of `data` (depth 1), or -1. Strings are skipped whole, so
+ * a quoted occurrence of the name inside a value never matches, and neither
+ * does a key of a nested object or array: a tool schema property named
+ * `usage`, or a `stop_reason` key inside a tool input, must not stand in for
+ * the envelope's own field whatever order the provider serializes keys in.
  */
-export function findFieldValueSubstring(data: string, fieldName: string): string | undefined {
+function findTopLevelKeyValueStart(data: string, fieldName: string): number {
   const needle = `"${fieldName}"`;
+  let depth = 0;
   let i = 0;
   while (i < data.length) {
-    // Skip strings entirely so a quoted occurrence of fieldName doesn't fool us
     const ch = data[i];
     if (ch === '"') {
       const end = findJsonStringEnd(data, i);
-      if (end < 0) return undefined;
-      // Check whether this string is our key (followed by `:`)
-      if (data.slice(i, end + 1) === needle) {
+      if (end < 0) return -1;
+      if (depth === 1 && end + 1 - i === needle.length && data.startsWith(needle, i)) {
         let j = end + 1;
-        while (j < data.length && /\s/.test(data[j] ?? '')) j++;
-        if (data[j] !== ':') {
-          // Not our key (some other string), keep scanning
-          i = end + 1;
-          continue;
-        }
-        j++;
-        return readJsonValueSubstring(data, j);
+        while (j < data.length && isJsonWhitespace(data[j])) j++;
+        // A string followed by `:` is a key; a value never is.
+        if (data[j] === ':') return j + 1;
       }
       i = end + 1;
       continue;
     }
+    if (ch === '{' || ch === '[') {
+      depth++;
+    } else if (ch === '}' || ch === ']') {
+      depth--;
+      // The outermost value closed without the key.
+      if (depth <= 0) return -1;
+    }
     i++;
   }
-  return undefined;
+  return -1;
 }
 
 /**
- * Replaces the value of a top-level field by substring. Locates
- * `"fieldName"` followed by `:`, finds the existing value's substring,
- * and splices in the new value. The new value MUST already be a valid
- * JSON expression (string-with-quotes, object, array, primitive).
+ * Finds a field of the outermost object of `data` by name and returns the
+ * raw substring of its value, or `undefined` if that object has no such key.
+ * Only depth-1 keys match (see `findTopLevelKeyValueStart`).
+ */
+export function findFieldValueSubstring(data: string, fieldName: string): string | undefined {
+  const valueStart = findTopLevelKeyValueStart(data, fieldName);
+  return valueStart < 0 ? undefined : readJsonValueSubstring(data, valueStart);
+}
+
+/**
+ * Replaces the value of a field of the outermost object by substring. Locates
+ * the depth-1 key `"fieldName"`, finds the existing value's substring, and
+ * splices in the new value. The new value MUST already be a valid JSON
+ * expression (string-with-quotes, object, array, primitive).
  *
  * A generic top-level-field splice — not provider-specific. Shared by
  * the Anthropic envelope-splice (`content`/`stop_reason`/`usage`) and the
  * Responses envelope-splice (`output`). Returns `body` unchanged if the
- * field is absent.
+ * field is absent. Like the lookup, it never touches a nested key of the same
+ * name, so an earlier splice cannot redirect a later one.
  */
 export function replaceTopLevelField(body: string, fieldName: string, newValue: string): string {
-  const needle = `"${fieldName}"`;
-  let i = 0;
-  while (i < body.length) {
-    const ch = body[i];
-    if (ch === '"') {
-      const end = findJsonStringEnd(body, i);
-      if (end < 0) return body;
-      if (body.slice(i, end + 1) === needle) {
-        let j = end + 1;
-        while (j < body.length && /\s/.test(body[j] ?? '')) j++;
-        if (body[j] === ':') {
-          j++;
-          while (j < body.length && /\s/.test(body[j] ?? '')) j++;
-          const existing = readJsonValueSubstring(body, j);
-          if (existing !== undefined) {
-            return body.slice(0, j) + newValue + body.slice(j + existing.length);
-          }
-        }
-      }
-      i = end + 1;
-      continue;
-    }
-    i++;
-  }
-  return body;
+  const valueStart = findTopLevelKeyValueStart(body, fieldName);
+  if (valueStart < 0) return body;
+  let j = valueStart;
+  while (j < body.length && isJsonWhitespace(body[j])) j++;
+  const existing = readJsonValueSubstring(body, j);
+  if (existing === undefined) return body;
+  return body.slice(0, j) + newValue + body.slice(j + existing.length);
 }
 
 /**
@@ -272,21 +285,31 @@ export function peekNumberField(data: string, name: string): number | undefined 
  * providers assemble differently (Anthropic splices a message envelope,
  * the OpenAI Responses reassembler assembles from item-done payloads), so
  * that logic stays subclass-private.
+ *
+ * Framing uses the trajectory limits (`TRAJECTORY_SSE_FRAMER_LIMITS`), not
+ * the metrics observer's smaller defaults. An exceeded limit keeps its
+ * `SseFramingError` type through `finalize()`, so the tap can tell a resource
+ * limit (the exchange is dropped) from a parser fault (the session is
+ * poisoned).
  */
 export abstract class AbstractSseReassembler implements Reassembler {
-  protected readonly splitter = new SseLineSplitter();
+  protected readonly splitter: SseLineSplitter;
   protected readonly events: RawEvent[] = [];
   protected readonly startedAt: number = Date.now();
   protected failed = false;
-  protected failureReason?: string;
+  /** The first failure, kept as thrown. */
+  private failure: unknown;
+
+  constructor(options: ReassemblerOptions = {}) {
+    this.splitter = new SseLineSplitter({ limits: { ...TRAJECTORY_SSE_FRAMER_LIMITS, ...options.framerLimits } });
+  }
 
   push(chunk: Buffer): void {
     if (this.failed) return;
     try {
       this.splitter.feed(chunk, (eventType, data) => this.onEvent(eventType, data));
     } catch (err) {
-      this.failed = true;
-      this.failureReason = err instanceof Error ? err.message : String(err);
+      this.fail(err);
     }
   }
 
@@ -295,12 +318,12 @@ export abstract class AbstractSseReassembler implements Reassembler {
       try {
         this.splitter.flush((eventType, data) => this.onEvent(eventType, data));
       } catch (err) {
-        this.failed = true;
-        this.failureReason = err instanceof Error ? err.message : String(err);
+        this.fail(err);
       }
     }
     if (this.failed) {
-      throw new ReassemblyError(this.failureReason ?? 'reassembly failed');
+      if (isSseFramingLimitError(this.failure)) throw this.failure;
+      throw new ReassemblyError(this.failure instanceof Error ? this.failure.message : String(this.failure));
     }
     if (!this.terminalSeen()) {
       throw new TruncatedStreamError('stream ended without terminal event');
@@ -322,11 +345,24 @@ export abstract class AbstractSseReassembler implements Reassembler {
     try {
       this.dispatch(eventType, data);
     } catch (err) {
-      this.failed = true;
-      this.failureReason = err instanceof Error ? err.message : String(err);
+      this.fail(err);
     }
   }
 
+  private fail(err: unknown): void {
+    if (this.failed) return;
+    this.failed = true;
+    this.failure = err ?? new Error('reassembly failed');
+    if (isSseFramingLimitError(err)) {
+      // No record of this exchange can be written any more; stop retaining
+      // the stream for the rest of its (possibly very long) life.
+      this.events.length = 0;
+      this.releaseState();
+    }
+  }
+
+  /** Drop retained per-stream state once the exchange can no longer be recorded. */
+  protected abstract releaseState(): void;
   protected abstract dispatch(eventType: string, data: string): void;
   protected abstract terminalSeen(): boolean;
   protected abstract assembleResult(): ReassemblyResult;
@@ -362,6 +398,12 @@ export class AnthropicReassembler extends AbstractSseReassembler {
 
   protected terminalSeen(): boolean {
     return this.receivedMessageStop;
+  }
+
+  protected releaseState(): void {
+    this.messageEnvelope = undefined;
+    this.blocks.clear();
+    this.usageRaw = undefined;
   }
 
   protected assembleResult(): ReassemblyResult {
@@ -530,18 +572,20 @@ export class AnthropicReassembler extends AbstractSseReassembler {
    * Strategy: the `message` envelope from `message_start` already has
    * the shape of a non-streaming response, but with empty content,
    * stop_reason: null, stop_sequence: null, and a partial usage. We
-   * mutate three fields by substring replacement:
-   *   - "content":[]  → "content":[<blocks>]
+   * mutate these fields of the envelope by substring replacement:
    *   - "stop_reason":null → "stop_reason":"<reason>"
    *   - "stop_sequence":null → "stop_sequence":<value>
    *   - "usage":{<initial>} → "usage":<final-from-message_delta>
+   *   - "content":[]  → "content":[<blocks>]
+   * The splices match envelope (depth-1) keys only, and the content array
+   * goes in last, so a `stop_reason` or `usage` key inside a tool_use input
+   * is never rewritten.
    */
   private assembleBody(): string {
     if (!this.messageEnvelope) {
       throw new ReassemblyError('cannot assemble: missing envelope');
     }
     let body = this.messageEnvelope;
-    body = replaceTopLevelField(body, 'content', this.assembleContentArray());
     if (this.stopReason !== undefined) {
       body = replaceTopLevelField(body, 'stop_reason', encodeJsonString(this.stopReason));
     }
@@ -551,7 +595,7 @@ export class AnthropicReassembler extends AbstractSseReassembler {
     if (this.usageRaw !== undefined) {
       body = replaceTopLevelField(body, 'usage', this.usageRaw);
     }
-    return body;
+    return replaceTopLevelField(body, 'content', this.assembleContentArray());
   }
 
   private assembleContentArray(): string {
@@ -652,6 +696,12 @@ export class ResponsesReassembler extends AbstractSseReassembler {
 
   protected terminalSeen(): boolean {
     return this.completedSeen;
+  }
+
+  protected releaseState(): void {
+    this.items.clear();
+    this.responseEnvelopeRaw = undefined;
+    this.usageRaw = undefined;
   }
 
   protected dispatch(eventType: string, data: string): void {
@@ -946,23 +996,27 @@ export function providerForHost(host: string, path?: string): CaptureProvider {
  * `openaiProvider` does not capture it. Unclassifiable hosts yield
  * `undefined`; the caller falls back to capturing raw bytes verbatim.
  */
-export function createReassembler(host: string, path?: string): Reassembler | undefined {
+export function createReassembler(
+  host: string,
+  path?: string,
+  options: ReassemblerOptions = {},
+): Reassembler | undefined {
   const h = host.toLowerCase();
   if (h === ZAI_HOST) {
     const cleanPath = path?.split('?')[0];
-    if (cleanPath?.endsWith('/v1/messages')) return new AnthropicReassembler();
-    if (cleanPath?.endsWith('/responses')) return new ResponsesReassembler();
+    if (cleanPath?.endsWith('/v1/messages')) return new AnthropicReassembler(options);
+    if (cleanPath?.endsWith('/responses')) return new ResponsesReassembler(options);
     return undefined;
   }
-  if (h === 'api.anthropic.com') return new AnthropicReassembler();
-  if (h === 'chatgpt.com' || h === 'api.openai.com') return new ResponsesReassembler();
+  if (h === 'api.anthropic.com') return new AnthropicReassembler(options);
+  if (h === 'chatgpt.com' || h === 'api.openai.com') return new ResponsesReassembler(options);
   // OpenRouter, disambiguated by path (§11.2): the Anthropic skin reassembles
   // as Anthropic; `/api/v1/responses` reuses the Responses reassembler;
   // `/api/v1/chat/completions` has no reassembler (raw-bytes capture, v0).
   if (h === OPENROUTER_HOST) {
     const wire = openRouterWireForPath(path);
-    if (wire === 'anthropic') return new AnthropicReassembler();
-    if (wire === 'responses') return new ResponsesReassembler();
+    if (wire === 'anthropic') return new AnthropicReassembler(options);
+    if (wire === 'responses') return new ResponsesReassembler(options);
     return undefined;
   }
   return undefined;

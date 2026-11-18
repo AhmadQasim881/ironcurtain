@@ -1,6 +1,7 @@
 # Token Stream Bus Ownership
 
-**Status:** Shipped (Option F — module-level singleton, all 5 migration steps landed on branch `feat/workflow-container-lifecycle-step-6`).
+**Status (2026-11-14):** Implemented (Option F, a module-level singleton read through `getTokenStreamBus()` in `src/docker/token-stream-bus.ts`). The Migration Plan below is a changelog.
+
 **Author:** feature-architect
 **Scope:** Who creates, threads, and disposes the `TokenStreamBus`, and how new entry points avoid forgetting to wire it up.
 

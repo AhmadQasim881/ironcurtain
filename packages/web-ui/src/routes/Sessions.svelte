@@ -17,12 +17,15 @@
     getModelProviders,
     listResumableSessions,
     resumeSession,
+    loadSessionNotices,
+    dismissSessionNotice,
   } from '../lib/stores.svelte.js';
   import type { CreateSessionOptions, ResumableSessionDto } from '../lib/types.js';
 
   import SessionSidebar from '$lib/components/features/session-sidebar.svelte';
   import TerminalConsole from '$lib/components/features/terminal-console.svelte';
   import ResumeSessionModal from '$lib/components/features/resume-session-modal.svelte';
+  import SessionNotices from '$lib/components/features/session-notices.svelte';
   import { Button } from '$lib/components/ui/button/index.js';
   import { Badge } from '$lib/components/ui/badge/index.js';
   import { Input } from '$lib/components/ui/input/index.js';
@@ -188,17 +191,25 @@
     appState.selectedSession?.source.kind === 'web-pty' ? appState.selectedSession.label : null,
   );
 
-  // PTY attach lifecycle. Register the buffering sink BEFORE attaching (the
-  // daemon sends a one-shot pty_replay on attach, which can beat the terminal's
-  // mount): the sink buffers frames until the mounted TerminalConsole connects
-  // its live handle via `onready`, so a replay is never dropped. Detach +
-  // unregister on switch/unmount.
+  // Reattach state for the selected terminal. `ptyDetached` flips on when the
+  // WebSocket drops while a terminal is on screen and off once the terminal has
+  // re-attached over the new connection; `ptyAttachError` carries a failed
+  // (re)attach. Both drive the banner above the terminal.
+  let ptyDetached = $state(false);
+  let ptyAttachError = $state('');
+
+  // PTY sink lifecycle, per label. Register the buffering sink BEFORE any
+  // attach (the daemon sends a one-shot pty_replay on attach, which can beat the
+  // terminal's mount): the sink buffers frames until the mounted TerminalConsole
+  // connects its live handle via `onready`, so a replay is never dropped.
+  // Detach + unregister on switch/unmount only -- deliberately NOT on reconnect,
+  // so the mounted terminal keeps its live handle while the effect below
+  // re-attaches (a fresh sink would never be connected again).
   $effect(() => {
     const label = selectedPtyLabel;
     if (label === null) return;
 
     registerPtySink(label);
-    attachPty(label).catch((err) => console.error('Failed to attach PTY:', err));
 
     return () => {
       disconnectPtyTerminal(label);
@@ -207,9 +218,79 @@
     };
   });
 
+  // (Re)attach: once per label AND again after every reconnect. The daemon
+  // drops this client's subscription the moment the socket closes (and arms the
+  // idle reaper); without a fresh ptyAttach on the new socket the terminal
+  // would stay frozen while keystrokes still reach the agent, and the session
+  // would be reaped 30 minutes later. Keyed on the connection state itself
+  // (not on `connectionGeneration`, which is bumped only when every RPC of the
+  // reconnect's state refresh succeeds): each connect re-runs this effect once
+  // and the replay snapshot repaints the terminal; while disconnected no
+  // doomed attach is sent.
+  $effect(() => {
+    const label = selectedPtyLabel;
+    const connected = appState.connected;
+    if (label === null || !connected) return;
+
+    // Idempotent; keeps register-before-attach true whatever the effect order.
+    registerPtySink(label);
+    let superseded = false;
+    attachPty(label)
+      .then(() => {
+        if (superseded) return;
+        ptyDetached = false;
+        ptyAttachError = '';
+      })
+      .catch((err: unknown) => {
+        if (superseded) return;
+        ptyAttachError = err instanceof Error ? err.message : String(err);
+        console.error('Failed to attach PTY:', err);
+      });
+
+    return () => {
+      superseded = true;
+    };
+  });
+
+  // The selected session's label unless it is a web-pty terminal (whose child
+  // process prints its notices in the terminal), else null. A primitive, so
+  // unrelated session updates (budget, status) do not refetch.
+  const selectedNoticeLabel = $derived(
+    appState.selectedSession && appState.selectedSession.source.kind !== 'web-pty'
+      ? appState.selectedSession.label
+      : null,
+  );
+  // When that session was created: after a daemon restart the same label can
+  // name another session, whose notices must be read anew.
+  const selectedNoticeCreatedAt = $derived(
+    selectedNoticeLabel === null ? null : (appState.selectedSession?.createdAt ?? null),
+  );
+
+  // Session notices (a stale policy, an MCP server that did not start,
+  // host-model fallbacks, annotation drift, host-mount findings): the ones the
+  // session reported before this view watched it come from its diagnostic log,
+  // read when it is selected, again after a reconnect and when its label comes
+  // to name another session; later ones arrive as `session.diagnostic` events.
+  $effect(() => {
+    const label = selectedNoticeLabel;
+    const connected = appState.connected;
+    void selectedNoticeCreatedAt;
+    if (label === null || !connected) return;
+    loadSessionNotices(label).catch((err: unknown) => {
+      console.error('Failed to load session notices:', err);
+    });
+  });
+
+  // A dropped connection detaches the terminal server-side; remember it until
+  // the re-attach above has completed so the banner can say so.
+  $effect(() => {
+    if (!appState.connected && selectedPtyLabel !== null) ptyDetached = true;
+  });
+
   // Return focus to the terminal after the escalation overlay is dismissed
-  // (the modal, owned by App.svelte, steals focus). `escalationDismissedAt` is
-  // bumped by App on dismiss.
+  // (the modal, owned by App.svelte, takes no focus when it opens, but the
+  // user may have clicked into it). `escalationDismissedAt` is bumped by App
+  // on dismiss.
   $effect(() => {
     void appState.escalationDismissedAt;
     if (selectedPtyLabel === null) return;
@@ -285,6 +366,46 @@
           </div>
         </div>
 
+        <SessionNotices
+          notices={appState.sessionNotices.get(ptySession.label) ?? []}
+          ondismiss={(key) => dismissSessionNotice(ptySession.label, key)}
+        />
+
+        <!-- OS-sandbox warning: MCP servers that asked for an OS sandbox the
+             daemon host cannot provide (refused under "enforce", unconfined
+             under "warn"). Computed by the daemon at create; absent when every
+             such server is sandboxed. -->
+        {#if ptySession.osSandboxWarning}
+          <div
+            class="px-6 py-2 border-b border-border bg-warning/10 text-xs text-warning"
+            role="alert"
+            data-testid="pty-os-sandbox-warning"
+          >
+            {ptySession.osSandboxWarning}
+          </div>
+        {/if}
+
+        <!-- Detached/reattaching banner: the daemon drops this client's terminal
+             subscription when the WebSocket closes; the attach effect re-sends
+             ptyAttach on the new connection and clears this once it succeeds. -->
+        {#if !appState.connected || ptyDetached}
+          <div
+            class="px-6 py-2 border-b border-border bg-warning/10 text-xs text-warning"
+            role="status"
+            aria-live="polite"
+            data-testid="pty-reattach-banner"
+          >
+            {#if !appState.connected}
+              Connection to the daemon lost — the terminal is detached. It will reattach automatically when the
+              connection returns.
+            {:else if ptyAttachError}
+              Reconnected, but reattaching the terminal failed: {ptyAttachError}
+            {:else}
+              Reconnected — reattaching the terminal…
+            {/if}
+          </div>
+        {/if}
+
         <!-- Remount a fresh terminal per label so switching PTY sessions never
              leaks buffer state from the previous one. -->
         {#key ptySession.label}
@@ -337,22 +458,31 @@
       </div>
     {:else}
       {@const session = appState.selectedSession}
-      <div class="flex-1 flex items-center justify-center text-muted-foreground">
-        <div class="max-w-sm text-center px-6">
-          <div class="text-sm font-semibold text-foreground mb-1">Unsupported session type</div>
-          <div class="text-sm">
-            Session <span class="font-mono">#{session.label}</span> is
-            <span class="font-mono">{session.source.kind}</span>. The web UI only supports container terminal sessions.
+      <div class="flex-1 flex flex-col min-h-0 overflow-hidden">
+        <!-- What the session reported for the user, though the web UI cannot
+             show the session itself. -->
+        <SessionNotices
+          notices={appState.sessionNotices.get(session.label) ?? []}
+          ondismiss={(key) => dismissSessionNotice(session.label, key)}
+        />
+        <div class="flex-1 flex items-center justify-center text-muted-foreground">
+          <div class="max-w-sm text-center px-6">
+            <div class="text-sm font-semibold text-foreground mb-1">Unsupported session type</div>
+            <div class="text-sm">
+              Session <span class="font-mono">#{session.label}</span> is
+              <span class="font-mono">{session.source.kind}</span>. The web UI only supports container terminal
+              sessions.
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              class="mt-4"
+              loading={endingSession === session.label}
+              onclick={handleEnd}
+            >
+              {endingSession === session.label ? 'Ending' : 'End session'}
+            </Button>
           </div>
-          <Button
-            variant="outline"
-            size="sm"
-            class="mt-4"
-            loading={endingSession === session.label}
-            onclick={handleEnd}
-          >
-            {endingSession === session.label ? 'Ending' : 'End session'}
-          </Button>
         </div>
       </div>
     {/if}

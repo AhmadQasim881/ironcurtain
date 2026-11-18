@@ -3,6 +3,8 @@
 **Draft v0.3 -- February 2026**
 **Author: Niels Provos**
 
+> **Status (2026-11-14):** Vision document, kept for its reasoning. Much of what it marks as planned has shipped since February 2026 and some of it has not. [`docs/MISSING_FEATURES.md`](MISSING_FEATURES.md) is the source of truth for what is implemented and what is missing; the status notes in this document were brought up to date on 2026-11-14, the vision text around them was not.
+
 ## The Problem
 
 Autonomous AI agents like OpenClaw have proven massive consumer demand for AI that "actually does things" -- managing email, scheduling meetings, automating workflows, and interacting with web services on the user's behalf. OpenClaw alone has 145k+ GitHub stars and millions of installs.
@@ -43,7 +45,7 @@ The architecture does not attempt to prevent the LLM from going rogue. It assume
 
 3. **Policy is expressed in plain English and compiled into enforcement.** The constitution is a human-readable document written in natural language. An LLM translates it into deterministic rules, LLM-assessable checks, and human escalation triggers for each MCP interface. Users write intent; the system figures out enforcement.
 
-4. **Every task gets its own policy.** [Planned] When a user assigns a task, the task description itself becomes a security constraint. The system generates a task-specific policy that limits the agent to actions consistent with the stated objective.
+4. **Every task gets its own policy.** [Implemented for cron jobs; opt-in `--task-scoped` for other sessions, see [Per-Task Policy](#per-task-policy)] When a user assigns a task, the task description itself becomes a security constraint. The system generates a task-specific policy that limits the agent to actions consistent with the stated objective.
 
 5. **Secure by default, customizable by choice.** The system ships with a sensible default constitution. Users can relax specific policies but cannot disable structural invariants.
 
@@ -107,8 +109,9 @@ The system consists of four components with strict trust boundaries between them
 |  |   access only  | |   token only   | |   token only  | |
 |  +----------------+ +----------------+ +---------------+ |
 |                                                          |
-|  [P] = Planned. Currently only the filesystem MCP server |
-|  (@modelcontextprotocol/server-filesystem) is configured.|
+|  [P] = Planned in Feb 2026. Shipped today: filesystem,   |
+|  git, fetch, github and google-workspace (Gmail among    |
+|  its tools). No Slack server ships.                      |
 |                                                          |
 |  Each server holds only its own credentials.             |
 |  Servers accept requests only from the trusted process.  |
@@ -122,13 +125,13 @@ The constitution is the heart of the system. It is written in plain English and 
 
 ### Example Constitution
 
-The example below illustrates a vision constitution for an agent with access to multiple services. The **actual constitution** currently implemented in the codebase (`src/config/constitution.md`) is scoped to filesystem operations and defines five principles:
+The example below illustrates a vision constitution for an agent with access to multiple services. The **shipped constitution** (status 2026-11-14) has two parts. The base, `src/config/constitution.md`, defines three principles:
 
 1. **Least privilege**: The agent may only access resources explicitly permitted by policy.
-2. **No destruction**: Delete operations outside the sandbox are never permitted.
-3. **Sandbox freedom**: Within the designated sandbox directory, the agent may freely read and write files.
-4. **Human oversight**: Operations outside the sandbox require explicit human approval.
-5. **Transparency**: Every tool call is logged to the audit trail.
+2. **No destruction**: Delete operations outside the sandbox are never permitted, unless an explicit exception is granted by the user guidance.
+3. **Human oversight**: Operations outside the sandbox require explicit human approval.
+
+The user guidance, `~/.ironcurtain/constitution-user.md` (or, while that file does not exist, the bundled `src/config/constitution-user-base.md`), adds concrete permissions for the Downloads and Documents folders, local git operations, web fetch and search, GitHub and Google Workspace. Sandbox containment and audit logging are enforced by the runtime rather than by a principle.
 
 Self-protection of the constitution, compiled policies, and audit log is enforced by **structural invariants** in the PolicyEngine (hardcoded protected-path checks), not by a constitution principle.
 
@@ -209,19 +212,19 @@ The constitution is compiled into enforceable policy through an LLM-powered comp
 
 The pipeline has four stages:
 
-**Stage 1: Tool Annotation.** For each registered MCP server, an LLM classifies every tool's arguments by their semantic role. Each argument receives one or more roles from a fixed vocabulary: `read-path`, `write-path`, `delete-path`, or `none`. The LLM also determines whether each tool has side effects. These annotations are the bridge between tool schemas (which describe data types) and policy rules (which reason about intent). For example, `edit_file`'s `path` argument gets both `read-path` and `write-path` roles, while `move_file`'s `source` gets `read-path` and `delete-path`. Annotations are validated heuristically (checking coverage, consistency) and cached by a content hash of the tool schemas.
+**Stage 1: Tool Annotation.** For each registered MCP server, an LLM classifies every tool's arguments by their semantic role. Each argument receives one or more roles from a fixed vocabulary: `read-path`, `write-path`, `delete-path`, or `none` in this draft; the registry in `src/types/argument-roles.ts` has since grown URL roles (such as `fetch-url` and `git-remote-url`), identifier roles and outbound-content roles. The LLM also determines whether each tool has side effects. These annotations are the bridge between tool schemas (which describe data types) and policy rules (which reason about intent). For example, `edit_file`'s `path` argument gets both `read-path` and `write-path` roles, while `move_file`'s `source` gets `read-path` and `delete-path`. Annotations are validated heuristically (checking coverage, consistency) and cached by a content hash of the tool schemas.
 
 **Stage 2: Constitution Compilation.** An LLM reads the constitution and the tool annotations, then produces an ordered list of declarative rules. Each rule has a `name`, a condition block (`if`) that can match on argument roles, server names, tool names, side-effect status, and path containment within directories, and an action (`then`: `allow`, `deny`, or `escalate`). Rules are evaluated first-match-wins. The compiler does not generate arbitrary code -- it populates a fixed declarative schema (`CompiledRule` / `CompiledRuleCondition`). Rules are validated structurally (checking for required fields, valid role references, and rule ordering). The compiled policy is cached by a content hash of the constitution, annotations, and compiler prompt.
 
-**Stage 3: Scenario Generation.** An LLM generates test scenarios -- pairs of tool-call requests and expected policy decisions -- designed to probe edge cases in the compiled rules. These LLM-generated scenarios are combined with a set of mandatory handwritten scenarios (currently 15) that cover critical invariants like protected-path access and delete denial. Together, they form the test suite for verification.
+**Stage 3: Scenario Generation.** An LLM generates test scenarios -- pairs of tool-call requests and expected policy decisions -- designed to probe edge cases in the compiled rules. These LLM-generated scenarios are combined with a set of mandatory handwritten scenarios that cover critical invariants (15 in this draft; as of 2026-11 two constitution-independent sandbox-containment scenarios in `src/pipeline/handwritten-scenarios.ts`, with protected paths enforced structurally by the PolicyEngine). Together, they form the test suite for verification.
 
 **Stage 4: Multi-Round Verification.** The verifier instantiates a **real PolicyEngine** with the compiled rules and tool annotations, then executes every test scenario through it. An LLM judge analyzes the results, identifies discrepancies between expected and actual decisions, and generates additional probe scenarios to explore gaps. This repeats for up to 3 rounds. If failures remain after all rounds, the pipeline exits with an error. Artifacts are still written to disk for inspection, but the non-zero exit code signals that the policy needs review.
 
 All four stages are content-hash cached: if the inputs to a stage have not changed since the last run, the LLM call is skipped and the cached artifact is reused. The compilation step happens when the constitution is written or updated, not at request time. Generated artifacts are written to `src/config/generated/`.
 
-### Per-Task Policy [Planned]
+### Per-Task Policy
 
-> **Status: Not yet implemented.** The description below is the intended design.
+> **Status (2026-11-14): Implemented in two forms.** Cron jobs compile a task policy from the job's task constitution (`src/cron/compile-task-policy.ts`), and it replaces the global policy for the job's runs (a job that runs as a persona uses the persona's policy instead). `ironcurtain start`, mux `/new` and `ironcurtain workflow start` accept an opt-in `--task-scoped`: the task text is compiled into a task scope that the policy engine intersects with the session policy, so the scope never allows what the session policy does not, and a call the session policy allows but the scope does not cover escalates instead of being denied (`docs/designs/task-scoped-sessions.md`). The description below is the original design; as built, the task scope is consulted after the session policy, not before it.
 
 When a user assigns a task, the task description is used to generate an additional, task-scoped policy layer:
 
@@ -262,17 +265,18 @@ For each MCP request, policies are evaluated in this order:
 1. **Structural invariants** (hardcoded, never overridden) -- **Implemented**
    - Protected paths: agent cannot modify the constitution, compiled policies, MCP server config, or audit log
    - Unknown tools: any tool not present in the tool annotations is denied
-   - Path extraction uses both heuristic detection and annotation-based extraction for defense-in-depth
+   - Path extraction uses both heuristic detection and annotation-based extraction for defense-in-depth (status 2026-11-14: the heuristic was removed; paths are taken from the tool annotations alone, and an argument without an annotation is denied)
    - **Per-role sandbox containment**: for mixed-path operations (e.g., `move_file` from sandbox to external), each argument role is checked independently. Roles whose paths are all within the sandbox are resolved here and skipped during compiled rule evaluation. All-in-sandbox is a fast path that auto-allows the entire request.
 
-2. **Task policy** (most restrictive -- scoped to current task) -- **Planned**
+2. **Task policy** (most restrictive -- scoped to current task) -- **Implemented as an opt-in** (status 2026-11-14)
    - If the action is outside the task's expected scope, deny or escalate
+   - As built, the `--task-scoped` scope is evaluated after the compiled rules and intersected with their result: an allowed call that the scope does not cover escalates. A cron job's task policy replaces the compiled rules instead.
 
 3. **Compiled rules** (declarative, per-role evaluation) -- **Implemented**
    - Only roles not already resolved by structural sandbox containment are evaluated
    - For tools with multiple argument roles (e.g., `edit_file` has `read-path` + `write-path`), each remaining role is evaluated independently through the rule chain (first-match-wins per role); the most restrictive result across all roles wins (`deny` > `escalate` > `allow`)
    - For tools with no role-bearing arguments, the chain is evaluated once without role filtering
-   - **LLM assessment** for ambiguous cases -- **Planned** (currently all rules are deterministic)
+   - **LLM assessment** for ambiguous cases -- **Partially implemented, opt-in** (status 2026-11-14): a rule may end in `assess`, which allows the call subject to a check of its outbound content and escalates content that fails; see component 3 below
 
 4. **Default deny** -- if no rule matches, the action is denied
 
@@ -306,11 +310,11 @@ The trusted process is the security kernel of the system. It:
 
 The trusted process is the only component that communicates with MCP servers. It acts as an MCP proxy -- to the sandbox, it looks like an MCP server; to the real MCP servers, it looks like an MCP client.
 
-**Trust model:** The trusted process is the TCB (trusted computing base). It must be small, auditable, and conservatively written. It does not run LLM-generated code. Its behavior is currently determined entirely by hardcoded structural invariants, compiled declarative rules, and a default-deny fallback. Planned additions include task-scoped policy and LLM assessment for ambiguous cases.
+**Trust model:** The trusted process is the TCB (trusted computing base). It must be small, auditable, and conservatively written. It does not run LLM-generated code. Its behavior is determined by hardcoded structural invariants, compiled declarative rules, and a default-deny fallback. Since this draft (status 2026-11-14), opt-in task scopes, taint escalation and outbound content assessment were added, and two optional LLM components can take part: the auto-approver, which may approve an escalation that the user's most recent message clearly authorizes and never decides a human-only one, and the content assessment's intelligibility check, whose verdict can only allow the call or escalate it to a human.
 
-### 3. LLM Assessment with Input Sanitization [Planned]
+### 3. LLM Assessment with Input Sanitization
 
-> **Status: Not yet implemented.** Currently all policy rules are deterministic. The description below is the intended design for handling ambiguous cases that require semantic evaluation.
+> **Status (2026-11-14): Partially implemented, opt-in.** The intelligibility requirement (point 5) exists as the outbound content assessment (`docs/designs/outbound-content-assessment.md`): a rule may end in `assess`; deterministic detectors check a call's outbound content (message bodies, commit messages, fetched URLs) for encoded blobs, high-entropy strings, ciphertext and invisible characters; an optional LLM intelligibility check runs behind its own flag; content that does not pass escalates to a human. General semantic conditions ("does this email contain sensitive financial information?") are not implemented. The description below is the intended design.
 
 When the constitution requires semantic evaluation (e.g., "does this email contain sensitive financial information?"), the trusted process invokes a separate LLM. This creates a second-order prompt injection risk: the content being assessed (an email body, a document) might contain adversarial instructions targeting the assessment LLM.
 
@@ -338,7 +342,7 @@ The system is compatible with the existing MCP ecosystem. Any MCP server that wo
 
 ### 5. Agent Identity and Attribution [Planned]
 
-> **Status: Not yet implemented.** The description below is the intended design.
+> **Status (2026-11-14): Not implemented.** No `X-Agent-ID` header or agent-scoped credentials exist. The description below is the intended design.
 
 Agent actions must be distinguishable from direct user actions in service logs and audit trails. When the trusted process forwards an approved MCP request to an MCP server, it ensures the request is attributed to the agent rather than the user directly:
 
@@ -348,9 +352,9 @@ Agent actions must be distinguishable from direct user actions in service logs a
 
 This means the agent is a first-class identity in the system, not an invisible proxy wearing the user's credentials.
 
-### 6. Resource Budget Enforcement [Planned]
+### 6. Resource Budget Enforcement
 
-> **Status: Not yet implemented.** The description below is the intended design.
+> **Status (2026-11-14): Implemented, differently from this sketch.** The limits (tokens, steps, wall clock, estimated cost) come from `resourceBudget` in `~/.ironcurtain/config.json` (with lower defaults for cron jobs, and overrides per job, persona and workflow), not from the constitution. Builtin sessions enforce them per turn (`src/session/resource-budget-tracker.ts`); for Docker agents the MITM proxy enforces the token and cost limits per agent container, mid-turn (`src/docker/budget-gate.ts`), and the wall clock bounds each turn. Loop detection is the `StepLoopDetector` and the coordinator's `CallCircuitBreaker` (a call-rate limit; there is no per-task count of MCP calls). Exhaustion stops the work with `BudgetExhaustedError` instead of pausing it for the user. The description below is the original design.
 
 The trusted process enforces resource limits from the constitution to prevent runaway costs and reasoning loops:
 
@@ -373,7 +377,7 @@ This means the agent can freely experiment, iterate, and self-improve without an
 
 ## Static Analysis of Agent Code [Planned]
 
-> **Status: Not yet implemented.** The description below is the intended design.
+> **Status (2026-11-14): Not implemented.** The description below is the intended design.
 
 Because Code Mode produces a complete TypeScript code block before execution, the trusted process can optionally perform static analysis before running anything:
 
@@ -385,9 +389,9 @@ Because Code Mode produces a complete TypeScript code block before execution, th
 
 This is a significant advantage over traditional sequential tool calling, where each call is decided independently. The trusted process sees the full plan and can reason about the aggregate intent.
 
-## Multi-Agent Coordination [Planned]
+## Multi-Agent Coordination
 
-> **Status: Not yet implemented.** The description below is the intended design.
+> **Status (2026-11-14): Implemented as concurrent sessions and multi-agent workflows.** The daemon and mux run many sessions at once, each with its own sandbox and policy, and workflows (`src/workflow/`, `WORKFLOWS.md`) run several agents per task; every agent's tool calls go through the policy engine. Two differences from the text below: agents of a workflow hand work to each other through the shared workspace and the orchestrator, not through policy-checked tool calls, and the states of one shared container scope form one trust domain (different personas may share a scope only when the workflow sets `allowMixedPersonas: true`). The description below is the original design.
 
 When multiple agents interact, each agent gets its own sandbox. There is no shared trust domain between agents.
 
@@ -397,11 +401,11 @@ If Agent A asks Agent B to send an email, Agent B's email-sending request still 
 
 ## Data Flow Example
 
-> **Note:** This example illustrates the full vision, including several planned features: Gmail MCP server, per-task policy, LLM assessment, static analysis, and push notification escalation. The current implementation supports only filesystem operations with deterministic policy rules and CLI-based escalation.
+> **Note:** This example illustrates the full vision, including several features that were planned in this draft: Gmail MCP server, per-task policy, LLM assessment, static analysis, and push notification escalation. Status 2026-11-14: Gmail is available through the google-workspace server, task scopes and outbound content assessment exist as opt-ins, static analysis does not exist, and escalations reach the user through the CLI, mux, web UI and Signal (no push notifications).
 
 **User says via Telegram:** "Forward my latest email from Alice to Bob with a summary"
 
-1. **Task policy generation.** [Planned] The system generates a task-scoped policy: this task requires gmail.search (read), gmail.sendEmail (send to specific recipient). Other skills are not needed.
+1. **Task policy generation.** [Opt-in, `--task-scoped`] The system generates a task-scoped policy: this task requires gmail.search (read), gmail.sendEmail (send to specific recipient). Other skills are not needed.
 
 2. **LLM generates TypeScript code** inside the V8 isolate:
    ```typescript
@@ -444,15 +448,15 @@ If Agent A asks Agent B to send an email, Agent B's email-sending request still 
 
 ## Human Escalation Design
 
-When the trusted process requires human approval, the current implementation uses a **CLI-based prompt** via stdin/stderr. The `EscalationHandler` (`src/trusted-process/escalation.ts`) displays the tool name, arguments, and policy reason, then asks for `y/N` approval. In proxy mode (MCP proxy server), escalations are auto-denied since there is no stdin access.
+> **Status (2026-11-14):** Escalations reach the human through the interactive CLI (`/approve`, `/approve+`, `/deny`), the mux and the escalation listener, the daemon's web UI, Signal (approved with the code shown in each escalation's banner), and for workflows through the daemon (`ironcurtain workflow escalation`). Where the policy coordinator and the human's front end run in different processes (Docker agent sessions under the mux, for example), escalations travel through request and response files in the session's escalation directory; a call is denied without asking only when no escalation route exists at all (`src/trusted-process/tool-call-pipeline.ts`). An optional LLM auto-approver (`src/trusted-process/auto-approver.ts`) may approve an escalation that the user's most recent message clearly authorizes. The `EscalationHandler` (`src/trusted-process/escalation.ts`) that this draft described no longer exists.
 
-The following capabilities are **planned but not yet implemented**:
+The capabilities this draft planned, with their status:
 
-- **Notification** sent via user's preferred channel (push notification, Telegram, SMS)
-- **Context** includes: what the agent wants to do, which policy triggered escalation, and a brief summary of why
-- **Batching** groups related approval requests ("Agent wants to send 5 calendar invites for your meeting series. Approve all?")
-- **Timeout** defaults to deny after a configurable period (default: 15 minutes)
-- **Policy learning** -- if the user repeatedly approves a pattern, the system suggests a constitution update: "You've approved emails to bob@example.com 5 times. Would you like to add to your constitution: 'The agent may send email to Bob (bob@example.com) without asking.'?"
+- **Notification** sent via user's preferred channel (push notification, Telegram, SMS) -- Signal is implemented; push notifications, Telegram and SMS are not.
+- **Context** includes: what the agent wants to do, which policy triggered escalation, and a brief summary of why -- implemented: the policy reason plus reviewer context that separates the human's last message and the task (trusted) from the agent's own justification (untrusted, shown as such).
+- **Batching** groups related approval requests ("Agent wants to send 5 calendar invites for your meeting series. Approve all?") -- implemented for escalations that share one whitelist pattern, approved as a group only after a confirmation that lists every member; summarization is not.
+- **Timeout** defaults to deny after a configurable period (default: 15 minutes) -- implemented as `escalationTimeoutSeconds` (default 300 seconds); a timed-out call is denied.
+- **Policy learning** -- if the user repeatedly approves a pattern, the system suggests a constitution update: "You've approved emails to bob@example.com 5 times. Would you like to add to your constitution: 'The agent may send email to Bob (bob@example.com) without asking.'?" -- implemented: after 3 human approvals of one pattern, `ironcurtain audit proposals` lists a deterministic English amendment, and the customize-policy flows show it as a diff that takes effect only when the user accepts it and the policy is recompiled.
 
 The learning loop means the constitution evolves from the user's actual trust decisions over time. Non-technical users never need to write policy directly -- they just approve or deny, and the system proposes English-language constitution amendments that capture the pattern.
 
@@ -460,7 +464,7 @@ The learning loop means the constitution evolves from the user's actual trust de
 
 Every interaction is logged in an append-only JSONL audit log.
 
-> **Note on field names:** The actual implementation (`src/types/audit.ts`) uses a flatter schema than the vision example below. Actual fields: `timestamp`, `requestId`, `serverName`, `toolName`, `arguments`, `policyDecision` (containing `status`, `rule`, `reason`), `escalationResult` (optional: `'approved'` | `'denied'`), `result` (containing `status`, `content`, `error`), and `durationMs`. The example below illustrates the richer schema envisioned when task policy, agent identity, and budget enforcement are implemented.
+> **Note on field names (status 2026-11-14):** The actual implementation (`src/types/audit.ts`) uses a flatter schema than the vision example below. Fields: `timestamp`, `requestId`, `serverName`, `toolName`, `arguments`, `policyDecision` (containing `status`, `rule`, `reason`), `escalationResult` (optional: `'approved'` | `'denied'` | `'timed-out'` | `'cancelled'`), `result` (containing `status`, `content`, `error`; a `dispatching` status marks the write-ahead record appended before a call is dispatched), `durationMs`, and the optional `sandboxed`, `autoApproved`, `whitelistApproved`, `whitelistPatternId`, `persona`, `taint` and `contentAssessment`. There is no agent identity or per-task budget field. The example below illustrates the richer schema this draft envisioned.
 
 ```json
 {
@@ -508,7 +512,7 @@ The log enables forensic analysis: given any agent action, you can trace exactly
 | **Strata AI Identity Gateway** | OPA/Rego policy + identity management for agents | Enterprise IAM, not a runtime for individual users |
 | **Claude Code Sandbox** | OS-level sandbox for bash commands | No policy engine, no MCP proxy, not a standalone runtime |
 | **Superagent** | Safety Agent evaluates actions before execution | Policies coupled to framework, not MCP-native |
-| **This Project** | English constitution compiled via four-stage LLM pipeline, UTCP Code Mode sandbox, MCP proxy, audit log. Planned: per-task policy, agent identity, LLM assessment, resource budgets | Targets individual users, agent-framework agnostic |
+| **This Project** | English constitution compiled via four-stage LLM pipeline, UTCP Code Mode sandbox, MCP proxy, audit log. Planned in this draft: per-task policy, agent identity, LLM assessment, resource budgets (status 2026-11-14: all but agent identity have shipped, LLM assessment only for outbound content) | Targets individual users, agent-framework agnostic |
 
 Key differentiators:
 
@@ -529,16 +533,16 @@ Key differentiators:
 - [x] Integrate UTCP Code Mode TypeScript execution in V8 sandbox
 - [x] Build and test with filesystem MCP server
 
-**Planned:**
-- [ ] Write detailed threat model with attack scenarios and mitigations
-- [ ] Implement per-task policy generation from task descriptions
-- [ ] Implement LLM assessment for ambiguous policy cases (with input sanitization)
+**Planned** (status 2026-11-14; `docs/MISSING_FEATURES.md` tracks what remains):
+- [x] Write detailed threat model with attack scenarios and mitigations (`docs/SECURITY_CONCERNS.md`)
+- [x] Implement per-task policy generation from task descriptions (cron job task policies; opt-in `--task-scoped`)
+- [ ] Implement LLM assessment for ambiguous policy cases (with input sanitization) -- partly: opt-in outbound content assessment
 - [ ] Implement agent identity injection and down-scoped credential management
-- [ ] Implement resource budget enforcement and loop detection in the trusted process
-- [ ] Implement push notification escalation channels (Telegram, SMS)
+- [x] Implement resource budget enforcement and loop detection in the trusted process (budgets in the session and at the MITM proxy for Docker agents)
+- [ ] Implement push notification escalation channels (Telegram, SMS) -- Signal instead; Telegram and SMS not built
 - [ ] Implement static analysis of agent code before execution
-- [ ] Build and test with Gmail, Slack, and Calendar MCP servers
-- [ ] Design the policy learning loop (human decisions -> constitution amendments)
-- [ ] Implement multi-agent coordination
-- [ ] Evaluate against known attack scenarios (Cisco prompt injection, CVE-2025-6514, AgentDojo benchmark)
+- [ ] Build and test with Gmail, Slack, and Calendar MCP servers -- Gmail and Calendar through the google-workspace server; no Slack server
+- [x] Design the policy learning loop (human decisions -> constitution amendments)
+- [x] Implement multi-agent coordination (concurrent sessions, multi-agent workflows)
+- [ ] Evaluate against known attack scenarios (Cisco prompt injection, CVE-2025-6514, AgentDojo benchmark) -- partly: a hermetic adversarial harness runs in the test suite; no benchmark evaluation
 - [ ] Write up as paper and/or blog post for community feedback

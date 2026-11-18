@@ -2,20 +2,45 @@
  * Policy Engine Stress Test — comprehensive coverage of edge cases.
  *
  * Each test group creates its own minimal CompiledPolicyFile and
- * ToolAnnotationsFile inline (not shared fixtures) to isolate behavior
+ * StoredToolAnnotationsFile inline (not shared fixtures) to isolate behavior
  * and make each group self-documenting.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, type PathLike } from 'node:fs';
+import { join } from 'node:path';
 import { PolicyEngine, domainMatchesAllowlist } from '../src/trusted-process/policy-engine.js';
 import type {
+  ArgumentRole,
   CompiledPolicyFile,
-  ToolAnnotationsFile,
   DynamicListsFile,
-  ToolAnnotation,
+  StoredToolAnnotation,
+  StoredToolAnnotationsFile,
 } from '../src/pipeline/types.js';
 import type { ToolCallRequest } from '../src/types/mcp.js';
-import { TEST_SANDBOX_DIR, REAL_TMP } from './fixtures/test-policy.js';
+import { TEST_SANDBOX_DIR, REAL_TMP, argsSchema } from './fixtures/test-policy.js';
+
+// Every realpath call is recorded and then made for real, so the whole suite
+// runs on the real filesystem with unchanged decisions; the "Path resolution
+// per evaluation" group reads the log. resolveRealPath uses the native
+// variant on macOS, so both are wrapped.
+const realpathLog = vi.hoisted(() => ({ calls: [] as string[] }));
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  const realpathSync = Object.assign(
+    (path: PathLike): string => {
+      realpathLog.calls.push(String(path));
+      return actual.realpathSync(path);
+    },
+    {
+      native: (path: PathLike): string => {
+        realpathLog.calls.push(String(path));
+        return actual.realpathSync.native(path);
+      },
+    },
+  );
+  return { ...actual, realpathSync };
+});
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -39,22 +64,18 @@ function makePolicy(rules: CompiledPolicyFile['rules']): CompiledPolicyFile {
   return { generatedAt: 'test', constitutionHash: 'test', inputHash: 'test', rules };
 }
 
-/** Shorthand for a minimal ToolAnnotationsFile. */
-function makeAnnotations(servers: Record<string, ToolAnnotation[]>): ToolAnnotationsFile {
-  const result: ToolAnnotationsFile = { generatedAt: 'test', servers: {} };
+/** Shorthand for a minimal StoredToolAnnotationsFile. */
+function makeAnnotations(servers: Record<string, StoredToolAnnotation[]>): StoredToolAnnotationsFile {
+  const result: StoredToolAnnotationsFile = { generatedAt: 'test', servers: {} };
   for (const [name, tools] of Object.entries(servers)) {
     result.servers[name] = { inputHash: 'test', tools };
   }
   return result;
 }
 
-/** Shorthand for a ToolAnnotation. */
-function makeTool(
-  serverName: string,
-  toolName: string,
-  args: Record<string, ToolAnnotation['args'][string]>,
-): ToolAnnotation {
-  return { toolName, serverName, comment: 'test', args };
+/** Shorthand for a StoredToolAnnotation whose input schema declares exactly its arguments. */
+function makeTool(serverName: string, toolName: string, args: Record<string, ArgumentRole[]>): StoredToolAnnotation {
+  return { toolName, serverName, comment: 'test', args, inputSchema: argsSchema(args) };
 }
 
 // ---------------------------------------------------------------------------
@@ -348,37 +369,34 @@ describe('Role-agnostic rules after structural resolution', () => {
     expect(result.rule).toBe('allow-github-domain');
   });
 
-  it('default-denies when lists condition does not match for non-filesystem server', () => {
-    const policy = makePolicy([
-      {
-        name: 'allow-listed',
-        description: 'Allow listed',
-        principle: 'test',
-        // lists condition matches on extracted domain from git-remote-url
-        // but domainMatchesAllowlist uses domain matching, and the extracted
-        // value is the raw URL (not domain) so it won't match 'github.com'
-        if: { lists: [{ roles: ['git-remote-url'], allowed: ['github.com'], matchType: 'domains' }] },
-        then: 'allow',
-        reason: 'Listed',
-      },
-    ]);
+  it('matches a domains lists condition by the destination a git remote URL resolves to', () => {
+    const listPolicy = (allowed: string[]) =>
+      makePolicy([
+        {
+          name: 'allow-listed',
+          description: 'Allow listed',
+          principle: 'test',
+          if: { lists: [{ roles: ['git-remote-url'], allowed, matchType: 'domains' }] },
+          then: 'allow',
+          reason: 'Listed',
+        },
+      ]);
+    const request = makeRequest({
+      serverName: 'git',
+      toolName: 'git_push',
+      arguments: { path: SANDBOX_DIR, remote: 'https://github.com/user/repo.git', branch: 'main' },
+    });
 
-    const engine = new PolicyEngine(policy, annotations, [], SANDBOX_DIR, domainAllowlists);
-    const result = engine.evaluate(
-      makeRequest({
-        serverName: 'git',
-        toolName: 'git_push',
-        arguments: { path: SANDBOX_DIR, remote: 'https://github.com/user/repo.git', branch: 'main' },
-      }),
-    );
+    // Non-filesystem: no structural sandbox-allow. Roles go to compiled rule
+    // evaluation, where a domains list on a URL role compares the resolved
+    // destination (github.com/user/repo), as a domains condition does. It
+    // used to compare the raw URL, so this rule never matched a URL at all.
+    const listed = new PolicyEngine(listPolicy(['github.com']), annotations, [], SANDBOX_DIR, domainAllowlists);
+    expect(listed.evaluate(request)).toMatchObject({ decision: 'allow', rule: 'allow-listed' });
 
-    // Non-filesystem: no structural sandbox-allow. Roles go to compiled rule evaluation.
-    // The lists condition extracts the raw URL string from git-remote-url,
-    // domainMatchesAllowlist('https://github.com/user/repo.git', ['github.com']) → false
-    // (lists extraction uses extractAnnotatedPaths which gets the raw value,
-    // not the policy-prepared domain). So rule doesn't match → default deny.
-    expect(result.decision).toBe('deny');
-    expect(result.rule).toBe('default-deny');
+    // A destination the list does not name: default deny.
+    const other = new PolicyEngine(listPolicy(['gitlab.com']), annotations, [], SANDBOX_DIR, domainAllowlists);
+    expect(other.evaluate(request)).toMatchObject({ decision: 'deny', rule: 'default-deny' });
   });
 });
 
@@ -493,7 +511,7 @@ describe('Sandbox containment edge cases', () => {
     expect(result.rule).toBe('structural-sandbox-allow');
   });
 
-  it('write-history role IS sandbox-resolved (agent can manipulate .git/ directly)', () => {
+  it('write-history role IS sandbox-resolved (sandbox-safe by design; .git writes escalate separately)', () => {
     const engine = new PolicyEngine(policy, annotations, [], SANDBOX_DIR);
     const result = engine.evaluate(
       makeRequest({
@@ -506,7 +524,7 @@ describe('Sandbox containment edge cases', () => {
     expect(result.rule).toBe('structural-sandbox-allow');
   });
 
-  it('delete-history role IS sandbox-resolved (agent can manipulate .git/ directly)', () => {
+  it('delete-history role IS sandbox-resolved (sandbox-safe by design; .git writes escalate separately)', () => {
     const engine = new PolicyEngine(policy, annotations, [], SANDBOX_DIR);
     const result = engine.evaluate(
       makeRequest({
@@ -688,9 +706,19 @@ describe('Domain allowlist edge cases', () => {
     expect(result.rule).not.toBe('structural-domain-escalate');
   });
 
-  it('empty domain allowlist escalates everything', () => {
+  it('empty domain allowlist escalates everything the compiled policy does not deny', () => {
     const allowlists = new Map([['git', [] as string[]]]);
-    const engine = new PolicyEngine(defaultPolicy, gitAnnotations, [], SANDBOX_DIR, allowlists);
+    const escalateClonePolicy = makePolicy([
+      {
+        name: 'escalate-clone',
+        description: 'Escalate clones',
+        principle: 'test',
+        if: { server: ['git'], tool: ['git_clone'] },
+        then: 'escalate',
+        reason: 'Clones need approval',
+      },
+    ]);
+    const engine = new PolicyEngine(escalateClonePolicy, gitAnnotations, [], SANDBOX_DIR, allowlists);
 
     const result = engine.evaluate(
       makeRequest({
@@ -701,6 +729,23 @@ describe('Domain allowlist edge cases', () => {
     );
     expect(result.decision).toBe('escalate');
     expect(result.rule).toBe('structural-domain-escalate');
+  });
+
+  it('empty domain allowlist never turns a compiled deny into an escalation', () => {
+    // The gate used to return early, so even an explicit deny-all policy
+    // became an approvable escalation for every URL call.
+    const allowlists = new Map([['git', [] as string[]]]);
+    const engine = new PolicyEngine(defaultPolicy, gitAnnotations, [], SANDBOX_DIR, allowlists);
+
+    const result = engine.evaluate(
+      makeRequest({
+        serverName: 'git',
+        toolName: 'git_clone',
+        arguments: { url: 'https://github.com/user/repo.git', path: `${SANDBOX_DIR}/repo` },
+      }),
+    );
+    expect(result.decision).toBe('deny');
+    expect(result.rule).toBe('deny-all');
   });
 });
 
@@ -1188,13 +1233,15 @@ describe('Per-element multi-path evaluation', () => {
 // ---------------------------------------------------------------------------
 
 describe('Lists condition matching', () => {
-  // Use fetch-url role as a stand-in for email-recipient since custom
-  // roles can't be added to the registry. The list matching logic is
-  // the same regardless of role name.
+  // Use the github-owner role (an identifier-category resource role) as a
+  // stand-in for email-recipient since custom roles can't be added to the
+  // registry. The list matching logic is the same regardless of role name.
+  // A url-category role would not do: the structural domain gate treats a
+  // fetch-url value that is not an http(s) URL as unverifiable.
   const emailAnnotations = makeAnnotations({
     email: [
       makeTool('email', 'send_email', {
-        to: ['fetch-url'],
+        to: ['github-owner'],
         subject: ['none'],
         body: ['none'],
       }),
@@ -1259,7 +1306,7 @@ describe('Lists condition matching', () => {
           tool: ['send_email'],
           lists: [
             {
-              roles: ['fetch-url'],
+              roles: ['github-owner'],
               allowed: ['alice@example.com', 'bob@example.com'],
               matchType: 'emails',
             },
@@ -1301,7 +1348,7 @@ describe('Lists condition matching', () => {
 
   it('lists condition with matchType identifiers exact match', () => {
     const idAnnotations = makeAnnotations({
-      myserver: [makeTool('myserver', 'my_tool', { id: ['fetch-url'] })],
+      myserver: [makeTool('myserver', 'my_tool', { id: ['github-owner'] })],
     });
 
     const policy = makePolicy([
@@ -1313,7 +1360,7 @@ describe('Lists condition matching', () => {
           tool: ['my_tool'],
           lists: [
             {
-              roles: ['fetch-url'],
+              roles: ['github-owner'],
               allowed: ['proj-123', 'proj-456'],
               matchType: 'identifiers',
             },
@@ -1475,7 +1522,11 @@ describe('Argument edge cases', () => {
     expect(result.decision).toBeDefined();
   });
 
-  it('argument value is an array of mixed types → only strings extracted', () => {
+  it('argument value is an array of mixed types → every value checked, and a human decides', () => {
+    // The null element makes the value one policy cannot evaluate value by
+    // value: its strings and numbers are still judged (here by
+    // escalate-reads), and the call goes to a human (see
+    // policy-engine-nested-args.test.ts).
     const engine = new PolicyEngine(policy, annotations, []);
     const result = engine.evaluate(
       makeRequest({
@@ -1484,6 +1535,8 @@ describe('Argument edge cases', () => {
       }),
     );
     expect(result.decision).toBe('escalate');
+    expect(result.rule).toBe('structural-nested-argument-escalate');
+    expect(result.humanOnly).toBe(true);
   });
 
   it('argument value is undefined → extraction handles gracefully', () => {
@@ -1638,5 +1691,168 @@ describe('Dynamic list expansion', () => {
       timestamp: '',
     });
     expect(result.decision).toBe('deny');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Path resolution per evaluation (realpath calls)
+// ---------------------------------------------------------------------------
+
+describe('Path resolution per evaluation', () => {
+  // Real directories and files, so every resolution is exactly one realpath
+  // call and the counts below are exact.
+  let base: string;
+  let sandbox: string;
+  let permitted: string;
+  let outside: string;
+  let sandboxFiles: string[];
+  let protectedEntries: string[];
+
+  beforeAll(() => {
+    base = mkdtempSync(join(REAL_TMP, 'ironcurtain-stress-realpath-'));
+    sandbox = join(base, 'sandbox');
+    permitted = join(base, 'permitted');
+    outside = join(base, 'outside');
+    for (const dir of [sandbox, permitted, outside, join(base, 'home', '.ironcurtain'), join(base, 'home', '.aws')]) {
+      mkdirSync(dir, { recursive: true });
+    }
+    sandboxFiles = Array.from({ length: 20 }, (_, i) => join(sandbox, `f${i}.txt`));
+    for (const file of [...sandboxFiles, join(permitted, 'r.txt'), join(outside, 'o.txt')]) writeFileSync(file, 'x');
+    writeFileSync(join(base, 'home', '.ironcurtain', 'config.json'), '{}');
+    mkdirSync(join(base, 'project'));
+    writeFileSync(join(base, 'project', '.env'), 'KEY=value');
+    protectedEntries = [
+      join(base, 'home', '.ironcurtain'),
+      join(base, 'home', '.aws'),
+      join(base, 'project', '.env'),
+      join(base, 'home', '.ironcurtain', 'config.json'),
+    ];
+  });
+
+  afterAll(() => {
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  const annotations = makeAnnotations({
+    filesystem: [
+      makeTool('filesystem', 'read_file', { path: ['read-path'] }),
+      makeTool('filesystem', 'read_multiple_files', { paths: ['read-path'] }),
+      makeTool('filesystem', 'edit_file', { path: ['read-path', 'write-path'], edits: ['none'] }),
+    ],
+  });
+
+  function makeEngine(within: string = permitted, entries: string[] = protectedEntries): PolicyEngine {
+    return new PolicyEngine(
+      makePolicy([
+        {
+          name: 'allow-permitted-reads',
+          description: 'Allow reads in the permitted directory',
+          principle: 'test',
+          if: { paths: { roles: ['read-path'], within }, server: ['filesystem'] },
+          then: 'allow',
+          reason: 'Permitted',
+        },
+        {
+          name: 'escalate-other-reads',
+          description: 'Escalate other reads',
+          principle: 'test',
+          if: { roles: ['read-path'], server: ['filesystem'] },
+          then: 'escalate',
+          reason: 'Reads need approval',
+        },
+      ]),
+      annotations,
+      entries,
+      sandbox,
+    );
+  }
+
+  /** Evaluates one call and returns its decision with the realpath inputs it made. */
+  function evaluateCounting(
+    engine: PolicyEngine,
+    toolName: string,
+    args: Record<string, unknown>,
+  ): { result: ReturnType<PolicyEngine['evaluate']>; calls: string[] } {
+    realpathLog.calls.length = 0;
+    const result = engine.evaluate(makeRequest({ toolName, arguments: args }));
+    return { result, calls: [...realpathLog.calls] };
+  }
+
+  it('resolves the sandbox and every rule directory once, when the engine is built', () => {
+    realpathLog.calls.length = 0;
+    const engine = makeEngine();
+    expect(realpathLog.calls).toEqual(expect.arrayContaining([sandbox, permitted]));
+
+    const { result, calls } = evaluateCounting(engine, 'read_file', { path: join(permitted, 'r.txt') });
+    expect(result).toMatchObject({ decision: 'allow', rule: 'allow-permitted-reads' });
+    expect(calls).not.toContain(sandbox);
+    expect(calls).not.toContain(permitted);
+  });
+
+  it('resolves a single path once, plus each protected entry once', () => {
+    // Before: the path was resolved again by the protected-path check and by
+    // sandbox containment, and the sandbox at every comparison (9 calls).
+    const { result, calls } = evaluateCounting(makeEngine(), 'read_file', { path: sandboxFiles[0] });
+    expect(result).toMatchObject({ decision: 'allow', rule: 'structural-sandbox-allow' });
+    expect([...calls].sort()).toEqual([sandboxFiles[0], ...protectedEntries].sort());
+  });
+
+  it('resolves a multi-path call once per path, not once per path and protected entry', () => {
+    // Before: 20 paths x (protected check: path, sandbox, 4 entries; sandbox
+    // containment: path, sandbox) + 20 = 180 calls.
+    const { result, calls } = evaluateCounting(makeEngine(), 'read_multiple_files', { paths: sandboxFiles });
+    expect(result).toMatchObject({ decision: 'allow', rule: 'structural-sandbox-allow' });
+    expect(calls).toHaveLength(sandboxFiles.length + protectedEntries.length);
+    expect(new Set(calls).size).toBe(calls.length);
+  });
+
+  it('resolves a path that several roles and rules compare only once', () => {
+    // read-path is discharged by allow-permitted-reads, write-path by no rule.
+    const path = join(permitted, 'r.txt');
+    const { result, calls } = evaluateCounting(makeEngine(), 'edit_file', { path, edits: [] });
+    expect(result).toMatchObject({ decision: 'deny', rule: 'default-deny' });
+    expect([...calls].sort()).toEqual([path, ...protectedEntries].sort());
+  });
+
+  it('makes no realpath call for a call without paths', () => {
+    expect(evaluateCounting(makeEngine(), 'read_multiple_files', { paths: [] }).calls).toEqual([]);
+  });
+
+  it('resolves protected entries when the call is made, so a symlink created later protects its target', () => {
+    // The entry does not exist when the engine is built; a symlink created
+    // there afterwards points at a file the policy otherwise allows reading.
+    const lateEntry = join(base, 'project', '.env.late');
+    const secret = join(permitted, 'secret.txt');
+    writeFileSync(secret, 'TOKEN=1');
+    const engine = makeEngine(permitted, [lateEntry]);
+    expect(evaluateCounting(engine, 'read_file', { path: secret }).result.decision).toBe('allow');
+
+    symlinkSync(secret, lateEntry);
+    expect(evaluateCounting(engine, 'read_file', { path: secret }).result).toMatchObject({
+      decision: 'deny',
+      rule: 'structural-protected-path',
+    });
+  });
+
+  it('keeps a rule directory created after the engine was built where it was named', () => {
+    // A plain directory created later resolves to the precomputed path...
+    const later = join(base, 'later');
+    const engine = makeEngine(later);
+    mkdirSync(later);
+    writeFileSync(join(later, 'l.txt'), 'x');
+    expect(evaluateCounting(engine, 'read_file', { path: join(later, 'l.txt') }).result).toMatchObject({
+      decision: 'allow',
+      rule: 'allow-permitted-reads',
+    });
+
+    // ...while a symlink created there later is not followed: the rule keeps
+    // naming the location it named when the engine was built.
+    const linked = join(base, 'linked');
+    const linkedEngine = makeEngine(linked);
+    symlinkSync(outside, linked);
+    expect(evaluateCounting(linkedEngine, 'read_file', { path: join(linked, 'o.txt') }).result).toMatchObject({
+      decision: 'escalate',
+      rule: 'escalate-other-reads',
+    });
   });
 });

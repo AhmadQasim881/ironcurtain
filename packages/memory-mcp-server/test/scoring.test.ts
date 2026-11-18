@@ -281,6 +281,22 @@ describe('computeCompositeScore', () => {
 
     expect(computeCompositeScore(accessed, now)).toBeGreaterThan(computeCompositeScore(notAccessed, now));
   });
+
+  // A row dated a year ahead (as_of was unbounded) scored ~956 against 0.9 for a
+  // perfect current row: recency exp(-0.001 * negativeAge) grew without bound.
+  it('scores a future-dated memory exactly like one dated now (ages clamp at zero)', () => {
+    const now = Date.now();
+    const yearAhead = now + 365 * 24 * 3600000;
+    const signals = { fusionScore: 0.5, compositeScore: 0, access_count: 10, importance: 0.5 };
+    const future = {
+      ...makeMemory({ created_at: yearAhead, last_accessed_at: yearAhead }),
+      ...signals,
+    } as ScoredMemory;
+    const current = { ...makeMemory({ created_at: now, last_accessed_at: now }), ...signals } as ScoredMemory;
+
+    expect(computeCompositeScore(future, now)).toBe(computeCompositeScore(current, now));
+    expect(computeCompositeScore(future, now)).toBeLessThanOrEqual(1);
+  });
 });
 
 describe('estimateTokens', () => {

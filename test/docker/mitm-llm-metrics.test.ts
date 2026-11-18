@@ -12,10 +12,13 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { loadOrCreateCA, type CertificateAuthority } from '../../src/docker/ca.js';
 import { createMitmProxy, type MitmProxy } from '../../src/docker/mitm-proxy.js';
 import type { OAuthTokenManager } from '../../src/docker/oauth-token-manager.js';
+import type { OutboundTransport } from '../../src/docker/outbound-transport.js';
 import { anthropicProvider, googleProvider, type ProviderConfig } from '../../src/docker/provider-config.js';
 import { createTrajectoryCaptureWriter, type TrajectoryCaptureWriter } from '../../src/docker/trajectory-capture.js';
 import { getLlmMetricsEventBus, resetLlmMetricsEventBus } from '../../src/llm-metrics/event-bus.js';
 import type { MetricsInvocationLease } from '../../src/llm-metrics/attribution-registry.js';
+import { ObservedUsageAccumulator } from '../../src/llm-metrics/observed-usage-accumulator.js';
+import { SqliteLlmMetricsRepository } from '../../src/llm-metrics/persistence/sqlite-repository.js';
 import type { LlmExchangeCompleted } from '../../src/llm-metrics/types.js';
 import type { SessionId } from '../../src/session/types.js';
 import { sendConnect } from '../helpers/mitm-tls-harness.js';
@@ -631,6 +634,52 @@ describe('MITM LLM metrics integration', () => {
     expect(exchanges).toHaveLength(1);
   });
 
+  it('counts the known input of an exchange the client aborts before terminal usage', async () => {
+    upstream = await createUpstream((_request, response) => {
+      response.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      response.write(
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_cut","model":"claude","usage":' +
+          '{"input_tokens":4000,"cache_read_input_tokens":60000,"cache_creation_input_tokens":500,"output_tokens":1}}}\n\n',
+      );
+      // Never sends message_delta: the output count is never reported.
+    });
+    proxy = createMitmProxy({
+      socketPath,
+      ca,
+      statisticsEnabled: true,
+      providers: [{ config: metricsProvider(upstream.port), fakeKey: FAKE_KEY, realKey: REAL_KEY }],
+    });
+    await proxy.start();
+    const lease = proxy.beginMetricsInvocation('http://127.0.0.1:9999', {
+      sessionId: 'session-cut',
+      turnId: 'turn-cut',
+    });
+    const { socket } = await sendConnect(socketPath, CLIENT_HOST, 443, {
+      'Proxy-Authorization': proxyAuthorization(lease),
+    });
+    const requestBody = Buffer.from(JSON.stringify({ model: 'claude-requested', stream: true, messages: [] }));
+    await abortHttpsRequestOnFirstResponse(socket as Socket, ca, requestBody);
+    await lease.end();
+
+    await expect.poll(() => exchanges.length).toBe(1);
+    expectUsage(exchanges[0], {
+      inputTokensTotal: 64500,
+      outputTokensTotal: null,
+      canonicalTotalTokens: null,
+      usageCompleteness: 'partial',
+    });
+    const session = new ObservedUsageAccumulator('session-cut', true);
+    for (const exchange of exchanges) session.observe(exchange);
+    // Formerly the whole exchange counted as zero toward the session total.
+    expect(session.takeTurnSnapshot('turn-cut')).toMatchObject({
+      inputTokens: 64500,
+      totalTokens: 64500,
+      incompleteExchanges: 1,
+      lowerBound: true,
+      status: 'partial',
+    });
+  });
+
   it('finalizes once on an upstream transport error', async () => {
     const resetServer = http.createServer((request) => {
       request.resume();
@@ -655,6 +704,83 @@ describe('MITM LLM metrics integration', () => {
       expect.objectContaining({ ordinal: 1, responseStatus: null, outcome: 'error' }),
     ]);
     expect(exchanges[0]?.outcome).toMatchObject({ responseStatus: 502, termination: 'error' });
+  });
+
+  it('completes the transport attempt when upstream response metadata is missing', async () => {
+    const responseBody = Buffer.from(
+      JSON.stringify({
+        id: 'msg_metadata_fixture',
+        type: 'message',
+        role: 'assistant',
+        model: 'claude-served',
+        content: [{ type: 'text', text: 'hello' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 3, output_tokens: 2 },
+      }),
+    );
+    upstream = await createUpstream((_request, response) =>
+      sendFixedResponse(response, responseBody, { 'Content-Type': 'application/json' }),
+    );
+    const upstreamPort = upstream.port;
+    const outboundTransport: OutboundTransport = {
+      kind: 'direct',
+      addressGuard: 'local-resolver',
+      request(request, onResponse) {
+        return http.request(
+          {
+            hostname: '127.0.0.1',
+            port: upstreamPort,
+            method: request.method,
+            path: request.path,
+            headers: request.headers,
+          },
+          (response) => {
+            // The origin sends ordinary HTTP 200. Fault-inject only the
+            // in-memory metadata passed to the proxy's response boundary.
+            Reflect.deleteProperty(response, 'statusCode');
+            onResponse?.(response);
+          },
+        );
+      },
+    };
+    proxy = createMitmProxy({
+      socketPath,
+      ca,
+      statisticsEnabled: true,
+      outboundTransport,
+      providers: [{ config: metricsProvider(upstream.port), fakeKey: FAKE_KEY, realKey: REAL_KEY }],
+    });
+    await proxy.start();
+
+    const { socket } = await sendConnect(socketPath, CLIENT_HOST, 443);
+    const requestBody = Buffer.from(JSON.stringify({ model: 'claude-requested', stream: false, messages: [] }));
+    const response = await makeHttpsBufferRequest(socket as Socket, ca, requestBody);
+
+    expect(response.statusCode).toBe(502);
+    expect(response.headers.connection).toBe('close');
+    await expect.poll(() => exchanges.length).toBe(1);
+    const exchange = exchanges.at(0);
+    if (exchange === undefined) throw new Error('expected one observed exchange');
+    expect(exchange.outcome).toMatchObject({ responseStatus: 502, termination: 'error' });
+    expect(exchange.transportAttempts).toEqual([
+      expect.objectContaining({ ordinal: 1, responseStatus: null, outcome: 'error' }),
+    ]);
+    expect(exchange.transportAttempts[0]?.endedOffsetMs).toBeGreaterThanOrEqual(
+      exchange.transportAttempts[0]?.startedOffsetMs ?? Number.POSITIVE_INFINITY,
+    );
+    expect(exchange.qualityFlags).toContain('response_body_not_observed');
+
+    const repository = await SqliteLlmMetricsRepository.open({
+      databasePath: join(tempDir, 'statistics', 'llm-usage.sqlite3'),
+      flushIntervalMs: 60_000,
+    });
+    try {
+      expect(repository.enqueue(exchange)).toBe(true);
+      await repository.flush();
+      expect(repository.health()).toMatchObject({ persisted: 1, dropped: 0, invalidByReason: {} });
+    } finally {
+      await repository.close();
+    }
   });
 
   it('finalizes once when an auth retry cannot refresh its token', async () => {

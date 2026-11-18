@@ -1,8 +1,46 @@
 import type { DatabaseSync } from 'node:sqlite';
 
 import { SQLITE_BUSY_TIMEOUT_MS, withSqliteBusyRetry } from './sqlite-busy-retry.js';
+import { LLM_METRICS_SCHEMA_INCOMPATIBLE } from './storage-errors.js';
 
-export const LLM_METRICS_SCHEMA_VERSION = 1;
+export const LLM_METRICS_SCHEMA_VERSION = 2;
+
+export type LlmMetricsSchemaRole = 'writer' | 'reader';
+
+/**
+ * A database schema this process must not use: newer than it supports without
+ * a compatibility range that admits it. Persistence latches off on it instead
+ * of restarting, because no restart of this binary can repair it.
+ */
+export class LlmMetricsSchemaIncompatibleError extends Error {
+  readonly code = LLM_METRICS_SCHEMA_INCOMPATIBLE;
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'LlmMetricsSchemaIncompatibleError';
+  }
+}
+
+/**
+ * Compatibility range of the current schema, rewritten by every migration in
+ * the same transaction as its DDL. An older binary that finds a newer
+ * `user_version` keeps using the database only while its own schema version is
+ * at least the minimum stored for its role, because only the newer binary can
+ * know whether its migration was additive. The table is created by the first
+ * migration a binary with this contract runs, so databases migrated before it
+ * existed simply lack it until their next migration.
+ */
+const COMPATIBILITY_TABLE_SQL = `
+  CREATE TABLE IF NOT EXISTS llm_metrics_meta (
+    key TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+  ) STRICT;
+`;
+
+const COMPATIBILITY_KEYS: Readonly<Record<LlmMetricsSchemaRole, string>> = {
+  writer: 'min_writer_schema',
+  reader: 'min_reader_schema',
+};
 
 /**
  * The first metrics schema is intentionally column-oriented. Request and
@@ -152,8 +190,42 @@ const MIGRATION_1 = `
     ON llm_exchanges (process_run_id);
 `;
 
-const MIGRATIONS: Readonly<Partial<Record<number, string>>> = {
-  1: MIGRATION_1,
+/**
+ * Host-side cost (schema 2), additive only: `cost_usd` keeps its meaning (the
+ * cost a gateway reported) and the host's list-price estimate gets its own
+ * column, qualified by where the exchange's cost comes from and the price
+ * table version behind an estimate. Rows written before have NULL in all
+ * three; their `cost_usd`, when set, was always gateway-reported.
+ *
+ * Its compatibility range stays at schema 1: the three columns are nullable,
+ * a schema-1 INSERT names its columns and leaves them NULL, which readers
+ * already interpret as a row without a host estimate (a non-NULL `cost_usd`
+ * with no `cost_source` reads as gateway-reported), and a schema-1 reader
+ * never selects them.
+ */
+const MIGRATION_2 = `
+  ALTER TABLE llm_exchanges ADD COLUMN estimated_cost_usd REAL;
+  ALTER TABLE llm_exchanges ADD COLUMN cost_source TEXT;
+  ALTER TABLE llm_exchanges ADD COLUMN pricing_version TEXT;
+`;
+
+interface LlmMetricsMigration {
+  readonly sql: string;
+  /**
+   * Oldest writer and reader schema versions that still work correctly against
+   * the schema this migration produces. An additive migration (new tables or
+   * indexes, or nullable/defaulted columns that older INSERTs, which name their
+   * columns explicitly, may omit) keeps the previous values. A migration that
+   * changes the shape or meaning of existing data raises them to its own
+   * version, or moves to a new table family instead.
+   */
+  readonly minWriterSchema: number;
+  readonly minReaderSchema: number;
+}
+
+const MIGRATIONS: Readonly<Partial<Record<number, LlmMetricsMigration>>> = {
+  1: { sql: MIGRATION_1, minWriterSchema: 1, minReaderSchema: 1 },
+  2: { sql: MIGRATION_2, minWriterSchema: 1, minReaderSchema: 1 },
 };
 
 function readUserVersion(database: DatabaseSync): number {
@@ -165,40 +237,98 @@ function readUserVersion(database: DatabaseSync): number {
   return value;
 }
 
+/** The stored minimum for a role, or null when the database declares none. */
+function readCompatibilityMinimum(database: DatabaseSync, role: LlmMetricsSchemaRole): number | null {
+  const table = database
+    .prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'llm_metrics_meta'")
+    .get();
+  if (table === undefined) return null;
+  const value: unknown = database
+    .prepare('SELECT value FROM llm_metrics_meta WHERE key = ?')
+    .get(COMPATIBILITY_KEYS[role])?.value;
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 ? value : null;
+}
+
+function assertNewerSchemaCompatible(database: DatabaseSync, version: number, role: LlmMetricsSchemaRole): void {
+  const minimum = readCompatibilityMinimum(database, role);
+  if (minimum !== null && minimum <= LLM_METRICS_SCHEMA_VERSION) return;
+  throw new LlmMetricsSchemaIncompatibleError(
+    minimum === null
+      ? `LLM metrics database schema ${version} is newer than ${role} schema ${LLM_METRICS_SCHEMA_VERSION} ` +
+          'and declares no compatible range'
+      : `LLM metrics database schema ${version} requires ${role} schema ${minimum} or newer; ` +
+          `this ${role} supports schema ${LLM_METRICS_SCHEMA_VERSION}`,
+  );
+}
+
 /**
- * Applies additive migrations while holding SQLite's cross-process write lock.
- * The version is re-read after BEGIN IMMEDIATE so concurrent starters cannot
- * both apply the same migration.
+ * Checks that this process may use the database in `role` and returns its
+ * schema version. A newer schema is accepted when its stored compatibility
+ * range admits this process's schema version; without one it is refused. The
+ * writer runs this before every batch and maintenance step, the reader when it
+ * opens, so a migration by another process is noticed without a restart.
  */
-export function migrateLlmMetricsDatabase(database: DatabaseSync): number {
+export function assertLlmMetricsSchemaCompatible(database: DatabaseSync, role: LlmMetricsSchemaRole): number {
+  const version = readUserVersion(database);
+  if (version === LLM_METRICS_SCHEMA_VERSION) return version;
+  if (version < LLM_METRICS_SCHEMA_VERSION) {
+    throw new Error(
+      `LLM metrics database schema ${version} is older than ${role} schema ${LLM_METRICS_SCHEMA_VERSION}`,
+    );
+  }
+  assertNewerSchemaCompatible(database, version, role);
+  return version;
+}
+
+/**
+ * Applies additive migrations while holding SQLite's cross-process write lock
+ * and returns the database's schema version. The version is re-read after
+ * BEGIN IMMEDIATE so concurrent starters cannot both apply the same migration.
+ * A newer schema is used without rewriting it when its compatibility range
+ * admits this writer; otherwise it is refused unchanged. `targetVersion`
+ * (default: the current schema) lets tests build a database at an older
+ * schema.
+ */
+export function migrateLlmMetricsDatabase(
+  database: DatabaseSync,
+  targetVersion: number = LLM_METRICS_SCHEMA_VERSION,
+): number {
+  if (!Number.isSafeInteger(targetVersion) || targetVersion < 1 || targetVersion > LLM_METRICS_SCHEMA_VERSION) {
+    throw new Error(`Unsupported LLM metrics target schema ${targetVersion}`);
+  }
   database.exec(`PRAGMA foreign_keys = ON; PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
 
   let version = readUserVersion(database);
   if (version > LLM_METRICS_SCHEMA_VERSION) {
-    throw new Error(
-      `LLM metrics database schema ${version} is newer than supported schema ${LLM_METRICS_SCHEMA_VERSION}`,
-    );
+    assertNewerSchemaCompatible(database, version, 'writer');
+    return version;
   }
 
-  while (version < LLM_METRICS_SCHEMA_VERSION) {
+  while (version < targetVersion) {
     version = withSqliteBusyRetry(() => {
       database.exec('BEGIN IMMEDIATE');
       try {
         const lockedVersion = readUserVersion(database);
         if (lockedVersion > LLM_METRICS_SCHEMA_VERSION) {
-          throw new Error(
-            `LLM metrics database schema ${lockedVersion} is newer than supported schema ${LLM_METRICS_SCHEMA_VERSION}`,
-          );
+          assertNewerSchemaCompatible(database, lockedVersion, 'writer');
+          database.exec('COMMIT');
+          return lockedVersion;
         }
-        if (lockedVersion === LLM_METRICS_SCHEMA_VERSION) {
+        if (lockedVersion >= targetVersion) {
           database.exec('COMMIT');
           return lockedVersion;
         }
 
         const nextVersion = lockedVersion + 1;
-        const sql = MIGRATIONS[nextVersion];
-        if (sql === undefined) throw new Error(`Missing LLM metrics migration ${nextVersion}`);
-        database.exec(sql);
+        const migration = MIGRATIONS[nextVersion];
+        if (migration === undefined) throw new Error(`Missing LLM metrics migration ${nextVersion}`);
+        database.exec(migration.sql);
+        database.exec(COMPATIBILITY_TABLE_SQL);
+        const writeMinimum = database.prepare(
+          'INSERT INTO llm_metrics_meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value',
+        );
+        writeMinimum.run(COMPATIBILITY_KEYS.writer, migration.minWriterSchema);
+        writeMinimum.run(COMPATIBILITY_KEYS.reader, migration.minReaderSchema);
         database.exec(`PRAGMA user_version = ${nextVersion}`);
         database.exec('COMMIT');
         return nextVersion;

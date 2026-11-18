@@ -9,6 +9,7 @@ import { buildSystemPrompt } from '../pipeline/constitution-customizer.js';
 import { runConstitutionCustomizerLoop, type CustomizerLoopContext } from '../pipeline/customizer-loop.js';
 import type { GitHubIdentity } from '../pipeline/github-identity.js';
 import type { ToolAnnotation } from '../pipeline/types.js';
+import type { ApprovalScope } from '../audit/approval-history.js';
 
 // ---------------------------------------------------------------------------
 // Persona-Scoped System Prompt
@@ -55,12 +56,15 @@ permissions required for the persona's purpose.`;
  * @param initialConstitution - Starting constitution text (from generator or existing)
  * @param personaDescription - The persona description (context for the LLM)
  * @param serverAllowlist - Optional server allowlist (context for the LLM)
+ * @param amendmentScope - The persona's approval scope when editing an existing
+ *   persona: amendments learned from its repeated human approvals are offered first
  * @returns The final constitution text, or undefined if the user cancelled
  */
 export async function runPersonaConstitutionCustomizer(
   initialConstitution: string,
   personaDescription: string,
   serverAllowlist?: readonly string[],
+  amendmentScope?: ApprovalScope,
 ): Promise<string | undefined> {
   return runConstitutionCustomizerLoop(
     initialConstitution,
@@ -70,6 +74,7 @@ export async function runPersonaConstitutionCustomizer(
       stepName: 'persona-customize-policy',
       noteTitle: 'Current Persona Constitution',
       refinePlaceholder: 'e.g., "also allow fetching from news sites"',
+      ...(amendmentScope !== undefined ? { amendmentScope } : {}),
     },
   );
 }

@@ -1,7 +1,8 @@
 # Third-Party OAuth Onboarding for MCP Servers
 
+**Status (2026-11-14):** Implemented (`src/auth/`, `ironcurtain auth`).
+
 **Date:** 2026-03-15
-**Status:** Design
 **Author:** Feature Architect
 
 ## Problem Statement
@@ -224,6 +225,20 @@ export interface OAuthProviderConfig {
    * Used by `ironcurtain auth revoke <provider>`.
    */
   readonly revocationUrl?: string;
+
+  /**
+   * Optional: page where the user revokes access by hand, printed when the
+   * revocation endpoint cannot confirm a revocation (Google:
+   * https://myaccount.google.com/permissions).
+   */
+  readonly manualRevocationUrl?: string;
+
+  /**
+   * Optional: token-introspection endpoint that takes `access_token` in a
+   * form POST body and reports the token's remaining lifetime without a
+   * refresh grant. Used by `ironcurtain doctor --check-api`.
+   */
+  readonly tokenInfoUrl?: string;
 }
 
 /**
@@ -269,6 +284,7 @@ export const googleOAuthProvider: OAuthProviderConfig = {
   clientSecretEnvVar: 'GOOGLE_CLIENT_SECRET',
   credentialsFilename: 'google-credentials.json',
   revocationUrl: 'https://oauth2.googleapis.com/revoke',
+  tokenInfoUrl: 'https://oauth2.googleapis.com/tokeninfo',
 };
 ```
 
@@ -352,10 +368,27 @@ export interface StoredOAuthToken {
 export function loadOAuthToken(providerId: string): StoredOAuthToken | null;
 
 /**
- * Saves an OAuth token to disk with 0o600 permissions.
- * Uses write-then-chmod pattern from oauth-credentials.ts (line 236-239).
+ * Saves an OAuth token to disk (authorization: always replaces what is stored).
+ * Atomic and owner-only: a 0600 temp file in oauth/ is fsynced and renamed
+ * over the token file (writePrivateFileAtomicSync), under the file's
+ * cross-process lock (<file>.lock), so a crash or a full disk never leaves an
+ * empty token file behind.
  */
 export function saveOAuthToken(providerId: string, token: StoredOAuthToken): void;
+
+/**
+ * Refresh write-back. Under the same lock it re-reads the stored token and
+ * keeps it (returning it) when it no longer holds `refreshedFrom` (another
+ * process rotated the refresh token, or the user re-authorized) and is still
+ * usable, or when it expires later than `refreshed` without holding the
+ * refresh token this grant just rotated away; otherwise it writes
+ * `refreshed` and returns it. See src/auth/refresh-write-back.ts.
+ */
+export function saveRefreshedOAuthToken(
+  providerId: string,
+  refreshed: StoredOAuthToken,
+  refreshedFrom: string,
+): StoredOAuthToken;
 
 /**
  * Deletes the stored token for a provider (revocation).
@@ -548,9 +581,16 @@ ironcurtain auth                     # List all OAuth providers and their status
 ironcurtain auth import google /path/to/credentials.json  # Import credentials
 ironcurtain auth google              # Authorize Google Workspace (opens browser)
 ironcurtain auth google --scopes gmail.send  # Add incremental scopes
+ironcurtain auth google --no-browser # Authorize from a headless or remote host
 ironcurtain auth revoke google       # Revoke and delete stored token
 ironcurtain auth status              # Show token status for all providers
 ```
+
+**Import** validates the file (JSON with a non-empty `client_id` and `client_secret`, either Google's `installed` wrapper or the flat form, at most 1 MiB, a regular file) before anything is written. A valid file then replaces the stored credentials atomically: the bytes go to a 0600 temporary file in `~/.ironcurtain/oauth/` that is renamed over the old one. An invalid file is refused with the reason, and previously imported credentials stay as they were.
+
+**Revoke** deletes the local token only when the provider confirms there is nothing left to revoke: a 2xx response, or `400` with `{"error": "invalid_token"}` (Google's answer for a token that is already revoked or expired). On a network error, a timeout, a 5xx or any other 4xx the token is kept, the command says it was NOT revoked, prints the manual revocation page (`manualRevocationUrl`) and exits non-zero, so the user can retry; deleting the only local copy of a live grant while printing "Token revoked" would leave the grant usable at Google with no local handle to revoke it. A provider without a revocation endpoint has its local token deleted with a pointer to the manual page.
+
+**Headless authorization** (`--no-browser`): the authorization URL is printed instead of opened. The user approves access in a browser on any machine; that browser is then redirected to `http://127.0.0.1:<port>/callback?...`, which fails to load when it runs on another machine, and the user pastes that URL from the address bar back into the prompt. The loopback callback server keeps listening meanwhile, so a browser on the same host still completes the flow directly; whichever arrives first wins and the other is abandoned. A pasted URL must name the exact redirect URI and carry the flow's `state`; otherwise the prompt asks again and says why. The wait defaults to 10 minutes instead of 2.
 
 ### Credential Import Flow UX
 
@@ -684,8 +724,8 @@ No changes to the flow runner, token store, or proxy integration code.
 
 - **PKCE**: Required for all providers (prevents authorization code interception)
 - **Loopback redirect**: `http://127.0.0.1:{dynamically-assigned-port}/callback` (not `localhost` to avoid DNS rebinding; port 0 allocation avoids conflicts)
-- **Ephemeral server**: Callback server starts, handles one request, stops
-- **State parameter**: Random nonce validated on callback (prevents CSRF)
+- **Ephemeral server**: Callback server starts, waits for the response to this flow, stops
+- **State parameter**: Random nonce validated on callback (prevents CSRF), compared in constant time. It is checked before anything else: a request with a missing or wrong `state` (a stale tab, another local process probing the port) gets `400` and the flow keeps waiting, and an `error=` response ends the flow only when it carries the right `state`, so no other local process can abort an authorization in progress
 - **Client credentials**: Stored in `~/.ironcurtain/oauth/` with `0o600` permissions. Google Desktop app client secrets are not truly secret (documented by Google for installed apps), but still protected on disk
 
 ### Audit Trail
@@ -712,6 +752,7 @@ For users whose Google Cloud project is in "Testing" mode (the default), refresh
 - Users must re-run `ironcurtain auth google` weekly
 - Long-running sessions that span the 7-day boundary will fail
 - The `OAuthTokenProvider` surfaces a clear `OAuthTokenExpiredError` with instructions to re-authorize
+- `ironcurtain doctor` reports the access token's expiry and warns when it has expired and the token file was last written more than 7 days ago. That is only a hint, since every refresh rewrites the file while the refresh token's 7 days run from authorization. `ironcurtain doctor --check-refresh` tests the refresh token itself with a refresh grant, as a session's relay would (`OAuthTokenProvider.forceRefresh()`), and saves the new access token under the token file's lock; `--check-api` only sends the current access token to `tokenInfoUrl`.
 
 Organizations that need persistent tokens should publish their OAuth app to "Production" and complete Google's verification process. For restricted scopes (gmail.readonly, drive.readonly), this requires the annual CASA security assessment.
 
@@ -898,6 +939,16 @@ async getValidAccessToken(): Promise<string> {
   return this.refreshPromise;
 }
 ```
+
+Re-reading before the refresh does not cover a refresh that another process
+completes while ours is in flight. The write-back therefore goes through
+`saveRefreshedOAuthToken(providerId, refreshed, refreshedFrom)`, which re-reads
+the file under its lock after the token endpoint answered and keeps the stored
+token when it no longer holds the refresh token we refreshed from (rotation
+elsewhere, or a re-authorization with new scopes) and is still usable, or when
+it expires later than ours (unless it still holds the refresh token our own
+grant just rotated away, which can no longer be used). `OAuthTokenProvider` then returns the access token
+that is actually in effect, so the token it hands out matches the file.
 
 ## Implementation Plan
 

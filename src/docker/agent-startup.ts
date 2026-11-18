@@ -32,6 +32,8 @@ expected=$(startup_identity) || exit
 interface StartupWaitOptions {
   readonly timeoutMs?: number;
   readonly pollIntervalMs?: number;
+  /** Ends the wait early (rejecting with the signal's reason) when setup is interrupted. */
+  readonly signal?: AbortSignal;
 }
 
 /**
@@ -39,10 +41,17 @@ interface StartupWaitOptions {
  * home ownership, and configuring the adapter. Wrap that handoff, not the
  * entrypoint itself. A fresh pathname avoids stale readiness in snapshots.
  * This is an ordering signal inside an untrusted container, not attestation.
+ *
+ * `probeUser` is the numeric `docker exec --user` for the readiness probe
+ * (`AgentContainerPrivilegePlan.startupProbeUser`), or undefined to run the
+ * command unwrapped without waiting. Sudo-on Linux probes as `0:0`: the
+ * account is still being renumbered, and the marker is private to it. A
+ * sudo-off container has no root at all, so it probes as the agent's own UID,
+ * which owns the marker.
  */
 export function prepareDockerAgentStartup(
   command: readonly string[],
-  needsUidRemap: boolean,
+  probeUser: string | undefined,
 ): {
   readonly command: readonly string[];
   waitUntilReady(
@@ -53,33 +62,37 @@ export function prepareDockerAgentStartup(
 } {
   const readyPath = `/tmp/ironcurtain-agent-ready-${randomUUID()}`;
   return {
-    command: needsUidRemap
-      ? [
-          '/bin/sh',
-          '-c',
-          `${STARTUP_IDENTITY}
+    command:
+      probeUser !== undefined
+        ? [
+            '/bin/sh',
+            '-c',
+            `${STARTUP_IDENTITY}
 rm -f -- "$1" || exit
 (umask 077; set -C; startup_identity > "$1") || exit
 shift
 exec "$@"`,
-          'ironcurtain-agent-startup',
-          readyPath,
-          ...command,
-        ]
-      : command,
+            'ironcurtain-agent-startup',
+            readyPath,
+            ...command,
+          ]
+        : command,
     async waitUntilReady(runtime, containerId, options = {}) {
-      if (!needsUidRemap) return;
-      const timeoutMs = options.timeoutMs ?? 90_000;
+      if (probeUser === undefined) return;
+      // Remapping a baked home copies ownership metadata into the writable
+      // layer. A fresh universal image can exceed 90s on a busy local disk.
+      const timeoutMs = options.timeoutMs ?? 180_000;
       const deadline = Date.now() + timeoutMs;
       let pollIntervalMs = options.pollIntervalMs ?? 250;
       for (;;) {
-        // Numeric root does not depend on the passwd entry being rewritten.
-        // Ordinary agent execs remain codespace and begin only after this gate.
+        options.signal?.throwIfAborted();
+        // A numeric user does not depend on the passwd entry being rewritten.
+        // Ordinary agent execs begin only after this gate.
         const result = await runtime.exec(
           containerId,
           ['/bin/sh', '-c', READY_PROBE, 'ironcurtain-agent-startup', readyPath],
           5_000,
-          '0:0',
+          probeUser,
         );
         if (result.exitCode === 0) return;
         let running: boolean | undefined;
@@ -101,7 +114,9 @@ exec "$@"`,
               `UID remapping and adapter initialization must finish before agent execs.\n${logs}`,
           );
         }
-        await delay(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
+        await delay(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())), undefined, {
+          signal: options.signal,
+        });
         if (options.pollIntervalMs === undefined) pollIntervalMs = Math.min(pollIntervalMs * 2, 2_000);
       }
     },

@@ -30,9 +30,12 @@ import { createMemoryEngineFromConfig } from '../src/engine-impl.js';
 import type { MemoryEngine } from '../src/engine.js';
 import type { MemoryConfig } from '../src/config.js';
 import { loadConfig } from '../src/config.js';
+import { testModelEnv } from './helpers/test-models.js';
 import { estimateTokens } from '../src/retrieval/scoring.js';
 import { rankSegmentPassages, realMemoryId } from '../src/retrieval/expansion.js';
 import { embedQuery } from '../src/embedding/embedder.js';
+import { splitToPassages } from '../src/storage/extraction.js';
+import { handleExpand } from '../src/tools/expand.js';
 
 const NAMESPACE = 'test';
 
@@ -57,7 +60,7 @@ function factsJson(facts: Array<{ fact: string; importance?: number }>): string 
 
 function testConfig(dbPath: string): MemoryConfig {
   return {
-    ...loadConfig({}),
+    ...loadConfig(testModelEnv()),
     dbPath,
     namespace: NAMESPACE,
     llmApiKey: 'test-key',
@@ -463,6 +466,7 @@ describe('parent re-expansion (Bandalert contract)', () => {
       const result = await engine.expand('does-not-exist');
       expect(result.found).toBe(false);
       expect(result.passages).toEqual([]);
+      expect(result.total_passages).toBe(0);
     });
   });
 
@@ -651,8 +655,117 @@ describe('memory_context auto-expands a shared-parent corpus', () => {
   });
 });
 
+// ---- A source of EIGHT passages (MEM-24): more than memory_expand returns by default, so ----
+// ---- the no-query path is a partial read and the query path must pick, not return all. ----
+// Each section repeats one on-topic sentence past half the passage cap (~800 chars of the
+// 1,400-char cap), so no two sections pack into one passage: the split yields one passage
+// per section, in section order.
+const LOGBOOK_SECTIONS = [
+  'The astronomy log records telescope sessions, planets observed, nebula sightings and star charts at the observatory.',
+  'The bakery log records sourdough starters, oven temperatures, proofing times and flour blends for the morning bread.',
+  'The sailing log records wind speeds, tacking drills, harbour moorings and sail repairs for the club regatta.',
+  'The beekeeping log records hive inspections, honey harvests, queen health and swarm prevention in the apiary.',
+  'The chess log records opening repertoires, endgame studies, tournament pairings and rating changes for the club.',
+  'The volcano log records seismic tremors, lava flows, gas emissions and evacuation drills near the crater.',
+  'The violin log records bowing exercises, scale practice, string changes and recital pieces for the quartet.',
+  'The orchard log records apple grafting, pruning cuts, pest traps and cider pressing in the autumn harvest.',
+].map((sentence) => Array.from({ length: 7 }, () => sentence).join(' '));
+
+const LOGBOOK = LOGBOOK_SECTIONS.join('\n\n');
+
+describe('memory_expand over a source longer than the default passage count', () => {
+  let tmpDir: string;
+  let dbPath: string;
+  let engine: MemoryEngine;
+  let db: Database.Database;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'memory-expand-long-'));
+    dbPath = join(tmpDir, 'test.db');
+    const config = testConfig(dbPath);
+    engine = createMemoryEngineFromConfig(config);
+    db = initDatabase(dbPath, config.embeddingModel);
+  });
+
+  afterEach(() => {
+    engine.close();
+    db.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+    vi.clearAllMocks();
+  });
+
+  async function ingestLogbook(): Promise<string> {
+    setResponses(
+      factsJson([
+        { fact: 'The club keeps a logbook of its hobbies', importance: 0.6 },
+        { fact: 'The logbook covers beekeeping and the orchard', importance: 0.6 },
+      ]),
+    );
+    const result = await engine.ingest(LOGBOOK, { mode: 'document' });
+    expect(result.segments_created).toBe(1);
+    const segment = db.prepare(`SELECT id FROM segments WHERE namespace = ?`).get(NAMESPACE) as
+      { id: string } | undefined;
+    expect(segment).toBeDefined();
+    return segment?.id ?? '';
+  }
+
+  it('the logbook splits into one passage per section (precondition)', () => {
+    expect(LOGBOOK_SECTIONS.every((s) => s.length > 700)).toBe(true);
+    expect(splitToPassages(LOGBOOK)).toEqual(LOGBOOK_SECTIONS);
+  });
+
+  it('without a query: the first 3 passages in source order, and how many there are', async () => {
+    const segmentId = await ingestLogbook();
+
+    const result = await engine.expand(segmentId);
+    expect(result).toEqual({
+      segment_id: segmentId,
+      passages: LOGBOOK_SECTIONS.slice(0, 3),
+      total_passages: 8,
+      found: true,
+    });
+
+    const text = await handleExpand(engine, { segment_id: segmentId });
+    expect(text).toContain('[passages 1-3 of 8 of this source, in source order; pass a query');
+    expect(text).not.toContain('beekeeping');
+  });
+
+  it('with a query: only the most relevant passages, best first, not the whole source', async () => {
+    const segmentId = await ingestLogbook();
+
+    const result = await engine.expand(segmentId, 'beekeeping hives honey harvest and the queen bee');
+    expect(result.total_passages).toBe(8);
+    // Bounded: before MEM-24 the query path returned all 8 passages, re-sorted.
+    expect(result.passages).toHaveLength(3);
+    expect(result.passages[0]).toBe(LOGBOOK_SECTIONS[3]);
+
+    const text = await handleExpand(engine, {
+      segment_id: segmentId,
+      query: 'beekeeping hives honey harvest and the queen bee',
+    });
+    expect(text).toContain('[passages 1-3 of 8 of this source, most relevant to the query first;');
+    // The best passage comes first in the text too.
+    expect(text.indexOf('beekeeping log')).toBeLessThan(text.indexOf('---'));
+  });
+
+  it('max_passages bounds both paths, up to the whole source', async () => {
+    const segmentId = await ingestLogbook();
+
+    const one = await engine.expand(segmentId, 'apple grafting and cider pressing', 1);
+    expect(one.passages).toEqual([LOGBOOK_SECTIONS[7]]);
+
+    const five = await engine.expand(segmentId, undefined, 5);
+    expect(five.passages).toEqual(LOGBOOK_SECTIONS.slice(0, 5));
+
+    const text = await handleExpand(engine, { segment_id: segmentId, max_passages: 20 });
+    for (const section of LOGBOOK_SECTIONS) expect(text).toContain(section);
+    expect(text).toContain('[passages 1-8 of 8: the whole source, in source order]');
+  });
+});
+
 // `rankSegmentPassages` is the shared split→embed→rank helper (F6), used by BOTH recall
-// expansion (limit 1 per segment) and `engine.expand`/`memory_expand` (all passages).
+// expansion (limit 1 per segment) and `engine.expand`/`memory_expand` (all passages ranked,
+// the best `max_passages` returned, through `rankPassages`).
 describe('rankSegmentPassages (shared split-and-rank helper)', () => {
   const config = testConfig(join(tmpdir(), 'rank-helper-unused.db'));
 

@@ -1,5 +1,7 @@
 # Proxy MCP Server Design
 
+**Status (2026-11-14):** Implemented (`src/docker/proxy-tools.ts`): the virtual `proxy` server and its domain tools. The nested (fixed-parent) passthrough path in decision 2 is reserved: no production path selects the fixed-parent transport.
+
 ## Overview
 
 The Proxy MCP Server gives the agent runtime control over which internet domains the MITM proxy allows through. Today, the MITM proxy's host allowlist is fixed at session start (derived from provider configs). This design adds a dynamic layer: the agent can request access to additional domains -- subject to human approval via the escalation flow -- and the MITM proxy will accept CONNECT requests to those domains at runtime.
@@ -8,23 +10,32 @@ The proxy tools run in a **dedicated `mcp-proxy-server.ts` instance** spawned wi
 
 ## Key Design Decisions
 
-1. **Domain-only, not domain:port.** The interface accepts bare domain names (e.g., `api.example.com`), not `domain:port` pairs. The MITM proxy always intercepts on the CONNECT-requested port (typically 443). The security boundary is "can the agent talk to this host at all." If port-level control is needed later, the type can be extended with a breaking version bump.
+1. **One host on one port (`host:port`).** An approval covers exactly one host and one port: `api.example.com` means `api.example.com:443`, and plain HTTP must be requested explicitly as `api.example.com:80`. No other port can be approved, so an approval never opens SSH, SMTP or a database port on the same host. The tool-call pipeline qualifies the argument before policy evaluation (`qualifyPassthroughTarget`), so the human reviewing the escalation, the audit log and the approval whitelist all see the exact scope (`api.example.com:443`), and a whitelist entry for `:443` never admits a later `:80` request. The MITM proxy stores approvals as `host:port` keys (`passthroughHosts`), refuses a CONNECT, plain-HTTP or `ws://` request to any other port of an approved host, and `list_proxy_domains` reports approvals as `host:port`. (Earlier versions approved bare domains on every port.)
 
-2. **Passthrough mode for dynamically added domains.** Dynamically added domains are treated as "passthrough" hosts -- the MITM proxy terminates TLS (for auditability), but does NOT perform fake-key-to-real-key swapping or endpoint filtering. The agent's own credentials are forwarded unchanged. Requests to statically configured provider domains always go through the provider path (with endpoint filtering and the updated `validateAndSwapApiKey`); the passthrough path only applies to genuinely new domains that are not already in `providersByHost`.
+2. **Passthrough mode for dynamically added domains.** Approved targets are "passthrough": no fake-key-to-real-key swapping and no endpoint filtering; the agent's own credentials are forwarded unchanged. How the bytes travel depends on the port and the outbound transport:
+   - **`host:443`, direct mode:** a raw TCP tunnel, relayed only after the proxy has read the client's TLS ClientHello (`src/docker/tls-client-hello.ts`) and found the SNI equal to the approved host. Bytes that are not TLS, a missing SNI and any other SNI close the tunnel before a byte reaches the upstream, so one approval cannot reach other tenants of a shared CDN edge by naming them in the SNI (domain fronting). The ClientHello read is bounded (64 KiB, 64 handshake records, 10 s). Residuals the pin cannot see: the Host header inside the encrypted session (a CDN that still routes on a Host/SNI mismatch), and Encrypted ClientHello. With ECH the SNI is only the outer name, so a client that deliberately uses ECH with the approved host as its outer name can reach another tenant of an ECH-enabled edge. ECH hellos are relayed, not refused, because the GREASE ECH that Chromium (preinstalled in the agent image) sends on every connection is indistinguishable from real ECH on the wire; the proxy logs every pinned tunnel whose ClientHello offers ECH. Only the first ClientHello of a tunnel is inspected.
+   - **`host:80`, direct and nested mode:** the CONNECT tunnel is served by an in-process HTTP server rather than relayed raw. Every request is re-originated to the approved host through the destination-bound transport, which owns the Host header, so Host-header fronting is impossible; `ws://` upgrades are bridged the same way; bytes that are not HTTP get `400`. Absolute-form `GET http://host/...` proxy requests and `ws://` upgrades sent to the proxy directly take the same route.
+   - **`host:443`, nested (fixed-parent) mode:** TLS is terminated and each request re-originated through the fixed parent transport; the TLS SNI must equal the approved host.
 
-3. **Provider domains cannot be added as passthrough.** When `addHost()` is called with a domain that is already a static provider, it returns `false`. The tool response says `"Domain is already accessible (built-in provider)"` to make this clear to the agent. The existing provider path (with key swap and endpoint filtering) handles those domains; there is no bypass via dynamic addition.
+   Every tunnel is bounded per bundle like the rest of the proxy (`tls-terminating-api-proxy.md`, "Timeout Handling and Resource Bounds"): raw and SNI-pinned tunnels, port-80 tunnels and `ws://` bridges share one tunnel ceiling (64; a CONNECT or upgrade over it gets `503`); a raw tunnel or bridge closes after 10 minutes without a byte either way; a port-80 tunnel gets the request-head (60 s) and idle (15 min) deadlines of a decrypted connection, and each request in it counts against the bundle's request ceiling.
 
-4. **All domain additions require escalation.** Adding a domain is a security-sensitive operation that expands the container's network perimeter. The policy engine always escalates `add_proxy_domain` calls. The auto-approver can approve domain additions when the user's message clearly authorizes them.
+   Requests to statically configured provider domains always go through the provider path (with endpoint filtering and the provider credential gate, which refuses any credential other than the session sentinel; see "Provider credential gate" below); the passthrough path only applies to genuinely new domains.
 
-5. **Communication via HTTP control API on a separate socket.** The `mcp-proxy-server.ts` child process communicates domain changes to the parent's MITM proxy via HTTP requests to a separate control socket. Node.js IPC (`process.send`/`process.on('message')`) is not feasible because `mcp-proxy-server.ts` is spawned by UTCP's `CodeModeUtcpClient.registerManual()`, which uses `StdioClientTransport` internally -- we do not control the `spawn()` call and cannot add an IPC channel. The control socket is NOT mounted into the container, preventing direct access by the agent.
+3. **Provider and registry domains cannot be added as passthrough.** When `addHost()` is called with a domain that is already a static provider or a package registry (or one of its mirrors), it returns `false`. The tool response says the domain is already accessible. The provider path (key swap, endpoint filtering) and the registry path (package validation, audit) handle those domains; an approval cannot route around them.
+
+4. **All domain additions require a human.** Adding a domain is a security-sensitive operation that expands the container's network perimeter: an approved `host:port` becomes a passthrough tunnel with no credential swap or endpoint filtering (decision 2). The policy engine always escalates `add_proxy_domain` calls, and the hardcoded rule is marked `humanOnly` (`CompiledRule.humanOnly`, carried as `EvaluationResult.humanOnly`): the LLM auto-approver is never consulted for it, no `/approve+` whitelist pattern is offered or matched, and the escalation request is flagged so `/approve all` in the mux and the escalation listener leaves it pending for an explicit `/approve N`. The domain argument is parsed as a passthrough target (`validateProxyToolArguments` -> `parsePassthroughTarget`: the host as `validateDomain` checks it, and a port of 443 or 80) during argument validation, before policy evaluation, so neither the policy engine nor a reviewer sees a target the MITM proxy would reject (`invalid-arguments`); the accepted value is then qualified with its port (decision 1).
+
+5. **Communication via HTTP control API on a separate socket.** The `mcp-proxy-server.ts` child process communicates domain changes to the parent's MITM proxy via HTTP requests to a separate control socket. Node.js IPC (`process.send`/`process.on('message')`) is not feasible because `mcp-proxy-server.ts` is spawned by UTCP's `CodeModeUtcpClient.registerManual()`, which uses `StdioClientTransport` internally -- we do not control the `spawn()` call and cannot add an IPC channel. The control socket is NOT mounted into the container, preventing direct access by the agent. Every control request must also carry a per-bundle bearer token (`Authorization: Bearer <token>`) that the MITM proxy mints at startup (`MitmProxyAddress.controlToken`). The token reaches only the in-process control client and the virtual proxy-tool relay (`config.mitmControlToken`, `MITM_CONTROL_TOKEN`), never the container; without it the API answers `401`. In TCP mode the control port is a loopback listener that any local process, and through Docker Desktop's host gateway any container, could otherwise reach.
 
 6. **Dedicated proxy process via `SERVER_FILTER=proxy`.** The sandbox registers `proxy` as a virtual MCP server entry that spawns `mcp-proxy-server.ts` with `SERVER_FILTER=proxy`. When this filter is set and there is no matching entry in the MCP servers config, the proxy enters "virtual-only" mode: no backend MCP client, only the three proxy tools. This follows the existing one-process-per-server pattern and avoids injecting virtual tools into every proxy instance.
 
-7. **The `proxy` server name is reserved.** User-configured MCP servers cannot use the name `proxy`. This prevents collisions with the virtual proxy tools.
+7. **The `proxy` server name is reserved.** User-configured MCP servers cannot use the name `proxy`. This prevents collisions with the virtual proxy tools. (`network`, the policy namespace of MITM egress decisions, is reserved for the same reason; see decision 10.)
 
 8. **Wildcard subdomains are not supported in dynamic additions.** Dynamically added domains must be exact hostnames. This prevents an agent from requesting `*.com` and bypassing the allowlist.
 
-9. **Block `*.docker.internal` suffix.** Domain validation rejects any domain ending in `.docker.internal`, not just the exact hostname `host.docker.internal`. This prevents the agent from reaching Docker's internal DNS names (e.g., `gateway.docker.internal`, `host.docker.internal`).
+9. **Block `*.docker.internal` and every other local or metadata name.** Domain validation rejects any domain ending in `.docker.internal`, not just the exact hostname `host.docker.internal`, and every other local or metadata-scoped name (`*.localhost`, `*.local`, `*.internal`, `*.localdomain`, `*.home.arpa`, `metadata.google.internal`, ...) via `isLocalOrMetadataHostname`. This prevents the agent from reaching Docker's internal DNS names or host-local services through an approval, before a human is ever asked.
+
+10. **Policy-evaluated egress (opt-in) decides unknown destinations; approvals settle its escalations.** With `egressPolicy.enabled` in `~/.ironcurtain/config.json`, every destination that is neither a provider nor a registry is decided by the session's policy engine as a call to the virtual `network/request` tool: a CONNECT at host:port, every request the proxy can read at path granularity (see [`mitm-egress-policy.md`](mitm-egress-policy.md)). An approval (from `add_proxy_domain`, or a human approving an egress escalation, which lands in the same `passthroughHosts` set) then admits nothing on its own: it settles a later escalation for the same `host:port` without asking again (escalate-once), never a policy deny. `list_proxy_domains` and `remove_proxy_domain` see and revoke egress approvals like any other. The deprecated `IRONCURTAIN_MITM_ALLOW_ALL_HOSTS` escape hatch is ignored while the opt-in is on; without it the variable still works and every proxy start warns that it is deprecated.
 
 ## Tool Interface Definitions
 
@@ -36,13 +47,16 @@ The proxy tools run in a **dedicated `mcp-proxy-server.ts` instance** spawned wi
   description:
     'Request access to an additional internet domain through the network proxy. ' +
     'This will be reviewed by a human before being granted. ' +
+    'Access is granted to one host on one port: HTTPS (443) unless the domain names port 80 explicitly. ' +
     'Provide a clear justification for why the domain is needed.',
   inputSchema: {
     type: 'object',
     properties: {
       domain: {
         type: 'string',
-        description: 'The exact domain name to allow (e.g., "api.example.com"). No wildcards.',
+        description:
+          'The exact domain name to allow (e.g., "api.example.com"), optionally with a port ' +
+          '("api.example.com:80"). Only ports 443 (the default) and 80 can be requested. No wildcards.',
       },
       justification: {
         type: 'string',
@@ -56,7 +70,7 @@ The proxy tools run in a **dedicated `mcp-proxy-server.ts` instance** spawned wi
 }
 ```
 
-**Policy:** Always escalate. The auto-approver may approve if the user's message clearly authorizes the domain.
+**Policy:** Always escalate, human-only. The auto-approver is never consulted, the escalation cannot be whitelisted, and bulk approval skips it; only an explicit human approval of this escalation adds the domain. An invalid domain (IP literal, wildcard, `localhost`, `*.docker.internal`, malformed text) is denied as `invalid-arguments` before policy evaluation.
 
 ### `remove_proxy_domain`
 
@@ -65,13 +79,14 @@ The proxy tools run in a **dedicated `mcp-proxy-server.ts` instance** spawned wi
   name: 'remove_proxy_domain',
   description:
     'Remove a previously approved domain from the proxy allowlist. ' +
-    'Only dynamically added domains can be removed; built-in provider domains cannot.',
+    'Only dynamically added domains can be removed; built-in provider domains cannot. ' +
+    'Live tunnels to the removed host and port are closed.',
   inputSchema: {
     type: 'object',
     properties: {
       domain: {
         type: 'string',
-        description: 'The domain name to remove.',
+        description: 'The domain name to remove, with the same optional port it was approved with (default 443).',
       },
     },
     required: ['domain'],
@@ -241,7 +256,10 @@ After policy evaluation succeeds (the call is allowed/escalated-and-approved), c
 ```typescript
 // After policy evaluation, before forwarding to backend:
 if (toolInfo.serverName === 'proxy') {
-  // Virtual tool -- handle locally, no backend forwarding
+  // Virtual tool -- handle locally, no backend forwarding.
+  // Write-ahead audit record first: an unwritable audit log throws here
+  // and the tool never runs (the same contract as a backend dispatch).
+  logAudit({ status: 'dispatching' }, 0);
   const result = await handleVirtualProxyTool(toolInfo.name, argsForTransport, controlApiClient);
   logAudit({ status: 'success' }, Date.now() - startTime);
   return { content: [{ type: 'text', text: JSON.stringify(result) }] };
@@ -399,7 +417,18 @@ export interface IronCurtainConfig {
 
 ## MITM Proxy Changes
 
-### `validateAndSwapApiKey` Modification
+### Provider credential gate (supersedes the `validateAndSwapApiKey` modification below)
+
+The passthrough change recorded below let a non-sentinel key on a **provider** route reach the provider. That let a compromised agent send workspace contents to an allowlisted completion endpoint authenticated as an account it chose, whose owner could read stored requests back (for example OpenAI Responses `store`). It was reverted: `validateAndSwapApiKey` is replaced by `applyProviderCredential` in `src/docker/provider-credentials.ts`. On every provider-route request it:
+
+- strips every credential carrier: `authorization`, `x-api-key`, `x-goog-api-key`, `api-key`, `anthropic-api-key` and the provider's own key header, cookies, and the `key`, `api_key`, `api-key`, `apikey`, `access_token` and `oauth_token` query parameters (the carrier lists live in `src/docker/credential-carriers.ts`);
+- accepts the session sentinel in any of them and injects the real key in the provider's configured location only (nothing at all when the real key is empty, as for a keyless gateway);
+- answers any other credential with a local 401 (JSON body readable by the Anthropic and OpenAI SDKs) and sends nothing upstream;
+- forwards a request that presents no credential, without one, only to an endpoint in the provider's `unauthenticatedEndpoints` (for Claude Code: `/api/hello`, the MCP registry, telemetry batches and GrowthBook evaluation; for Claude Platform: `/v1/oauth/hello`; for ChatGPT: the agent-identity key sets). Anywhere else it is a local 401.
+
+The 401 retry is enabled only for a sentinel request, and a refreshed OAuth token is injected only into one. Dynamically added passthrough domains are unaffected: they still carry the agent's own headers.
+
+The original modification, kept for history:
 
 The current `validateAndSwapApiKey` returns `{ valid: false }` when a key is present but doesn't match the sentinel. This must change to allow non-sentinel keys (the agent's own credentials) to pass through:
 
@@ -456,6 +485,8 @@ The call site in the inner server's request handler no longer needs the `if (!ke
 // 401 retry only makes sense when we swapped our own managed credential
 const canRetryAuth = keyResult.swapped && !!provider.tokenManager;
 ```
+
+The same `swapped` test gates the proactive OAuth refresh: when `getValidAccessToken()` returns a rotated token, only a request that presented the sentinel gets the new real token injected. Gating that on `hadKey` (any key at all) used to hand the user's freshly refreshed token to the first request after a rotation, even one carrying a junk key.
 
 **Endpoint filtering for provider domains:** `isEndpointAllowed()` continues to apply for all requests routed through the provider path. Requests to provider domains always take the provider path (whether the key is sentinel or the agent's own). The passthrough path (no endpoint filtering) is only for genuinely new domains that are not in `providersByHost`.
 
@@ -597,8 +628,8 @@ const controller: DynamicHostController = {
     if (providersByHost.has(domain)) return false;
     if (passthroughHosts.has(domain)) return false;
     passthroughHosts.add(domain);
-    // Pre-warm cert cache for the new domain
-    getOrCreateSecureContext(domain);
+    // No leaf is minted here: a direct proxy tunnels passthrough hosts raw,
+    // and a nested one mints on the first CONNECT to the host.
     return true;
   },
 
@@ -681,11 +712,13 @@ const controlServer = http.createServer((req, res) => {
 });
 ```
 
-The control server starts/stops alongside the MITM proxy. Its address is passed to the `proxy` server entry (only) via the `MITM_CONTROL_ADDR` env var:
+The control server starts/stops alongside the MITM proxy. Its address is passed to the `proxy` server entry (only) via the `MITM_CONTROL_ADDR` env var, together with the per-bundle bearer token in `MITM_CONTROL_TOKEN`:
 - UDS mode: `unix:///path/to/mitm-control.sock`
 - TCP mode: `http://127.0.0.1:PORT`
 
-**Security:** The control socket path is in `sessionDir` (not `sessionDir/sockets/`). Only the `sockets/` subdirectory is mounted into the container, so the control API is inaccessible from inside the container. In TCP mode, the socat sidecar only forwards specific ports (MCP proxy and MITM proxy), not the control port.
+The sketch above predates two additions in `createMitmProxy()`: every request is first checked for `Authorization: Bearer <token>` (constant-time comparison; `401` otherwise), and the add/remove bodies carry an optional integer `port` (default 443; `addHost` refuses anything but 443 and 80). Revoking an approval also destroys every live tunnel, WebSocket bridge, port-80 HTTP tunnel and TLS-terminated (nested) passthrough connection opened under it; a nested keep-alive connection also re-checks its approval on every request.
+
+**Security:** The control socket path is in `sessionDir` (not `sessionDir/sockets/`). Only the `sockets/` subdirectory is mounted into the container, so the control API is inaccessible from inside the container. In TCP mode, the socat sidecar only forwards specific ports (MCP proxy and MITM proxy), not the control port, and the control port binds `127.0.0.1`. Because a loopback port is still reachable by every local process (and, through Docker Desktop's host gateway, by other containers), the bearer token is what actually authorizes a change.
 
 ## Policy Rules
 
@@ -939,15 +972,16 @@ src/config/
 ## Edge Cases and Security Considerations
 
 ### 1. Domain validation (in `addHost()`)
-- Reject wildcards (`*`), IP addresses, localhost, and all `*.docker.internal` hostnames
+- Reject wildcards (`*`), IP addresses, localhost, all `*.docker.internal` hostnames and every other local or metadata-scoped name
+- Reject every port except 443 (the default) and 80
 - Maximum domain length: 253 characters (DNS limit)
 - Reject empty labels, leading/trailing hyphens
 - Validation happens in `addHost()` itself, not just in the MCP tool handler
 
-### 2. Provider domains are not passthrough
-- Provider domains CANNOT be added via `add_proxy_domain` as passthrough. If the domain is already a static provider, `addHost()` returns false. The tool response says "Domain is already accessible (built-in provider)".
+### 2. Provider and registry domains are not passthrough
+- Provider and package-registry domains (mirrors included) CANNOT be added via `add_proxy_domain` as passthrough. If the domain is already a static provider or registry, `addHost()` returns false and the tool response says the domain is already accessible. An approved registry host would otherwise route its plain-HTTP traffic around package validation.
 - The existing provider path (with key swap and endpoint filtering) handles those domains exclusively.
-- `validateAndSwapApiKey` now handles three cases: sentinel key (swap), non-sentinel key (pass through), no key (pass through). But endpoint filtering always applies on the provider path.
+- The provider credential gate (`applyProviderCredential` in `src/docker/provider-credentials.ts`, which replaced `validateAndSwapApiKey`) swaps the sentinel for the real key and answers any other credential with a local 401; a request without a credential is forwarded, without one, only to the provider's `unauthenticatedEndpoints` (see "Provider credential gate" above). Endpoint filtering always applies on the provider path.
 
 ### 3. Race conditions
 - The control API is synchronous (add/remove from a Set). No race conditions.
@@ -960,25 +994,36 @@ src/config/
 ### 5. Audit logging
 - All domain changes flow through `mcp-proxy-server.ts`'s standard policy engine and audit log.
 - The justification text from `add_proxy_domain` is captured in the audit entry's tool arguments.
+- Like a backend dispatch, a virtual tool call is preceded by a write-ahead audit record (`result.status: 'dispatching'`) and followed by its outcome record; if the audit log cannot be written, the tool is not run and the coordinator stops admitting tool calls (see `AuditLog` in `src/trusted-process/audit-log.ts`).
 
 ### 6. Auto-approver interaction
-- The auto-approver can approve domain additions when the user's message clearly authorizes them (e.g., "deploy to api.example.com"). This is the desired behavior.
+- The auto-approver never approves domain additions, even when the user's message names the domain (e.g., "deploy to api.example.com"). Opening an uninspected tunnel is the one decision that is never delegated: the hardcoded rule is `humanOnly`, the pipeline skips the auto-approver and the whitelist for it, and the escalation request carries `humanOnly: true` so bulk approval leaves it for an explicit `/approve N`.
 
 ### 7. SSRF via passthrough
-- IP addresses are rejected at the domain validation layer, preventing direct SSRF to internal services.
-- All `*.docker.internal` hostnames are blocked, preventing access to Docker's internal networking.
-- Dynamically added domains go through TLS termination. The human approved the domain; the agent can make any HTTPS request to it.
+- IP addresses are rejected at the domain validation layer in every spelling the resolver or the URL parser reads as an address (`127.1`, `0x7f.1`, `8.8.2056`, not only the dotted quad), so a human is never asked to approve an address dressed up as a domain.
+- All `*.docker.internal` hostnames, and every other local or metadata name, are blocked, preventing access to Docker's internal networking.
+- The CONNECT authority is parsed strictly before anything is acknowledged (`src/docker/proxy-authority.ts`): a canonical host (lowercase, no trailing dot, IDNA ASCII; delimiters, percent escapes and whitespace refused rather than folded), a decimal port 1-65535, IPv6 only in brackets. Anything else gets `400` and the socket is dropped. The former `lastIndexOf(':')` + `parseInt` split let `host:99999` throw `ERR_SOCKET_BAD_PORT` out of the server's `connect` listener and end the whole process.
+- The same canonical spelling keys the provider, registry and passthrough lookups on the CONNECT, plain-HTTP and upgrade paths, so `api.anthropic.com.` (trailing dot) takes the provider path instead of an "unknown host" tunnel.
+- A raw tunnel resolves names through the guarded resolver, which refuses private, loopback, link-local and metadata answers. IP literals never reach a resolver, so under the deprecated `IRONCURTAIN_MITM_ALLOW_ALL_HOSTS` they are screened at the CONNECT boundary (`screenIpLiteral`) and every non-public literal (`127.0.0.1`, `[::1]`, `169.254.169.254`, `10.0.0.1`, `127.1`, ...) is refused with `403`, and the tunnel's dial screens any literal again. Local and metadata names are refused there too. A "name" is never allowed to canonicalize into a literal: `canonicalizeHostname` drops the trailing dot only after the URL host parser ran (which drops one itself when it reads IPv4), because stripping one beforehand turned `127.0.0.1..`, a name to every classifier, into `127.0.0.1` and reached host loopback through the wildcard tunnel.
+- See decision 2 for the SNI pin on 443 and the Host pin on 80, which keep an approval from reaching other tenants of a shared CDN edge.
 
 ### 8. HTTP (non-TLS) to passthrough domains
-- The MITM proxy only handles CONNECT (TLS). Plain HTTP requests are rejected with 405. The initial implementation only supports HTTPS passthrough.
+- Plain HTTP needs its own approval (`host:80`). Absolute-form proxy requests, `ws://` upgrades and CONNECT tunnels to port 80 are all forwarded through the destination-bound transport with the Host header pinned to the approved host.
 
 ### 9. Control API isolation
 - UDS mode: control socket is in `sessionDir` (not `sessionDir/sockets/`). Only `sockets/` is mounted into the container.
-- TCP mode: the socat sidecar only forwards the MCP proxy and MITM proxy ports, not the control port.
+- TCP mode: the socat sidecar only forwards the MCP proxy and MITM proxy ports, not the control port, which binds `127.0.0.1`.
+- Both modes: every request needs the per-bundle bearer token (decision 5).
 
 ### 10. Virtual-only mode safety
 - When `SERVER_FILTER=proxy` and no backend exists, the `clientStates` map is empty. The virtual tool handler intercepts calls before the forwarding path, so the "no client connection" error is never reached for proxy tools.
 - If somehow a non-proxy tool name arrives at the proxy instance (should be impossible given UTCP routing), it fails with "Unknown tool" because it is not in the `toolMap`.
+
+### 11. Listener exposure in TCP mode (macOS Docker Desktop)
+- The MITM proxy binds `127.0.0.1` in the `tcp-sidecar` topology (`MitmProxyOptions.listenHost`, default loopback), like the Code Mode proxy: Docker Desktop delivers `host.docker.internal` traffic to the host as loopback. It used to bind `0.0.0.0` with no source guard, which made it an open proxy for every LAN peer. A loopback-only connection-source guard stays on as defense in depth, and only the retained `tcp-hostonly` topology binds `0.0.0.0`, always with its subnet guard (`createMitmProxy` refuses a non-loopback bind without one). The nested registry and package egress listeners bind loopback as well.
+
+### 12. Containment of per-connection failures
+- Every per-connection listener body (outer `request`/`connect`/`upgrade`, inner `request`/`upgrade`, the port-80 tunnel server and the control API) runs inside a guard that logs and drops only the offending connection: a synchronous throw inside an `http.Server` event handler would otherwise be an uncaught exception and, in daemon mode, end every session at once. The TLS-terminated passthrough forwarder answers a synchronous transport rejection with `502`.
 
 ## Testing Strategy
 

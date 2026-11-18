@@ -1,177 +1,138 @@
 /**
- * Host-side advisory lock for the shared, content-keyed workflow dependency
- * cache.
+ * Host-side lock that serializes provisioning of a shared, content-keyed cache:
+ * the workflow dependency base (`workflow-dependency-cache.ts`) and the Apple
+ * selected-agent artifact cache (`selected-agent-artifact.ts`).
  *
- * The cache directory is keyed solely by `computeWorkflowDependencyHash` and
- * is shared across concurrent workflow runs. Without serialization, two
- * concurrent runs with identical dependencies both observe the absent
- * provisioned-sentinel and race on `rm -rf` + venv/`node_modules` creation,
- * corrupting the cache for both.
+ * Concurrent runs that need the same cache would otherwise both find it
+ * unprovisioned and race on wiping and repopulating it. In-container `flock` on a
+ * bind mount does NOT serialize across containers on Docker Desktop / macOS
+ * (VirtioFS does not propagate file locks), but every provisioner is a host
+ * process, so the lock lives on the host.
  *
- * In-container `flock` on the bind-mounted cache dir does NOT serialize across
- * containers on Docker Desktop / macOS (VirtioFS does not propagate file locks
- * across the host bind mount — verified empirically). Concurrent runs do,
- * however, share the same host process tree, so a HOST-side lock on the cache
- * directory serializes them regardless of container/VirtioFS semantics.
+ * Ownership and takeover use the Docker-workload process lock
+ * (`../docker-workload/process-lock.ts`):
  *
- * Uses `mkdir` (atomic on POSIX) to create a sibling lock directory containing
- * a metadata file with the owning PID and timestamp, enabling stale-lock
- * detection when a holder crashes without releasing. Self-contained (no
- * dependency on other domain modules) so the `docker/` layer stays decoupled.
+ * - The complete owner record (PID, OS process-start identity, random token) is
+ *   written first and published with an atomic hard link, so a contender never
+ *   sees a half-written owner.
+ * - A contender reclaims a lock only when the owner PID is gone or now belongs to
+ *   a different process (PID reuse). It captures the exact inode it judged stale
+ *   with a rename and restores a racer's freshly published lock instead of
+ *   deleting it, so two contenders that both judge one lock stale still leave
+ *   exactly one holder.
+ * - Release unlinks only the inode this holder published.
+ * - A live holder is never stolen from, however long it holds the lock. Waiters
+ *   poll and give up after `maxWaitMs` instead.
+ *
+ * This replaces an earlier `mkdir` + `meta.json` lock whose check-then-delete
+ * takeover could delete a lock another waiter had just acquired (two holders),
+ * and whose release removed the lock unconditionally. The lock file uses a new
+ * name (`<cacheDir>.provision-lock`) so a directory left behind by a crashed
+ * holder of the old lock (`<cacheDir>.lock/`) can never block it.
  */
 
-import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import {
+  acquireProcessLock,
+  ProcessLockBusyError,
+  type ProcessIdentityResolver,
+  type ProcessLockHandle,
+} from '../docker-workload/process-lock.js';
+import { errorMessage } from '../utils/error-message.js';
+import * as logger from '../logger.js';
 
 /** Polling interval while waiting for a contended lock. */
-const RETRY_INTERVAL_MS = 200;
+const DEFAULT_RETRY_INTERVAL_MS = 200;
 
-/**
- * Grace window for a lock directory that exists but has no readable `meta.json`
- * yet: the holder created the dir (atomic `mkdir`) and is about to write its
- * metadata. Within this window the lock is treated as freshly held and is never
- * stolen; past it, a meta-less dir is an orphaned mid-acquisition (the holder
- * crashed between `mkdir` and the metadata write) and is reclaimable.
- */
-const ACQUIRE_GRACE_MS = 5_000;
+/** Default wait budget; must exceed the worst-case provisioning time. */
+const DEFAULT_MAX_WAIT_MS = 25 * 60_000;
 
-interface LockMetadata {
-  readonly pid: number;
-  readonly timestamp: number;
-}
+const LOCK_SUFFIX = '.provision-lock';
 
-/** Returns true if a process with the given PID is alive (signal 0 probe). */
-function isPidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err: unknown) {
-    // ESRCH → no such process (dead). EPERM → process exists but is owned by
-    // another user (still alive). Any other unexpected error → treat as alive
-    // so a transient probe failure never lets a waiter steal a live holder.
-    return (err as NodeJS.ErrnoException).code !== 'ESRCH';
-  }
-}
-
-/** Best-effort recursive removal of a lock directory. */
-function forceRelease(lockDir: string): void {
-  try {
-    rmSync(lockDir, { recursive: true, force: true });
-  } catch {
-    /* best effort */
-  }
-}
-
-/**
- * Returns true when an existing lock is stale and may be reclaimed: the owning
- * process is dead, or the lock has been held past `staleMs`. When `meta.json`
- * is not yet readable, the lock is reclaimed only if its directory is older than
- * `ACQUIRE_GRACE_MS` — otherwise the holder is mid-acquisition (it created the
- * dir but has not written metadata yet) and must not be stolen.
- */
-function isLockStale(lockDir: string, staleMs: number): boolean {
-  let meta: LockMetadata;
-  try {
-    meta = JSON.parse(readFileSync(resolve(lockDir, 'meta.json'), 'utf-8')) as LockMetadata;
-  } catch {
-    // meta.json missing or unparseable. Do NOT treat that as stale outright, or
-    // a waiter could steal a lock during the holder's mkdir→write window. Fall
-    // back to the lock dir's own age: reclaim only an orphaned dir whose holder
-    // crashed before writing metadata.
-    try {
-      return Date.now() - statSync(lockDir).mtimeMs > ACQUIRE_GRACE_MS;
-    } catch {
-      // Lock dir vanished entirely → not held.
-      return true;
-    }
-  }
-  if (!isPidAlive(meta.pid)) return true;
-  return Date.now() - meta.timestamp > staleMs;
-}
-
-/**
- * Single non-blocking attempt to acquire the lock. Atomic `mkdir` is the
- * authoritative acquisition; stale detection only runs after EEXIST. The window
- * between a holder's `mkdir` and its `meta.json` write is covered by
- * `isLockStale`'s grace fallback, so a just-acquired lock is never stolen.
- */
-function tryAcquire(lockDir: string, staleMs: number): boolean {
-  try {
-    mkdirSync(lockDir);
-  } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-    if (!isLockStale(lockDir, staleMs)) return false;
-    forceRelease(lockDir);
-    try {
-      mkdirSync(lockDir);
-    } catch (retryErr: unknown) {
-      if ((retryErr as NodeJS.ErrnoException).code === 'EEXIST') return false;
-      throw retryErr;
-    }
-  }
-
-  const meta: LockMetadata = { pid: process.pid, timestamp: Date.now() };
-  try {
-    writeFileSync(resolve(lockDir, 'meta.json'), JSON.stringify(meta));
-  } catch {
-    forceRelease(lockDir);
-    return false;
-  }
-  return true;
-}
-
-/** Options for {@link withProvisionLock}. */
+/** Options for {@link withProvisionLock} and {@link tryAcquireProvisionLock}. */
 export interface ProvisionLockOptions {
   /**
-   * Max time to wait to acquire a contended lock before giving up. Must exceed
-   * the worst-case provisioning time so a waiter does not abandon while the
-   * holder is mid-install. Defaults to 25 minutes.
+   * Max time to wait for a contended lock before giving up. Must exceed the
+   * worst-case provisioning time so a waiter does not abandon while the holder
+   * is mid-install. Defaults to 25 minutes.
    */
   readonly maxWaitMs?: number;
+  /** Polling interval while the lock is held by a live owner. Defaults to 200 ms. */
+  readonly retryIntervalMs?: number;
   /**
-   * Time after which an unreleased lock is considered stale (crashed holder).
-   * Must also exceed the worst-case provisioning time so a slow-but-alive
-   * holder is never stolen from. Defaults to 25 minutes; PID-liveness reclaims
-   * crashed holders well before this.
+   * Test seam: resolves a PID to its OS process-start identity, or `undefined`
+   * when the process is gone. Production uses the host process table.
    */
-  readonly staleMs?: number;
+  readonly processIdentityForPid?: ProcessIdentityResolver;
 }
 
-const DEFAULT_TIMEOUT_MS = 25 * 60_000;
+/** The lock file guarding `cacheDir`: a sibling, never inside the cache itself. */
+export function provisionLockPath(cacheDir: string): string {
+  return `${cacheDir}${LOCK_SUFFIX}`;
+}
 
 /**
- * Runs `fn` while holding a host-side advisory lock at `{cacheDir}.lock/`.
+ * One non-blocking acquisition attempt. Returns the held lock, or `undefined`
+ * when a live process (possibly this one) holds it. A stale lock (dead owner or
+ * reused PID) is reclaimed as part of the attempt. Any other failure, such as an
+ * unwritable parent directory or an unknown own process identity, throws.
+ */
+export function tryAcquireProvisionLock(
+  cacheDir: string,
+  options: Pick<ProvisionLockOptions, 'processIdentityForPid'> = {},
+): ProcessLockHandle | undefined {
+  try {
+    return acquireProcessLock(
+      provisionLockPath(cacheDir),
+      options.processIdentityForPid === undefined ? {} : { processIdentityForPid: options.processIdentityForPid },
+    );
+  } catch (error) {
+    if (error instanceof ProcessLockBusyError) return undefined;
+    throw error;
+  }
+}
+
+/**
+ * Runs `fn` while holding the host-side provisioning lock for `cacheDir`.
  *
  * Serializes concurrent provisioning of the same content-keyed cache so the
- * second run blocks until the first finishes, then observes the populated
- * cache (sentinel present) and short-circuits. Releases the lock in a finally
- * block. Throws if the lock cannot be acquired within `maxWaitMs`.
+ * second run blocks until the first finishes and then observes the populated
+ * cache. Throws if the lock cannot be acquired within `maxWaitMs`.
+ *
+ * Release verifies ownership. If the published lock is no longer the inode this
+ * call installed, the critical section may not have been exclusive, so a
+ * successful `fn` is turned into an error rather than reported as done. When
+ * `fn` itself throws, its error wins and the release failure is only logged.
  */
 export async function withProvisionLock<T>(
   cacheDir: string,
   fn: () => Promise<T>,
   options: ProvisionLockOptions = {},
 ): Promise<T> {
-  const maxWaitMs = options.maxWaitMs ?? DEFAULT_TIMEOUT_MS;
-  const staleMs = options.staleMs ?? DEFAULT_TIMEOUT_MS;
-  const lockDir = `${cacheDir}.lock`;
+  const maxWaitMs = options.maxWaitMs ?? DEFAULT_MAX_WAIT_MS;
+  const retryIntervalMs = options.retryIntervalMs ?? DEFAULT_RETRY_INTERVAL_MS;
+  const lockPath = provisionLockPath(cacheDir);
   const deadline = Date.now() + maxWaitMs;
 
-  let acquired = false;
-  while (Date.now() < deadline) {
-    if (tryAcquire(lockDir, staleMs)) {
-      acquired = true;
-      break;
+  let handle = tryAcquireProvisionLock(cacheDir, options);
+  while (handle === undefined) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Failed to acquire provisioning lock: ${lockPath} (timed out after ${maxWaitMs}ms)`);
     }
-    await new Promise((resolveTimer) => setTimeout(resolveTimer, RETRY_INTERVAL_MS));
-  }
-  if (!acquired) {
-    throw new Error(`Failed to acquire workflow provisioning lock: ${lockDir} (timed out after ${maxWaitMs}ms)`);
+    await new Promise((resolveTimer) => setTimeout(resolveTimer, retryIntervalMs));
+    handle = tryAcquireProvisionLock(cacheDir, options);
   }
 
+  let result: T;
   try {
-    return await fn();
-  } finally {
-    forceRelease(lockDir);
+    result = await fn();
+  } catch (error) {
+    try {
+      handle.release();
+    } catch (releaseError) {
+      logger.warn(`withProvisionLock: releasing ${lockPath} failed: ${errorMessage(releaseError)}`);
+    }
+    throw error;
   }
+  handle.release();
+  return result;
 }

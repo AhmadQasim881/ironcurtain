@@ -1,0 +1,68 @@
+--- a/src/main.go
++++ b/src/main.go
+@@ -1,6 +1,9 @@
+ package main
+ 
+ import (
++	"crypto/tls"
++	"net"
++	"time"
+ 	"encoding/json"
+ 	"flag"
+ 	"io/ioutil"
+@@ -70,6 +73,11 @@
+ 	avatarTmpDir := flag.String("avatar-tmp-dir", "/tmp/", "Avatar tmp directory")
+ 	flag.Parse()
+ 
++	credentials, credentialsError := loadIronCurtainSignalCredentials()
++	if credentialsError != nil {
++		log.Fatal(credentialsError.Error())
++	}
++
+ 	logLevel := utils.GetEnv("LOG_LEVEL", "")
+ 	if logLevel != "" {
+ 		err := utils.SetLogLevel(logLevel)
+@@ -87,6 +95,16 @@
+ 	docs.SwaggerInfo.Version = utils.GetEnv("BUILD_VERSION", "1.0")
+ 
+ 	router := gin.New()
++	// Gin redirects can run before the middleware chain. Refuse aliases instead.
++	router.RedirectTrailingSlash = false
++	router.RedirectFixedPath = false
++	router.Use(func(context *gin.Context) {
++		if !authorizeIronCurtainSignalRequest(context.Writer, context.Request, credentials) {
++			context.Abort()
++			return
++		}
++		context.Next()
++	})
+ 	router.Use(gin.LoggerWithConfig(gin.LoggerConfig{
+ 		SkipPaths: []string{"/v1/health"}, //do not log the health requests (to avoid spamming the log file)
+ 	}))
+@@ -479,5 +497,14 @@
+ 		c.Start()
+ 	}
+ 
+-	router.Run()
++	server := &http.Server{
++		Addr: net.JoinHostPort("", port),
++		Handler: router,
++		ReadHeaderTimeout: 5 * time.Second,
++		DisableGeneralOptionsHandler: true,
++		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{credentials.certificate}},
++	}
++	if serveError := server.ListenAndServeTLS("", ""); serveError != nil && serveError != http.ErrServerClosed {
++		log.Fatal("Signal bridge TLS listener failed: ", serveError)
++	}
+ }
+--- a/src/api/api.go
++++ b/src/api/api.go
+@@ -702,7 +702,7 @@
+ 	}
+ 
+ 	if a.signalClient.GetSignalCliMode() == client.JsonRpc {
+-		ws, err := connectionUpgrader.Upgrade(c.Writer, c.Request, nil)
++		ws, err := connectionUpgrader.Upgrade(c.Writer, c.Request, http.Header{"X-IronCurtain-Signal-Auth": []string{"1"}})
+ 		if err != nil {
+ 			c.JSON(400, Error{Msg: err.Error()})
+ 			return

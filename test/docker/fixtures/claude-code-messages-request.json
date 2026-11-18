@@ -1,0 +1,190 @@
+{
+  "model": "claude-sonnet-4-5-20250929",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# claudeMd\nCodebase and user instructions are shown below.\n</system-reminder>\n"
+        },
+        {
+          "type": "text",
+          "text": "List the files in /workspace, look at the screenshot and summarize report.pdf.",
+          "cache_control": { "type": "ephemeral" }
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": "The user wants a listing first, then the screenshot and the PDF.",
+          "signature": "ErUBCkYIBxgCKkCvZ2V0LXNpZ25hdHVyZS1maXh0dXJlLW5vdC1hLXJlYWwtc2lnbmF0dXJl"
+        },
+        { "type": "text", "text": "I'll list the workspace first." },
+        {
+          "type": "tool_use",
+          "id": "toolu_01AbCdEfGhIjKlMnOpQrStUv",
+          "name": "Bash",
+          "input": { "command": "ls /workspace", "description": "List workspace files" }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_01AbCdEfGhIjKlMnOpQrStUv",
+          "content": "README.md\nreport.pdf\nscreenshot.png",
+          "is_error": false
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_01BcDeFgHiJkLmNoPqRsTuVw",
+          "name": "Read",
+          "input": { "file_path": "/workspace/screenshot.png" }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_01BcDeFgHiJkLmNoPqRsTuVw",
+          "content": [
+            {
+              "type": "image",
+              "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_01CdEfGhIjKlMnOpQrStUvWx",
+          "name": "ToolSearch",
+          "input": { "query": "select:mcp__ironcurtain__execute_code" }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_01CdEfGhIjKlMnOpQrStUvWx",
+          "content": [{ "type": "tool_reference", "tool_name": "mcp__ironcurtain__execute_code" }]
+        },
+        {
+          "type": "document",
+          "source": {
+            "type": "base64",
+            "media_type": "application/pdf",
+            "data": "JVBERi0xLjQKJcfsj6IKMSAwIG9iago8PD4+CmVuZG9iagp0cmFpbGVyCjw8Pj4KJSVFT0YK"
+          },
+          "title": "report.pdf"
+        },
+        { "type": "text", "text": "Now summarize report.pdf.", "cache_control": { "type": "ephemeral" } }
+      ]
+    }
+  ],
+  "temperature": 1,
+  "system": [
+    {
+      "type": "text",
+      "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      "cache_control": { "type": "ephemeral" }
+    },
+    {
+      "type": "text",
+      "text": "\nYou are an interactive CLI tool that helps users with software engineering tasks.\n",
+      "cache_control": { "type": "ephemeral" }
+    }
+  ],
+  "tools": [
+    {
+      "name": "Bash",
+      "description": "Executes a given bash command in a persistent shell session.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "command": { "type": "string", "description": "The command to execute" },
+          "timeout": { "type": "number", "description": "Optional timeout in milliseconds (max 600000)" },
+          "description": { "type": "string", "description": "Clear, concise description of what this command does" }
+        },
+        "required": ["command"],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      }
+    },
+    {
+      "name": "Read",
+      "description": "Reads a file from the local filesystem.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "file_path": { "type": "string", "description": "The absolute path to the file to read" } },
+        "required": ["file_path"],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      }
+    },
+    {
+      "name": "WebFetch",
+      "description": "Fetches content from a specified URL and processes it using an AI model.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "url": { "type": "string", "format": "uri", "description": "The URL to fetch content from" },
+          "prompt": { "type": "string", "description": "The prompt to run on the fetched content" }
+        },
+        "required": ["url", "prompt"],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      }
+    },
+    {
+      "name": "ToolSearch",
+      "description": "Search for deferred tools and load their schemas.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "query": { "type": "string" } },
+        "required": ["query"],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      }
+    },
+    {
+      "name": "mcp__ironcurtain__execute_code",
+      "description": "Execute TypeScript in the IronCurtain sandbox.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "code": { "type": "string" } },
+        "required": ["code"],
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "defer_loading": true
+    }
+  ],
+  "metadata": { "user_id": "user_0123456789abcdef_account__session_fedcba98-7654-3210-0123-456789abcdef" },
+  "max_tokens": 32000,
+  "thinking": { "budget_tokens": 31999, "type": "enabled" },
+  "context_management": { "edits": [{ "type": "clear_thinking_20251015", "keep": "all" }] },
+  "stream": true
+}

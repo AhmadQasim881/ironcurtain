@@ -1,5 +1,11 @@
 import { asArray, asFiniteCost, asIdentifier, asProviderIdentifier, asRecord } from '../normalization.js';
-import type { GatewayObservation, GatewayResponseHeaders, LlmGatewayAccumulator, LlmGatewayAdapter } from '../types.js';
+import type {
+  GatewayObservation,
+  GatewayResponseHeaders,
+  LlmGatewayAccumulator,
+  LlmGatewayAdapter,
+  LlmProtocolAccumulatorOptions,
+} from '../types.js';
 import { emptyGatewayObservation, parseGatewayRouteAttempts, readHeader } from './common.js';
 
 const MAX_ROUTE_ATTEMPTS = 64;
@@ -86,6 +92,16 @@ class OpenRouterGatewayAccumulator implements LlmGatewayAccumulator {
 
 export class OpenRouterGatewayAdapter implements LlmGatewayAdapter {
   readonly id = 'openrouter';
+  /**
+   * OpenRouter's Anthropic-compatible Messages skin omits or nulls cache
+   * counters it has no value for (`cache_creation_input_tokens` absent or
+   * null, `cache_read_input_tokens` only in `message_delta`). Counters still
+   * absent from the final usage report are zero under its contract; a stream
+   * cut before that report leaves them unknown.
+   */
+  readonly protocolAccumulatorOptions: LlmProtocolAccumulatorOptions = Object.freeze({
+    absentCacheCountsAreZero: true,
+  });
 
   createAccumulator(): LlmGatewayAccumulator {
     return new OpenRouterGatewayAccumulator();

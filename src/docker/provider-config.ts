@@ -1,13 +1,22 @@
 /**
  * LLM API provider configuration for the MITM proxy.
  *
- * Each provider defines its host, allowed endpoints, key injection method,
- * and fake key prefix. The proxy uses these to filter requests and swap
- * sentinel keys for real ones.
+ * Each provider defines its host, allowed endpoints (and the few of them a
+ * client calls without a credential), key injection method, fake key prefix
+ * and the request sanitizers bound to its completion endpoints. The proxy uses
+ * these to filter requests, strip provider-hosted tools and swap sentinel keys
+ * for real ones (`provider-credentials.ts`).
  */
 
 import { isPlainObject } from '../utils/is-plain-object.js';
+import type { ProviderKeyHeaderName } from './credential-carriers.js';
 import { matchesEndpointPattern, resolveCompletionEndpoint } from './llm-observation/completion-endpoint.js';
+import {
+  openaiPlatformSanitizer,
+  sanitizedEndpointsFor,
+  type RequestSanitizer,
+  type SanitizedEndpoint,
+} from './request-sanitizers/index.js';
 
 /**
  * Discriminator for the execution mode invoking the proxy. Set at proxy
@@ -108,6 +117,17 @@ export interface ProviderConfig {
   readonly allowedEndpoints: readonly EndpointPattern[];
 
   /**
+   * Allowed endpoints a client calls without any credential (connectivity
+   * checks, public catalogs and key sets). A request that presents no
+   * credential is forwarded, with none, only to these; anywhere else it gets a
+   * local 401. Each entry must also appear in `allowedEndpoints` (checked when
+   * the proxy starts): this list never grants network access. A request that
+   * presents the session sentinel here still gets the real key, and any other
+   * credential still gets a 401 (see `provider-credentials.ts`).
+   */
+  readonly unauthenticatedEndpoints?: readonly EndpointPattern[];
+
+  /**
    * Endpoints whose exchanges are training-relevant and may be recorded by
    * the trajectory-capture pipeline. Same matcher shape as
    * `allowedEndpoints` (method + path glob, query string stripped before
@@ -130,8 +150,9 @@ export interface ProviderConfig {
   readonly gatewayAdapterId?: string;
 
   /**
-   * How the API key is transmitted in requests.
-   * Determines where the proxy looks for the fake key and injects the real one.
+   * How the API key is transmitted in requests: where the proxy injects the
+   * real key once the session sentinel was presented. The sentinel itself is
+   * accepted in any credential carrier and moved here.
    */
   readonly keyInjection: KeyInjection;
 
@@ -142,8 +163,10 @@ export interface ProviderConfig {
   readonly fakeKeyPrefix: string;
 
   /**
-   * Optional function to inspect and modify request bodies before forwarding.
-   * Only called for endpoints listed in rewriteEndpoints.
+   * Optional compatibility rewriter (model mapping, schedule-tool strips,
+   * gateway fields). Only called for endpoints listed in rewriteEndpoints.
+   * It is not a security control: hosted-tool removal is the job of
+   * `sanitizedEndpoints`, which runs after it.
    */
   readonly requestRewriter?: RequestBodyRewriter;
 
@@ -154,12 +177,46 @@ export interface ProviderConfig {
   readonly rewriteEndpoints?: readonly string[];
 
   /**
+   * Endpoints whose request bodies pass through a protocol sanitizer that
+   * removes provider-hosted tools, connectors and URL-sourced content (see
+   * `./request-sanitizers/index.ts`). The proxy buffers, sanitizes and
+   * re-serializes every such request that passes its credential gate
+   * (decoding a compressed body first), and answers a body it cannot sanitize
+   * with a local 400, 413 or 415 instead of forwarding it.
+   * Built-in providers declare a binding for every completion endpoint, plus
+   * same-format siblings such as count_tokens; `sanitizedEndpointsFor` keeps a
+   * declaration inert (`[]`) until its protocol registers a sanitizer.
+   */
+  readonly sanitizedEndpoints?: readonly SanitizedEndpoint[];
+
+  /**
    * Optional upstream target override. When set, the MITM proxy routes
    * requests to this target instead of the provider's canonical host.
    * Populated from environment variables (e.g., ANTHROPIC_BASE_URL).
    */
   readonly upstreamTarget?: UpstreamTarget;
+
+  /**
+   * Largest request body the proxy buffers on this provider's sanitized,
+   * rewritten or 401-retry routes, checked on the raw bytes and again once a
+   * compressed body is decoded; a larger body gets a 413. The same ceiling
+   * bounds the trajectory-capture tee of a streamed request. Set it to the
+   * provider's documented request limit; it defaults to
+   * `DEFAULT_MAX_REQUEST_BODY_BYTES` (32 MiB, Anthropic's limit; see
+   * `mitm-resource-limits.ts`). Agents resend the whole conversation every
+   * turn, so a session with inline images or PDFs grows toward this limit.
+   * Streamed routes are not buffered and are not limited by it.
+   */
+  readonly maxRequestBodyBytes?: number;
 }
+
+/**
+ * OpenAI's documented ceiling on one request's payload (50 MB, the image-input
+ * limit of the Responses and Chat Completions APIs). The Codex backend on
+ * chatgpt.com takes the same Responses wire format and is given the same
+ * ceiling.
+ */
+const OPENAI_MAX_REQUEST_BODY_BYTES = 50 * 1024 * 1024;
 
 export interface EndpointPattern {
   readonly method: 'GET' | 'POST' | 'PUT' | 'DELETE';
@@ -167,7 +224,9 @@ export interface EndpointPattern {
    * Path pattern. Supports two forms:
    * - Exact match: '/v1/messages' (compared after stripping query string)
    * - Glob within a segment: '/v1beta/models/STAR:generateContent'
-   *   (each '*' matches exactly one path segment [^/]+)
+   *   (each '*' matches one or more RFC 3986 unreserved characters
+   *   `[A-Za-z0-9._~-]`, never only dots, so it cannot match a dot segment,
+   *   a percent-encoded separator, a backslash or a path parameter)
    *
    * Non-glob characters are regex-escaped before matching to prevent
    * metacharacters in paths (e.g., '.') from being interpreted as regex.
@@ -176,9 +235,12 @@ export interface EndpointPattern {
 }
 
 /**
- * How the API key is transmitted in requests.
+ * How the API key is transmitted in requests. A header provider's key header
+ * is one of the credential carriers (`credential-carriers.ts`), so the proxy
+ * strips it from agent requests and the trajectory capture redacts it.
  */
-export type KeyInjection = { readonly type: 'header'; readonly headerName: string } | { readonly type: 'bearer' };
+export type KeyInjection =
+  { readonly type: 'header'; readonly headerName: ProviderKeyHeaderName } | { readonly type: 'bearer' };
 
 /**
  * Returns true if `method`+`path` matches any pattern in `patterns`.
@@ -204,6 +266,37 @@ export function isEndpointAllowed(
   path: string | undefined,
 ): boolean {
   return matchesEndpoint(config.allowedEndpoints, method, path);
+}
+
+/**
+ * Checks whether a request that presents no credential may be forwarded
+ * without one (see `ProviderConfig.unauthenticatedEndpoints`).
+ */
+export function isUnauthenticatedEndpoint(
+  config: Pick<ProviderConfig, 'unauthenticatedEndpoints'>,
+  method: string | undefined,
+  path: string | undefined,
+): boolean {
+  return matchesEndpoint(config.unauthenticatedEndpoints ?? [], method, path);
+}
+
+/**
+ * Startup check: every unauthenticated endpoint must be one of the provider's
+ * allowed endpoints, so the list can never widen what is forwarded.
+ *
+ * @throws {Error} naming the first endpoint that is not allowed.
+ */
+export function validateUnauthenticatedEndpoints(config: ProviderConfig): void {
+  for (const endpoint of config.unauthenticatedEndpoints ?? []) {
+    const allowed = config.allowedEndpoints.some(
+      (candidate) => candidate.method === endpoint.method && candidate.path === endpoint.path,
+    );
+    if (!allowed) {
+      throw new Error(
+        `${config.displayName}: unauthenticated endpoint ${endpoint.method} ${endpoint.path} is not an allowed endpoint`,
+      );
+    }
+  }
 }
 
 /**
@@ -260,19 +353,6 @@ function stripToolsBy(body: Record<string, unknown>, classify: (tool: unknown) =
 
   if (stripped.length === 0) return null;
   return { modified: { ...body, tools: kept }, stripped };
-}
-
-/**
- * Server-side tools (e.g. web_search_20250305, computer_20250124) have a
- * `type` field that is not "custom". Custom/MCP-bridged tools either have
- * no `type` field or `type: "custom"`.
- */
-export function stripServerSideTools(body: Record<string, unknown>): RewriteResult | null {
-  return stripToolsBy(body, (tool) => {
-    if (typeof tool !== 'object' || tool === null || !('type' in tool)) return null;
-    const { type } = tool as Record<string, unknown>;
-    return typeof type === 'string' && type !== 'custom' ? type : null;
-  });
 }
 
 /**
@@ -438,32 +518,35 @@ function scrubToolResultEntry(rawEntry: unknown): EntryResult | null {
 }
 
 /**
- * Combined rewriter for Anthropic /v1/messages requests. Always strips
- * server-side tools; additionally strips the schedule built-in skill's tools
- * and any dangling history references to them for one-shot batch and workflow
- * agents. PTY agents retain those tools because their interactive Claude Code
- * runtime can dispatch scheduled work. Unknown callers also retain them as a
+ * Claude Code compatibility rewriter for Anthropic /v1/messages requests.
+ * Strips the schedule built-in skill's tools and any dangling history
+ * references to them for one-shot batch and workflow agents. PTY agents
+ * retain those tools because their interactive Claude Code runtime can
+ * dispatch scheduled work. Unknown callers also retain them as a
  * conservative fallback.
+ *
+ * Provider-hosted tools are not this rewriter's concern: the
+ * `anthropic-messages` request sanitizer removes them (and `mcp_servers`,
+ * `container`, URL-sourced content and egress betas) on every Anthropic-shaped
+ * route, after this rewriter runs.
  */
 export function anthropicRequestRewriter(
   body: Record<string, unknown>,
   context: { method: string; path: string; agentKind?: AgentKind },
 ): RewriteResult | null {
-  const serverSide = stripServerSideTools(body);
-  let current = serverSide ? serverSide.modified : body;
-  const stripped: string[] = serverSide ? [...serverSide.stripped] : [];
+  if (context.agentKind !== 'batch' && context.agentKind !== 'workflow') return null;
 
-  if (context.agentKind === 'batch' || context.agentKind === 'workflow') {
-    const toolsStrip = stripScheduleSkillTools(current);
-    if (toolsStrip) {
-      current = toolsStrip.modified;
-      stripped.push(...toolsStrip.stripped);
-    }
-    const historyStrip = stripScheduleSkillToolReferences(current);
-    if (historyStrip) {
-      current = historyStrip.modified;
-      stripped.push(...historyStrip.stripped);
-    }
+  let current = body;
+  const stripped: string[] = [];
+  const toolsStrip = stripScheduleSkillTools(current);
+  if (toolsStrip) {
+    current = toolsStrip.modified;
+    stripped.push(...toolsStrip.stripped);
+  }
+  const historyStrip = stripScheduleSkillToolReferences(current);
+  if (historyStrip) {
+    current = historyStrip.modified;
+    stripped.push(...historyStrip.stripped);
   }
 
   if (stripped.length === 0) return null;
@@ -485,6 +568,22 @@ export function shouldRewriteBody(
   const cleanPath = path.split('?')[0];
   return config.rewriteEndpoints.includes(cleanPath);
 }
+
+/**
+ * The request sanitizer bound to this method+path, if any (first match).
+ * Paths are matched like `allowedEndpoints` (query string stripped, `*`
+ * matches one segment).
+ */
+export function resolveRequestSanitizer(
+  config: ProviderConfig,
+  method: string | undefined,
+  path: string | undefined,
+): RequestSanitizer | undefined {
+  return config.sanitizedEndpoints?.find((endpoint) => matchesEndpointPattern(endpoint, method, path))?.sanitizer;
+}
+
+/** Anthropic Messages paths on api.anthropic.com; both carry the same request body. */
+const ANTHROPIC_MESSAGES_PATHS: readonly string[] = ['/v1/messages', '/v1/messages/count_tokens'];
 
 // --- Built-in providers ---
 
@@ -509,6 +608,18 @@ export const anthropicProvider: ProviderConfig = {
     // MCP marketplace
     { method: 'GET', path: '/mcp-registry/v0/servers' },
   ],
+  // Calls Claude Code makes without a credential: the connectivity preflight
+  // (only a User-Agent), the MCP registry catalog (fetched with auth "none"),
+  // telemetry batches (its exporters can skip auth) and GrowthBook remote
+  // evaluation (keyless until workspace trust). Every other route needs the
+  // session credential; the completion and account routes never run keyless.
+  unauthenticatedEndpoints: [
+    { method: 'GET', path: '/api/hello' },
+    { method: 'GET', path: '/mcp-registry/v0/servers' },
+    { method: 'POST', path: '/api/event_logging/batch' },
+    { method: 'POST', path: '/api/event_logging/v2/batch' },
+    { method: 'POST', path: '/api/eval/*' },
+  ],
   // Capture only the completion endpoint; the housekeeping paths above
   // (settings, telemetry, eval, registry) carry no model-emitted content.
   captureEndpoints: [{ method: 'POST', path: '/v1/messages' }],
@@ -525,6 +636,7 @@ export const anthropicProvider: ProviderConfig = {
   fakeKeyPrefix: 'sk-ant-api03-ironcurtain-',
   requestRewriter: anthropicRequestRewriter,
   rewriteEndpoints: ['/v1/messages'],
+  sanitizedEndpoints: sanitizedEndpointsFor('anthropic-messages', ANTHROPIC_MESSAGES_PATHS),
 };
 
 export const claudePlatformProvider: ProviderConfig = {
@@ -532,6 +644,8 @@ export const claudePlatformProvider: ProviderConfig = {
   host: 'platform.claude.com',
   displayName: 'Claude Platform',
   allowedEndpoints: [{ method: 'GET', path: '/v1/oauth/hello' }],
+  // Claude Code's connectivity preflight sends no credential.
+  unauthenticatedEndpoints: [{ method: 'GET', path: '/v1/oauth/hello' }],
   keyInjection: { type: 'header', headerName: 'x-api-key' },
   fakeKeyPrefix: 'sk-ant-api03-ironcurtain-',
 };
@@ -573,6 +687,15 @@ export const openaiProvider: ProviderConfig = {
   gatewayAdapterId: 'direct',
   keyInjection: { type: 'bearer' },
   fakeKeyPrefix: 'sk-ironcurtain-',
+  // Hosted tools, replayed hosted items and URL-sourced content are removed
+  // by the OpenAI sanitizers (./request-sanitizers/openai.ts). The
+  // openai-platform layer in front of them refuses OpenAI's web-search and
+  // deep-research models, which search the web just by being named.
+  sanitizedEndpoints: [
+    ...sanitizedEndpointsFor('openai-responses', ['/v1/responses'], openaiPlatformSanitizer),
+    ...sanitizedEndpointsFor('openai-chat-completions', ['/v1/chat/completions'], openaiPlatformSanitizer),
+  ],
+  maxRequestBodyBytes: OPENAI_MAX_REQUEST_BODY_BYTES,
 };
 
 export const codexChatGptProvider: ProviderConfig = {
@@ -590,8 +713,13 @@ export const codexChatGptProvider: ProviderConfig = {
     // is forwarded to exactly the endpoints Codex needs and nothing else.
     //
     // (a) The only functionally required backend-api calls observed are
-    //     GET /backend-api/codex/models and GET+POST /backend-api/codex/responses
-    //     (the completion stream); sessions complete with these alone.
+    //     GET /backend-api/codex/models and POST /backend-api/codex/responses
+    //     (the completion stream); sessions complete with these alone. The GETs
+    //     those runs also showed on /backend-api/codex/responses are Codex's
+    //     WebSocket handshake (about seven per turn: its connect retries). The
+    //     proxy refuses every upgrade before this allowlist is consulted (inner
+    //     `upgrade` listener in mitm-proxy.ts) and the Codex adapter turns
+    //     WebSockets off, so no GET is allowed on that path.
     // (b) REPLACES a prior `/backend-api/codex/*` single-segment wildcard, which
     //     would also have forwarded the token to unrelated future sub-surfaces.
     // (c) Intentionally still blocked (Codex attempts them; runs are unaffected):
@@ -602,16 +730,26 @@ export const codexChatGptProvider: ProviderConfig = {
     // (d) If a future Codex version 403s on a path it genuinely needs, add that
     //     specific exact path here — do NOT re-introduce a wildcard.
     { method: 'GET', path: '/backend-api/codex/models' },
-    { method: 'GET', path: '/backend-api/codex/responses' },
     { method: 'POST', path: '/backend-api/codex/responses' },
+    // (e) Workspace routing discovery: Codex 0.157.1 (the pinned
+    //     docker/Dockerfile.codex version) reads its account list here before
+    //     the first turn in ChatGPT mode and fails the turn ("workspace routing
+    //     discovery failed") when the call does not succeed. Read-only GET.
+    { method: 'GET', path: '/backend-api/wham/accounts/check' },
+  ],
+  // The agent-identity key sets are public; Codex may fetch them without a
+  // credential. Every backend-api route needs the session credential.
+  unauthenticatedEndpoints: [
+    { method: 'GET', path: '/agent-identities/jwks' },
+    { method: 'GET', path: '/wham/agent-identities/jwks' },
   ],
   // The completion call Codex streams is POST /backend-api/codex/responses
   // (verified against a live codex exec run). chatgpt.com classifies as the
   // 'openai' capture provider and is reassembled by ResponsesReassembler
   // against the named-event Responses stream (response.* events; terminal
-  // response.completed). The ~7 GET /backend-api/codex/responses calls are
-  // polling/resume that return application/json state, not a fresh
-  // generation, and are GETs — so they never match this POST capture gate.
+  // response.completed). It is the only completion transport: the ~7 GETs on
+  // the same path that older captures showed were WebSocket handshakes, which
+  // the proxy refuses and the generated Codex config no longer attempts.
   captureEndpoints: [{ method: 'POST', path: '/backend-api/codex/responses' }],
   completionEndpoints: [
     {
@@ -628,6 +766,22 @@ export const codexChatGptProvider: ProviderConfig = {
   // then swap it host-side before forwarding upstream.
   fakeKeyPrefix:
     'eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjQxMDI0NDQ4MDAsImlzcyI6Imlyb25jdXJ0YWluIiwic3ViIjoiY29kZXgtZmFrZSJ9.',
+  // Codex's completion POST goes through the openai-responses sanitizer,
+  // behind the same openai-platform layer as api.openai.com: this is the
+  // route every Codex session reaches OpenAI by, and a process in the
+  // container can name any model on it, so OpenAI's web-search and
+  // deep-research models are refused here too, whether or not this backend
+  // would serve one.
+  // Codex enables zstd request compression by default; the proxy decodes a
+  // compressed body before sanitizing and forwards the decoded JSON.
+  sanitizedEndpoints: sanitizedEndpointsFor(
+    'openai-responses',
+    ['/backend-api/codex/responses'],
+    openaiPlatformSanitizer,
+  ),
+  // Codex resends the whole conversation, inline images included, every turn;
+  // the ceiling applies to the zstd body and again to the decoded JSON.
+  maxRequestBodyBytes: OPENAI_MAX_REQUEST_BODY_BYTES,
 };
 
 export const codexAuthProvider: ProviderConfig = {
@@ -648,6 +802,7 @@ export const anthropicOAuthProvider: ProviderConfig = {
     // OAuth-only: usage data requires an OAuth session
     { method: 'GET' as const, path: '/api/oauth/usage' },
   ],
+  unauthenticatedEndpoints: anthropicProvider.unauthenticatedEndpoints,
   captureEndpoints: anthropicProvider.captureEndpoints,
   completionEndpoints: anthropicProvider.completionEndpoints,
   gatewayAdapterId: 'direct',
@@ -655,6 +810,7 @@ export const anthropicOAuthProvider: ProviderConfig = {
   fakeKeyPrefix: 'sk-ant-oat01-ironcurtain-',
   requestRewriter: anthropicRequestRewriter,
   rewriteEndpoints: ['/v1/messages'],
+  sanitizedEndpoints: anthropicProvider.sanitizedEndpoints,
 };
 
 export const claudePlatformOAuthProvider: ProviderConfig = {
@@ -662,6 +818,7 @@ export const claudePlatformOAuthProvider: ProviderConfig = {
   host: 'platform.claude.com',
   displayName: 'Claude Platform (OAuth)',
   allowedEndpoints: claudePlatformProvider.allowedEndpoints,
+  unauthenticatedEndpoints: claudePlatformProvider.unauthenticatedEndpoints,
   keyInjection: { type: 'bearer' },
   fakeKeyPrefix: 'sk-ant-oat01-ironcurtain-',
 };
@@ -695,4 +852,10 @@ export const googleProvider: ProviderConfig = {
   gatewayAdapterId: 'direct',
   keyInjection: { type: 'header', headerName: 'x-goog-api-key' },
   fakeKeyPrefix: 'AIzaSy-ironcurtain-',
+  // The google-generate-content sanitizer keeps only function declarations in
+  // `tools` and neutralizes URI-referencing (`fileData`) parts.
+  sanitizedEndpoints: sanitizedEndpointsFor('google-generate-content', [
+    '/v1beta/models/*:generateContent',
+    '/v1beta/models/*:streamGenerateContent',
+  ]),
 };

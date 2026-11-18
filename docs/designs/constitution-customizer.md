@@ -1,6 +1,7 @@
 # LLM-Assisted Constitution Customization
 
-**Status:** Proposed
+**Status (2026-11-14):** Implemented: `ironcurtain customize-policy` (`src/pipeline/constitution-customizer.ts`); the persona and job customizers reuse it, and it can apply learned amendments (section 11).
+
 **Date:** 2026-02-19
 **Updated:** 2026-02-22
 **Author:** IronCurtain Engineering
@@ -61,7 +62,10 @@ The base user constitution is also prepended (as read-only context) to the LLM p
 7.  System asks (via @clack/prompts confirm): "Compile policy now?"
     - yes: runs compile-policy, shows result, offers revert on failure
     - no: reminds user to run `ironcurtain compile-policy` before next session
-8.  On compilation failure: show errors, offer to revert from .bak file
+8.  On compilation failure (no policy written): show errors, offer to
+    revert from .bak file. On a partial failure (policy written, but some
+    servers failed and have no rules): warn and keep exit status 2; no
+    revert is offered, since reverting would not undo the written policy
 9.  On compilation success: display summary of active policy rules
 ```
 
@@ -137,6 +141,8 @@ The user describes purposes ("make fixes to my source code", "write a daily news
 
 Diffs are shown inline in the terminal using a unified diff format, colorized with chalk. Lines prefixed with `-` (red) are removed, `+` (green) are added, and unprefixed lines are unchanged context. This uses a simple line-level diff (e.g., `diff` library from npm or a minimal implementation).
 
+Constitution text can be model-generated from repository or remote content. Every initial or generated constitution, proposed diff line, generated question and summary is displayed through `toDisplayText` before trusted styling is added. Control and invisible format characters become visible escapes; review text is never shortened. The persona generation and `persona show` screens use the same display rule, and the job confirmation screen shows every constitution line. These transformations affect display only: accepted text, conversation history and saved constitution contents retain their original values. Compilation progress details, summaries, warnings and errors also use display-safe text in both parallel and sequential output.
+
 ## 6. LLM Prompt
 
 The customizer uses `policyModelId` from user config (same model as compile-policy, defaults to Sonnet).
@@ -154,7 +160,10 @@ The LLM returns structured output (via AI SDK's `generateObject()`) so we can pr
 ```typescript
 const CustomizerResponseSchema = z.object({
   type: z.enum(['constitution', 'question']),
-  constitution: z.string().optional().describe('The complete updated user constitution text (when type is "constitution")'),
+  constitution: z
+    .string()
+    .optional()
+    .describe('The complete updated user constitution text (when type is "constitution")'),
   summary: z.string().optional().describe('Brief summary of what changed and why (when type is "constitution")'),
   question: z.string().optional().describe('A clarifying question to ask the user (when type is "question")'),
 });
@@ -167,10 +176,7 @@ When the response is a `question`, the system displays it and loops back for use
 ```typescript
 // src/pipeline/constitution-customizer.ts
 
-function buildSystemPrompt(
-  baseConstitution: string,
-  toolAnnotations: ToolAnnotation[],
-): string {
+function buildSystemPrompt(baseConstitution: string, toolAnnotations: ToolAnnotation[]): string {
   return `You are helping a user customize their IronCurtain security policy.
 
 The user will describe tasks and purposes they want their agent to perform.
@@ -261,10 +267,7 @@ Respond with either a "constitution" or a "question":
 Each turn sends the current user constitution state plus the user's message:
 
 ```typescript
-function buildUserMessage(
-  currentUserConstitution: string | undefined,
-  userRequest: string,
-): string {
+function buildUserMessage(currentUserConstitution: string | undefined, userRequest: string): string {
   const current = currentUserConstitution
     ? `## Current User Customizations\n${currentUserConstitution}`
     : '## No existing user customizations.';
@@ -278,10 +281,10 @@ The conversation history is maintained across turns so the LLM has context from 
 
 - Subcommand of `ironcurtain` CLI, registered in `src/cli.ts` alongside existing commands.
 - Uses `createPipelineLlm()` from `pipeline-shared.ts` for model setup and logging.
-- Tool annotations loaded from disk via `loadExistingArtifact()` — no MCP server connections needed.
+- Tool annotations loaded from disk via `loadToolAnnotationsFile()` (the user's annotation overlay layered per server over the package annotations, see [tool-annotation-overlay.md](tool-annotation-overlay.md)) — no MCP server connections needed.
 - User constitution lives at `~/.ironcurtain/constitution-user.md` (via `getUserConstitutionPath()`).
 - Before writing, the existing user constitution is backed up to `constitution-user.md.bak`.
-- Compilation is invoked programmatically (importing `compile.ts`'s `main()`), not via subprocess.
+- Compilation is invoked programmatically through `compileAfterSave()`, which calls `compile.ts`'s `runCompilePolicy()` (it returns the exit status instead of exiting the process), not via subprocess.
 - Constitution versioning: user constitution only adds guidance, never modifies base principles. If a base update conflicts, compile-policy fails, alerting the user.
 - LLM interactions logged to `llm-interactions.jsonl` in the generated directory (via pipeline logging middleware).
 - Uses `PromptCacheStrategy` from `src/session/prompt-cache.ts` to mark the system prompt and conversation history with cache breakpoints. The system prompt (base constitution + tool annotations) is large and stable across turns, making it ideal for Anthropic's prompt caching. This significantly reduces token costs for multi-turn refinement sessions.
@@ -294,10 +297,12 @@ Phase numbering continues from the fetch server design (phases 4-5).
 ### Phase 6: Constitution Customizer CLI
 
 **New files:**
+
 - `src/config/constitution-user-base.md` -- base user constitution shipped with IronCurtain
 - `src/pipeline/constitution-customizer.ts` -- LLM-assisted conversational customization logic
 
 **Files changed:**
+
 - `src/cli.ts` -- register `customize-policy` subcommand
 - `src/config/paths.ts` -- add `getBaseUserConstitutionPath()` helper
 
@@ -306,36 +311,42 @@ Phase numbering continues from the fetch server design (phases 4-5).
 ### Unit Tests (`test/constitution-customizer.test.ts`)
 
 **Prompt construction:**
+
 - `buildSystemPrompt()` includes base constitution and tool annotations
 - `buildSystemPrompt()` includes purpose-driven reasoning instructions
 - `buildUserMessage()` includes current user constitution when present
 - `buildUserMessage()` handles missing user constitution gracefully
 
 **Diff generation:**
+
 - Correctly identifies added, removed, and unchanged lines
 - Handles empty old constitution (all additions)
 - Handles empty new constitution (all removals)
 - Handles identical constitutions (no changes)
 
 **Backup and revert:**
+
 - Writing constitution creates `.bak` of previous version
 - Revert restores from `.bak` file
 - Revert when no `.bak` exists produces clear error
 - First-time write (no existing file) skips backup
 
 **Base constitution seeding:**
+
 - First run copies base to user path when no user constitution exists
 - Does not overwrite existing user constitution
 
 ### Integration Tests (`test/constitution-customizer-integration.test.ts`)
 
 **End-to-end flow (with mocked LLM):**
+
 - Purpose-driven request ("fix bugs in my code at ~/src/myapp") → LLM generates scoped permissions → written to disk
 - Mock LLM returns constitution that causes compile failure → revert offered → `.bak` restored
 - Multi-turn refinement: first response rejected, second accepted
 - User constitution is correctly merged with base for compilation
 
 **Compilation integration:**
+
 - Generated user constitution compiles without errors via real compile-policy pipeline (may require LLM, so guarded behind `INTEGRATION_TEST` flag)
 - Combined hash changes when user constitution changes
 - Compilation cache invalidated after customizer writes new constitution
@@ -343,3 +354,17 @@ Phase numbering continues from the fetch server design (phases 4-5).
 ## 10. References
 
 - Tsai, L. & Bagdasarian, E. (2025). "Contextual Agent Security: A Policy for Every Purpose." HOTOS '25. — Demonstrates purpose-driven, contextual policy generation for agent systems. Key insights applied here: users specify tasks not permissions; LLM infers least-privilege constraints from task intent; deterministic enforcement of generated policies.
+
+## 11. Amendments Learned From Repeated Approvals
+
+Users who approve the same benign call in every session are a symptom of a constitution that never converges. The approval history (`src/audit/approval-history.ts`, see `approval-whitelisting.md` §7.7) remembers, per constitution scope (`global`, `persona:<name>`, `job:<id>`), the generalized pattern of every escalation a _human_ approved. `src/audit/amendment-proposals.ts` turns each pattern approved at least three times (since its last dismissal) into one policy statement, for example:
+
+```
+The agent may use the `filesystem/write_file` tool without asking for human approval when it writes files within `/srv/reports`.
+```
+
+**Review.** Before the LLM conversation, `customize-policy` (global scope) and the shared customizer loop behind `persona edit` and `daemon edit-job` (when editing an existing persona or job) run `reviewPendingAmendments` (`src/pipeline/amendment-review.ts`). Each pending proposal is shown as a diff against the constitution being edited, with how often and when it was approved, and the user chooses **Accept** (the statement is appended in memory and saved through the flow's normal save path), **Skip for now**, or **Dismiss** (recorded in the history; the pattern needs three new approvals before it is proposed again). Nothing is applied without an explicit accept, and an accepted statement takes effect only after the policy is recompiled. A proposal whose statement the constitution already holds is not shown. `ironcurtain audit proposals` lists the pending proposals for every scope without changing anything.
+
+**Determinism and safety.** No LLM is involved in proposing the statement: it comes from a fixed template per role (`reads/writes/deletes files within`, `fetches URLs on`, `uses the git remote`, `the GitHub owner is`, ...). The values in it reached the history through calls the agent chose, so a pattern is withheld instead of proposed when a value cannot be quoted unambiguously (control or format characters, quotes or backticks in a directory; a destination `displayableDomain` would not show as is; an identifier outside `[A-Za-z0-9._-]`), or when a directory is the filesystem root, contains the user's home directory, or is one the approval whitelist refuses a directory-wide grant over (the real home's ancestors, and in or around `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config`, `~/.local`, their macOS counterparts and the credential stores; `isDirectoryWideGrantRefused`), each compared as recorded and by its current real path, so a home reached through a symlink or a directory since replaced by a link is still caught. The history only ever holds the directory-wide whitelist candidate of a call with paths, never the exact path approved (`approval-whitelisting.md` §7.7). Everything shown on the terminal is escaped, and history records carry only the ISO timestamps the recorder writes. Once accepted, the statement is an ordinary line of the constitution: the compiler (an LLM) translates it like any other, and the persona broad-policy validator still applies to the result.
+
+Interactive constitution/task editing uses a random per-edit temporary directory with mode 0700 and an exclusively created content file with mode 0600. Success, cancellation and launch/write failures remove the directory and editor backups together (`src/utils/editor.ts`, RV-26).

@@ -30,7 +30,9 @@ function createMockSession(overrides: Partial<Session> = {}): Session {
       maxSteps: 200,
       maxSessionSeconds: 1800,
       maxEstimatedCostUsd: 5,
+      warnThresholdPercent: 80,
     },
+    lastTurn: null,
     cumulative: {
       totalInputTokens: 0,
       totalOutputTokens: 0,
@@ -48,7 +50,7 @@ function createMockSession(overrides: Partial<Session> = {}): Session {
     getHistory: () => [] as readonly ConversationTurn[],
     getDiagnosticLog: () => [] as readonly DiagnosticEvent[],
     resolveEscalation: vi.fn().mockResolvedValue(undefined),
-    getPendingEscalation: () => undefined,
+    getPendingEscalations: () => [],
     getBudgetStatus: () => defaultBudget,
     close: vi.fn().mockResolvedValue(undefined),
     ...overrides,
@@ -164,6 +166,89 @@ describe('CliTransport shutdown', () => {
     rejectSendMessage(new Error('Session closed'));
 
     await expect(runPromise).rejects.toThrow('Session closed');
+  });
+
+  it('single-shot: still shows the session summary when a budget stops the task', async () => {
+    const { BudgetExhaustedError } = await import('../src/types/errors.js');
+    const spent: BudgetStatus = {
+      ...createMockSession().getBudgetStatus(),
+      tokenTrackingAvailable: true,
+      cumulative: {
+        totalInputTokens: 900,
+        totalOutputTokens: 50,
+        totalTokens: 950,
+        stepCount: 3,
+        activeSeconds: 12,
+        estimatedCostUsd: 0.42,
+      },
+    };
+    const stderrWrite = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      transport = new CliTransport({ initialMessage: 'test task', input: stdinMock });
+      const session = createMockSession({
+        sendMessage: vi
+          .fn()
+          .mockRejectedValue(
+            new BudgetExhaustedError(
+              'steps',
+              'Step budget exhausted: 3 / 3 steps used. Stopped after 3 steps without a final answer.',
+            ),
+          ),
+        getBudgetStatus: () => spent,
+      });
+
+      await expect(transport.run(session)).rejects.toThrow('Stopped after 3 steps without a final answer');
+
+      const written = stderrWrite.mock.calls.map(([chunk]) => String(chunk)).join('');
+      expect(written).toContain('Session: 950 tokens');
+      expect(written).toContain('3 steps');
+      expect(written).toContain('~$0.42');
+    } finally {
+      stderrWrite.mockRestore();
+    }
+  });
+
+  it('single-shot: marks a partial (lower-bound) Docker session total in the summary', async () => {
+    const partial: BudgetStatus = {
+      ...createMockSession().getBudgetStatus(),
+      tokenTrackingAvailable: true,
+      tokenTrackingStatus: 'partial',
+      observedExchanges: 3,
+      incompleteExchanges: 1,
+      cumulative: {
+        totalInputTokens: 900,
+        totalOutputTokens: 50,
+        totalTokens: 950,
+        stepCount: 1,
+        activeSeconds: 4,
+        estimatedCostUsd: 0.1,
+      },
+    };
+    const stderrWrite = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      transport = new CliTransport({ initialMessage: 'test task', input: stdinMock });
+      await transport.run(createMockSession({ getBudgetStatus: () => partial }));
+
+      const written = stderrWrite.mock.calls.map(([chunk]) => String(chunk)).join('');
+      expect(written).toContain('Session: ≥950 tokens (partial: 1 of 3 exchanges incomplete) · 1 steps');
+    } finally {
+      stderrWrite.mockRestore();
+    }
+  });
+
+  it('single-shot: other errors do not print a session summary', async () => {
+    const stderrWrite = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      transport = new CliTransport({ initialMessage: 'test task', input: stdinMock });
+      const session = createMockSession({ sendMessage: vi.fn().mockRejectedValue(new Error('upstream failed')) });
+
+      await expect(transport.run(session)).rejects.toThrow('upstream failed');
+
+      const written = stderrWrite.mock.calls.map(([chunk]) => String(chunk)).join('');
+      expect(written).not.toContain('Session:');
+    } finally {
+      stderrWrite.mockRestore();
+    }
   });
 
   it('signal handler with force exit works in sequence', async () => {

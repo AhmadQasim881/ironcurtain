@@ -6,13 +6,13 @@ import { fileURLToPath } from 'node:url';
 import type { SessionOptions } from '../../src/session/types.js';
 import type { Session } from '../../src/session/types.js';
 import type { HumanGateRequest } from '../../src/workflow/types.js';
-import { FileCheckpointStore } from '../../src/workflow/checkpoint.js';
 import {
   WorkflowOrchestrator,
   type WorkflowOrchestratorDeps,
   type WorkflowLifecycleEvent,
 } from '../../src/workflow/orchestrator.js';
 import {
+  resolveActiveGate,
   MockSession,
   statusBlock,
   simulateArtifacts,
@@ -20,6 +20,8 @@ import {
   waitForGateOrCompletion,
   waitForCompletion,
   stubPersonasForTest,
+  makeTestUserConfig,
+  createCheckpointStore,
 } from './test-helpers.js';
 
 // ---------------------------------------------------------------------------
@@ -104,7 +106,8 @@ describe('workflow-spike demo definition', () => {
       raiseGate: (gate) => raisedGates.push(gate),
       dismissGate: () => {},
       baseDir: tmpDir,
-      checkpointStore: new FileCheckpointStore(resolve(tmpDir, '..', `${resolve(tmpDir).split('/').pop()!}-ckpt`)),
+      checkpointStore: createCheckpointStore(tmpDir),
+      userConfig: makeTestUserConfig(),
     };
 
     orchestrator = new WorkflowOrchestrator(deps);
@@ -123,14 +126,14 @@ describe('workflow-spike demo definition', () => {
     expect(result).toBe('gate');
     expect(raisedGates).toHaveLength(1);
     expect(raisedGates[0].stateName).toBe('plan_review');
-    orchestrator.resolveGate(workflowId, { type: 'APPROVE' });
+    resolveActiveGate(orchestrator, workflowId, { type: 'APPROVE' });
 
     // Gate 2: design_review
     result = await waitForGateOrCompletion(orchestrator, workflowId);
     expect(result).toBe('gate');
     expect(raisedGates).toHaveLength(2);
     expect(raisedGates[1].stateName).toBe('design_review');
-    orchestrator.resolveGate(workflowId, { type: 'APPROVE' });
+    resolveActiveGate(orchestrator, workflowId, { type: 'APPROVE' });
 
     // From here: implement -> validate -> review(reject) -> implement ->
     // validate -> review -- at this point round >= maxRounds so
@@ -143,7 +146,7 @@ describe('workflow-spike demo definition', () => {
     if (result === 'gate') {
       const lastGate = raisedGates[raisedGates.length - 1];
       expect(lastGate.stateName).toBe('escalate_gate');
-      orchestrator.resolveGate(workflowId, { type: 'APPROVE' });
+      resolveActiveGate(orchestrator, workflowId, { type: 'APPROVE' });
     }
 
     await waitForCompletion(orchestrator, workflowId);
@@ -215,7 +218,8 @@ describe('workflow-spike demo definition', () => {
       raiseGate: (gate) => raisedGates.push(gate),
       dismissGate: () => {},
       baseDir: tmpDir,
-      checkpointStore: new FileCheckpointStore(resolve(tmpDir, '..', `${resolve(tmpDir).split('/').pop()!}-ckpt`)),
+      checkpointStore: createCheckpointStore(tmpDir),
+      userConfig: makeTestUserConfig(),
     };
 
     orchestrator = new WorkflowOrchestrator(deps);
@@ -224,7 +228,7 @@ describe('workflow-spike demo definition', () => {
     // Gate 1: plan_review -> FORCE_REVISION
     await waitForGateOrCompletion(orchestrator, workflowId);
     expect(raisedGates[0].stateName).toBe('plan_review');
-    orchestrator.resolveGate(workflowId, {
+    resolveActiveGate(orchestrator, workflowId, {
       type: 'FORCE_REVISION',
       prompt: 'Add security considerations',
     });
@@ -239,11 +243,11 @@ describe('workflow-spike demo definition', () => {
     expect(secondPlanner.sentMessages[0]).toContain('Add security considerations');
 
     // Now approve and let the rest flow
-    orchestrator.resolveGate(workflowId, { type: 'APPROVE' });
+    resolveActiveGate(orchestrator, workflowId, { type: 'APPROVE' });
 
     // Auto-approve design_review
     await waitForGateOrCompletion(orchestrator, workflowId);
-    orchestrator.resolveGate(workflowId, { type: 'APPROVE' });
+    resolveActiveGate(orchestrator, workflowId, { type: 'APPROVE' });
 
     await waitForCompletion(orchestrator, workflowId);
     expect(orchestrator.getStatus(workflowId)?.phase).toBe('completed');
@@ -268,14 +272,15 @@ describe('workflow-spike demo definition', () => {
       raiseGate: (gate) => raisedGates.push(gate),
       dismissGate: () => {},
       baseDir: tmpDir,
-      checkpointStore: new FileCheckpointStore(resolve(tmpDir, '..', `${resolve(tmpDir).split('/').pop()!}-ckpt`)),
+      checkpointStore: createCheckpointStore(tmpDir),
+      userConfig: makeTestUserConfig(),
     };
 
     orchestrator = new WorkflowOrchestrator(deps);
     const workflowId = await orchestrator.start(definitionPath, 'Build API');
 
     await waitForGateOrCompletion(orchestrator, workflowId);
-    orchestrator.resolveGate(workflowId, { type: 'ABORT' });
+    resolveActiveGate(orchestrator, workflowId, { type: 'ABORT' });
 
     await waitForCompletion(orchestrator, workflowId);
     const status = orchestrator.getStatus(workflowId);

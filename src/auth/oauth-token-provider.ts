@@ -11,7 +11,7 @@ import { existsSync } from 'node:fs';
 import { getOAuthTokenPath } from '../config/paths.js';
 import type { OAuthProviderConfig, OAuthClientCredentials, StoredOAuthToken } from './oauth-provider.js';
 import { fetchWithTimeout, safeResponseJson } from './oauth-flow.js';
-import { loadOAuthToken, saveOAuthToken, isTokenExpired } from './oauth-token-store.js';
+import { loadOAuthToken, saveRefreshedOAuthToken, isTokenExpired } from './oauth-token-store.js';
 
 // ---------------------------------------------------------------------------
 // Error
@@ -207,6 +207,11 @@ export class OAuthTokenProvider {
    *
    * When force=true, skips the early return so the token is always
    * refreshed via the provider's token endpoint.
+   *
+   * The write-back re-reads the store after the token endpoint answered and
+   * keeps a token another process stored meanwhile (a rotated refresh token,
+   * a re-authorization, or a later expiry); the token in effect is returned
+   * so this caller and the file agree.
    */
   private async executeRefresh(force = false): Promise<string> {
     // Re-read from disk -- another process may have refreshed already
@@ -221,7 +226,6 @@ export class OAuthTokenProvider {
     }
 
     const refreshed = await refreshAccessToken(this.provider, this.clientCredentials, reread);
-    saveOAuthToken(this.provider.id, refreshed);
-    return refreshed.accessToken;
+    return saveRefreshedOAuthToken(this.provider.id, refreshed, reread.refreshToken).accessToken;
   }
 }

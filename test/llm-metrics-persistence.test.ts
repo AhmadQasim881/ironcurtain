@@ -1,4 +1,4 @@
-import { readFileSync, rmSync, statSync } from 'node:fs';
+import { readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,9 +6,11 @@ import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Worker } from 'node:worker_threads';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { makeNormalizedUsage } from '../src/llm-metrics/normalization.js';
 import { LlmStatisticsQueryService } from '../src/llm-metrics/query-service.js';
+import { LLM_METRICS_SCHEMA_VERSION, migrateLlmMetricsDatabase } from '../src/llm-metrics/persistence/migrations.js';
 import { LlmMetricsRepositoryUnavailableError } from '../src/llm-metrics/persistence/repository.js';
 import { defaultWorkerFactory, SqliteLlmMetricsRepository } from '../src/llm-metrics/persistence/sqlite-repository.js';
 import type { LlmExchangeCompleted } from '../src/llm-metrics/types.js';
@@ -223,7 +225,7 @@ describe('SQLite LLM metrics repository', () => {
 
     await opened.repository.close();
     const database = new DatabaseSync(opened.databasePath, { readOnly: true });
-    expect(database.prepare('PRAGMA user_version').get()).toMatchObject({ user_version: 1 });
+    expect(database.prepare('PRAGMA user_version').get()).toMatchObject({ user_version: 2 });
     expect(database.prepare('PRAGMA journal_mode').get()).toMatchObject({ journal_mode: 'wal' });
     expect(database.prepare('SELECT COUNT(*) AS count FROM llm_transport_attempts').get()).toMatchObject({ count: 1 });
     expect(database.prepare('SELECT started_offset_ms, ended_offset_ms FROM llm_transport_attempts').get()).toEqual({
@@ -407,6 +409,307 @@ describe('SQLite LLM metrics repository', () => {
       });
       await opened.repository.close();
     }
+  });
+
+  it('drops only the invalid record of a full batch and counts it by reason', async () => {
+    const opened = await repository();
+    for (let index = 0; index < 63; index++) {
+      opened.repository.enqueue(exchange(`exchange-valid-${index}`, { startedAtMs: BASE_TIME + index }));
+    }
+    const invalid = exchange('exchange-status-999', { startedAtMs: BASE_TIME + 63 });
+    opened.repository.enqueue({ ...invalid, outcome: { ...invalid.outcome, responseStatus: 999 } });
+    await opened.repository.flush();
+
+    expect(opened.repository.health()).toMatchObject({
+      state: 'degraded',
+      persisted: 63,
+      dropped: 1,
+      queuedRecords: 0,
+      invalidByReason: { 'Invalid responseStatus': 1 },
+      lastError: expect.stringMatching(/Dropped 1 invalid statistics record\(s\): Invalid responseStatus/),
+    });
+    const rows = await opened.repository.scan({ fromMs: BASE_TIME, toMs: BASE_TIME + 1_000, limit: 100 });
+    expect(rows).toHaveLength(63);
+    expect(rows.some((row) => row.exchangeId === 'exchange-status-999')).toBe(false);
+
+    opened.repository.enqueue(exchange('exchange-after-invalid', { startedAtMs: BASE_TIME + 64 }));
+    await opened.repository.flush();
+    expect(opened.repository.health()).toMatchObject({ state: 'ready', persisted: 64, lastError: null });
+    await opened.repository.close();
+  });
+
+  it('rolls back only the record whose rows violate a constraint', async () => {
+    const opened = await repository();
+    const conflicting = exchange('exchange-duplicate-ordinals', { startedAtMs: BASE_TIME + 1 });
+    const attempt = conflicting.transportAttempts.at(0);
+    if (attempt === undefined) throw new Error('fixture has a transport attempt');
+    opened.repository.enqueue(exchange('exchange-before'));
+    opened.repository.enqueue({ ...conflicting, transportAttempts: [attempt, attempt] });
+    opened.repository.enqueue(exchange('exchange-after', { startedAtMs: BASE_TIME + 2 }));
+    await opened.repository.flush();
+
+    const health = opened.repository.health();
+    expect(health).toMatchObject({ state: 'degraded', persisted: 2, dropped: 1 });
+    expect(Object.entries(health.invalidByReason)).toEqual([
+      [expect.stringMatching(/UNIQUE constraint failed: llm_transport_attempts/), 1],
+    ]);
+    await opened.repository.close();
+
+    const database = new DatabaseSync(opened.databasePath, { readOnly: true });
+    expect(
+      database
+        .prepare('SELECT exchange_id AS exchangeId FROM llm_exchanges ORDER BY exchange_id')
+        .all()
+        .map((row) => row.exchangeId),
+    ).toEqual(['exchange-after', 'exchange-before']);
+    expect(database.prepare('SELECT COUNT(*) AS count FROM llm_transport_attempts').get()).toMatchObject({ count: 2 });
+    database.close();
+  });
+
+  it('requeues a batch that stays busy beyond the worker retries and writes it once the lock clears', async () => {
+    const opened = await repository({ busyRetryDelayMs: 60_000, logSink: () => {} });
+    const lock = new DatabaseSync(opened.databasePath);
+    lock.exec('BEGIN IMMEDIATE');
+    try {
+      opened.repository.enqueue(exchange('exchange-during-lock'));
+      await opened.repository.flush();
+      expect(opened.repository.health()).toMatchObject({
+        state: 'degraded',
+        persisted: 0,
+        dropped: 0,
+        queuedRecords: 1,
+        lastError: expect.stringMatching(/locked/),
+      });
+    } finally {
+      lock.exec('COMMIT');
+      lock.close();
+    }
+
+    await opened.repository.flush();
+    expect(opened.repository.health()).toMatchObject({ state: 'ready', persisted: 1, dropped: 0, queuedRecords: 0 });
+    await opened.repository.close();
+  });
+
+  it('drops a busy record after its bounded write attempts without growing the queue', async () => {
+    let inserts = 0;
+    const opened = await repository({
+      busyRetryDelayMs: 1,
+      maxQueuedRecords: 2,
+      logSink: () => {},
+      workerFactory: () => {
+        const worker = new Worker(
+          `const { parentPort } = require('node:worker_threads');
+           parentPort.postMessage({ kind: 'ready', schemaVersion: 1 });
+           parentPort.on('message', (request) => {
+             if (request.kind === 'insert') {
+               parentPort.postMessage({ kind: 'error', id: request.id, message: 'database is locked', code: 'busy' });
+             } else {
+               parentPort.postMessage({ kind: 'result', id: request.id, value: null });
+             }
+           });`,
+          { eval: true },
+        );
+        const post = worker.postMessage.bind(worker);
+        worker.postMessage = (message: { readonly kind?: string }) => {
+          if (message.kind === 'insert') inserts++;
+          post(message);
+        };
+        return worker;
+      },
+    });
+    expect(opened.repository.enqueue(exchange('exchange-always-busy'))).toBe(true);
+    expect(opened.repository.enqueue(exchange('exchange-also-busy', { startedAtMs: BASE_TIME + 1 }))).toBe(true);
+    await opened.repository.flush();
+    expect(opened.repository.health()).toMatchObject({
+      state: 'degraded',
+      dropped: 0,
+      queuedRecords: 2,
+      lastError: expect.stringMatching(/locked/),
+    });
+    // The requeued batch still counts toward the queue bound.
+    expect(opened.repository.enqueue(exchange('exchange-over-bound', { startedAtMs: BASE_TIME + 2 }))).toBe(false);
+
+    await vi.waitFor(() => expect(opened.repository.health()).toMatchObject({ dropped: 3, queuedRecords: 0 }), {
+      timeout: 10_000,
+      interval: 10,
+    });
+    // One record over the bound, and the batch of two dropped after five attempts.
+    expect(inserts).toBe(5);
+    expect(opened.repository.health()).toMatchObject({ persisted: 0, enqueued: 2 });
+    await opened.repository.close();
+  });
+
+  it('records the compatibility range of the schema it creates', async () => {
+    const opened = await repository();
+    await opened.repository.close();
+    const database = new DatabaseSync(opened.databasePath, { readOnly: true });
+    expect(database.prepare('PRAGMA user_version').get()).toMatchObject({ user_version: LLM_METRICS_SCHEMA_VERSION });
+    // Every migration so far is additive (schema 2 only adds nullable cost columns).
+    expect(database.prepare('SELECT key, value FROM llm_metrics_meta ORDER BY key').all()).toEqual([
+      { key: 'min_reader_schema', value: 1 },
+      { key: 'min_writer_schema', value: 1 },
+    ]);
+    database.close();
+  });
+
+  it('records the compatibility range when it upgrades a database migrated before ranges existed', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'ironcurtain-llm-metrics-legacy-'));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, 'llm-usage.sqlite3');
+    // A schema-1 database as a binary without the range contract left it: no llm_metrics_meta.
+    const legacy = new DatabaseSync(databasePath);
+    expect(migrateLlmMetricsDatabase(legacy, 1)).toBe(1);
+    legacy.exec('DROP TABLE llm_metrics_meta');
+    legacy.close();
+
+    const upgraded = await SqliteLlmMetricsRepository.open({ databasePath, flushIntervalMs: 60_000 });
+    expect(upgraded.health()).toMatchObject({ state: 'ready', schemaVersion: LLM_METRICS_SCHEMA_VERSION });
+    await upgraded.close();
+
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    expect(database.prepare('PRAGMA user_version').get()).toMatchObject({ user_version: LLM_METRICS_SCHEMA_VERSION });
+    expect(database.prepare('SELECT key, value FROM llm_metrics_meta ORDER BY key').all()).toEqual([
+      { key: 'min_reader_schema', value: 1 },
+      { key: 'min_writer_schema', value: 1 },
+    ]);
+    database.close();
+  });
+
+  /** The schema a newer binary would migrate to; this binary supports LLM_METRICS_SCHEMA_VERSION. */
+  const NEXT_SCHEMA_VERSION = LLM_METRICS_SCHEMA_VERSION + 1;
+
+  function migrateToNextSchema(
+    databasePath: string,
+    compatibility: { readonly minWriterSchema: number; readonly minReaderSchema: number },
+  ): void {
+    const database = new DatabaseSync(databasePath);
+    try {
+      database.exec(`
+        BEGIN IMMEDIATE;
+        ALTER TABLE llm_exchanges ADD COLUMN future_annotation TEXT;
+        CREATE TABLE IF NOT EXISTS llm_metrics_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL) STRICT;
+        INSERT INTO llm_metrics_meta (key, value)
+          VALUES ('min_writer_schema', ${compatibility.minWriterSchema}),
+                 ('min_reader_schema', ${compatibility.minReaderSchema})
+          ON CONFLICT (key) DO UPDATE SET value = excluded.value;
+        PRAGMA user_version = ${NEXT_SCHEMA_VERSION};
+        COMMIT;
+      `);
+    } finally {
+      database.close();
+    }
+  }
+
+  it('accepts an additive newer schema whose range admits this writer and reader', async () => {
+    const seeded = await repository();
+    seeded.repository.enqueue(exchange('exchange-before-upgrade'));
+    await seeded.repository.close();
+    migrateToNextSchema(seeded.databasePath, {
+      minWriterSchema: LLM_METRICS_SCHEMA_VERSION,
+      minReaderSchema: LLM_METRICS_SCHEMA_VERSION,
+    });
+
+    const older = await SqliteLlmMetricsRepository.open({ databasePath: seeded.databasePath, flushIntervalMs: 60_000 });
+    expect(older.health()).toMatchObject({ state: 'ready', schemaVersion: NEXT_SCHEMA_VERSION });
+    older.enqueue(exchange('exchange-by-older-writer', { startedAtMs: BASE_TIME + 1 }));
+    await older.flush();
+    expect(older.health()).toMatchObject({ state: 'ready', persisted: 1, dropped: 0 });
+    const rows = await older.scan({ fromMs: BASE_TIME, toMs: BASE_TIME + 1_000, limit: 10 });
+    expect(rows.map((row) => row.exchangeId).sort()).toEqual(['exchange-before-upgrade', 'exchange-by-older-writer']);
+    await older.close();
+
+    const database = new DatabaseSync(seeded.databasePath, { readOnly: true });
+    expect(database.prepare('PRAGMA user_version').get()).toMatchObject({ user_version: NEXT_SCHEMA_VERSION });
+    expect(
+      database
+        .prepare(
+          "SELECT future_annotation AS annotation FROM llm_exchanges WHERE exchange_id = 'exchange-by-older-writer'",
+        )
+        .get(),
+    ).toEqual({ annotation: null });
+    database.close();
+  });
+
+  it('keeps writing when another process applies an additive migration mid-run', async () => {
+    const opened = await repository();
+    opened.repository.enqueue(exchange('exchange-before-upgrade'));
+    await opened.repository.flush();
+    migrateToNextSchema(opened.databasePath, {
+      minWriterSchema: LLM_METRICS_SCHEMA_VERSION,
+      minReaderSchema: LLM_METRICS_SCHEMA_VERSION,
+    });
+
+    opened.repository.enqueue(exchange('exchange-after-upgrade', { startedAtMs: BASE_TIME + 1 }));
+    await opened.repository.flush();
+    expect(opened.repository.health()).toMatchObject({ state: 'ready', persisted: 2, dropped: 0 });
+    await opened.repository.close();
+  });
+
+  it('refuses a newer schema whose range excludes this writer, per role, without rewriting it', async () => {
+    const seeded = await repository();
+    seeded.repository.enqueue(exchange('exchange-before-breaking-upgrade'));
+    await seeded.repository.close();
+    migrateToNextSchema(seeded.databasePath, {
+      minWriterSchema: NEXT_SCHEMA_VERSION,
+      minReaderSchema: LLM_METRICS_SCHEMA_VERSION,
+    });
+
+    let writers = 0;
+    const older = await SqliteLlmMetricsRepository.open({
+      databasePath: seeded.databasePath,
+      restartDelayMs: 1,
+      logSink: () => {},
+      workerFactory: (url, options) => {
+        writers++;
+        return defaultWorkerFactory(url, options);
+      },
+    });
+    expect(older.health()).toMatchObject({
+      state: 'disabled',
+      schemaVersion: null,
+      lastError: expect.stringContaining(
+        `schema ${NEXT_SCHEMA_VERSION} requires writer schema ${NEXT_SCHEMA_VERSION} or newer`,
+      ),
+    });
+    expect(older.enqueue(exchange('exchange-refused'))).toBe(false);
+    // The reader range still admits this binary.
+    await expect(older.scan({ fromMs: BASE_TIME, toMs: BASE_TIME + 1_000, limit: 10 })).resolves.toMatchObject([
+      { exchangeId: 'exchange-before-breaking-upgrade' },
+    ]);
+    await delay(50);
+    expect(writers).toBe(1);
+    await older.close();
+
+    const database = new DatabaseSync(seeded.databasePath, { readOnly: true });
+    expect(database.prepare('PRAGMA user_version').get()).toMatchObject({ user_version: NEXT_SCHEMA_VERSION });
+    expect(database.prepare("SELECT value FROM llm_metrics_meta WHERE key = 'min_writer_schema'").get()).toEqual({
+      value: NEXT_SCHEMA_VERSION,
+    });
+    database.close();
+  });
+
+  it('latches off when another process applies a breaking migration mid-run', async () => {
+    const opened = await repository({ logSink: () => {} });
+    opened.repository.enqueue(exchange('exchange-before-breaking-upgrade'));
+    await opened.repository.flush();
+    migrateToNextSchema(opened.databasePath, {
+      minWriterSchema: NEXT_SCHEMA_VERSION,
+      minReaderSchema: NEXT_SCHEMA_VERSION,
+    });
+
+    opened.repository.enqueue(exchange('exchange-after-breaking-upgrade', { startedAtMs: BASE_TIME + 1 }));
+    await opened.repository.flush();
+    expect(opened.repository.health()).toMatchObject({
+      state: 'disabled',
+      persisted: 1,
+      dropped: 1,
+      queuedRecords: 0,
+      lastError: expect.stringContaining(`requires writer schema ${NEXT_SCHEMA_VERSION}`),
+    });
+    await expect(opened.repository.scan({ fromMs: BASE_TIME, toMs: BASE_TIME + 1_000, limit: 10 })).rejects.toThrow(
+      `requires reader schema ${NEXT_SCHEMA_VERSION}`,
+    );
+    await opened.repository.close();
   });
 
   it('persists bounded OpenRouter provider labels and the full adapter attempt cap', async () => {
@@ -709,6 +1012,38 @@ describe('SQLite LLM metrics repository', () => {
     await opened.repository.close();
   });
 
+  it('times each read from when the worker serves it, not while it waits behind earlier reads', async () => {
+    // Each read takes 40 ms; twelve together take about 480 ms, more than
+    // twice the 200 ms per-read deadline. Only time being served counts.
+    let readerWorkers = 0;
+    const opened = await repository({
+      readTimeoutMs: 200,
+      readWorkerFactory: () => {
+        readerWorkers++;
+        return new Worker(
+          `const { parentPort } = require('node:worker_threads');
+           let chain = Promise.resolve();
+           parentPort.postMessage({ kind: 'ready', schemaVersion: 1 });
+           parentPort.on('message', (request) => {
+             chain = chain.then(() => new Promise((resolve) => setTimeout(() => {
+               parentPort.postMessage({ kind: 'result', id: request.id, value: [] });
+               resolve();
+             }, 40)));
+           });`,
+          { eval: true },
+        );
+      },
+    });
+    const query = { fromMs: BASE_TIME, toMs: BASE_TIME + 1_000, limit: 10 };
+
+    const reads = await Promise.allSettled(Array.from({ length: 12 }, () => opened.repository.scan(query)));
+
+    expect(reads.map((read) => read.status)).toEqual(Array.from({ length: 12 }, () => 'fulfilled'));
+    expect(readerWorkers).toBe(1);
+    expect(opened.repository.health()).toMatchObject({ readerState: 'ready', readerLastError: null });
+    await opened.repository.close();
+  });
+
   it('retires a reader after an operational failure without disabling writes', async () => {
     let readerWorkers = 0;
     const opened = await repository({
@@ -794,7 +1129,7 @@ describe('SQLite LLM metrics repository', () => {
                } else if (request.kind === 'releaseMaintenanceLease') {
                  leaseHeld = false;
                } else if (request.kind === 'insert') {
-                 value = { inserted: request.exchanges.length, duplicates: 0 };
+                 value = { inserted: request.exchanges.length, duplicates: 0, rejected: {} };
                }
                parentPort.postMessage({ kind: 'result', id: request.id, value });
              });
@@ -859,7 +1194,9 @@ describe('SQLite LLM metrics repository', () => {
     await opened.repository.close();
   });
 
-  it('keeps the independent reader usable after a terminal writer failure', async () => {
+  // Previously pinned a terminal 'disabled' latch for any writer failure; a
+  // wedged writer is now replaced while the reader keeps serving.
+  it('keeps the independent reader usable while a wedged writer restarts', async () => {
     const seeded = await repository();
     seeded.repository.enqueue(exchange('exchange-before-writer-failure'));
     await seeded.repository.flush();
@@ -868,8 +1205,10 @@ describe('SQLite LLM metrics repository', () => {
     const repositoryWithFailedWriter = await SqliteLlmMetricsRepository.open({
       databasePath: seeded.databasePath,
       flushIntervalMs: 60_000,
-      flushTimeoutMs: 30,
+      writeTimeoutMs: 30,
       closeTimeoutMs: 30,
+      restartDelayMs: 60_000,
+      logSink: () => {},
       workerFactory: () =>
         new Worker(
           `const { parentPort } = require('node:worker_threads');
@@ -883,21 +1222,386 @@ describe('SQLite LLM metrics repository', () => {
     await expect(repositoryWithFailedWriter.scan(query)).resolves.toMatchObject([
       { exchangeId: 'exchange-before-writer-failure' },
     ]);
-    repositoryWithFailedWriter.enqueue(exchange('exchange-that-cannot-be-persisted'));
+    repositoryWithFailedWriter.enqueue(exchange('exchange-waiting-for-a-writer'));
     await repositoryWithFailedWriter.flush();
     expect(repositoryWithFailedWriter.health()).toMatchObject({
-      state: 'disabled',
+      state: 'restarting',
       readerState: 'ready',
-      dropped: 1,
+      dropped: 0,
+      queuedRecords: 1,
+      lastError: expect.stringMatching(/insert request timed out/),
     });
+    expect(repositoryWithFailedWriter.enqueue(exchange('exchange-during-restart'))).toBe(true);
     await expect(repositoryWithFailedWriter.scan(query)).resolves.toMatchObject([
       { exchangeId: 'exchange-before-writer-failure' },
     ]);
     await expect(new LlmStatisticsQueryService(repositoryWithFailedWriter).capabilities()).resolves.toMatchObject({
       available: true,
-      health: { state: 'disabled', readerState: 'ready' },
+      health: { state: 'restarting', readerState: 'ready' },
     });
     await repositoryWithFailedWriter.close();
+    expect(repositoryWithFailedWriter.health()).toMatchObject({ state: 'closed', dropped: 2, queuedRecords: 0 });
+  });
+
+  it('restarts a killed writer and persists records queued meanwhile', async () => {
+    const writers: Worker[] = [];
+    const logs: string[] = [];
+    const opened = await repository({
+      processRunId: 'process-run-restarted',
+      restartDelayMs: 10,
+      logSink: (level, message) => logs.push(`${level} ${message}`),
+      workerFactory: (url, options) => {
+        const worker = defaultWorkerFactory(url, options);
+        writers.push(worker);
+        return worker;
+      },
+    });
+    opened.repository.enqueue(exchange('exchange-before-crash'));
+    await opened.repository.flush();
+    expect(opened.repository.health()).toMatchObject({ state: 'ready', persisted: 1 });
+
+    await writers[0]?.terminate();
+    expect(opened.repository.health()).toMatchObject({
+      state: 'restarting',
+      lastError: expect.stringMatching(/exited with code/),
+    });
+    expect(opened.repository.enqueue(exchange('exchange-during-restart', { startedAtMs: BASE_TIME + 1 }))).toBe(true);
+    expect(opened.repository.health().queuedRecords).toBe(1);
+
+    await vi.waitFor(
+      () => expect(opened.repository.health()).toMatchObject({ state: 'ready', persisted: 2, queuedRecords: 0 }),
+      { timeout: 10_000, interval: 20 },
+    );
+    opened.repository.enqueue(exchange('exchange-after-restart', { startedAtMs: BASE_TIME + 2 }));
+    await opened.repository.flush();
+    expect(opened.repository.health()).toMatchObject({
+      state: 'ready',
+      persisted: 3,
+      dropped: 0,
+      writerRestarts: 1,
+      lastError: null,
+    });
+    expect(writers).toHaveLength(2);
+    const rows = await opened.repository.scan({ fromMs: BASE_TIME, toMs: BASE_TIME + 1_000, limit: 10 });
+    expect(rows.map((row) => row.exchangeId).sort()).toEqual([
+      'exchange-after-restart',
+      'exchange-before-crash',
+      'exchange-during-restart',
+    ]);
+    expect(logs).toEqual([
+      expect.stringMatching(/^warn \[llm-metrics\] Statistics writer unavailable \(LLM metrics worker exited/),
+      expect.stringMatching(/^info \[llm-metrics\] Statistics writer running again after 1 restart/),
+    ]);
+    await opened.repository.close();
+
+    // The restarted worker re-ran startup under the same process run, so the
+    // start marker is not duplicated and the counters stay process-lifetime.
+    const database = new DatabaseSync(opened.databasePath, { readOnly: true });
+    expect(database.prepare('SELECT * FROM llm_process_runs').all()).toEqual([
+      expect.objectContaining({
+        process_run_id: 'process-run-restarted',
+        observed_count: 3,
+        enqueued_count: 3,
+        clean_ended_at_ms: expect.any(Number),
+      }),
+    ]);
+    expect(
+      database
+        .prepare("SELECT COUNT(*) AS count FROM llm_exchanges WHERE process_run_id = 'process-run-restarted'")
+        .get(),
+    ).toMatchObject({ count: 3 });
+    database.close();
+  });
+
+  describe('a record enqueued while a running drain awaits its checkpoint', () => {
+    /**
+     * A writer that answers at once, except for the first checkpoint: that one
+     * is answered late, so the drain that sent it has already passed its last
+     * queue check while the test enqueues behind it.
+     */
+    async function repositoryWithSlowFirstCheckpoint(): Promise<SqliteLlmMetricsRepository> {
+      const opened = await repository({
+        workerFactory: () =>
+          new Worker(
+            `const { parentPort } = require('node:worker_threads');
+             let holdCheckpoint = true;
+             parentPort.postMessage({ kind: 'ready', schemaVersion: 1 });
+             parentPort.on('message', (request) => {
+               const value =
+                 request.kind === 'insert' ? { inserted: request.exchanges.length, duplicates: 0, rejected: {} } : null;
+               const answer = () => parentPort.postMessage({ kind: 'result', id: request.id, value });
+               if (request.kind === 'checkpoint' && holdCheckpoint) {
+                 holdCheckpoint = false;
+                 setTimeout(answer, 300);
+               } else {
+                 answer();
+               }
+             });`,
+            { eval: true },
+          ),
+      });
+      const metrics = opened.repository;
+      metrics.enqueue(exchange('exchange-first-drain'));
+      void metrics.flush();
+      // The drain wrote its only batch and now waits for its checkpoint answer.
+      await vi.waitFor(() => expect(metrics.health()).toMatchObject({ persisted: 1, queuedRecords: 0 }), {
+        timeout: 5_000,
+        interval: 5,
+      });
+      expect(metrics.enqueue(exchange('exchange-behind-the-drain', { startedAtMs: BASE_TIME + 1 }))).toBe(true);
+      return metrics;
+    }
+
+    it('is written by a flush called meanwhile', async () => {
+      const metrics = await repositoryWithSlowFirstCheckpoint();
+      await metrics.flush();
+      expect(metrics.health()).toMatchObject({ state: 'ready', persisted: 2, queuedRecords: 0, dropped: 0 });
+      await metrics.close();
+    });
+
+    it('is written, not dropped, by close', async () => {
+      const metrics = await repositoryWithSlowFirstCheckpoint();
+      await metrics.close();
+      expect(metrics.health()).toMatchObject({ state: 'closed', persisted: 2, queuedRecords: 0, dropped: 0 });
+    });
+  });
+
+  it('requeues the unacknowledged batch of a writer that dies mid-insert', async () => {
+    let writers = 0;
+    const opened = await repository({
+      restartDelayMs: 10,
+      logSink: () => {},
+      workerFactory: (url, options) => {
+        writers++;
+        if (writers === 1) {
+          return new Worker(
+            `const { parentPort } = require('node:worker_threads');
+             parentPort.postMessage({ kind: 'ready', schemaVersion: 1 });
+             parentPort.on('message', (request) => {
+               if (request.kind === 'insert') process.exit(3);
+               parentPort.postMessage({ kind: 'result', id: request.id, value: null });
+             });`,
+            { eval: true },
+          );
+        }
+        return defaultWorkerFactory(url, options);
+      },
+    });
+    opened.repository.enqueue(exchange('exchange-1'));
+    opened.repository.enqueue(exchange('exchange-2', { startedAtMs: BASE_TIME + 1 }));
+    await opened.repository.flush();
+    expect(opened.repository.health()).toMatchObject({ state: 'restarting', dropped: 0, queuedRecords: 2 });
+
+    await vi.waitFor(
+      () => expect(opened.repository.health()).toMatchObject({ state: 'ready', persisted: 2, queuedRecords: 0 }),
+      { timeout: 10_000, interval: 20 },
+    );
+    expect(opened.repository.health()).toMatchObject({ dropped: 0, writerRestarts: 1 });
+    await opened.repository.close();
+  });
+
+  it('bounds each writer request and drops a record only after its bounded write attempts', async () => {
+    let writers = 0;
+    const opened = await repository({
+      writeTimeoutMs: 30,
+      closeTimeoutMs: 30,
+      restartDelayMs: 1,
+      maxRestartDelayMs: 1,
+      logSink: () => {},
+      workerFactory: () => {
+        writers++;
+        return new Worker(
+          `const { parentPort } = require('node:worker_threads');
+           parentPort.postMessage({ kind: 'ready', schemaVersion: 1 });
+           parentPort.on('message', () => {});`,
+          { eval: true },
+        );
+      },
+    });
+    opened.repository.enqueue(exchange('exchange-unresponsive-flush'));
+
+    const startedAt = performance.now();
+    await opened.repository.flush();
+    expect(performance.now() - startedAt).toBeLessThan(1_000);
+    expect(opened.repository.health()).toMatchObject({
+      state: 'restarting',
+      dropped: 0,
+      queuedRecords: 1,
+      lastError: expect.stringMatching(/insert request timed out/),
+    });
+
+    // Every replacement worker is wedged too: the record is retried a bounded
+    // number of times, then dropped, and the queue drains.
+    await vi.waitFor(() => expect(opened.repository.health()).toMatchObject({ dropped: 1, queuedRecords: 0 }), {
+      timeout: 10_000,
+      interval: 20,
+    });
+    expect(opened.repository.health().persisted).toBe(0);
+    expect(opened.repository.health().writerRestarts).toBeGreaterThanOrEqual(4);
+    expect(writers).toBeGreaterThanOrEqual(5);
+    await opened.repository.close();
+  });
+
+  it('gives each writer request its own deadline, so a drain longer than one deadline completes', async () => {
+    let writers = 0;
+    const opened = await repository({
+      batchSize: 1,
+      writeTimeoutMs: 1_500,
+      logSink: () => {},
+      workerFactory: () => {
+        writers++;
+        return new Worker(
+          `const { parentPort } = require('node:worker_threads');
+           parentPort.postMessage({ kind: 'ready', schemaVersion: 1 });
+           parentPort.on('message', (request) => {
+             const value =
+               request.kind === 'insert' ? { inserted: request.exchanges.length, duplicates: 0, rejected: {} } : null;
+             setTimeout(() => parentPort.postMessage({ kind: 'result', id: request.id, value }), 250);
+           });`,
+          { eval: true },
+        );
+      },
+    });
+    for (let index = 0; index < 8; index++) {
+      opened.repository.enqueue(exchange(`exchange-slow-batch-${index}`, { startedAtMs: BASE_TIME + index }));
+    }
+
+    const startedAt = performance.now();
+    await opened.repository.flush();
+    // Eight answers at 250 ms each outlast a single request deadline, which
+    // a whole-drain deadline would have cut short.
+    expect(performance.now() - startedAt).toBeGreaterThan(1_500);
+    expect(opened.repository.health()).toMatchObject({
+      state: 'ready',
+      persisted: 8,
+      dropped: 0,
+      queuedRecords: 0,
+      writerRestarts: 0,
+    });
+    expect(writers).toBe(1);
+    await opened.repository.close();
+  });
+
+  it('backs off writer restarts exponentially from 1 s to a 5 min ceiling', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      let spawns = 0;
+      const opened = await repository({
+        logSink: () => {},
+        workerFactory: () => {
+          spawns++;
+          throw new Error('Worker threads are exhausted');
+        },
+      });
+      expect(spawns).toBe(1);
+      expect(opened.repository.health()).toMatchObject({ state: 'restarting', writerRestarts: 0 });
+
+      const delaysMs = [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 256_000, 300_000, 300_000];
+      for (const [index, delayMs] of delaysMs.entries()) {
+        vi.advanceTimersByTime(delayMs - 1);
+        expect(spawns).toBe(index + 1);
+        vi.advanceTimersByTime(1);
+        expect(spawns).toBe(index + 2);
+      }
+      expect(opened.repository.health()).toMatchObject({ state: 'restarting', writerRestarts: delaysMs.length });
+
+      // The queue keeps accepting while the writer is away; close drops what it holds and stops restarting.
+      expect(opened.repository.enqueue(exchange('exchange-while-backing-off'))).toBe(true);
+      await opened.repository.close();
+      expect(opened.repository.health()).toMatchObject({ state: 'closed', dropped: 1, queuedRecords: 0 });
+      vi.advanceTimersByTime(10 * 60 * 1_000);
+      expect(spawns).toBe(delaysMs.length + 1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('restarts after a transient startup failure and logs the open-time failure', async () => {
+    let writers = 0;
+    const logs: string[] = [];
+    const opened = await repository({
+      restartDelayMs: 10,
+      logSink: (level, message) => logs.push(`${level} ${message}`),
+      workerFactory: (url, options) => {
+        writers++;
+        if (writers === 1) {
+          return new Worker(
+            `const { parentPort } = require('node:worker_threads');
+             parentPort.postMessage({ kind: 'error', message: 'disk I/O error' });`,
+            { eval: true },
+          );
+        }
+        return defaultWorkerFactory(url, options);
+      },
+    });
+    expect(opened.repository.health()).toMatchObject({
+      state: 'restarting',
+      lastError: expect.stringMatching(/disk I\/O error/),
+    });
+    expect(logs).toEqual([expect.stringMatching(/^warn .*Statistics writer unavailable \(disk I\/O error\)/)]);
+    expect(opened.repository.enqueue(exchange('exchange-before-first-start'))).toBe(true);
+
+    await vi.waitFor(
+      () => expect(opened.repository.health()).toMatchObject({ state: 'ready', persisted: 1, writerRestarts: 1 }),
+      { timeout: 10_000, interval: 20 },
+    );
+    expect(writers).toBe(2);
+    await opened.repository.close();
+  });
+
+  it('latches persistence off for a corrupt database without restarting or rewriting it', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'ironcurtain-llm-metrics-corrupt-'));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, 'llm-usage.sqlite3');
+    const garbage = Buffer.alloc(8192, 0x5a);
+    writeFileSync(databasePath, garbage, { mode: 0o600 });
+    let writers = 0;
+    const logs: string[] = [];
+
+    const repositoryOnCorruptFile = await SqliteLlmMetricsRepository.open({
+      databasePath,
+      restartDelayMs: 1,
+      logSink: (level, message) => logs.push(`${level} ${message}`),
+      workerFactory: (url, options) => {
+        writers++;
+        return defaultWorkerFactory(url, options);
+      },
+    });
+    expect(repositoryOnCorruptFile.health()).toMatchObject({
+      state: 'disabled',
+      lastError: expect.stringMatching(/not a database/),
+    });
+    expect(repositoryOnCorruptFile.enqueue(exchange('exchange-1'))).toBe(false);
+    await delay(50);
+    expect(writers).toBe(1);
+    expect(logs).toEqual([expect.stringMatching(/^error .*Statistics persistence disabled: file is not a database/)]);
+    await repositoryOnCorruptFile.close();
+    expect(readFileSync(databasePath).equals(garbage)).toBe(true);
+  });
+
+  it('latches persistence off for a permission failure reported at startup', async () => {
+    let writers = 0;
+    const opened = await repository({
+      restartDelayMs: 1,
+      logSink: () => {},
+      workerFactory: () => {
+        writers++;
+        return new Worker(
+          `const { parentPort } = require('node:worker_threads');
+           parentPort.postMessage({
+             kind: 'error', message: "EACCES: permission denied, chmod 'statistics'", code: 'permission'
+           });`,
+          { eval: true },
+        );
+      },
+    });
+    expect(opened.repository.health()).toMatchObject({
+      state: 'disabled',
+      lastError: expect.stringMatching(/permission denied/),
+    });
+    await delay(50);
+    expect(writers).toBe(1);
+    await opened.repository.close();
   });
 
   it('bounds its queue and fails open when persistence cannot accept another record', async () => {
@@ -908,35 +1612,9 @@ describe('SQLite LLM metrics repository', () => {
     await opened.repository.close();
   });
 
-  it('bounds flush and exposes dropped work when a worker is unresponsive', async () => {
-    const opened = await repository({
-      flushTimeoutMs: 30,
-      closeTimeoutMs: 30,
-      workerFactory: () =>
-        new Worker(
-          `const { parentPort } = require('node:worker_threads');
-           parentPort.postMessage({ kind: 'ready', schemaVersion: 1 });
-           parentPort.on('message', () => {});`,
-          { eval: true },
-        ),
-    });
-    opened.repository.enqueue(exchange('exchange-unresponsive-flush'));
-
-    const startedAt = performance.now();
-    await opened.repository.flush();
-    expect(performance.now() - startedAt).toBeLessThan(1_000);
-    expect(opened.repository.health()).toMatchObject({
-      state: 'disabled',
-      dropped: 1,
-      queuedRecords: 0,
-      lastError: expect.stringMatching(/flush timed out/),
-    });
-    await opened.repository.close();
-  });
-
   it('uses one bounded deadline for queue drain and close', async () => {
     const opened = await repository({
-      flushTimeoutMs: 60_000,
+      writeTimeoutMs: 60_000,
       closeTimeoutMs: 30,
       workerFactory: () =>
         new Worker(
@@ -1063,10 +1741,74 @@ describe('LLM statistics query service', () => {
       });
       expect(await service.capabilities()).toMatchObject({
         available: true,
-        dtoVersion: 2,
-        formulaVersion: 1,
-        maxScannedRows: 100_000,
+        dtoVersion: 3,
+        formulaVersion: 4,
+        maxScannedRows: 1_000_000,
+        maxGroups: 500,
+        maxOutputItems: 10_000,
+        maxTimeSeriesBuckets: 1_000,
+        maxRangeDays: 366,
+        quantileSampleSize: 2_048,
         allowedCalendarBucketUnits: ['day'],
+      });
+    } finally {
+      await repository.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('adds the known parts of partly measured rows to the token sums as lower bounds', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'ironcurtain-llm-lower-bounds-'));
+    const repository = await SqliteLlmMetricsRepository.open({
+      databasePath: join(directory, 'llm-usage.sqlite3'),
+      flushIntervalMs: 60_000,
+    });
+    try {
+      repository.enqueue(exchange('complete'));
+      // A cache counter the gateway omitted: the input total is unknown, but
+      // 80 uncached plus 20 cache-read input tokens and 40 output are known.
+      const partial = exchange('partial', { startedAtMs: BASE_TIME + 1, completeness: 'partial' });
+      repository.enqueue({
+        ...partial,
+        usage: {
+          ...partial.usage,
+          inputTokensTotal: null,
+          cacheWriteInputTokens: null,
+          providerTotalTokens: null,
+          canonicalTotalTokens: null,
+        },
+      });
+      repository.enqueue({ ...exchange('unmeasured', { startedAtMs: BASE_TIME + 2 }), usage: makeNormalizedUsage() });
+      await repository.flush();
+      const service = new LlmStatisticsQueryService(repository);
+      const summaries = await service.summarize({
+        fromMs: BASE_TIME,
+        toMs: BASE_TIME + 1_000,
+        measures: ['inputTokens', 'outputTokens', 'totalTokens'],
+      });
+      expect(summaries.find((summary) => summary.measure === 'inputTokens')).toMatchObject({
+        value: 200,
+        sampleCount: 1,
+        lowerBoundCount: 1,
+        eligibleCount: 3,
+        median: 100,
+      });
+      expect(summaries.find((summary) => summary.measure === 'outputTokens')).toMatchObject({
+        value: 80,
+        sampleCount: 2,
+        lowerBoundCount: 0,
+      });
+      expect(summaries.find((summary) => summary.measure === 'totalTokens')).toMatchObject({
+        value: 280,
+        sampleCount: 1,
+        lowerBoundCount: 1,
+      });
+      expect(await service.sessionTotals('session-1')).toMatchObject({
+        exchanges: 3,
+        inputTokens: 200,
+        outputTokens: 80,
+        totalTokens: 280,
+        tokenTotalsLowerBound: true,
       });
     } finally {
       await repository.close();

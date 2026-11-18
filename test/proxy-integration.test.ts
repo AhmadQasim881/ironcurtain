@@ -84,6 +84,7 @@ function buildProxyPolicyEngine(): PolicyEngine {
 
   // PolicyEngine expects StoredToolAnnotationsFile with servers.{name}.tools structure
   const toolAnnotations: StoredToolAnnotationsFile = {
+    generatedAt: 'test-fixture',
     servers: {
       proxy: {
         inputHash: 'test-fixture',
@@ -104,6 +105,7 @@ describe('Proxy MCP Server Integration', { timeout: 30_000 }, () => {
   let ca: CertificateAuthority;
   let proxy: MitmProxy;
   let controlClient: ControlApiClient;
+  let controlToken: string;
   let mitmSocketPath: string;
   let controlSocketPath: string;
 
@@ -130,9 +132,11 @@ describe('Proxy MCP Server Integration', { timeout: 30_000 }, () => {
       providers: [{ config: testProvider, fakeKey, realKey }],
       controlSocketPath,
     });
-    await proxy.start();
+    const address = await proxy.start();
+    if (address.controlToken === undefined) throw new Error('control API started without a token');
+    controlToken = address.controlToken;
 
-    controlClient = createControlApiClient(`unix://${controlSocketPath}`);
+    controlClient = createControlApiClient(`unix://${controlSocketPath}`, { token: controlToken });
   });
 
   afterAll(async () => {
@@ -153,18 +157,31 @@ describe('Proxy MCP Server Integration', { timeout: 30_000 }, () => {
       expect(listing.dynamic).toEqual([]);
     });
 
+    it('refuses a control client that does not hold the per-bundle token', async () => {
+      const anonymous = createControlApiClient(`unix://${controlSocketPath}`);
+      await expect(anonymous.addDomain('anonymous.example.com')).rejects.toThrow('Control API 401');
+      await expect(anonymous.listDomains()).rejects.toThrow('Control API 401');
+      const listing = await controlClient.listDomains();
+      expect(listing.dynamic).not.toContain('anonymous.example.com:443');
+    });
+
     it('adds a domain via control API and MITM proxy accepts CONNECT', async () => {
       const addResult = await controlClient.addDomain('api.github.com');
       expect(addResult.added).toBe(true);
 
       // Verify the domain appears in listings
       const listing = await controlClient.listDomains();
-      expect(listing.dynamic).toContain('api.github.com');
+      expect(listing.dynamic).toContain('api.github.com:443');
 
       // Verify MITM proxy accepts CONNECT to the newly added domain
       const { socket, statusCode } = await sendConnect(mitmSocketPath, 'api.github.com', 443);
       expect(statusCode).toBe(200);
       socket?.destroy();
+
+      // The approval is for HTTPS only: other ports on the host stay closed.
+      const ssh = await sendConnect(mitmSocketPath, 'api.github.com', 22);
+      expect(ssh.statusCode).toBe(403);
+      ssh.socket?.destroy();
     });
 
     it('rejects CONNECT to domains not in any allowlist', async () => {
@@ -181,7 +198,7 @@ describe('Proxy MCP Server Integration', { timeout: 30_000 }, () => {
 
       // Verify removal
       const listing = await controlClient.listDomains();
-      expect(listing.dynamic).not.toContain('temp.example.com');
+      expect(listing.dynamic).not.toContain('temp.example.com:443');
 
       // Verify MITM proxy now rejects CONNECT
       const { socket, statusCode } = await sendConnect(mitmSocketPath, 'temp.example.com', 443);
@@ -223,7 +240,7 @@ describe('Proxy MCP Server Integration', { timeout: 30_000 }, () => {
         { domain: 'api.newdomain.com', justification: 'integration test' },
         controlClient,
       );
-      expect(result).toEqual({ status: 'added', domain: 'api.newdomain.com' });
+      expect(result).toEqual({ status: 'added', domain: 'api.newdomain.com', port: 443 });
 
       // Verify the domain was actually added to the MITM proxy
       const { socket, statusCode } = await sendConnect(mitmSocketPath, 'api.newdomain.com', 443);
@@ -236,7 +253,7 @@ describe('Proxy MCP Server Integration', { timeout: 30_000 }, () => {
       await controlClient.addDomain('api.removeme.com');
 
       const result = await handleVirtualProxyTool('remove_proxy_domain', { domain: 'api.removeme.com' }, controlClient);
-      expect(result).toEqual({ status: 'removed', domain: 'api.removeme.com' });
+      expect(result).toEqual({ status: 'removed', domain: 'api.removeme.com', port: 443 });
 
       // Verify the MITM proxy now rejects
       const { socket, statusCode } = await sendConnect(mitmSocketPath, 'api.removeme.com', 443);
@@ -261,7 +278,9 @@ describe('Proxy MCP Server Integration', { timeout: 30_000 }, () => {
       );
       expect(result).toEqual({
         status: 'already_accessible',
-        message: 'Domain is already accessible (built-in provider)',
+        message: 'Domain is already accessible (built-in provider, package registry, or previously approved)',
+        domain: 'api.anthropic.com',
+        port: 443,
       });
     });
 
@@ -389,7 +408,7 @@ describe('Proxy MCP Server Integration', { timeout: 30_000 }, () => {
         { domain: 'api.flow-test.com' },
         controlClient,
       );
-      expect(result).toEqual({ status: 'removed', domain: 'api.flow-test.com' });
+      expect(result).toEqual({ status: 'removed', domain: 'api.flow-test.com', port: 443 });
 
       // Step 3: MITM proxy rejects CONNECT
       const { socket, statusCode } = await sendConnect(mitmSocketPath, 'api.flow-test.com', 443);
@@ -416,7 +435,7 @@ describe('Proxy MCP Server Integration', { timeout: 30_000 }, () => {
         { domain: 'api.new-service.com', justification: 'need API access' },
         controlClient,
       );
-      expect(result).toEqual({ status: 'added', domain: 'api.new-service.com' });
+      expect(result).toEqual({ status: 'added', domain: 'api.new-service.com', port: 443 });
 
       // Verify MITM proxy now accepts CONNECT
       const { socket, statusCode } = await sendConnect(mitmSocketPath, 'api.new-service.com', 443);
@@ -451,8 +470,8 @@ describe('Proxy MCP Server Integration', { timeout: 30_000 }, () => {
       await controlClient.addDomain('svc-b.example.com');
 
       const listing = await controlClient.listDomains();
-      expect(listing.dynamic).toContain('svc-a.example.com');
-      expect(listing.dynamic).toContain('svc-b.example.com');
+      expect(listing.dynamic).toContain('svc-a.example.com:443');
+      expect(listing.dynamic).toContain('svc-b.example.com:443');
 
       // Both should be accessible
       const connA = await sendConnect(mitmSocketPath, 'svc-a.example.com', 443);
@@ -498,6 +517,7 @@ describe('Proxy MCP Server Integration', { timeout: 30_000 }, () => {
           SERVER_FILTER: 'proxy',
           MCP_SERVERS_CONFIG: '{}',
           MITM_CONTROL_ADDR: `unix://${controlSocketPath}`,
+          MITM_CONTROL_TOKEN: controlToken,
           GENERATED_DIR: generatedDir,
           ALLOWED_DIRECTORY: tempDir,
           PROTECTED_PATHS: '[]',
@@ -549,7 +569,7 @@ describe('Proxy MCP Server Integration', { timeout: 30_000 }, () => {
 
       // Verify it exists
       const beforeListing = await controlClient.listDomains();
-      expect(beforeListing.dynamic).toContain('section6-remove.example.com');
+      expect(beforeListing.dynamic).toContain('section6-remove.example.com:443');
 
       // Remove via MCP tool call through the spawned proxy server
       const result = await mcpClient.callTool({
@@ -580,6 +600,7 @@ describe('Proxy MCP Server Integration', { timeout: 30_000 }, () => {
       const data = JSON.parse(content[0].text);
       expect(data.status).toBe('added');
       expect(data.domain).toBe('section6-add.example.com');
+      expect(data.port).toBe(443);
 
       // Verify MITM proxy accepts CONNECT to the newly added domain
       const { socket, statusCode } = await sendConnect(mitmSocketPath, 'section6-add.example.com', 443);

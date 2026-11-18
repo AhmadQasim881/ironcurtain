@@ -1,5 +1,7 @@
 # Workflow Session Identity Unification
 
+**Status (2026-11-14):** Implemented (see Implementation status below).
+
 ## Implementation status
 
 Revised 2026-04-19 after implementer review — socket layout flattened, BundleId=SessionId for CLI, AgentConversationId orchestrator-minted, transient-bundle teardown explicit, control-socket routing per-bundle, conversationStateDir now multi-conversation.
@@ -321,7 +323,7 @@ the Docker metadata.
 export interface CreateWorkflowInfrastructureInput {
   readonly workflowId: WorkflowId;
   readonly bundleId: BundleId; // NEW — minted by orchestrator
-  readonly agentId: AgentId;
+  readonly agentId: AgentId; // the scope's harness (see "Harness per scope" below)
   readonly controlSocketPath: string;
   readonly workspacePath: string;
   /**
@@ -365,10 +367,24 @@ Inside `executeAgentState(stateId)`, **before** session construction:
    insert the result via `instance.bundlesByScope.set(scope, bundle)`,
    then borrow it the same way.
 
+**Harness per scope.** The factory's `agentId` is the scope's agent
+harness, not a workflow-wide setting: `resolveScopeDockerAgent` in
+`src/workflow/agent-harness.ts` returns the one harness the scope's agent
+states resolve to (`states.<id>.dockerAgent`, else `settings.dockerAgent`,
+else `claude-code`), or the workflow default for a scope that only runs
+containerized deterministic states. A bundle is one container built from
+one harness image, so `validateDefinition()` rejects a scope whose agent
+states resolve to different harnesses (a state on another harness gets its
+own `containerScope`), and `resolveScopeDockerAgent` throws for such a
+scope before anything is minted. A session borrowing the bundle runs with
+`SessionMode.agent` set to the same harness.
+
 Under `sharedContainer: false`, the branch above is skipped entirely:
 every state spins up and tears down its own `DockerInfrastructure`
 inline (today's behavior, unchanged), and any `containerScope` field
-on the state is a validation error at load time (§9).
+on the state is a validation error at load time (§9). Each such state runs
+on its own resolved harness, so a coder on `claude-code` and a reviewer on
+`codex` need no scopes there.
 
 ### `agentConversationId` propagation
 
@@ -715,30 +731,52 @@ the signal.
 
 ## 8. Logger singleton interaction
 
-The retargeting semantics added in Step 5 (`src/logger.ts`) exist
-because per-state sessions need to redirect `session.log` mid-workflow
-between per-state directories. Under the new model those artifacts
-live at `containers/<bundleId>/states/<slug>/session.log`. The
-retarget is still per-state-visit, not per-bundle: two re-entries of
-the same state within the same bundle still need distinct
-`session.log` files. The retarget stays.
+Per-state sessions need their own `session.log` mid-workflow, in
+per-state directories. Under the new model those artifacts live at
+`containers/<bundleId>/states/<slug>/session.log`. The log is still
+per-state-visit, not per-bundle: two re-entries of the same state within
+the same bundle still need distinct `session.log` files.
 
-The only consumer change is the path the retarget points at: today
-`getWorkflowStateLogPath(wfId, slug)`, post-refactor
-`resolve(getInvocationDir(wfId, bundleId, slug), SESSION_LOG_FILENAME)`.
-`session/index.ts:buildSessionConfig` computes this path and calls
-`logger.setup({ logFilePath })` as today.
-
-No behavioral change; only path plumbing.
+`session/index.ts:buildSessionConfig` computes this path
+(`resolve(getInvocationDir(wfId, bundleId, slug), SESSION_LOG_FILENAME)`)
+and claims the logger for it (`logger.setup({ logFilePath })` returns a
+claim). Since WP-85 (`src/logger.ts`) claims stack instead of retargeting
+one global path: the session binds its own work to its claim
+(`logger.runWithClaim`), so parallel lanes each write to their own state's
+log, and its `close()` releases only that claim, so the next state's (or
+a concurrent lane's, or the daemon's) log carries on. Lines no claim is
+bound to (the orchestrator's own) go to the newest live claim, or to the
+daemon's log when the workflow runs inside the daemon.
 
 ## 8.5 Agent conversation state under shared bundles
 
 Today the adapter stores one `{sessionId}.jsonl` per Docker session in
 `conversationStateDir` (Claude Code's `projects/<cwd-hash>/` bind-mount).
-The "prior conversation exists" probe at
-`src/docker/docker-agent-session.ts:152-154` checks for that file to
-decide whether to emit `--session-id` (first turn, file absent) or
-`--resume` (subsequent turn, file present).
+The "prior conversation exists" probe (`hasStoredConversation` in
+`src/docker/conversation-state.ts`, run by the `DockerAgentSession`
+constructor) checks for that file to decide whether to emit
+`--session-id` (first turn, file absent) or `--resume` (subsequent turn,
+file present).
+
+`conversationStateDir` is the agent's read-write mount, so an earlier
+state on the same bundle can plant symlink loops or replace `projects`
+with a link to `/`. The probe is therefore two levels deep and never
+follows a symlink: `projects` must `lstat` as a real directory, one
+non-recursive pass reads at most 10,000 of its entries and keeps only
+real subdirectories, and `<subdir>/<agentConversationId>.jsonl` must
+`lstat` as a regular file. Any error or reaching the cap reads as "no
+stored conversation", which only switches `--resume` to `--session-id`.
+
+The probe is chosen by the adapter's `transcriptLayout`
+(`findStoredConversation`). Codex mints its own thread id and Goose names
+its sessions, so for them the session keeps a record per conversation in
+the host-only bundle directory (`<bundleDir>/agent-conversations/
+<agentConversationId>.json`, never mounted): Codex resumes
+(`exec resume <thread>`) only when the record names a thread whose rollout
+`sessions/YYYY/MM/DD/rollout-*-<thread>.jsonl` exists, and Goose resumes
+(`--name <agentConversationId> --resume`) only when the record exists and
+its session store is non-empty. Codex never falls back to "the most recent
+session": states sharing the bundle share `~/.codex`.
 
 Under the new model `conversationStateDir` is **bundle-scoped and
 multi-conversation**: the shared primary bundle accumulates one `.jsonl`

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { spawnSync } from 'node:child_process';
 import {
   closeSync,
   existsSync,
@@ -135,6 +136,53 @@ describe('runtime trust consumers', () => {
       expect(entrypoint).toContain('. /usr/local/bin/ironcurtain-uid-remap.sh');
     }
   });
+
+  it.skipIf(process.platform !== 'linux')(
+    'skips the root-only system trust store when agent sudo is disabled, and still needs sudo by default',
+    () => {
+      const directory = mkdtempSync(join(tmpdir(), 'ic-trust-entrypoint-'));
+      try {
+        const bin = join(directory, 'bin');
+        mkdirSync(bin);
+        const calls = join(directory, 'calls.log');
+        const runtimeCa = join(directory, 'ca-cert.pem');
+        writeFileSync(runtimeCa, CA_ONE);
+        const stub = (name: string, body: string): void => {
+          writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+        };
+        // A non-root agent; sudo (refused, as under no-new-privileges) and the
+        // trust-store tool record that they were reached.
+        stub('id', 'echo 1000');
+        stub('sudo', `echo "sudo $*" >> '${calls}'; exit 1`);
+        stub('update-ca-certificates', `echo update >> '${calls}'`);
+        const script = readFileSync(join(process.cwd(), 'docker', 'entrypoint-uid-remap.sh'), 'utf8')
+          .replace('IRONCURTAIN_RUNTIME_CA=/etc/ironcurtain/ca-cert.pem', `IRONCURTAIN_RUNTIME_CA='${runtimeCa}'`)
+          .replace(
+            'IRONCURTAIN_SYSTEM_CA=/usr/local/share/ca-certificates/ironcurtain-session-ca.crt',
+            `IRONCURTAIN_SYSTEM_CA='${join(directory, 'system-ca.crt')}'`,
+          );
+        const helper = join(directory, 'ironcurtain-uid-remap.sh');
+        writeFileSync(helper, script);
+        const source = (env: Record<string, string>) =>
+          spawnSync('bash', ['-c', '. "$1"; echo sourced-ok', 'entrypoint', helper], {
+            env: { PATH: `${bin}:/usr/bin:/bin`, ...env },
+            encoding: 'utf8',
+          });
+
+        const sudoOff = source({ IRONCURTAIN_AGENT_SUDO: 'disabled' });
+        expect(sudoOff.status).toBe(0);
+        expect(sudoOff.stdout).toContain('sourced-ok');
+        expect(existsSync(calls)).toBe(false);
+
+        const sudoOn = source({});
+        expect(sudoOn.status).toBe(1);
+        expect(sudoOn.stdout).not.toContain('sourced-ok');
+        expect(readFileSync(calls, 'utf8')).toContain('sudo -n install -m 0444');
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
 
   it('binds apt HTTP, HTTPS, and TLS trust to one fixed endpoint', () => {
     expect(renderAptProxyConfig('http://127.0.0.1:18080')).toBe(

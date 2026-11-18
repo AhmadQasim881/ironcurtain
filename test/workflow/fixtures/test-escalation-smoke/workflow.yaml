@@ -1,0 +1,26 @@
+name: test-escalation-smoke
+description: 'TESTING ONLY - one shared-container agent state whose tool call policy escalates. Drives the workflow tool-call escalation integration test with no real LLM or Docker (stub session factory and infrastructure).'
+initial: work
+
+settings:
+  mode: docker
+  dockerAgent: claude-code
+  sharedContainer: true
+  maxRounds: 1
+
+states:
+  work:
+    type: agent
+    description: Write one file outside the workspace, which policy escalates.
+    persona: global
+    prompt: |
+      Write the requested file. Do not do anything else.
+    inputs: []
+    outputs:
+      - result
+    transitions:
+      - to: done
+
+  done:
+    type: terminal
+    description: Done.

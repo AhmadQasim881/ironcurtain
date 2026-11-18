@@ -4,9 +4,12 @@
    *
    * Pure prop-driven (no store access — see `packages/web-ui/CLAUDE.md` layer
    * rules). The parent route is responsible for fetching pages via the
-   * `workflows.messageLog` RPC and feeding them in.
+   * `workflows.messageLog` RPC and feeding them in. Long messages arrive cut
+   * (`entry.truncated` with an opaque `entry.ref`); the parent passes
+   * `fetchFullEntry` so the complete text is fetched only when a reviewer
+   * expands such an entry.
    */
-  import type { MessageLogEntry } from '$lib/types.js';
+  import type { MessageLogEntry, MessageLogEntryDto, MessageLogEntryResponseDto } from '$lib/types.js';
   import { Badge } from '$lib/components/ui/badge/index.js';
   import { Button } from '$lib/components/ui/button/index.js';
   import { Card } from '$lib/components/ui/card/index.js';
@@ -19,8 +22,9 @@
     hasMore,
     onLoadOlder,
     maxHeight = '60vh',
+    fetchFullEntry,
   }: {
-    entries: readonly MessageLogEntry[];
+    entries: readonly MessageLogEntryDto[];
     loading?: boolean;
     hasMore: boolean;
     onLoadOlder?: () => void;
@@ -30,6 +34,8 @@
      * larger value (e.g. `'100vh'`) to opt out.
      */
     maxHeight?: string;
+    /** Loads the complete entry behind a truncated page entry's `ref`. */
+    fetchFullEntry?: (ref: string) => Promise<MessageLogEntryResponseDto>;
   } = $props();
 
   // ------------------------------------------------------------------
@@ -49,10 +55,25 @@
     state_transition: { label: 'State', badgeVariant: 'outline' },
     gate_raised: { label: 'Gate raised', badgeVariant: 'secondary' },
     gate_resolved: { label: 'Gate resolved', badgeVariant: 'secondary' },
+    tool_call_escalation: { label: 'Escalation', badgeVariant: 'warning' },
     error: { label: 'Error', badgeVariant: 'destructive' },
     quota_exhausted: { label: 'Quota exhausted', badgeVariant: 'destructive' },
     agent_retry: { label: 'Retry', badgeVariant: 'warning' },
   };
+
+  /**
+   * The daemon may log entry types this build does not know yet (the log is
+   * append-only and outlives UI versions). Render those with a neutral badge
+   * instead of failing the whole timeline on a missing table entry.
+   */
+  function metaFor(entry: MessageLogEntry): VariantMeta {
+    return (
+      (VARIANT_META as Partial<Record<string, VariantMeta>>)[entry.type] ?? {
+        label: String(entry.type),
+        badgeVariant: 'outline',
+      }
+    );
+  }
 
   // `ts:type` alone is not unique enough: rapid `agent_retry` bursts can emit
   // multiple same-type entries within the same millisecond (orchestrator.ts:1531),
@@ -62,10 +83,10 @@
   // message-log refresh (re-fetched entries are new object references); a
   // backend `seq` field on `MessageLogEntry` would fix that, but a silent
   // expansion reset is far better than a fatal render crash.
-  const entryIds = new WeakMap<MessageLogEntry, number>();
+  const entryIds = new WeakMap<MessageLogEntryDto, number>();
   let nextEntryId = 0;
 
-  function entryKey(entry: MessageLogEntry): string {
+  function entryKey(entry: MessageLogEntryDto): string {
     let id = entryIds.get(entry);
     if (id === undefined) {
       id = nextEntryId++;
@@ -76,12 +97,49 @@
 
   let expanded = $state<Set<string>>(new Set());
 
-  function toggleExpanded(key: string): void {
+  // Complete entries fetched for truncated page entries, keyed like `expanded`.
+  let fullEntries = $state<Map<string, MessageLogEntry>>(new Map());
+  let fullLoading = $state<Set<string>>(new Set());
+  let fullErrors = $state<Map<string, string>>(new Map());
+
+  /** The entry to render: the fetched complete entry when there is one, else the page entry. */
+  function shownEntry(entry: MessageLogEntryDto, key: string): MessageLogEntry {
+    return fullEntries.get(key) ?? entry;
+  }
+
+  function isTruncated(entry: MessageLogEntryDto, key: string): boolean {
+    return entry.truncated === true && !fullEntries.has(key);
+  }
+
+  async function loadFull(entry: MessageLogEntryDto, key: string): Promise<void> {
+    if (!isTruncated(entry, key) || fullLoading.has(key)) return;
+    if (entry.ref === undefined || fetchFullEntry === undefined) return;
+    fullLoading = new Set(fullLoading).add(key);
+    try {
+      const res = await fetchFullEntry(entry.ref);
+      fullEntries = new Map(fullEntries).set(key, res.entry);
+      if (fullErrors.has(key)) {
+        const next = new Map(fullErrors);
+        next.delete(key);
+        fullErrors = next;
+      }
+    } catch (err) {
+      fullErrors = new Map(fullErrors).set(key, err instanceof Error ? err.message : String(err));
+    } finally {
+      const done = new Set(fullLoading);
+      done.delete(key);
+      fullLoading = done;
+    }
+  }
+
+  function toggleExpanded(key: string, entry: MessageLogEntryDto): void {
     const next = new Set(expanded);
     if (next.has(key)) {
       next.delete(key);
     } else {
       next.add(key);
+      // Expanding a cut message is when the full text is wanted.
+      void loadFull(entry, key);
     }
     expanded = next;
   }
@@ -154,8 +212,10 @@
     {/if}
 
     {#each entries as entry (entryKey(entry))}
-      {@const meta = VARIANT_META[entry.type]}
+      {@const meta = metaFor(entry)}
       {@const key = entryKey(entry)}
+      {@const shown = shownEntry(entry, key)}
+      {@const truncated = isTruncated(entry, key)}
       <Card data-testid="message-log-entry" data-entry-type={entry.type} class="px-3 py-2">
         <div class="flex items-baseline gap-2 text-xs text-muted-foreground mb-1">
           <Badge variant={meta.badgeVariant} class="font-mono shrink-0">{meta.label}</Badge>
@@ -163,72 +223,115 @@
           <span class="ml-auto" title={formatAbsoluteTime(entry.ts)}>{formatMessageRelativeTime(entry.ts)}</span>
         </div>
 
-        {#if isAgentMessage(entry)}
+        {#if isAgentMessage(shown)}
           {@const isOpen = isExpanded(key)}
           <button
             type="button"
             class="w-full text-left text-sm text-foreground/90 hover:text-foreground transition-colors"
-            onclick={() => toggleExpanded(key)}
+            onclick={() => toggleExpanded(key, entry)}
             data-testid="agent-toggle"
             aria-expanded={isOpen}
           >
             {#if isOpen}
-              <div class="prose-markdown" data-testid="agent-full">{@html renderMarkdown(entry.message)}</div>
+              <div class="prose-markdown" data-testid="agent-full">{@html renderMarkdown(shown.message)}</div>
             {:else}
               <div class="truncate" data-testid="agent-preview">
-                <span class="text-[10px] uppercase tracking-wider text-muted-foreground/70 mr-2">{entry.role}</span>
-                {previewOf(entry.message)}
+                <span class="text-[10px] uppercase tracking-wider text-muted-foreground/70 mr-2">{shown.role}</span>
+                {previewOf(shown.message)}
               </div>
             {/if}
           </button>
-          {#if entry.type === 'agent_received' && entry.verdict}
-            <div class="mt-1 text-xs text-muted-foreground">
-              verdict: <span class="font-mono text-foreground/80">{entry.verdict}</span>
-              {#if entry.confidence}
-                · confidence: <span class="font-mono text-foreground/80">{entry.confidence}</span>
+          {#if isOpen && truncated}
+            <div class="mt-1 flex items-center gap-2 text-xs text-muted-foreground" data-testid="agent-truncated">
+              {#if fullLoading.has(key)}
+                <Spinner size="xs" />
+                <span>Loading the full message…</span>
+              {:else if fullErrors.has(key)}
+                <span class="text-destructive">Showing the first part only — {fullErrors.get(key)}</span>
+              {:else}
+                <span>Showing the first part only (message truncated).</span>
               {/if}
             </div>
           {/if}
-        {:else if entry.type === 'state_transition'}
+          {#if shown.type === 'agent_received' && shown.verdict}
+            <div class="mt-1 text-xs text-muted-foreground">
+              verdict: <span class="font-mono text-foreground/80">{shown.verdict}</span>
+              {#if shown.confidence}
+                · confidence: <span class="font-mono text-foreground/80">{shown.confidence}</span>
+              {/if}
+            </div>
+          {/if}
+        {:else if shown.type === 'state_transition'}
           <div class="text-sm font-mono text-foreground/90">
-            <span class="text-muted-foreground">{entry.from}</span>
+            <span class="text-muted-foreground">{shown.from}</span>
             <span class="mx-1.5 text-muted-foreground">→</span>
-            <span>{entry.state}</span>
+            <span>{shown.state}</span>
             <span class="mx-2 text-muted-foreground">/</span>
-            <span class="text-foreground/70">{entry.event}</span>
+            <span class="text-foreground/70">{shown.event}</span>
           </div>
-        {:else if entry.type === 'gate_raised'}
+        {:else if shown.type === 'gate_raised'}
           <div class="text-sm text-foreground/90">
             <span class="text-muted-foreground">accepted events:</span>
-            <span class="font-mono text-foreground/80">{entry.acceptedEvents.join(', ') || '—'}</span>
+            <span class="font-mono text-foreground/80">{shown.acceptedEvents.join(', ') || '—'}</span>
           </div>
-        {:else if entry.type === 'gate_resolved'}
+        {:else if shown.type === 'gate_resolved'}
           <div class="text-sm text-foreground/90">
             <span class="text-muted-foreground">resolved with</span>
-            <span class="font-mono text-foreground/80">{entry.event}</span>
-            {#if entry.prompt}
-              <div class="mt-1 text-xs text-muted-foreground italic">{entry.prompt}</div>
+            <span class="font-mono text-foreground/80">{shown.event}</span>
+            {#if shown.resolvedBy}
+              <span class="text-muted-foreground">via</span>
+              <span class="font-mono text-foreground/80" data-testid="gate-resolved-by">{shown.resolvedBy}</span>
+            {/if}
+            {#if shown.prompt}
+              <div class="mt-1 text-xs text-muted-foreground italic">{shown.prompt}</div>
             {/if}
           </div>
-        {:else if entry.type === 'error'}
-          <div class="text-sm text-destructive whitespace-pre-wrap">{entry.error}</div>
-          {#if entry.context}
-            <div class="mt-1 text-xs text-muted-foreground whitespace-pre-wrap">{entry.context}</div>
+        {:else if shown.type === 'tool_call_escalation'}
+          <div class="text-sm text-foreground/90">
+            <span class="font-mono text-foreground/80">{shown.serverName}/{shown.toolName}</span>
+            <span class="mx-1.5 text-muted-foreground">·</span>
+            <span class="font-mono">{shown.outcome}</span>
+          </div>
+          <div class="mt-1 text-xs text-muted-foreground whitespace-pre-wrap">{shown.reason}</div>
+        {:else if shown.type === 'error'}
+          <div class="text-sm text-destructive whitespace-pre-wrap">{shown.error}</div>
+          {#if shown.context}
+            <div class="mt-1 text-xs text-muted-foreground whitespace-pre-wrap">{shown.context}</div>
           {/if}
-        {:else if entry.type === 'quota_exhausted'}
+        {:else if shown.type === 'quota_exhausted'}
           <div class="text-sm text-destructive">
-            <span class="text-[10px] uppercase tracking-wider mr-2">{entry.role}</span>
-            <span class="whitespace-pre-wrap">{entry.rawMessage}</span>
+            <span class="text-[10px] uppercase tracking-wider mr-2">{shown.role}</span>
+            <span class="whitespace-pre-wrap">{shown.rawMessage}</span>
           </div>
-          {#if entry.resetAt}
-            <div class="mt-1 text-xs text-muted-foreground">resets at {formatAbsoluteTime(entry.resetAt)}</div>
+          {#if shown.resetAt}
+            <div class="mt-1 text-xs text-muted-foreground">resets at {formatAbsoluteTime(shown.resetAt)}</div>
           {/if}
-        {:else if entry.type === 'agent_retry'}
+        {:else if shown.type === 'agent_retry'}
           <div class="text-sm text-warning">
-            <span class="text-[10px] uppercase tracking-wider mr-2">{entry.role}</span>
-            <span class="font-mono">{entry.reason}</span>
+            <span class="text-[10px] uppercase tracking-wider mr-2">{shown.role}</span>
+            <span class="font-mono">{shown.reason}</span>
           </div>
-          <div class="mt-1 text-xs text-muted-foreground whitespace-pre-wrap">{entry.details}</div>
+          <div class="mt-1 text-xs text-muted-foreground whitespace-pre-wrap">{shown.details}</div>
+        {/if}
+
+        {#if !isAgentMessage(shown) && truncated}
+          <div class="mt-1 flex items-center gap-2 text-xs text-muted-foreground" data-testid="entry-truncated">
+            <span>Text truncated.</span>
+            {#if fetchFullEntry && entry.ref !== undefined}
+              <button
+                type="button"
+                class="text-primary hover:underline disabled:opacity-60"
+                onclick={() => loadFull(entry, key)}
+                disabled={fullLoading.has(key)}
+                data-testid="load-full-entry"
+              >
+                {fullLoading.has(key) ? 'Loading…' : 'Show full text'}
+              </button>
+            {/if}
+            {#if fullErrors.has(key)}
+              <span class="text-destructive">{fullErrors.get(key)}</span>
+            {/if}
+          </div>
         {/if}
       </Card>
     {/each}

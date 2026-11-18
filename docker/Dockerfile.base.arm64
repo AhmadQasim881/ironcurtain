@@ -64,7 +64,12 @@ RUN setcap cap_setuid+ep /usr/bin/newuidmap && \
     setcap cap_setgid+ep /usr/bin/newgidmap && \
     chmod u-s /usr/bin/newuidmap /usr/bin/newgidmap
 
-# Grant passwordless sudo to codespace (matches devcontainers/universal behavior)
+# Grant passwordless sudo to codespace (matches devcontainers/universal behavior).
+# It works only while the agent container keeps SETUID/SETGID and runs without
+# no-new-privileges, the default. With `agentSudo: false` the host starts the
+# container as UID 1000 under no-new-privileges and without file-privilege
+# capabilities, so this grant (and any setuid binary) is inert; see
+# src/docker/agent-privileges.ts.
 RUN echo "codespace ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/codespace && \
     chmod 0440 /etc/sudoers.d/codespace
 
@@ -92,7 +97,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3-pip && 
 
 RUN npm install -g node-gyp
 
-# Rust toolchain (rustc, cargo) + cargo-fuzz for the vuln-discovery workflow.
+# Rust build and test tooling (rustc, cargo, cargo-fuzz).
 # Containers run with --network=none, so the toolchain and the nightly
 # channel that cargo-fuzz invokes must be baked into the image. Installed
 # system-wide under /opt/rust so the codespace user inherits it via ENV.
@@ -140,3 +145,6 @@ USER codespace
 # Must run as codespace — node-gyp caches headers in ~/.cache/node-gyp/
 # and the runtime user is codespace, not root.
 RUN node-gyp install
+
+# Keep the small transport asset after toolchain installation layers.
+COPY --chown=root:root --chmod=0444 mcp-bridge.mjs /usr/local/bin/ironcurtain-mcp-bridge.mjs

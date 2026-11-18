@@ -6,7 +6,8 @@
  *   - `config.setModelProviders` — mutation; gated on `ctx.allowPolicyMutation`,
  *     persists the WHOLE section via `saveUserConfig`, emits `config.changed`.
  *   - `config.getDockerWorkload` — read; returns enablement plus the three-state network selector.
- *   - `config.setDockerWorkload` — gated mutation; persists only those controls.
+ *   - `config.setDockerWorkload` — gated mutation; persists only those controls,
+ *     and refuses to leave nested Docker enabled on a host that cannot run it.
  *   - `config.getStatistics` / `config.setStatistics` — resolved statistics
  *     settings, with the same mutation gate and change event.
  *
@@ -45,6 +46,7 @@ import { getProviderEditorDescriptors, providerProfileSummary } from '../../conf
 import { resolvedGatewayToInput } from '../../config/provider-editor.js';
 import { providerProfileSchema } from '../../config/user-config.js';
 import { DOCKER_WORKLOAD_NETWORK_ACCESS } from '../../docker-workload/config.js';
+import { unsupportedNestedDockerHostReason } from '../../docker-workload/environment.js';
 
 // The mask FORMAT that `maskApiKey` produces is the DTO contract (§12.6): the
 // `resolveApiKey` round-trip below compares an incoming wire value against
@@ -114,7 +116,7 @@ export async function configDispatch(
       requirePolicyMutation(ctx);
       const input: ResourceBudgetConfigDto = validateParams(resourceBudgetFieldsSchema.required().strict(), params);
       try {
-        // Refuse to overwrite an unreadable config; saveUserConfig otherwise starts fresh on corrupt JSON.
+        // Validate the whole existing config first; saveUserConfig itself refuses unreadable JSON.
         loadUserConfig({ readOnly: true });
         saveUserConfig({ resourceBudget: input });
       } catch (err) {
@@ -380,9 +382,21 @@ function setModelProviders(ctx: WorkflowDispatchContext, input: SetInput): GetMo
 /**
  * Persists the two fields owned by the web UI. A normal load first performs
  * validated legacy migration so the subsequent canonical write cannot merge
- * old imageIngress and new networkAccess fields.
+ * old imageIngress and new networkAccess fields. On a host where nested Docker
+ * can never be admitted (native Linux, for one) a write that leaves it enabled
+ * is refused before anything is read or written: while it is on, every Docker
+ * agent session would fail admission. Turning it off is always allowed.
  */
 function setDockerWorkload(ctx: WorkflowDispatchContext, input: DockerWorkloadSettingsDto): DockerWorkloadSettingsDto {
+  if (input.enabled) {
+    const unsupportedHost = unsupportedNestedDockerHostReason();
+    if (unsupportedHost !== undefined) {
+      throw new RpcError(
+        'INVALID_PARAMS',
+        `${unsupportedHost} Nothing was saved; on this host nested Docker can only be turned off.`,
+      );
+    }
+  }
   try {
     loadUserConfig();
     saveUserConfig({

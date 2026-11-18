@@ -69,8 +69,9 @@ describe('isCapturableEndpoint: capture-endpoint allowlist', () => {
     expect(isCapturableEndpoint(codexChatGptProvider, 'POST', '/backend-api/codex/responses')).toBe(true);
     expect(isCapturableEndpoint(codexChatGptProvider, 'POST', '/backend-api/codex/responses?stream=true')).toBe(true);
     expect(isCapturableEndpoint(codexChatGptProvider, 'post', '/backend-api/codex/responses')).toBe(true);
-    // The bare path (the old, never-matching capture target) and the GET poll /
-    // model-list housekeeping calls must NOT be captured.
+    // The bare path (the old, never-matching capture target), a GET on the
+    // completion path (where Codex's refused WebSocket handshakes arrive) and
+    // the model-list housekeeping call must NOT be captured.
     expect(isCapturableEndpoint(codexChatGptProvider, 'POST', '/backend-api/codex')).toBe(false);
     expect(isCapturableEndpoint(codexChatGptProvider, 'GET', '/backend-api/codex/responses')).toBe(false);
     expect(isCapturableEndpoint(codexChatGptProvider, 'GET', '/backend-api/codex/models')).toBe(false);

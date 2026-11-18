@@ -1,12 +1,15 @@
 import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { stableStringify } from '../../src/hash.js';
 import {
   activateDockerWorkloadLease,
+  bindDockerWorkloadOuterResourceStorage,
   closeDockerWorkloadLease,
   createDockerWorkloadLease,
+  heartbeatDockerWorkloadLease,
   loadDockerWorkloadLease,
   observeDockerWorkloadOuterResource,
   recoverDockerWorkloadLeaseIncident,
@@ -16,6 +19,14 @@ import {
   revokeDockerWorkloadLease,
   type CreateDockerWorkloadLeaseOptions,
 } from '../../src/docker-workload/bundle-lease.js';
+import { getProcessStartIdentity } from '../../src/docker-workload/process-lock.js';
+import { createVersion2DockerWorkloadLease } from '../helpers/legacy-docker-workload-lease.js';
+import {
+  buildRuntimeWatchdogPolicy,
+  loadFrozenWatchdogPolicyTemplate,
+} from '../../src/docker-workload/watchdog-policy.js';
+
+const TEMPLATE = loadFrozenWatchdogPolicyTemplate(resolve('config/docker-workload/resource-watchdog-policy.json'));
 
 const temporaryDirectories: string[] = [];
 
@@ -37,14 +48,16 @@ describe('Docker-workload bundle lease', () => {
   it('keeps legacy catalog-bearing v1 leases readable and cleanable without writing those fields to new leases', () => {
     const { path, options } = fixture();
     const created = createDockerWorkloadLease(path, options);
-    expect(created).toMatchObject({ schemaVersion: 2, bindings: options.bindings });
+    expect(created).toMatchObject({ schemaVersion: 3, bindings: options.bindings });
 
     const legacy = JSON.parse(readFileSync(path, 'utf8')) as {
       schemaVersion: number;
       bindings: Record<string, unknown>;
+      coordinator: Record<string, unknown>;
     };
     legacy.schemaVersion = 1;
     legacy.bindings = { watchdogPolicySha256: '5'.repeat(64), catalogSha256: '2'.repeat(64) };
+    delete legacy.coordinator.processIdentity;
     writeFileSync(path, `${stableStringify(legacy)}\n`, { mode: 0o600 });
     expect(loadDockerWorkloadLease(path)).toMatchObject({ schemaVersion: 1, bindings: legacy.bindings });
 
@@ -58,6 +71,57 @@ describe('Docker-workload bundle lease', () => {
       ],
     });
     expect(closed).toMatchObject({ schemaVersion: 1, status: 'closed', bindings: legacy.bindings });
+  });
+
+  it('binds a new lease to its coordinator process-start identity and rejects a v3 record without one', () => {
+    const { path, options } = fixture();
+    const created = createDockerWorkloadLease(path, options);
+    expect(created.coordinator).toEqual({
+      pid: process.pid,
+      processIdentity: getProcessStartIdentity(process.pid),
+      startedAt: '2026-07-20T12:00:00.000Z',
+      heartbeatAt: '2026-07-20T12:00:00.000Z',
+    });
+
+    const record = JSON.parse(readFileSync(path, 'utf8')) as { coordinator: Record<string, unknown> };
+    delete record.coordinator.processIdentity;
+    writeFileSync(path, `${stableStringify(record)}\n`, { mode: 0o600 });
+    expect(() => loadDockerWorkloadLease(path)).toThrow(/lease is invalid/u);
+
+    const explicit = fixture();
+    expect(
+      createDockerWorkloadLease(explicit.path, {
+        ...explicit.options,
+        coordinatorPid: 4242,
+        coordinatorProcessIdentity: 'Mon Jul 20 12:00:00 2026',
+      }).coordinator,
+    ).toMatchObject({ pid: 4242, processIdentity: 'Mon Jul 20 12:00:00 2026' });
+
+    // A PID above the largest Linux pid_max can never exist, so no identity can be read for it.
+    const unknown = fixture();
+    expect(() => createDockerWorkloadLease(unknown.path, { ...unknown.options, coordinatorPid: 4_194_305 })).toThrow(
+      /coordinator process start identity/u,
+    );
+  });
+
+  it('keeps a v2 lease without coordinator identity at its version through every mutation', () => {
+    const { path, options } = fixture();
+    expect(createVersion2DockerWorkloadLease(path, options)).toMatchObject({
+      schemaVersion: 2,
+      coordinator: { pid: process.pid },
+    });
+    heartbeatDockerWorkloadLease(path, options.generation, new Date('2026-07-20T12:00:05.000Z'));
+    revokeDockerWorkloadLease(path, options.generation);
+    const closed = closeDockerWorkloadLease(path, options.generation, {
+      exactOuterResourcesAbsent: true,
+      stateRootAbsent: true,
+      inventories: [
+        { capturedAt: '2026-07-20T12:00:00.000Z', ownedResourceIds: [] },
+        { capturedAt: '2026-07-20T12:00:00.200Z', ownedResourceIds: [] },
+      ],
+    });
+    expect(closed).toMatchObject({ schemaVersion: 2, status: 'closed' });
+    expect(closed.coordinator).not.toHaveProperty('processIdentity');
   });
 
   it('durably records request before immutable observation and closes only after exact cleanup proof', () => {
@@ -223,6 +287,75 @@ describe('Docker-workload bundle lease', () => {
     const parsed = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
     writeFileSync(path, JSON.stringify(parsed, null, 2), { mode: 0o600 });
     expect(() => loadDockerWorkloadLease(path)).toThrow(/canonical JSON/u);
+  });
+});
+
+describe('Docker-workload lease runtime-storage binding', () => {
+  const storage = {
+    kind: 'host-file',
+    path: '/Users/me/apple/containers/vm/rootfs.ext4',
+    device: 7,
+    inode: 9,
+  } as const;
+
+  function appleLease() {
+    const { path, options } = fixture();
+    createDockerWorkloadLease(path, {
+      ...options,
+      bindings: {
+        watchdogPolicy: buildRuntimeWatchdogPolicy(TEMPLATE, 'apple-container', {
+          root: options.paths.stateRoot,
+          device: 1,
+          inode: 1,
+        }),
+      },
+      cleanupInventoryGapMs: TEMPLATE.cleanupInventoryGapMs,
+    });
+    requestDockerWorkloadOuterResource(path, options.generation, {
+      requestId: 'agent-vm',
+      kind: 'container',
+      role: 'agent',
+      requestedName: 'agent-vm',
+      ownershipLabelKey: 'com.ironcurtain.docker-workload.generation',
+    });
+    return { path, generation: options.generation };
+  }
+
+  it('pins storage only to an observed container during admission and requires its activation baseline', () => {
+    const { path, generation } = appleLease();
+    expect(() => bindDockerWorkloadOuterResourceStorage(path, generation, 'agent-vm', storage)).toThrow(
+      /not observed yet/u,
+    );
+    observeDockerWorkloadOuterResource(path, generation, 'agent-vm', 'agent-vm');
+    bindDockerWorkloadOuterResourceStorage(path, generation, 'agent-vm', storage);
+    expect(loadDockerWorkloadLease(path).resources[0]?.storage).toMatchObject({
+      ...storage,
+      baselineAllocatedBytes: null,
+    });
+    expect(() => bindDockerWorkloadOuterResourceStorage(path, generation, 'agent-vm', storage)).toThrow(
+      /already bound/u,
+    );
+
+    expect(() => activateDockerWorkloadLease(path, generation)).toThrow(/baseline for exactly every bound/u);
+    expect(() => activateDockerWorkloadLease(path, generation, new Date(), new Map([['other', 1]]))).toThrow(
+      /baseline for exactly every bound/u,
+    );
+    activateDockerWorkloadLease(path, generation, new Date(), new Map([['agent-vm', 4096]]));
+    expect(loadDockerWorkloadLease(path).resources[0]?.storage?.baselineAllocatedBytes).toBe(4096);
+    expect(() => bindDockerWorkloadOuterResourceStorage(path, generation, 'agent-vm', storage)).toThrow(
+      /only during admission/u,
+    );
+  });
+
+  it('rejects a lease record that binds storage outside an Apple container or activates without a baseline', () => {
+    const { path, generation } = appleLease();
+    observeDockerWorkloadOuterResource(path, generation, 'agent-vm', 'agent-vm');
+    bindDockerWorkloadOuterResourceStorage(path, generation, 'agent-vm', storage);
+    const record = JSON.parse(readFileSync(path, 'utf8')) as { status: string; runtimeKind: string };
+    writeFileSync(path, `${stableStringify({ ...record, status: 'active' })}\n`, { mode: 0o600 });
+    expect(() => loadDockerWorkloadLease(path)).toThrow(/storage baseline for every bound file/u);
+    writeFileSync(path, `${stableStringify({ ...record, runtimeKind: 'docker' })}\n`, { mode: 0o600 });
+    expect(() => loadDockerWorkloadLease(path)).toThrow(/invalid/u);
   });
 });
 

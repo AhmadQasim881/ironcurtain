@@ -3,11 +3,15 @@ import { performance } from 'node:perf_hooks';
 
 import type { CompletionEndpoint } from '../docker/llm-observation/completion-endpoint.js';
 import type {
+  ObservationConsumerDegraded,
   ObservationConsumerDetached,
   ResponseObservationConsumer,
 } from '../docker/llm-observation/response-observation-hub.js';
 import { DEFAULT_SSE_EVENT_FRAMER_LIMITS, type SseEventFrame } from '../docker/llm-observation/sse-event-framer.js';
+import { estimateListPriceCostUsd, UNRECOGNIZED_PRICING_MODE } from './cost-estimate.js';
+import { MAX_EXCHANGE_QUALITY_FLAGS } from './query-contract.js';
 import type {
+  GatewayObservation,
   GatewayResponseHeaders,
   IdentitySource,
   LlmExchangeAttribution,
@@ -15,11 +19,15 @@ import type {
   LlmExchangeRoute,
   LlmGatewayAdapter,
   LlmProtocolAdapter,
+  LlmProtocolObservation,
   LlmRequestFacts,
+  NormalizedUsage,
   TransportAttempt,
 } from './types.js';
 
 const MAX_JSON_RESPONSE_BYTES = 8 * 1024 * 1024;
+/** RFC 9110 section 15: a client processes a status outside 100-599 as a 5xx (Server Error). */
+const INVALID_STATUS_PROCESSED_AS = 500;
 
 export interface LlmMetricsExchangeObserverOptions {
   readonly endpoint: CompletionEndpoint;
@@ -57,6 +65,18 @@ function identitySource(value: string | null, present: IdentitySource): Identity
   return value === null ? 'not_exposed' : present;
 }
 
+/**
+ * The record's flags, sorted and bounded. A malformed or adversarial response
+ * can raise many distinct flags at once; past the bound persistence would
+ * reject the record, so keep a deterministic subset and mark the truncation
+ * instead.
+ */
+function boundedQualityFlags(flags: ReadonlySet<string>): readonly string[] {
+  const sorted = [...flags].sort();
+  if (sorted.length <= MAX_EXCHANGE_QUALITY_FLAGS) return sorted;
+  return [...sorted.slice(0, MAX_EXCHANGE_QUALITY_FLAGS - 1), 'quality_flags_truncated'].sort();
+}
+
 /** One content-free observation lifecycle for one completion HTTP request. */
 export class LlmMetricsExchangeObserver {
   readonly exchangeId: string;
@@ -71,6 +91,8 @@ export class LlmMetricsExchangeObserver {
   private originalRequest = emptyRequestFacts();
   private forwardedRequest = emptyRequestFacts();
   private responseStatus: number | null = null;
+  /** The upstream status was outside 100-599; it is stored as unknown but still classified and priced as an error. */
+  private invalidResponseStatus = false;
   private requestBodyCompleteOffsetMs: number | null = null;
   private responseHeadersOffsetMs: number | null = null;
   private firstUpstreamBodyByteOffsetMs: number | null = null;
@@ -90,7 +112,9 @@ export class LlmMetricsExchangeObserver {
 
   constructor(private readonly options: LlmMetricsExchangeObserverOptions) {
     this.exchangeId = options.exchangeId ?? randomUUID();
-    this.protocol = options.protocolAdapter.createAccumulator();
+    // The gateway knows its own usage-reporting contract (for example cache
+    // counters it omits); the protocol accumulator applies it.
+    this.protocol = options.protocolAdapter.createAccumulator(options.gatewayAdapter.protocolAccumulatorOptions);
     this.gateway = options.gatewayAdapter.createAccumulator();
   }
 
@@ -123,7 +147,13 @@ export class LlmMetricsExchangeObserver {
         if (completed || !this.pendingTransportAttempts.has(ordinal)) return;
         completed = true;
         this.pendingTransportAttempts.delete(ordinal);
-        this.transportAttempts.push({ ordinal, startedOffsetMs, endedOffsetMs: this.offset(), ...attempt });
+        this.transportAttempts.push({
+          ordinal,
+          startedOffsetMs,
+          endedOffsetMs: this.offset(),
+          ...attempt,
+          responseStatus: this.httpStatus(attempt.responseStatus),
+        });
       },
     };
   }
@@ -133,7 +163,7 @@ export class LlmMetricsExchangeObserver {
   }
 
   observeResponseHeaders(status: number, headers: GatewayResponseHeaders): void {
-    this.responseStatus = status;
+    this.setResponseStatus(status);
     this.responseHeadersOffsetMs ??= this.offset();
     this.protocol.observeResponseHeaders(headers);
     this.gateway.observeHeaders(headers);
@@ -149,7 +179,17 @@ export class LlmMetricsExchangeObserver {
       maxDecodedBytes: streaming ? DEFAULT_SSE_EVENT_FRAMER_LIMITS.maxStreamBytes : MAX_JSON_RESPONSE_BYTES,
       maxSseEvents: 100_000,
       ...(streaming
-        ? { onSseEvent: (frame: SseEventFrame) => this.observeSseEvent(frame) }
+        ? {
+            onSseEvent: (frame: SseEventFrame) => this.observeSseEvent(frame),
+            // Past the full-fidelity caps, keep reading usage-bearing events:
+            // terminal usage arrives last, and losing it would leave the
+            // exchange's output unknown.
+            usageScanAfterLimits: true,
+            onDegrade: (degraded: ObservationConsumerDegraded) => {
+              this.flags.add(degraded.reason);
+              this.flags.add('usage_only_observation');
+            },
+          }
         : { onDecodedChunk: (chunk: Buffer) => this.observeJsonChunk(chunk) }),
       onEnd: () => this.endObservation(streaming),
       onDetach: (detached: ObservationConsumerDetached) => {
@@ -168,7 +208,7 @@ export class LlmMetricsExchangeObserver {
   /** Settle a proxy-generated response for which no upstream body is observed. */
   markObservationUnavailable(status: number | null, reason: string): void {
     if (this.finalized) return;
-    this.responseStatus = status;
+    this.setResponseStatus(status);
     this.flags.add(reason);
     this.observationEnded = true;
     this.upstreamResponseEndOffsetMs ??= this.offset();
@@ -178,7 +218,7 @@ export class LlmMetricsExchangeObserver {
   /** Detach response parsing while retaining the real upstream settlement boundary. */
   markResponseObservationUnavailable(status: number | null, reason: string): void {
     if (this.finalized) return;
-    this.responseStatus = status;
+    this.setResponseStatus(status);
     this.flags.add(reason);
     this.observationEnded = true;
     this.tryFinalize();
@@ -286,8 +326,9 @@ export class LlmMetricsExchangeObserver {
     this.finalized = true;
     const protocol = this.protocol.snapshot();
     const gateway = this.gateway.snapshot(protocol);
-    const usage = gateway.costUsd === null ? protocol.usage : { ...protocol.usage, costUsd: gateway.costUsd };
-    const errorStatus = this.responseStatus !== null && this.responseStatus >= 400;
+    const usage = this.costedUsage(protocol, gateway);
+    const processedStatus = this.processedResponseStatus();
+    const errorStatus = processedStatus !== null && processedStatus >= 400;
     const outcome = {
       ...protocol.outcome,
       responseStatus: this.responseStatus,
@@ -356,9 +397,100 @@ export class LlmMetricsExchangeObserver {
           [...this.transportAttempts].sort((left, right) => left.ordinal - right.ordinal),
         ),
         gatewayRouteAttempts: gateway.routeAttempts,
-        qualityFlags: Object.freeze([...this.flags].sort()),
+        qualityFlags: Object.freeze(boundedQualityFlags(this.flags)),
       }),
     );
+  }
+
+  /**
+   * The protocol's usage with the exchange's cost. A cost the gateway
+   * reported (OpenRouter `usage.cost`) is kept as is. Otherwise, on a verified
+   * official provider origin, the host prices the observed tokens at that
+   * provider's first-party list prices: the served model, the speed the
+   * response reports (else the one requested), the service tier and the
+   * 5-minute/1-hour cache-write split, once the protocol's terminal event has
+   * made the usage final. Any other route, or anything the price table cannot
+   * price exactly, leaves the cost unknown (null), with a flag saying why on
+   * official routes.
+   */
+  private costedUsage(protocol: LlmProtocolObservation, gateway: GatewayObservation): NormalizedUsage {
+    const base = { ...protocol.usage, costUsd: null, estimatedCostUsd: null, costSource: null, pricingVersion: null };
+    const reported = gateway.costUsd ?? protocol.usage.costUsd;
+    if (reported !== null) return { ...base, costUsd: reported, costSource: 'gateway_reported' };
+    const provider = gateway.servedProvider.value;
+    if (gateway.officialListPricing !== true || provider === null) return base;
+    // A speed or tier the adapter could not recognize was reported, so the
+    // exchange may have billed at a price this table does not know.
+    const serviceTier = protocol.qualityFlags.includes('unknown_response_service_tier')
+      ? UNRECOGNIZED_PRICING_MODE
+      : protocol.actualServiceTier;
+    const estimate = estimateListPriceCostUsd({
+      usage: protocol.usage,
+      provider,
+      model: gateway.servedModel.value ?? this.forwardedRequest.requestedModel,
+      speed: this.pricingSpeed(protocol),
+      serviceTier,
+      // Null would tell the estimator no response arrived; an invalid status
+      // did arrive and is priced as the server error it is processed as.
+      responseStatus: this.processedResponseStatus(),
+      terminal: protocol.protocolTerminal,
+    });
+    if (estimate.kind === 'unavailable') {
+      this.flags.add(`list_price_unavailable:${estimate.reason}`);
+      return base;
+    }
+    for (const flag of estimate.qualityFlags) this.flags.add(flag);
+    return {
+      ...base,
+      estimatedCostUsd: estimate.costUsd,
+      costSource: 'list_price',
+      pricingVersion: estimate.pricingVersion,
+    };
+  }
+
+  /**
+   * The speed to price at: the one the response reports, else the request's.
+   * An unrecognized value from either source is unpriced, never treated as
+   * standard.
+   */
+  private pricingSpeed(protocol: LlmProtocolObservation): string | null {
+    if (protocol.qualityFlags.includes('unknown_response_speed_mode')) return UNRECOGNIZED_PRICING_MODE;
+    if (protocol.actualSpeedMode != null) return protocol.actualSpeedMode;
+    if (this.forwardedRequest.qualityFlags.includes('unknown_speed_mode')) return UNRECOGNIZED_PRICING_MODE;
+    return this.forwardedRequest.speedMode;
+  }
+
+  /**
+   * Upstreams, gateways and parent proxies can answer with any three-digit
+   * status, and Node's HTTP client reports 600-999 as is. Persistence stores
+   * only 100-599, so an out-of-range status is recorded as unknown with a
+   * flag rather than letting the record be refused at the durable boundary.
+   */
+  private httpStatus(status: number | null): number | null {
+    if (status === null) return null;
+    if (Number.isSafeInteger(status) && status >= 100 && status <= 599) return status;
+    this.markQualityFlag('invalid_http_status');
+    return null;
+  }
+
+  /**
+   * The exchange's final status. RFC 9110 section 15 tells a client to treat
+   * an invalid status as a 5xx, so one still counts as an error status when
+   * the termination is classified, although it is stored as unknown.
+   */
+  private setResponseStatus(status: number | null): void {
+    this.responseStatus = this.httpStatus(status);
+    this.invalidResponseStatus = status !== null && this.responseStatus === null;
+  }
+
+  /**
+   * The status as a client processes it: the stored one, or a 5xx for an
+   * invalid one (RFC 9110 section 15). Null only when no response arrived.
+   * Classifying the termination and pricing the exchange both read this, so
+   * normalizing an invalid status for storage changes neither.
+   */
+  private processedResponseStatus(): number | null {
+    return this.invalidResponseStatus ? INVALID_STATUS_PROCESSED_AS : this.responseStatus;
   }
 
   private offset(): number {

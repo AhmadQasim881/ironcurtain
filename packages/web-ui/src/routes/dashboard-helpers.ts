@@ -26,6 +26,7 @@ const ISSUE_PHASES: ReadonlySet<WorkflowPhase> = new Set<WorkflowPhase>([
  */
 export const DISTRIBUTION_PHASES: readonly WorkflowPhase[] = [
   PHASE.RUNNING,
+  PHASE.RUNNING_ELSEWHERE,
   PHASE.WAITING_HUMAN,
   PHASE.COMPLETED,
   PHASE.FAILED,

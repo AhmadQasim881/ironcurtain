@@ -1,5 +1,7 @@
 # IronCurtain Multi-Agent Architecture: High-Level Design Spec
 
+**Status (2026-11-14):** Superseded by the workflow system (`src/workflow/`, `WORKFLOWS.md`, `workflow-implementation-final.md`), which built its XState orchestration, file checkpoints, per-agent personas and critic loop. The Docker Compose deployment and the orchestrator-in-a-container model of section 7 were not built: the orchestrator runs on the host and creates the agent containers itself.
+
 ## 1. Purpose
 
 This document specifies a multi-agent architecture for IronCurtain that maximizes autonomous design and coding output quality. The architecture runs locally via Docker Compose, with each agent in its own IronCurtain-secured container. The goal is to enable a single developer to produce high-quality, reviewed, tested code with minimal supervision.
@@ -579,6 +581,11 @@ This gives:
 
 ### 7.2 Orchestrator Execution Loop
 
+> **Status: future work.** Per-module git worktrees, merging worktree branches with conflicts routed to a gate,
+> and `cancel_siblings` are not implemented. The workflow schema still accepts the old `worktree` and
+> `settings.gitRepoPath` fields for compatibility, but nothing reads them (lint WF017), and the unused
+> `GitWorktreeManager` was removed. Fan-out lanes share one container and one `/workspace`.
+
 ```
 On each state transition:
   1. Read state definition from workflow:
@@ -665,6 +672,10 @@ volumes:
 The orchestrator needs access to the Docker socket to create agent containers. This is the only container defined in the compose file. Agent containers are created dynamically. State is persisted to `/shared/state.json` via file-based checkpointing (Section 6.2).
 
 ### 7.4 Container Runtime Abstraction
+
+> **Status: partly built.** A pluggable `ContainerRuntime` exists for Docker and Apple `container`
+> (`src/docker/`), driven through the CLIs rather than dockerode. The `run`/`runParallel` interface below and
+> the Kubernetes and DryRun runtimes are future work.
 
 The orchestrator should abstract the container runtime behind an interface:
 

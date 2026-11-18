@@ -1,5 +1,7 @@
 # Historical Linux nested-Docker assessment — 2026-09-10
 
+**Status (2026-11-14):** Historical: the pre-implementation assessment of 2026-09-10. Current support is in `CONFIG.md` and `linux-nested-docker-implementation-plan.md`.
+
 This document preserves the pre-implementation investigation, not current support status.
 See [CONFIG.md](../../CONFIG.md#nested-docker-workloads) for admitted profiles and
 the [implementation design](linux-nested-docker-implementation-plan.md) for architecture

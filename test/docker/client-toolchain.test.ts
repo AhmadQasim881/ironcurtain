@@ -32,24 +32,36 @@ describe('Docker client toolchain manifest', () => {
     expect(getDockerToolchainSourceReference(loaded.manifest)).toBe('docker:29.2.1-dind-rootless');
   });
 
-  it('rejects symlink, writable, malformed, and internally incompatible manifests', () => {
+  it('rejects symlink, world-writable, malformed, and internally incompatible manifests', () => {
     const fixture = manifestFixture();
     const symlink = join(fixture.directory, 'link.json');
     symlinkSync(fixture.path, symlink);
-    expect(() => loadClientToolchainManifest(symlink, 'arm64')).toThrow(/non-symlink/u);
+    expect(() => loadClientToolchainManifest(symlink, 'arm64', fixture.directory)).toThrow(/non-symlink/u);
 
     chmodSync(fixture.path, 0o666);
-    expect(() => loadClientToolchainManifest(fixture.path, 'arm64')).toThrow(/group\/world writable/u);
+    expect(() => loadClientToolchainManifest(fixture.path, 'arm64', fixture.directory)).toThrow(
+      /must not be world-writable: .* Fix it with: chmod o-w /u,
+    );
     chmodSync(fixture.path, 0o600);
     writeFileSync(fixture.path, '{\n', { mode: 0o600 });
-    expect(() => loadClientToolchainManifest(fixture.path, 'arm64')).toThrow(/not valid JSON/u);
+    expect(() => loadClientToolchainManifest(fixture.path, 'arm64', fixture.directory)).toThrow(/not valid JSON/u);
 
     writeFileSync(
       fixture.path,
       `${JSON.stringify({ ...fixture.manifest, docker: { ...fixture.manifest.docker, clientApiVersion: '1.99' } })}\n`,
       { mode: 0o600 },
     );
-    expect(() => loadClientToolchainManifest(fixture.path, 'arm64')).toThrow(/outside the compatible range/u);
+    expect(() => loadClientToolchainManifest(fixture.path, 'arm64', fixture.directory)).toThrow(
+      /outside the compatible range/u,
+    );
+  });
+});
+
+describe('Docker client toolchain manifest location', () => {
+  it('refuses a manifest outside the IronCurtain package unless a test names its root', () => {
+    const fixture = manifestFixture();
+    expect(() => loadClientToolchainManifest(fixture.path, 'arm64')).toThrow(/must ship inside the package root/u);
+    expect(loadClientToolchainManifest(fixture.path, 'arm64', fixture.directory).manifest.architecture).toBe('arm64');
   });
 });
 
@@ -58,7 +70,7 @@ describe('Docker client toolchain preflight', () => {
     'checks the connected %s tuple and records version provenance',
     async (architecture) => {
       const fixture = manifestFixture();
-      const loaded = loadClientToolchainManifest(fixture.path, architecture);
+      const loaded = loadClientToolchainManifest(fixture.path, architecture, fixture.directory);
       const runtime = runtimeFixture({ architecture });
       const tuple = { dockerCli: '29.2.1', dockerDaemon: '29.2.1', buildx: '0.31.1', compose: '5.1.0' };
       const result = await preflightClientToolchain({
@@ -82,7 +94,7 @@ describe('Docker client toolchain preflight', () => {
 
   it('rejects either client or daemon architecture mismatching the selected target', async () => {
     const fixture = manifestFixture();
-    const loaded = loadClientToolchainManifest(fixture.path, 'amd64');
+    const loaded = loadClientToolchainManifest(fixture.path, 'amd64', fixture.directory);
     for (const side of ['Client', 'Server'] as const) {
       const docker = dockerVersion({}, 'amd64');
       docker[side].Arch = 'arm64';
@@ -98,7 +110,7 @@ describe('Docker client toolchain preflight', () => {
 
   it('fails closed for absent server data, version drift, and plugin drift', async () => {
     const fixture = manifestFixture();
-    const loaded = loadClientToolchainManifest(fixture.path, 'arm64');
+    const loaded = loadClientToolchainManifest(fixture.path, 'arm64', fixture.directory);
     await expect(
       preflightClientToolchain({
         runtime: runtimeFixture({ docker: JSON.stringify({ Client: dockerVersion().Client, Server: null }) }),
@@ -126,7 +138,7 @@ describe('Docker client toolchain preflight', () => {
 
   it('rejects failed commands and unparseable plugin output', async () => {
     const fixture = manifestFixture();
-    const loaded = loadClientToolchainManifest(fixture.path, 'arm64');
+    const loaded = loadClientToolchainManifest(fixture.path, 'arm64', fixture.directory);
     await expect(
       preflightClientToolchain({
         runtime: runtimeFixture({ failureAt: 1 }),

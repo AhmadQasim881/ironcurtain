@@ -549,7 +549,8 @@
                 <span class="block text-xs text-muted-foreground mt-1">
                   Gives new container sessions a private, ephemeral Docker daemon. It does not expose the host Docker
                   socket or host ports. Currently requires macOS with Docker Desktop or, on Apple silicon, Apple
-                  Container installed.
+                  Container, or Windows with WSL2 and Docker Desktop. Native Linux Docker Engine is not yet supported,
+                  and the daemon refuses to turn it on there.
                 </span>
               </span>
             </label>

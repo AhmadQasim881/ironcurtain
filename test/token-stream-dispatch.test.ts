@@ -32,8 +32,22 @@ function makeBudgetStatus(): BudgetStatus {
     elapsedSeconds: 0,
     estimatedCostUsd: 0,
     tokenTrackingAvailable: false,
-    cumulative: { totalInputTokens: 0, totalOutputTokens: 0, totalTokens: 0 },
-    limits: { maxTotalTokens: null, maxSteps: null, maxSessionSeconds: null, maxEstimatedCostUsd: null },
+    lastTurn: null,
+    cumulative: {
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalTokens: 0,
+      stepCount: 0,
+      activeSeconds: 0,
+      estimatedCostUsd: 0,
+    },
+    limits: {
+      maxTotalTokens: null,
+      maxSteps: null,
+      maxSessionSeconds: null,
+      maxEstimatedCostUsd: null,
+      warnThresholdPercent: 80,
+    },
   };
 }
 
@@ -50,7 +64,7 @@ function stubSession(id: string): Session {
     getHistory: vi.fn().mockReturnValue([]),
     getDiagnosticLog: vi.fn().mockReturnValue([]),
     resolveEscalation: vi.fn().mockResolvedValue(undefined),
-    getPendingEscalation: vi.fn(),
+    getPendingEscalations: vi.fn(() => []),
     getBudgetStatus: vi.fn().mockReturnValue(makeBudgetStatus()),
     close: vi.fn().mockResolvedValue(undefined),
   };
@@ -71,12 +85,13 @@ function makeMockHandler(): ControlRequestHandler {
       signalConnected: false,
       nextFireTime: undefined,
     }),
-    addJob: vi.fn().mockResolvedValue(undefined),
     removeJob: vi.fn().mockResolvedValue(undefined),
     enableJob: vi.fn().mockResolvedValue(undefined),
     disableJob: vi.fn().mockResolvedValue(undefined),
     recompileJob: vi.fn().mockResolvedValue(undefined),
+    refreshLists: vi.fn(),
     reloadJob: vi.fn().mockResolvedValue(undefined),
+    startJobRun: vi.fn(),
     runJobNow: vi.fn().mockResolvedValue({}),
     listJobs: vi.fn().mockReturnValue([]),
   };

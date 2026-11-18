@@ -14,11 +14,18 @@ import { validateWorkspacePath } from '../session/workspace-validation.js';
 
 export type { SessionSnapshot } from '../docker/pty-types.js';
 
+interface ValidatedResumeSession {
+  /** The snapshot exactly as persisted (used for listings and labels). */
+  readonly snapshot: SessionSnapshot;
+  /** Canonical workspace path returned by validateWorkspacePath(). */
+  readonly canonicalWorkspacePath: string;
+}
+
 function validateParsedResumeSession(
   parsed: unknown,
   resumeSessionId: string,
-  protectedPaths: string[],
-): SessionSnapshot {
+  protectedPaths: readonly string[],
+): ValidatedResumeSession {
   const parsedSessionId =
     typeof parsed === 'object' && parsed !== null ? (parsed as { sessionId?: unknown }).sessionId : undefined;
   if (parsedSessionId !== resumeSessionId) {
@@ -31,8 +38,9 @@ function validateParsedResumeSession(
     throw new Error(`Cannot resume session "${resumeSessionId}": session is not resumable (status: ${parsed.status})`);
   }
 
+  let canonicalWorkspacePath: string;
   try {
-    validateWorkspacePath(parsed.workspacePath, protectedPaths);
+    canonicalWorkspacePath = validateWorkspacePath(parsed.workspacePath, protectedPaths);
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     throw new Error(`Cannot resume session "${resumeSessionId}": workspace path is unsafe: ${detail}`, {
@@ -40,15 +48,23 @@ function validateParsedResumeSession(
     });
   }
 
-  return parsed;
+  return { snapshot: parsed, canonicalWorkspacePath };
 }
 
 /**
  * Loads and authoritatively validates one persisted session for resume.
  * Direct launch callers must use this again even if the session was previously
  * listed, because the mutable snapshot or workspace may have changed.
+ *
+ * The returned snapshot's `workspacePath` is the canonical path the validator
+ * approved, not the stored string: if a component of the stored path was
+ * swapped for a symlink since the session ran, the resumed session mounts the
+ * directory that was checked rather than re-resolving the stored path later.
  */
-export function validateResumeSession(resumeSessionId: string, protectedPaths: string[] = []): SessionSnapshot {
+export function validateResumeSession(
+  resumeSessionId: string,
+  protectedPaths: readonly string[] = [],
+): SessionSnapshot {
   const sessionDir = getSessionDir(resumeSessionId);
   if (!existsSync(sessionDir)) {
     throw new Error(`Cannot resume session "${resumeSessionId}": session directory not found`);
@@ -64,7 +80,8 @@ export function validateResumeSession(resumeSessionId: string, protectedPaths: s
   } catch {
     throw new Error(`Cannot resume session "${resumeSessionId}": session state snapshot is corrupted or invalid`);
   }
-  return validateParsedResumeSession(parsed, resumeSessionId, protectedPaths);
+  const { snapshot, canonicalWorkspacePath } = validateParsedResumeSession(parsed, resumeSessionId, protectedPaths);
+  return { ...snapshot, workspacePath: canonicalWorkspacePath };
 }
 
 /**
@@ -72,7 +89,7 @@ export function validateResumeSession(resumeSessionId: string, protectedPaths: s
  * Applies the same snapshot and workspace checks as direct resume validation.
  * Returns snapshots sorted by lastActivity descending (most recent first).
  */
-export function scanResumableSessions(protectedPaths: string[]): SessionSnapshot[] {
+export function scanResumableSessions(protectedPaths: readonly string[]): SessionSnapshot[] {
   const sessionsDir = getSessionsDir();
 
   let entries: string[];
@@ -89,7 +106,7 @@ export function scanResumableSessions(protectedPaths: string[]): SessionSnapshot
       const statePath = resolve(getSessionDir(entry), SESSION_STATE_FILENAME);
       const raw = readFileSync(statePath, 'utf-8');
       const snapshot: unknown = JSON.parse(raw);
-      snapshots.push(validateParsedResumeSession(snapshot, entry, protectedPaths));
+      snapshots.push(validateParsedResumeSession(snapshot, entry, protectedPaths).snapshot);
     } catch {
       // Skip sessions without a valid state file
     }

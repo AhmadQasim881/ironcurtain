@@ -145,6 +145,10 @@ export class OpenAiChatCompletionsAccumulator implements LlmProtocolAccumulator 
     if (model !== null) this.responseModel = model;
     if (id !== null) this.providerResponseId = id;
     if (tier !== null) this.actualServiceTier = tier;
+    // An unrecognized tier may bill at its own prices: never price it as standard.
+    else if (chunk['service_tier'] !== undefined && chunk['service_tier'] !== null) {
+      this.flags.add('unknown_response_service_tier');
+    }
     if (chunk['usage'] !== undefined) this.usage.observe(chunk['usage'], authoritativeUsage || this.sawFinishReason);
 
     for (const choice of asArray(chunk['choices']) ?? []) {

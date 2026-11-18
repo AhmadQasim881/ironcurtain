@@ -1,5 +1,7 @@
 # Agent Messages in Transition History
 
+**Status (2026-11-14):** Implemented: `TransitionRecord.agentMessage` (`src/workflow/types.ts`) carries the agent's output onto each transition, and the workflow detail view shows it (`packages/web-ui/src/routes/WorkflowDetail.svelte`).
+
 ## Overview
 
 Show what each agent produced alongside each transition in the workflow detail view.

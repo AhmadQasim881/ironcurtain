@@ -1,6 +1,7 @@
 # Design: Session Logging System
 
-**Status:** Proposed
+**Status (2026-11-14):** Implemented: `src/logger.ts` writes each session's `session.log` and captures console output. Since then the logger takes stacked claims, so a daemon and every session it runs (or the lanes of a workflow) each keep their own log. The in-process `EscalationHandler` this design touches no longer exists (see below), and neither do the legacy agent in src/agent/ it converts and the direct-tool-call mode it mentions: the builtin agent loop is `AgentSession` (`src/session/agent-session.ts`), and `TrustedProcess` (`src/trusted-process/index.ts`) serves only integration tests.
+
 **Date:** 2026-02-18
 
 ## Problem
@@ -574,6 +575,8 @@ async closeAll(): Promise<void> {
 ```
 
 ### EscalationHandler (`src/trusted-process/escalation.ts`)
+
+> **Removed since (2026-11):** `src/trusted-process/escalation.ts` and its `EscalationHandler` no longer exist. Escalations go through the `ToolCallCoordinator`: an in-process `onEscalation` callback (`EscalationPromptFn`) or request and response files in the session's escalation directory (`src/trusted-process/tool-call-pipeline.ts`), answered by the session's transport. The rows below that name `escalation.ts` describe the original plan.
 
 This is the in-process escalation handler used by `TrustedProcess` in direct-tool-call mode (not by sessions). Its output is user-facing (prompting for approval via readline), so it switches to `process.stderr.write()`:
 

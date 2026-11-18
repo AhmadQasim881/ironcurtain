@@ -18,3 +18,6 @@ export { Input } from './input/index.js';
 export { Spinner } from './spinner/index.js';
 
 export { Modal } from './modal/index.js';
+export type { ModalFocusOnOpen } from './modal/index.js';
+
+export { SafeText } from './safe-text/index.js';

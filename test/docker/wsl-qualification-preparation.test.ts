@@ -3,7 +3,11 @@ import { describe, expect, it, vi } from 'vitest';
 import { prepareWslQualificationImages } from '../../scripts/prepare-wsl-qualification.js';
 import type { ensureDockerImage } from '../../src/docker/docker-infrastructure.js';
 
-const preparedWslEnvironment = {
+const preparedWslEnvironment: Awaited<ReturnType<typeof ensureDockerImage>> = {
+  mode: 'build-if-stale',
+  logicalName: 'ironcurtain-claude-code:latest',
+  imageRef: 'ironcurtain-claude-code:latest',
+  buildHash: 'a'.repeat(64),
   dockerWorkloadEnvironment: {
     profile: 'wsl-desktop',
     architecture: 'amd64',
@@ -18,7 +22,7 @@ const preparedWslEnvironment = {
       securityOptions: ['name=seccomp,profile=builtin', 'name=cgroupns'],
     },
   },
-} as Awaited<ReturnType<typeof ensureDockerImage>>;
+};
 
 describe('WSL qualification image preparation', () => {
   it('prepares every required UID-test adapter through admitted Offline source resolution', async () => {
@@ -35,7 +39,7 @@ describe('WSL qualification image preparation', () => {
     for (const [, config] of ensure.mock.calls) {
       expect(config.containerRuntime).toBe('docker');
       expect(config.dockerWorkload).toMatchObject({ enabled: true, networkAccess: 'offline' });
-      expect(config.dockerResources).toEqual({ memoryMb: 4096, cpus: 2 });
+      expect(config.dockerResources).toEqual({ memoryMb: 4096, cpus: 2, pidsLimit: 4096 });
     }
     expect(process.env.IRONCURTAIN_HOME).toBe(previousHome);
     expect(new Set(homes).size).toBe(1);

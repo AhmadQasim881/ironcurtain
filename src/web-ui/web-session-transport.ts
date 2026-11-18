@@ -9,6 +9,7 @@
 import { BaseTransport, type BaseTransportOptions } from '../session/base-transport.js';
 import type { Session, DiagnosticEvent, EscalationRequest } from '../session/types.js';
 import type { SessionManager, PendingEscalationData } from '../session/session-manager.js';
+import { escalationDisplayFields } from '../escalation/escalation-review.js';
 import type { WebEventBus } from './web-event-bus.js';
 import type { EscalationDto } from './web-ui-types.js';
 import * as logger from '../logger.js';
@@ -27,6 +28,16 @@ export class WebSessionTransport extends BaseTransport {
   /** Session label assigned after construction. */
   sessionLabel = 0;
 
+  /**
+   * Diagnostics that must reach the browser but arrived before the session
+   * had a label: the start-up notices (`annotation_drift`,
+   * `mcp_server_unavailable`, `host_model_fallback`, `policy_stale`) are
+   * emitted while the session initializes, before the dispatcher registers
+   * it. Flushed once `run()` starts (see {@link runSession}). The browser
+   * shows every session notice (`isSessionNotice`) in the session view.
+   */
+  private pendingDiagnostics: DiagnosticEvent[] = [];
+
   constructor(options: WebSessionTransportOptions) {
     super(options);
     this.eventBus = options.eventBus;
@@ -35,6 +46,10 @@ export class WebSessionTransport extends BaseTransport {
 
   protected async runSession(session: Session): Promise<void> {
     this.session = session;
+    // The dispatcher assigns the label before run() and announces the
+    // session (`session.created`) right after calling it; deferring the
+    // flush to a microtask lets the browser learn about the session first.
+    queueMicrotask(() => this.flushPendingDiagnostics());
     return new Promise<void>((resolve) => {
       this.exitResolve = resolve;
     });
@@ -76,8 +91,27 @@ export class WebSessionTransport extends BaseTransport {
             stepIndex: event.stepIndex,
           });
           break;
+        case 'annotation_drift':
+        case 'mcp_server_unavailable':
+        case 'host_model_fallback':
+        case 'policy_stale':
+        case 'host_privileged_files':
+          // Start-up notices are emitted during initialization, usually
+          // before the label exists; host-mount findings after a turn.
+          if (this.sessionLabel === 0) this.pendingDiagnostics.push(event);
+          else this.eventBus.emit('session.diagnostic', { label: this.sessionLabel, event });
+          break;
       }
     };
+  }
+
+  private flushPendingDiagnostics(): void {
+    if (this.sessionLabel === 0) return;
+    const pending = this.pendingDiagnostics;
+    this.pendingDiagnostics = [];
+    for (const event of pending) {
+      this.eventBus.emit('session.diagnostic', { label: this.sessionLabel, event });
+    }
   }
 
   createEscalationHandler(): (request: EscalationRequest) => void {
@@ -96,6 +130,7 @@ export class WebSessionTransport extends BaseTransport {
         reason: request.reason,
         context: request.context,
         whitelistCandidates: request.whitelistCandidates,
+        ...escalationDisplayFields(request),
         receivedAt: new Date().toISOString(),
       };
 
@@ -119,11 +154,13 @@ export class WebSessionTransport extends BaseTransport {
     };
   }
 
-  createEscalationExpiredHandler(): () => void {
-    return () => {
-      const managed = this.sessionManager.get(this.sessionLabel);
-      const escalationId = managed?.pendingEscalation?.escalationId ?? 'unknown';
-      this.sessionManager.clearPendingEscalation(this.sessionLabel);
+  /**
+   * Returns the onEscalationExpired callback: drops that escalation (the
+   * session's other pending escalations stay) and tells the browsers.
+   */
+  createEscalationExpiredHandler(): (escalationId: string) => void {
+    return (escalationId) => {
+      this.sessionManager.clearPendingEscalation(this.sessionLabel, escalationId);
       this.eventBus.emit('escalation.expired', {
         escalationId,
         sessionLabel: this.sessionLabel,

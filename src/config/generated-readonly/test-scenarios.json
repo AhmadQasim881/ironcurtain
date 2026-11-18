@@ -564,8 +564,8 @@
           "format": "text"
         }
       },
-      "expectedDecision": "allow",
-      "reasoning": "The constitution states 'Fetching URLs from known safe domains is permitted for data gathering' but provides no enumerated blocklist; the compiled rule's wildcard domain allowance correctly implements this open-ended permission.",
+      "expectedDecision": "deny",
+      "reasoning": "An unknown domain is not one of the known safe domains, so no rule allows it (default deny).",
       "source": "generated"
     },
     {
@@ -578,8 +578,8 @@
           "format": "text"
         }
       },
-      "expectedDecision": "allow",
-      "reasoning": "The constitution permits broad URL fetching for data gathering without enumerating prohibited IP ranges or schemes; the expected decision should be allow, consistent with the wildcard domain rule.",
+      "expectedDecision": "deny",
+      "reasoning": "A raw private IP address never matches the known-safe-domain list, so the fetch is denied by default.",
       "source": "generated"
     },
     {
@@ -592,8 +592,8 @@
           "format": "text"
         }
       },
-      "expectedDecision": "allow",
-      "reasoning": "The constitution grants broad read/fetch access without enumerating localhost or loopback as prohibited destinations; the compiled rule correctly allows this.",
+      "expectedDecision": "deny",
+      "reasoning": "localhost is not a known safe domain; the fetch is denied by default.",
       "source": "generated"
     },
     {
@@ -635,8 +635,8 @@
           "format": "text"
         }
       },
-      "expectedDecision": "allow",
-      "reasoning": "The compiled rule uses wildcard domain matching and the constitution provides no scheme-level restrictions, so 'allow' is the correct outcome per the current policy.",
+      "expectedDecision": "deny",
+      "reasoning": "A file:// URL has no host on the known-safe-domain list, so the fetch is denied by default.",
       "source": "generated"
     },
     {
@@ -649,8 +649,8 @@
           "format": "text"
         }
       },
-      "expectedDecision": "allow",
-      "reasoning": "The constitution permits broad URL fetching without enumerating prohibited IP ranges; per the compiled wildcard policy, this should be allowed consistent with other fetch scenarios.",
+      "expectedDecision": "deny",
+      "reasoning": "The cloud metadata address is a raw IP, never a known safe domain, so the fetch is denied by default.",
       "source": "generated"
     },
     {
@@ -691,8 +691,8 @@
           "format": "text"
         }
       },
-      "expectedDecision": "allow",
-      "reasoning": "The compiled wildcard domain rule correctly allows all HTTP fetch operations per the constitution's broad read access principle; encoded path components don't change the policy outcome.",
+      "expectedDecision": "deny",
+      "reasoning": "An unknown domain is not one of the known safe domains, so no rule allows it (default deny).",
       "source": "generated"
     },
     {
@@ -720,8 +720,8 @@
           "format": "text"
         }
       },
-      "expectedDecision": "allow",
-      "reasoning": "The constitution permits broad URL fetching; IPv6 addresses are a valid URL form and should be allowed just like IPv4 and hostname-based URLs.",
+      "expectedDecision": "deny",
+      "reasoning": "A raw IPv6 loopback address never matches the known-safe-domain list, so the fetch is denied by default.",
       "source": "generated"
     },
     {
@@ -734,8 +734,8 @@
           "format": "text"
         }
       },
-      "expectedDecision": "allow",
-      "reasoning": "The constitution permits broad URL fetching; a public IP address URL should be allowed just as hostname-based URLs are, since no IP-based restrictions are specified.",
+      "expectedDecision": "deny",
+      "reasoning": "A raw public IP address never matches the known-safe-domain list, so the fetch is denied by default.",
       "source": "generated"
     },
     {
@@ -754,6 +754,345 @@
       "expectedDecision": "allow",
       "reasoning": "The constitution permits fetching URLs for data gathering; additional arguments like headers and max_length are standard fetch parameters and do not change the read-only nature of the operation.",
       "source": "generated"
+    },
+    {
+      "description": "Read git status of a repository",
+      "request": {
+        "serverName": "git",
+        "toolName": "git_status",
+        "arguments": {
+          "path": "/home/user/project"
+        }
+      },
+      "expectedDecision": "allow",
+      "reasoning": "Reading git status is explicitly permitted.",
+      "source": "handwritten"
+    },
+    {
+      "description": "Read the git log",
+      "request": {
+        "serverName": "git",
+        "toolName": "git_log",
+        "arguments": {
+          "path": "/home/user/project",
+          "maxCount": 20
+        }
+      },
+      "expectedDecision": "allow",
+      "reasoning": "Reading git log is explicitly permitted.",
+      "source": "handwritten"
+    },
+    {
+      "description": "Read a git diff",
+      "request": {
+        "serverName": "git",
+        "toolName": "git_diff",
+        "arguments": {
+          "path": "/home/user/project",
+          "staged": true
+        }
+      },
+      "expectedDecision": "allow",
+      "reasoning": "Reading git diffs is explicitly permitted.",
+      "source": "handwritten"
+    },
+    {
+      "description": "Show a commit",
+      "request": {
+        "serverName": "git",
+        "toolName": "git_show",
+        "arguments": {
+          "path": "/home/user/project",
+          "object": "HEAD"
+        }
+      },
+      "expectedDecision": "allow",
+      "reasoning": "Showing a commit only reads history.",
+      "source": "handwritten"
+    },
+    {
+      "description": "Blame a file",
+      "request": {
+        "serverName": "git",
+        "toolName": "git_blame",
+        "arguments": {
+          "path": "/home/user/project",
+          "filePath": "README.md"
+        }
+      },
+      "expectedDecision": "allow",
+      "reasoning": "Blame only reads history.",
+      "source": "handwritten"
+    },
+    {
+      "description": "List branches",
+      "request": {
+        "serverName": "git",
+        "toolName": "git_branch",
+        "arguments": {
+          "path": "/home/user/project",
+          "mode": "list"
+        }
+      },
+      "expectedDecision": "allow",
+      "reasoning": "Reading branch information is explicitly permitted.",
+      "source": "handwritten"
+    },
+    {
+      "description": "Create a branch",
+      "request": {
+        "serverName": "git",
+        "toolName": "git_branch",
+        "arguments": {
+          "path": "/home/user/project",
+          "mode": "create",
+          "branchName": "feature"
+        }
+      },
+      "expectedDecision": "escalate",
+      "reasoning": "Creating a branch modifies git state and must be approved.",
+      "source": "handwritten"
+    },
+    {
+      "description": "Delete a branch",
+      "request": {
+        "serverName": "git",
+        "toolName": "git_branch",
+        "arguments": {
+          "path": "/home/user/project",
+          "mode": "delete",
+          "branchName": "old"
+        }
+      },
+      "expectedDecision": "escalate",
+      "reasoning": "Deleting a branch modifies git state and must be approved.",
+      "source": "handwritten"
+    },
+    {
+      "description": "List remotes",
+      "request": {
+        "serverName": "git",
+        "toolName": "git_remote",
+        "arguments": {
+          "path": "/home/user/project",
+          "mode": "list"
+        }
+      },
+      "expectedDecision": "allow",
+      "reasoning": "Listing remotes only reads repository configuration.",
+      "source": "handwritten"
+    },
+    {
+      "description": "Add a remote",
+      "request": {
+        "serverName": "git",
+        "toolName": "git_remote",
+        "arguments": {
+          "path": "/home/user/project",
+          "mode": "add",
+          "name": "upstream",
+          "url": "https://github.com/org/repo.git"
+        }
+      },
+      "expectedDecision": "escalate",
+      "reasoning": "Adding a remote requires approval per the constitution.",
+      "source": "handwritten"
+    },
+    {
+      "description": "List tags",
+      "request": {
+        "serverName": "git",
+        "toolName": "git_tag",
+        "arguments": {
+          "path": "/home/user/project",
+          "mode": "list"
+        }
+      },
+      "expectedDecision": "allow",
+      "reasoning": "Listing tags only reads repository metadata.",
+      "source": "handwritten"
+    },
+    {
+      "description": "Create a tag",
+      "request": {
+        "serverName": "git",
+        "toolName": "git_tag",
+        "arguments": {
+          "path": "/home/user/project",
+          "mode": "create",
+          "tagName": "v1.0.0"
+        }
+      },
+      "expectedDecision": "escalate",
+      "reasoning": "Creating a tag modifies git state and must be approved.",
+      "source": "handwritten"
+    },
+    {
+      "description": "List stashes",
+      "request": {
+        "serverName": "git",
+        "toolName": "git_stash",
+        "arguments": {
+          "path": "/home/user/project",
+          "mode": "list"
+        }
+      },
+      "expectedDecision": "allow",
+      "reasoning": "Listing stashes only reads repository state.",
+      "source": "handwritten"
+    },
+    {
+      "description": "Push a stash",
+      "request": {
+        "serverName": "git",
+        "toolName": "git_stash",
+        "arguments": {
+          "path": "/home/user/project",
+          "mode": "push"
+        }
+      },
+      "expectedDecision": "escalate",
+      "reasoning": "Stashing changes modifies the working tree and must be approved.",
+      "source": "handwritten"
+    },
+    {
+      "description": "Dry-run git clean",
+      "request": {
+        "serverName": "git",
+        "toolName": "git_clean",
+        "arguments": {
+          "path": "/home/user/project",
+          "dryRun": true
+        }
+      },
+      "expectedDecision": "allow",
+      "reasoning": "A dry run only lists what would be removed.",
+      "source": "handwritten"
+    },
+    {
+      "description": "Run git clean",
+      "request": {
+        "serverName": "git",
+        "toolName": "git_clean",
+        "arguments": {
+          "path": "/home/user/project",
+          "force": true
+        }
+      },
+      "expectedDecision": "escalate",
+      "reasoning": "Removing untracked files is a delete operation and must be approved.",
+      "source": "handwritten"
+    },
+    {
+      "description": "Set the git working directory",
+      "request": {
+        "serverName": "git",
+        "toolName": "git_set_working_dir",
+        "arguments": {
+          "path": "/home/user/project"
+        }
+      },
+      "expectedDecision": "allow",
+      "reasoning": "Setting the working directory for navigation is explicitly permitted.",
+      "source": "handwritten"
+    },
+    {
+      "description": "Set the working directory and initialize a repository",
+      "request": {
+        "serverName": "git",
+        "toolName": "git_set_working_dir",
+        "arguments": {
+          "path": "/home/user/project",
+          "initializeIfNotPresent": true
+        }
+      },
+      "expectedDecision": "escalate",
+      "reasoning": "Initializing a repository creates data and must be approved.",
+      "source": "handwritten"
+    },
+    {
+      "description": "Clear the git working directory",
+      "request": {
+        "serverName": "git",
+        "toolName": "git_clear_working_dir",
+        "arguments": {
+          "confirm": "Y"
+        }
+      },
+      "expectedDecision": "allow",
+      "reasoning": "Clearing the session working directory is navigation only.",
+      "source": "handwritten"
+    },
+    {
+      "description": "Commit changes",
+      "request": {
+        "serverName": "git",
+        "toolName": "git_commit",
+        "arguments": {
+          "path": "/home/user/project",
+          "message": "Update"
+        }
+      },
+      "expectedDecision": "escalate",
+      "reasoning": "Committing modifies git state and must be approved.",
+      "source": "handwritten"
+    },
+    {
+      "description": "Check out a branch",
+      "request": {
+        "serverName": "git",
+        "toolName": "git_checkout",
+        "arguments": {
+          "path": "/home/user/project",
+          "target": "main"
+        }
+      },
+      "expectedDecision": "escalate",
+      "reasoning": "Checkout modifies git state and must be approved.",
+      "source": "handwritten"
+    },
+    {
+      "description": "Push to a remote",
+      "request": {
+        "serverName": "git",
+        "toolName": "git_push",
+        "arguments": {
+          "path": "/home/user/project",
+          "remote": "https://github.com/org/repo.git",
+          "branch": "main"
+        }
+      },
+      "expectedDecision": "escalate",
+      "reasoning": "Pushing requires approval per the constitution.",
+      "source": "handwritten"
+    },
+    {
+      "description": "Fetch from a remote",
+      "request": {
+        "serverName": "git",
+        "toolName": "git_fetch",
+        "arguments": {
+          "path": "/home/user/project",
+          "remote": "https://github.com/org/repo.git"
+        }
+      },
+      "expectedDecision": "escalate",
+      "reasoning": "Fetching contacts a remote and updates local refs; it must be approved.",
+      "source": "handwritten"
+    },
+    {
+      "description": "Clone a repository",
+      "request": {
+        "serverName": "git",
+        "toolName": "git_clone",
+        "arguments": {
+          "url": "https://github.com/org/repo.git",
+          "path": "/home/user/clone"
+        }
+      },
+      "expectedDecision": "escalate",
+      "reasoning": "Cloning creates a repository from a remote and must be approved.",
+      "source": "handwritten"
     },
     {
       "description": "Read-only: get authenticated GitHub user profile (no arguments)",

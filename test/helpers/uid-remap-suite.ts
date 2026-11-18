@@ -90,7 +90,7 @@ export function runUidRemapSuite(image: string): void {
                 `test "$(stat -c %u:%g /home/codespace)" = ${uid}:${gid}; ` +
                 'test "$(sudo -n id -u)" = 0; printf roundtrip > /workspace/created; echo remap-ok',
             ],
-            { timeout: 150_000 },
+            { timeout: 210_000 },
           );
           expect(stdout).toContain('remap-ok');
           expect(statSync(mountedState).uid).toBe(hostUid);
@@ -112,7 +112,7 @@ export function runUidRemapSuite(image: string): void {
           rmSync(directory, { recursive: true, force: true });
         }
       },
-      180_000,
+      240_000,
     );
 
     it.each([

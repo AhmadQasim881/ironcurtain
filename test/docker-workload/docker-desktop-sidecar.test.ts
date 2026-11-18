@@ -45,6 +45,7 @@ function hostDirectory(): string {
 }
 
 const SIDECAR_IMAGE_ID = `sha256:${'d'.repeat(64)}`;
+const SIDECAR_BUILD_HASH = '9'.repeat(64);
 const SIDECAR_CONTAINER_ID = 'c'.repeat(64);
 const DESKTOP_GENERATION = 'gen-desktop-test';
 const RESOURCE_SUFFIX = computeHash({ generation: DESKTOP_GENERATION }).slice(0, 16);
@@ -157,6 +158,8 @@ function runtimeFixture(
   options: {
     readonly failBuild?: boolean;
     readonly failShim?: boolean;
+    /** Build hash the inspected daemon image carries (a concurrent retag changes it). */
+    readonly sidecarBuildHash?: string;
     readonly wrongApiOwner?: boolean;
     readonly wrongVolumeLabels?: boolean;
     readonly observedWorkspaceBind?: string;
@@ -183,7 +186,10 @@ function runtimeFixture(
       return {
         id: SIDECAR_IMAGE_ID,
         repoTags: [reference],
-        labels: { 'com.ironcurtain.docker-workload.image-role': 'nested-daemon' },
+        labels: {
+          'com.ironcurtain.docker-workload.image-role': 'nested-daemon',
+          'ironcurtain.build-hash': options.sidecarBuildHash ?? SIDECAR_BUILD_HASH,
+        },
         created: '2026-08-25T00:00:00.000Z',
       };
     },
@@ -404,7 +410,7 @@ function startOptions(fixture: RuntimeFixture): StartDockerDesktopSidecarOptions
   const events = fixture.events;
   return {
     runtime: fixture.runtime,
-    sidecarImage: 'ironcurtain-nested-daemon:latest',
+    sidecarImage: { imageId: SIDECAR_IMAGE_ID, buildHash: SIDECAR_BUILD_HASH },
     outerAgentImageId: OUTER_AGENT_IMAGE_ID,
     workspaceRoot: WORKSPACE_ROOT,
     identity: { uid: 1000, gid: 1000 },
@@ -588,7 +594,7 @@ describe('Docker Desktop sidecar lifecycle', () => {
     expect(privateEvidence).toBeGreaterThan(fixture.events.indexOf('canary:run'));
     expect(fixture.events).not.toContain(`container:stop:${SIDECAR_CONTAINER_ID}`);
     expect(fixture.events.slice(0, 10)).toEqual([
-      'outer-image-inspect:ironcurtain-nested-daemon:latest',
+      `outer-image-inspect:${SIDECAR_IMAGE_ID}`,
       'ledger:volume:daemon-api:false',
       `volume:create:${API_VOLUME_NAME}`,
       `volume:inspect:${API_VOLUME_NAME}`,
@@ -848,6 +854,40 @@ describe('Docker Desktop sidecar lifecycle', () => {
     expect(fixture.events).toEqual([]);
   });
 
+  it('creates the daemon only from the exact prepared image ID, never the shared mutable tag', async () => {
+    const fixture = runtimeFixture();
+
+    await startDockerDesktopSidecar(startOptions(fixture));
+
+    expect(fixture.events[0]).toBe(`outer-image-inspect:${SIDECAR_IMAGE_ID}`);
+    expect(fixture.events.some((event) => event.includes('ironcurtain-nested-daemon:latest'))).toBe(false);
+    expect(fixture.configs[0]?.image).toBe(SIDECAR_IMAGE_ID);
+  });
+
+  it('refuses a daemon image whose build hash changed after preparation before creating anything', async () => {
+    // Another install rebuilt and retagged the shared image between
+    // preparation and create: the exact ID no longer carries this build.
+    const fixture = runtimeFixture({ sidecarBuildHash: '8'.repeat(64) });
+
+    await expect(startDockerDesktopSidecar(startOptions(fixture))).rejects.toThrow(
+      /does not carry the expected build hash/u,
+    );
+    expect(fixture.events).toEqual([`outer-image-inspect:${SIDECAR_IMAGE_ID}`]);
+    expect(fixture.configs).toEqual([]);
+  });
+
+  it('rejects a prepared daemon image reference that is not an immutable ID', async () => {
+    const fixture = runtimeFixture();
+
+    await expect(
+      startDockerDesktopSidecar({
+        ...startOptions(fixture),
+        sidecarImage: { imageId: 'ironcurtain-nested-daemon:latest', buildHash: SIDECAR_BUILD_HASH },
+      }),
+    ).rejects.toThrow(/daemon image ID is not immutable/u);
+    expect(fixture.events).toEqual([]);
+  });
+
   it('removes an API volume whose post-create inspection does not preserve exact ownership', async () => {
     const fixture = runtimeFixture({ wrongVolumeLabels: true });
 
@@ -951,6 +991,28 @@ describe('Docker Desktop sidecar lifecycle', () => {
     { fieldName: 'IpcMode', value: null, field: 'IPC namespace mode' },
   ])('rejects missing $fieldName evidence before sidecar start', async ({ fieldName, value, field }) => {
     await expectStoppedProfileRejection(runtimeFixture({ observedHostConfig: { [fieldName]: value } }), field);
+  });
+
+  it('accepts the exact nanocpus Docker stores for a millicpu share binary arithmetic cannot represent', async () => {
+    // 2.01 * 1e9 is 2009999999.9999998 in binary floating point.
+    const fixture = runtimeFixture({ observedHostConfig: { NanoCpus: 2_010_000_000 } });
+    await expect(
+      startDockerDesktopSidecar({
+        ...startOptions(fixture),
+        resources: { memoryMb: 4096, cpus: 2.01, pidsLimit: 2048 },
+      }),
+    ).resolves.toMatchObject({ containerId: SIDECAR_CONTAINER_ID });
+  });
+
+  it('refuses a CPU share finer than a millicpu before provisioning', async () => {
+    const fixture = runtimeFixture();
+    await expect(
+      startDockerDesktopSidecar({
+        ...startOptions(fixture),
+        resources: { memoryMb: 4096, cpus: 2.0004, pidsLimit: 2048 },
+      }),
+    ).rejects.toThrow(/whole number of millicpus/u);
+    expect(fixture.events).toEqual([]);
   });
 
   it('adjudicates the stopped effective profile before starting the sidecar', async () => {

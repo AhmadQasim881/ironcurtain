@@ -1,3 +1,5 @@
+import { testUserConfig } from '../helpers/user-config.js';
+import { USER_CONFIG_DEFAULTS } from '../../src/config/user-config.js';
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -17,6 +19,7 @@ import {
 } from '../../src/workflow/orchestrator.js';
 import type { SessionOptions } from '../../src/session/types.js';
 import {
+  resolveActiveGate,
   approvedResponse,
   createDeps,
   MockSession,
@@ -24,6 +27,7 @@ import {
   waitForCompletion,
   waitForGate,
 } from './test-helpers.js';
+import type { AgentId } from '../../src/docker/agent-adapter.js';
 
 const IMAGE = 'ironcurtain-claude-code:latest';
 const TEST_HOME = `${REAL_TMP}/ironcurtain-evolve-multi-round-${process.pid}`;
@@ -65,13 +69,10 @@ function buildDockerSessionConfig(workspaceDir: string, generatedDir: string): I
     constitutionPath: join(generatedDir, 'constitution.md'),
     agentModelId: 'anthropic:claude-sonnet-4-6',
     escalationTimeoutSeconds: 300,
-    userConfig: {
+    userConfig: testUserConfig({
       agentModelId: 'anthropic:claude-sonnet-4-6',
       policyModelId: 'anthropic:claude-sonnet-4-6',
       anthropicApiKey: 'test-fake-key-no-network',
-      googleApiKey: '',
-      openaiApiKey: '',
-      escalationTimeoutSeconds: 300,
       resourceBudget: {
         maxTotalTokens: 1_000_000,
         maxSteps: 300,
@@ -79,25 +80,17 @@ function buildDockerSessionConfig(workspaceDir: string, generatedDir: string): I
         maxEstimatedCostUsd: 5.0,
         warnThresholdPercent: 80,
       },
-      autoCompact: {
-        enabled: false,
-        thresholdTokens: 80_000,
-        keepRecentMessages: 10,
-        summaryModelId: 'anthropic:claude-haiku-4-5',
-      },
-      autoApprove: { enabled: false, modelId: 'anthropic:claude-haiku-4-5' },
       auditRedaction: { enabled: false },
-      memory: { enabled: false, llmBaseUrl: undefined, llmApiKey: undefined },
       packageInstall: {
         enabled: true,
         quarantineDays: 2,
         allowedPackages: ['numpy', 'pyyaml'],
         deniedPackages: [],
       },
-      serverCredentials: {},
-      dockerResources: { memoryMb: null, cpus: null },
-    },
-  } as unknown as IronCurtainConfig;
+      dockerResources: { ...USER_CONFIG_DEFAULTS.dockerResources, memoryMb: null, cpus: null },
+      containerRuntime: 'docker',
+    }),
+  };
 }
 
 function writePreflightRunSpec(workspacePath: string, rounds: number): void {
@@ -126,7 +119,10 @@ function writePreflightRunSpec(workspacePath: string, rounds: number): void {
       command: evaluationCommand,
       script_path: '',
       timeout_secs: 30,
-      success_criteria: ['eval_score >= 1.0'],
+      // Unreachable on purpose: the deterministic stop_check ends the run on
+      // target_met, and round 1 already scores 2, so a reachable target would
+      // stop it after one round. These runs end on max_rounds.
+      success_criteria: ['eval_score >= 99'],
     },
     budget: { max_rounds: rounds, patience: 2 },
     stop_conditions: ['max_rounds'],
@@ -253,6 +249,7 @@ describe.skipIf(!dockerReady)('evolve multi-round workflow with real Docker cont
   let originalAuth: string | undefined;
   let originalApiKey: string | undefined;
   const liveBundles = new Set<DockerInfrastructure>();
+  const liveOrchestrators = new Set<WorkflowOrchestrator>();
 
   beforeAll(() => {
     originalHome = process.env.IRONCURTAIN_HOME;
@@ -265,11 +262,31 @@ describe.skipIf(!dockerReady)('evolve multi-round workflow with real Docker cont
     cpSync(hostCaDir as string, join(TEST_HOME, 'ca'), { recursive: true });
   });
 
+  async function drainFixtures(): Promise<void> {
+    const orchestratorResults = await Promise.allSettled(
+      [...liveOrchestrators].map(async (orchestrator) => {
+        await orchestrator.shutdownAll();
+        liveOrchestrators.delete(orchestrator);
+      }),
+    );
+    const bundleResults = await Promise.allSettled(
+      [...liveBundles].map(async (bundle) => {
+        await destroyDockerInfrastructure(bundle);
+        liveBundles.delete(bundle);
+      }),
+    );
+    const failures = [...orchestratorResults, ...bundleResults].filter(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    );
+    if (failures.length > 0)
+      throw new AggregateError(
+        failures.map((result) => result.reason),
+        'Docker fixture cleanup failed',
+      );
+  }
+
   afterAll(async () => {
-    for (const bundle of liveBundles) {
-      await destroyDockerInfrastructure(bundle).catch(() => {});
-    }
-    liveBundles.clear();
+    await drainFixtures();
 
     if (originalHome === undefined) delete process.env.IRONCURTAIN_HOME;
     else process.env.IRONCURTAIN_HOME = originalHome;
@@ -279,15 +296,17 @@ describe.skipIf(!dockerReady)('evolve multi-round workflow with real Docker cont
     else process.env.ANTHROPIC_API_KEY = originalApiKey;
 
     rmSync(TEST_HOME, { recursive: true, force: true });
-  });
+  }, 120_000);
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'evolve-multi-round-'));
   });
 
-  afterEach(() => {
+  // Stop workflow activity and containers before deleting their run files.
+  afterEach(async () => {
+    await drainFixtures();
     rmSync(tmpDir, { recursive: true, force: true });
-  });
+  }, 120_000);
 
   async function runEvolve(label: string, mode: RunMode): Promise<{ states: readonly string[]; workspaceDir: string }> {
     const runDir = resolve(tmpDir, `run-${label}`);
@@ -307,7 +326,7 @@ describe.skipIf(!dockerReady)('evolve multi-round workflow with real Docker cont
       mkdirSync(escalationDir, { recursive: true });
       const bundle = await createDockerInfrastructure(
         config,
-        { kind: 'docker', agent: 'claude-code' },
+        { kind: 'docker', agent: 'claude-code' as AgentId },
         bundleDir,
         input.workspacePath,
         escalationDir,
@@ -317,18 +336,23 @@ describe.skipIf(!dockerReady)('evolve multi-round workflow with real Docker cont
         input.resolvedSkills,
         undefined,
         input.workflowScriptsDir,
+        { workflowRunDir: input.workflowRunDir },
       );
       liveBundles.add(bundle);
       return bundle;
     });
 
     const destroyInfra = vi.fn(async (bundle: DockerInfrastructure) => {
-      liveBundles.delete(bundle);
       await destroyDockerInfrastructure(bundle);
+      liveBundles.delete(bundle);
     });
 
+    // The orchestrator agent is consulted at the start and after each recorded
+    // round that did not meet a stop condition; the deterministic stop_check
+    // ends the run after the last round without asking it. It always asks for
+    // another round here, so the stop must come from stop_check.
     const orchestratorScript =
-      mode === 'positive' ? [...Array.from({ length: ROUND_COUNT }, () => 'design'), 'complete'] : ['design', 'design'];
+      mode === 'positive' ? Array.from({ length: ROUND_COUNT }, () => 'design') : ['design', 'design'];
 
     let provisionTurns = 0;
     let preflightTurns = 0;
@@ -387,6 +411,7 @@ describe.skipIf(!dockerReady)('evolve multi-round workflow with real Docker cont
       }),
     );
     const states: string[] = [];
+    liveOrchestrators.add(orchestrator);
     orchestrator.onEvent((event: WorkflowLifecycleEvent) => {
       if (event.kind === 'state_entered') states.push(event.state);
     });
@@ -397,13 +422,13 @@ describe.skipIf(!dockerReady)('evolve multi-round workflow with real Docker cont
     const firstGate = await waitForGate(raiseGate, 1, 180_000);
     expect(firstGate[0].stateName).toBe('preflight_review');
     expect([...firstGate[0].presentedArtifacts.keys()].sort()).toEqual(['cognition_seed', 'run_spec']);
-    orchestrator.resolveGate(workflowId, { type: 'APPROVE' });
+    resolveActiveGate(orchestrator, workflowId, { type: 'APPROVE' });
 
     if (mode === 'positive') {
       const gates = await waitForGate(raiseGate, 2, 180_000);
       expect(gates[1].stateName).toBe('final_review');
       expect(gates[1].presentedArtifacts.has('final_report')).toBe(true);
-      orchestrator.resolveGate(workflowId, { type: 'APPROVE' });
+      resolveActiveGate(orchestrator, workflowId, { type: 'APPROVE' });
     } else {
       const gates = await waitForGate(raiseGate, 2, 180_000);
       expect(gates[1].stateName).toBe('human_escalation');
@@ -411,7 +436,7 @@ describe.skipIf(!dockerReady)('evolve multi-round workflow with real Docker cont
       expect(gates[1].presentedArtifacts.has('run_spec')).toBe(true);
       expect(gates[1].summary).toContain('verdict: escalate');
       expect(gates[1].summary).toContain('lane 0 blocked');
-      orchestrator.resolveGate(workflowId, { type: 'ABORT' });
+      resolveActiveGate(orchestrator, workflowId, { type: 'ABORT' });
     }
 
     await waitForCompletion(orchestrator, workflowId, 180_000);
@@ -420,7 +445,7 @@ describe.skipIf(!dockerReady)('evolve multi-round workflow with real Docker cont
     expect(provisionTurns).toBe(1);
     expect(preflightTurns).toBe(1);
     if (mode === 'positive') {
-      expect(orchestratorTurns).toBe(ROUND_COUNT + 1);
+      expect(orchestratorTurns).toBe(ROUND_COUNT);
       expect(researcherTurns).toBe(ROUND_COUNT);
       expect(analyzerTurns).toBe(ROUND_COUNT);
       expect(finalSummaryTurns).toBe(1);
@@ -447,7 +472,8 @@ describe.skipIf(!dockerReady)('evolve multi-round workflow with real Docker cont
     expect(first.states).toContain('final_summary');
     expect(first.states).toContain('final_review');
     expect(countStates(first.states, 'workers')).toBe(ROUND_COUNT);
-    expect(countStates(first.states, 'orchestrator')).toBe(ROUND_COUNT + 1);
+    expect(countStates(first.states, 'stop_check')).toBe(ROUND_COUNT);
+    expect(countStates(first.states, 'orchestrator')).toBe(ROUND_COUNT);
 
     const nodes = readJson(resolve(runDir, 'database_data', 'nodes.json')) as NodesFile;
     expect(nodes.next_id).toBe(ROUND_COUNT);

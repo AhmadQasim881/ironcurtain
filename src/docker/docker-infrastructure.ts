@@ -1,7 +1,22 @@
 import { getGatewayDefinition } from '../config/provider-definitions.js';
+import { createTcpTransportTlsOptions } from './tcp-transport-tls.js';
 import { bindDockerEndpointExec } from './docker-endpoint.js';
 import { DOCKER_AGENT_VOLUME_SHADOW } from './docker-agent-volume-shadow.js';
 import { prepareDockerAgentStartup } from './agent-startup.js';
+import {
+  isAgentSudoEnabled,
+  planAgentContainerPrivileges,
+  planBundleAgentPrivileges,
+  type AgentContainerPrivilegePlan,
+} from './agent-privileges.js';
+import {
+  createBundlePrivilegedFileScanner,
+  deliverHostPrivilegedFilesNotice,
+  hostPrivilegedFilesNotice,
+  includeHostPrivilegedFilesInFailure,
+  type HostMountPrivilegeScanner,
+} from './host-mount-privilege-scan.js';
+import type { HostPrivilegedFilesDiagnostic } from '../session/startup-notices.js';
 /**
  * Shared Docker session infrastructure setup.
  *
@@ -10,7 +25,7 @@ import { prepareDockerAgentStartup } from './agent-startup.js';
  * and the PTY session module.
  */
 
-import { resolve, dirname } from 'node:path';
+import { resolve, dirname, isAbsolute, relative } from 'node:path';
 import {
   existsSync,
   readdirSync,
@@ -26,12 +41,12 @@ import {
   renameSync,
 } from 'node:fs';
 import { validateToolchainExecutable } from './toolchain-executable.js';
-import { readHardenedFile } from '../hardened-fs.js';
+import { readHardenedFile, readPackageAsset } from '../hardened-fs.js';
 import { arch, tmpdir } from 'node:os';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { quote } from 'shell-quote';
 import type { DockerAuthKind, IronCurtainConfig } from '../config/types.js';
-import { getBundleRuntimeRoot } from '../config/paths.js';
+import { getBundleRuntimeRoot, getWorkflowRunDir } from '../config/paths.js';
 import {
   getBundleShortId,
   type BundleId,
@@ -40,16 +55,28 @@ import {
   type SessionMode,
 } from '../session/types.js';
 import { DEFAULT_CONTAINER_SCOPE, type WorkflowId } from '../workflow/types.js';
+import { validatedWorkflowStagedDirectory } from '../workflow/staged-directories.js';
+import { toDisplayText } from '../terminal/display-sanitize.js';
 import {
   CONTAINER_SCRIPTS_DIR,
   type AgentAdapter,
   type AgentId,
   type ConversationStateConfig,
 } from './agent-adapter.js';
-import { buildContainerWorkspaceMount, CONTAINER_WORKSPACE_DIR } from './container-workspace.js';
+import { buildContainerWorkspaceMount } from './container-workspace.js';
+import { assertReadOnlyWorkspaceSupported } from '../config/read-only-workspace.js';
+import type { ReadOnlyWorkspace } from '../types/read-only-workspace.js';
 import type { ResolvedUserConfig } from '../config/user-config.js';
-import { resolveActiveProfile } from '../config/user-config.js';
+import { resolveActiveProfile, USER_CONFIG_DEFAULTS } from '../config/user-config.js';
+import {
+  checkDockerAvailable,
+  classifyDockerUserNamespace,
+  type DockerServerFacts,
+  type DockerUserNamespaceMode,
+} from './docker-probe.js';
 import type { DockerProxy } from './code-mode-proxy.js';
+import type { EscalationPromptFn } from '../trusted-process/tool-call-coordinator.js';
+import type { WorkflowCommitHandler } from '../trusted-process/workflow-commit-tool.js';
 import { defaultExecFile, IRONCURTAIN_LABEL_BUNDLE } from './docker-manager.js';
 import type { MitmProxy } from './mitm-proxy.js';
 import type { TrajectoryCaptureWriter } from './trajectory-capture.js';
@@ -60,7 +87,18 @@ import type {
   DockerMount,
   DockerNamedVolumeMount,
   DockerTrustedCreateOptions,
+  DockerUlimit,
+  ImageBuildOptions,
 } from './types.js';
+import { checkAgentCliVersion, resolveAgentCliBuildArgs } from './agent-cli-version.js';
+import {
+  BASE_IMAGE_LOGICAL_NAME,
+  IMAGE_BUILD_HASH_LABEL,
+  imageBuildTag,
+  isImageBuildTagOf,
+  isImmutableImageId,
+  shortBuildHash,
+} from './image-identity.js';
 import { createContainerRuntime, resolveRuntimeKind, type ContainerRuntimeKind } from './container-runtime.js';
 import type { HostOnlyNetwork, NetworkTopology } from './network-topology.js';
 import type { ProviderKeyMapping } from './mitm-proxy.js';
@@ -71,9 +109,9 @@ import {
   createIronCurtainInternalNetwork,
   InternalNetworkConnectivityError,
   ironCurtainInternalSubnetHostAddress,
+  finalizeManagedResourceLease,
   managedResourceLabels,
   reconcileIronCurtainDockerResourcesBestEffort,
-  releaseManagedResourceLease,
   selectIronCurtainInternalSubnet,
   withInternalNetworkAllocationRetry,
   type AllocatedInternalNetwork,
@@ -81,16 +119,41 @@ import {
 } from './docker-resource-lifecycle.js';
 import { clampDockerResources } from './resource-limits.js';
 import type { EffectiveDockerResources, HostResources } from './resource-limits.js';
+import { ensureTransportSidecarImage, hardenTransportSidecarCreate } from './transport-sidecar-image.js';
+import {
+  tcpTransportSidecarAddress,
+  tcpTransportListenEndpoint,
+  tcpTransportUpstreamEndpoint,
+  tcpTransportHostCaMount,
+  startTcpTransportSidecar,
+} from './tcp-transport-sidecar.js';
 import { errorMessage } from '../utils/error-message.js';
 import { createCachedStager } from '../skills/staging.js';
 import type { ResolvedSkill } from '../skills/types.js';
-import { withProvisionLock } from './provision-lock.js';
+import {
+  assertWorkflowDependencyProvisioningAvailable,
+  buildWorkflowDependencyProvisionScript,
+  ensureWorkflowDependencyLayers,
+  listWorkflowDependencyLayers,
+  planWorkflowDependencyLayers,
+  readWorkflowDependencyManifests,
+  workflowRunDependencyRoot,
+  WORKFLOW_DEPENDENCY_MANIFESTS_DIR,
+  WORKFLOW_NODE_MODULES_DIR,
+  WORKFLOW_PYTHON_VENV_DIR,
+  type WorkflowDependencyLayers,
+  type WorkflowDependencyProvisionRequest,
+  type WorkflowNodeModulesLayer,
+  type WorkflowPythonVenvLayer,
+} from './workflow-dependency-cache.js';
 import {
   buildRuntimeTrustEnv,
   CONTAINER_RUNTIME_CA_BUNDLE,
   renderAptProxyConfig,
+  stageAptProxyConfig,
   stageRuntimeTrust,
 } from './runtime-trust.js';
+import { buildPackageClientEnv } from './package-client-env.js';
 import {
   getFrozenClientToolchainManifestPath,
   getFrozenWatchdogPolicyTemplatePath,
@@ -129,6 +192,7 @@ import {
 } from '../docker-workload/apple-vm-daemon.js';
 import type { MetricsInvocationContext, MetricsInvocationLease } from '../llm-metrics/attribution-registry.js';
 import { acquireLlmMetricsRuntime, type LlmMetricsRuntimeLease } from '../llm-metrics/runtime.js';
+import { budgetGateOptionsFor, createBudgetGate, type BundleBudgetGate } from './budget-gate.js';
 import { hasMetricsCapableCompletionEndpoint } from './llm-observation/completion-endpoint.js';
 import {
   appleVmDockerWorkloadArtifactMount,
@@ -141,8 +205,10 @@ import {
   PRIVATE_DOCKER_WORKLOAD_NETWORK_ENV,
 } from '../docker-workload/private-docker.js';
 import {
+  assertDockerDesktopSidecarImage,
   DOCKER_DESKTOP_SIDECAR_DOCKER_HOST,
   type DockerDesktopSidecarHandle,
+  type DockerDesktopSidecarImage,
   type DockerDesktopSidecarResources,
 } from '../docker-workload/docker-desktop-sidecar.js';
 import {
@@ -154,9 +220,22 @@ import {
   type DesktopRelayExposure,
 } from '../docker-workload/desktop-relay.js';
 import { loadClientToolchainManifest } from '../docker-workload/client-toolchain.js';
+import {
+  canonicalPathBelowHome,
+  resolveCanonicalIronCurtainHome,
+  type CanonicalIronCurtainHome,
+} from '../docker-workload/canonical-home.js';
 import { resolveDockerToolchainSource, type DockerToolchainSource } from '../docker-workload/toolchain-source.js';
-import { dockerWorkloadRuntimeKind, type DockerWorkloadEnvironment } from '../docker-workload/environment.js';
-import { resolveContainerIdentity, type ContainerIdentity } from './container-identity.js';
+import {
+  dockerDesktopVmCapacity,
+  dockerWorkloadRuntimeKind,
+  type DockerWorkloadEnvironment,
+} from '../docker-workload/environment.js';
+import {
+  assertAgentHostIdentityIsNotRoot,
+  resolveContainerIdentity,
+  type ContainerIdentity,
+} from './container-identity.js';
 import type { ExpandedOuterCreate } from '../docker-workload/lifecycle-evidence.js';
 import {
   DOCKER_BUILD_TRUST_APT_CONFIG_PATH,
@@ -174,10 +253,11 @@ import {
   type DockerBuildTrustCanaryContract,
 } from './docker-build-shim.js';
 import type { DockerWorkloadEgressSet } from './docker-workload-egress.js';
-import { createProxyAuthorization, type ProxyAuthorization } from './proxy-authorization.js';
+import { createProxyAuthorization, proxyAuthorizedUrl, type ProxyAuthorization } from './proxy-authorization.js';
 import * as logger from '../logger.js';
 
 export { InternalNetworkConnectivityError };
+export { computeWorkflowDependencyHash } from './workflow-dependency-cache.js';
 
 /**
  * Create a bundle-owned directory and enforce 0o700 permissions even if
@@ -323,14 +403,15 @@ export function stageDockerBuildShim(
       target: dirname(contract.proxyConfigArtifact.targetPath),
       readonly: true,
     });
-    const wrapper = readHardenedFile(
-      resolve(getIronCurtainPackageRoot(), contract.buildTrustWrapperArtifact.packagePath),
-      {
-        label: 'packaged build-trust wrapper',
-        minBytes: 64,
-        maxBytes: 32 << 20,
-      },
-    );
+    // A packaged binary: an install made under umask 002 leaves it 0775, which
+    // the package-asset rules accept only for the owner's private group.
+    const packageRoot = getIronCurtainPackageRoot();
+    const wrapper = readPackageAsset(resolve(packageRoot, contract.buildTrustWrapperArtifact.packagePath), {
+      label: 'packaged build-trust wrapper',
+      minBytes: 64,
+      maxBytes: 32 << 20,
+      packageRoot,
+    });
     validateToolchainExecutable(wrapper, options.architecture, 'packaged build-trust wrapper');
     stage(
       'build-trust-wrapper',
@@ -449,7 +530,14 @@ export interface DockerDesktopResourcePartition {
   readonly agent: EffectiveDockerResources & { readonly pidsLimit: number };
 }
 
+export interface TcpTransportCredentials {
+  readonly mcpToken: string;
+  readonly proxyAuthorization: ProxyAuthorization;
+}
+
 export interface PreContainerInfrastructure {
+  /** Startup and provisioning findings, including those emitted before a session exists. */
+  readonly onHostPrivilegedFiles?: (notice: HostPrivilegedFilesDiagnostic) => void;
   /**
    * Stable key for this bundle. Used by:
    *  - Docker container name: `ironcurtain-<bundleId[0:12]>`
@@ -475,6 +563,8 @@ export interface PreContainerInfrastructure {
    * See `docs/designs/workflow-session-identity.md` §7.
    */
   readonly workflowId?: WorkflowId;
+  /** Actual run root supplied by the orchestrator, including external resumes. */
+  readonly workflowRunDir?: string;
   /**
    * Scope this bundle was minted for, if any. Present only on
    * workflow-mode bundles (alongside `workflowId`). Emitted directly as
@@ -497,6 +587,15 @@ export interface PreContainerInfrastructure {
    * callers pass a per-session sandbox here.
    */
   readonly workspaceDir: string;
+  /**
+   * The bundle's read-only workspace, copied from
+   * `config.readOnlyWorkspace` when it was prepared: its container mounts
+   * `workspaceDir` read-only and its coordinator denies every change outside
+   * the writable directories. Absent for an ordinary read-write bundle. The
+   * workflow orchestrator checks it before a read-only state borrows the
+   * bundle.
+   */
+  readonly readOnlyWorkspace?: ReadOnlyWorkspace;
   readonly escalationDir: string;
   /**
    * Audit log path, populated by `prepareDockerInfrastructure()` from
@@ -508,6 +607,30 @@ export interface PreContainerInfrastructure {
   readonly proxy: DockerProxy;
   readonly mitmProxy: MitmProxy;
   readonly docker: ContainerRuntime;
+  /**
+   * True for native Linux Docker bundles whose daemon runs neither rootless
+   * nor with userns-remap (or whose security options could not be read):
+   * container root is host root on the bind mounts, so the agent container's
+   * read-write host mounts are scanned for setuid/setgid and root-owned
+   * entries after each turn and at teardown (`privilegedFileScanner`, audit
+   * finding DINF-3). Absent (false) everywhere else.
+   */
+  readonly containerRootIsHostRoot?: boolean;
+  /**
+   * `docker exec --user` for agent execs that name one explicitly, when it is
+   * not `codespace`: the numeric agent UID of a sudo-off bundle
+   * (`agentSudo: false`), so no exec trusts the image to map an account name
+   * to a non-root UID. The bundle's runtime already defaults to it.
+   */
+  readonly agentExecUser?: string;
+  /**
+   * Whether the bundle's agent keeps passwordless sudo: the `agentSudo` of the
+   * privilege plan it was prepared with (see `agent-privileges.ts`). Workflow
+   * snapshots record it, so a resume under `agentSudo: false` can refuse one
+   * taken while the agent had root. Absent on hand-built bundles (tests),
+   * whose snapshots then count as taken with sudo.
+   */
+  readonly agentSudo?: boolean;
   readonly adapter: AgentAdapter;
   readonly ca: CertificateAuthority;
   readonly fakeKeys: Map<string, string>;
@@ -524,6 +647,8 @@ export interface PreContainerInfrastructure {
    */
   readonly topology: NetworkTopology;
   readonly useTcp: boolean;
+  /** Per-bundle admission for the shared Desktop host-gateway TCP route. */
+  readonly tcpTransport?: TcpTransportCredentials;
   /**
    * Per-bundle host-only network, present only on `tcp-hostonly`
    * bundles. Created during the prepare phase (the gateway address is
@@ -564,19 +689,15 @@ export interface PreContainerInfrastructure {
     readonly hostDir: string;
     readonly target: string;
   };
-  /** Host-side cached Python venv mounted at /opt/workflow-venv for workflow helpers. */
-  readonly workflowPythonVenvMount?: {
-    readonly hostDir: string;
-    readonly target: string;
-    readonly cacheKey: string;
-  };
-  /** Host-side cached node_modules mounted for workflow helper scripts. */
-  readonly workflowNodeModulesMount?: {
-    readonly hostDir: string;
-    readonly target: string;
-    readonly cacheKey: string;
-    readonly hasPackageLock: boolean;
-  };
+  /**
+   * This run's writable Python dependency layer (`hostDir`), mounted read-write
+   * at /opt/workflow-venv. It is seeded from a host-verified, content-keyed
+   * shared base (`baseDir`) that no agent container ever mounts; see
+   * `workflow-dependency-cache.ts`.
+   */
+  readonly workflowPythonVenvMount?: WorkflowPythonVenvLayer;
+  /** This run's writable node_modules layer, mounted read-write at /opt/workflow-node_modules. */
+  readonly workflowNodeModulesMount?: WorkflowNodeModulesLayer;
   /**
    * Re-stages the bundle's skills with the given resolved set.
    * No-op when `skillsMount` is undefined or when the set is byte-identical
@@ -599,6 +720,17 @@ export interface PreContainerInfrastructure {
 
   /** Register an exact invocation context and return its credentialed proxy URL. */
   beginMetricsInvocation?(context: MetricsInvocationContext): MetricsInvocationLease;
+
+  /**
+   * Host-enforced token and cost budget of this bundle, enforced by its MITM
+   * proxy on every completion request (see `budget-gate.ts`). Batch and
+   * workflow sessions open a turn on it around each agent exec (no
+   * completion is forwarded outside a turn) and stop the turn when it
+   * refuses a request for budget; PTY bundles have one session-long
+   * allowance. Always set by `prepareDockerInfrastructure()`; optional so
+   * hand-built bundles (tests) need not carry one.
+   */
+  readonly budgetGate?: BundleBudgetGate;
 
   /**
    * Begin trajectory capture for a session. Atomically:
@@ -695,9 +827,43 @@ function requireUdsEgressAddress(
 }
 
 /** Docker Desktop forwards host-gateway traffic as loopback on macOS. */
-function allowDockerDesktopRelaySource(remoteAddress: string | undefined): boolean {
+export function allowDockerDesktopRelaySource(remoteAddress: string | undefined): boolean {
   const normalized = remoteAddress?.startsWith('::ffff:') ? remoteAddress.slice('::ffff:'.length) : remoteAddress;
   return normalized === '127.0.0.1' || normalized === '::1';
+}
+
+/** Bind address and connection-source guard of a TCP-mode MITM listener. */
+export interface MitmTcpBind {
+  readonly listenHost: string;
+  readonly allowRemoteAddress: (remoteAddress: string | undefined) => boolean;
+}
+
+/**
+ * Where the ordinary MITM proxy listens in a TCP topology, and who may
+ * connect to it.
+ *
+ * - `tcp-sidecar` (Docker Desktop on macOS): the socat sidecar forwards to
+ *   `host.docker.internal`, which Docker Desktop delivers to the host as
+ *   loopback. The listener therefore binds `127.0.0.1`, exactly like the Code
+ *   Mode proxy and the nested egress listeners on the same hop, and keeps
+ *   the loopback-only source guard as defense in depth. Binding `0.0.0.0`
+ *   here (the previous behavior) handed every LAN peer, and every other
+ *   container on the host gateway, the session's proxy.
+ * - `tcp-hostonly` (retained, not currently selected): the vmnet gateway
+ *   interface does not exist until the first container attaches, so the
+ *   listener binds `0.0.0.0` and admits only the bundle's host-only subnet.
+ */
+export function resolveMitmTcpBind(
+  topology: NetworkTopology,
+  hostOnlySubnetGuard: ((remoteAddress: string | undefined) => boolean) | undefined,
+): MitmTcpBind {
+  if (topology === 'tcp-hostonly') {
+    if (hostOnlySubnetGuard === undefined) {
+      throw new Error('tcp-hostonly MITM listener requires the host-only subnet connection-source guard');
+    }
+    return { listenHost: '0.0.0.0', allowRemoteAddress: hostOnlySubnetGuard };
+  }
+  return { listenHost: '127.0.0.1', allowRemoteAddress: allowDockerDesktopRelaySource };
 }
 
 const DESKTOP_REGISTRY_RELAY_PORT = 18_081;
@@ -862,6 +1028,14 @@ export interface DockerInfrastructure extends PreContainerInfrastructure {
   readonly sidecarContainerId?: string;
   /** Per-session `--internal` Docker network name (TCP mode only, macOS). */
   readonly internalNetwork?: string;
+  /**
+   * Scanner for the agent container's read-write host mounts, present only
+   * when `containerRootIsHostRoot` (see `ContainerResources`). Run after each
+   * agent turn and by `destroyDockerInfrastructure`.
+   */
+  readonly privilegedFileScanner?: HostMountPrivilegeScanner;
+  /** Why an offered workflow snapshot was not used (see `ContainerResources`). */
+  readonly snapshotRefusal?: string;
 }
 
 /** Hosts that use Anthropic OAuth credentials when available. */
@@ -874,26 +1048,65 @@ const CONTAINER_NAME_PREFIX = 'ironcurtain-';
 
 const DOCKER_DESKTOP_SIDECAR_IMAGE = 'ironcurtain-nested-daemon:latest';
 const DOCKER_DESKTOP_RELAY_IMAGE = 'ironcurtain-fixed-relay:latest';
-const DOCKER_DESKTOP_SIDECAR_MEMORY_MB = 512;
-const DOCKER_DESKTOP_SIDECAR_CPUS = 0.25;
-const DOCKER_DESKTOP_TRANSPORT_MEMORY_MB = DESKTOP_RELAY_PROFILE.memoryBytes / (1024 * 1024);
-const DOCKER_DESKTOP_TRANSPORT_CPUS = DESKTOP_RELAY_PROFILE.nanoCpus / 1_000_000_000;
-const DOCKER_DESKTOP_TRANSPORT_PIDS = DESKTOP_RELAY_PROFILE.pidsLimit;
-const DOCKER_DESKTOP_AGENT_PIDS = 128;
+/**
+ * Floors of the Docker Desktop partition. CPU is counted in millicpus so every
+ * share is an exact decimal that Docker's `--cpus` parser and the effective
+ * `NanoCpus` comparison accept.
+ */
+const DOCKER_DESKTOP_MIN_SIDECAR_MEMORY_MB = 512;
+const DOCKER_DESKTOP_MIN_SIDECAR_MILLICPUS = 250;
+const DOCKER_DESKTOP_MIN_SIDECAR_PIDS = 256;
 const DOCKER_DESKTOP_MIN_AGENT_MEMORY_MB = 512;
-const DOCKER_DESKTOP_MIN_AGENT_CPUS = 0.25;
+const DOCKER_DESKTOP_MIN_AGENT_MILLICPUS = 250;
+const DOCKER_DESKTOP_MIN_AGENT_PIDS = 128;
+const DOCKER_DESKTOP_RELAY_MEMORY_MB = DESKTOP_RELAY_PROFILE.memoryBytes / (1024 * 1024);
+const DOCKER_DESKTOP_RELAY_MILLICPUS = DESKTOP_RELAY_PROFILE.nanoCpus / 1_000_000;
+
+/**
+ * Open-files ceiling (soft and hard) for every process in a Docker agent
+ * container. Daemon defaults are typically ~1M; 64k leaves room for Node
+ * toolchains and package installs while bounding descriptor exhaustion.
+ * `nproc` is deliberately not set: see `DockerUlimit` in types.ts.
+ */
+export const AGENT_OPEN_FILES_LIMIT = 65_536;
+
+/**
+ * Fixed envelope for the macOS Docker Desktop TCP transport sidecar when no
+ * nested-Docker partition applies. The sidecar runs `socat ... fork`, which
+ * forks one child per agent connection; unbounded, a compromised agent could
+ * open thousands of connections and exhaust the Docker Desktop VM that every
+ * session shares (audit finding DINF-11).
+ */
+export const TRANSPORT_SIDECAR_LIMITS = Object.freeze({
+  memoryMb: 64,
+  cpus: 0.25,
+  pidsLimit: 64,
+  openFilesLimit: 256,
+});
+
+/**
+ * Logged once per Linux Docker bundle when the daemon runs without rootless
+ * mode or userns-remap, so container root is real host root on bind mounts.
+ * Agents keep passwordless sudo inside the container by default (package
+ * installs), so a compromised agent can leave root-owned setuid files in the
+ * workspace and under the conversation-state mounts (audit finding DINF-3).
+ * Neither rootless Docker nor userns-remap works with the Linux UID-remap
+ * entrypoint yet, so this is a warning rather than a refusal; the bundle scans
+ * its read-write host mounts after each turn and at teardown, and
+ * `agentSudo: false` removes the agent's way to root.
+ */
+export const HOST_ROOT_EXPOSURE_WARNING =
+  '[docker] Container root is host root on this daemon (no rootless Docker or userns-remap). Agent containers ' +
+  'keep passwordless sudo, so a compromised agent can leave root-owned or setuid files in the workspace and ' +
+  'conversation-state mounts. IronCurtain strips setuid/setgid bits from your files in those mounts and reports ' +
+  'root-owned entries after each turn and at session end; set "agentSudo": false in ~/.ironcurtain/config.json ' +
+  'to run agents without sudo (no-new-privileges). `ironcurtain doctor` reports this check.';
 
 /** Host gateway alias used by Docker containers on macOS/Windows. */
 const DOCKER_HOST_GATEWAY = 'host.docker.internal';
 
 /** Bundle-relative subdir name for the skills staging dir. */
 const BUNDLE_SKILLS_SUBDIR = 'skills';
-
-/** Container path for runtime-provisioned workflow Python dependencies. */
-const WORKFLOW_PYTHON_VENV_DIR = '/opt/workflow-venv';
-
-/** Container path for runtime-provisioned workflow Node dependencies. */
-const WORKFLOW_NODE_MODULES_DIR = '/opt/workflow-node_modules';
 
 /**
  * Prepares the shared (non-container) parts of Docker session infrastructure.
@@ -950,11 +1163,43 @@ export type AgentImageResolution = {
   readonly artifact?: SelectedAgentArtifact;
 };
 
+/** Revalidate immediately before every staged-script read or mount plan. */
+function requireStagedWorkflowScripts(runDir: string | undefined, scriptsDir: string): string {
+  const validated = runDir === undefined ? undefined : validatedWorkflowStagedDirectory(runDir, scriptsDir, 'scripts');
+  if (validated === undefined) {
+    throw new Error('Workflow scripts must name the run-owned workflow-scripts directory');
+  }
+  return validated;
+}
+
 export interface PrepareDockerInfrastructureOptions {
+  readonly onHostPrivilegedFiles?: (notice: HostPrivilegedFilesDiagnostic) => void;
+  /** Trusted runtime run root; never derived from a checkpoint's staged path. */
+  readonly workflowRunDir?: string;
   readonly providerProfileName?: string;
   readonly preparedImageResolution?: AgentImageResolution;
   /** Explicit request-rewriter mode for this container lifecycle. */
   readonly proxyAgentKind?: AgentKind;
+  /**
+   * In-process escalation handler handed to the bundle's coordinator (via
+   * `createCodeModeProxy`). Workflow bundles set it so escalated tool calls
+   * reach the orchestrator's human route; standalone sessions leave it
+   * unset and use the file-IPC escalation directory.
+   */
+  readonly onEscalation?: EscalationPromptFn;
+  /**
+   * Most agent lanes expected to share the bundle's coordinator at once
+   * (handed to `createCodeModeProxy`). Workflow bundles whose scope runs a
+   * fan-out set it to the widest fan-out; everything else leaves it unset.
+   */
+  readonly maxLanes?: number;
+  /**
+   * Target of the bundle coordinator's `workflow_commit` tool (via
+   * `createCodeModeProxy`). Set by the workflow orchestrator only: a
+   * workflow bundle's channel, or a per-state channel for a workflow state
+   * that owns its container. Every other session leaves it unset.
+   */
+  readonly workflowCommit?: WorkflowCommitHandler;
 }
 
 export async function prepareDockerInfrastructure(
@@ -971,7 +1216,15 @@ export async function prepareDockerInfrastructure(
   scriptsDir?: string,
   options: PrepareDockerInfrastructureOptions = {},
 ): Promise<PreContainerInfrastructure> {
-  const { providerProfileName, preparedImageResolution, proxyAgentKind } = options;
+  const { providerProfileName, preparedImageResolution, proxyAgentKind, onEscalation, maxLanes, workflowCommit } =
+    options;
+  const workflowRunDir =
+    options.workflowRunDir ?? (workflowId === undefined ? undefined : getWorkflowRunDir(workflowId));
+  const stagedScriptsDir =
+    scriptsDir === undefined ? undefined : requireStagedWorkflowScripts(workflowRunDir, scriptsDir);
+  // A read-only workspace never runs with nested Docker, whose daemon would
+  // mount the workspace read-write (applyReadOnlyWorkspace switches it off).
+  assertReadOnlyWorkspaceSupported(config);
   // Secure nested Docker resolves the effective runtime and rejects every
   // unsupported variant before feature-attributable runtime, image, artifact,
   // proxy, lease, or filesystem provisioning. Runtime resolution is a
@@ -981,6 +1234,17 @@ export async function prepareDockerInfrastructure(
     config.userConfig,
     preparedImageResolution?.dockerWorkloadEnvironment,
   );
+  // Workflow runtime dependencies are read once here: the content key hashes
+  // these exact bytes and the provisioning container installs them. A
+  // workflow whose dependencies cannot be provisioned fails before any proxy,
+  // lease, or container work.
+  const workflowDependencyManifests = readWorkflowDependencyManifests(stagedScriptsDir);
+  if (workflowDependencyManifests !== undefined) {
+    assertWorkflowDependencyProvisioningAvailable({
+      packageInstallEnabled: config.userConfig.packageInstall.enabled,
+      nestedDockerAdmitted: admitted !== undefined,
+    });
+  }
   const admittedEnvironment = admitted?.environment;
   const admittedRuntimeKind =
     admittedEnvironment === undefined ? undefined : dockerWorkloadRuntimeKind(admittedEnvironment);
@@ -989,7 +1253,7 @@ export async function prepareDockerInfrastructure(
     if (admittedRuntimeKind === 'docker') {
       dockerDesktopResources = selectDockerDesktopResourcePartition(
         config.userConfig,
-        undefined,
+        dockerDesktopVmCapacity(admittedEnvironment),
         admittedEnvironment?.egressTransport === 'tcp',
       );
     }
@@ -1053,7 +1317,8 @@ export async function prepareDockerInfrastructure(
     getBundlePackageEgressSocketPath,
   } = await import('../config/paths.js');
 
-  await registerBuiltinAdapters(config.userConfig);
+  // Adapters read every session-specific value from `config` per call.
+  await registerBuiltinAdapters();
   const adapter = getAgent(mode.agent);
   const runtimeKind = admittedRuntimeKind ?? (await resolveRuntimeKind(config.userConfig.containerRuntime));
   const topology = resolveNetworkTopology(
@@ -1061,6 +1326,18 @@ export async function prepareDockerInfrastructure(
     admittedEnvironment === undefined ? undefined : admittedEnvironment.egressTransport === 'tcp',
   );
   const useTcp = topology !== 'uds';
+  // Fail fast on a root host identity before credentials, proxies, image
+  // preparation, or any container work (see assertLinuxDockerHostIdentity).
+  assertLinuxDockerHostIdentity(runtimeKind, useTcp);
+  // Likewise refuse an `agentSudo: false` this runtime cannot enforce (see
+  // agent-privileges.ts) before any credential, proxy, image or container
+  // work. The same plan later sets the container's create flags.
+  const agentPrivileges = planAgentContainerPrivileges({
+    runtimeKind,
+    useTcp,
+    agentSudo: isAgentSudoEnabled(config.userConfig),
+    nestedDocker: admitted !== undefined,
+  });
 
   // Detect authentication method. Adapters with detectCredential() handle
   // their own credential detection (e.g., Goose checks provider-specific keys;
@@ -1073,7 +1350,7 @@ export async function prepareDockerInfrastructure(
   const authMethod = detected ?? (await detectAuthMethod(config));
   if (authMethod.kind === 'none') {
     throw new Error(
-      adapter.credentialHelpText ??
+      adapter.credentialHelpText?.(config) ??
         'No credentials available for Docker session. ' +
           'Log in with `claude login` (OAuth) or set ANTHROPIC_API_KEY.',
     );
@@ -1107,7 +1384,25 @@ export async function prepareDockerInfrastructure(
 
   const socketPath = getBundleProxySocketPath(bundleId);
 
-  const docker = createContainerRuntime(runtimeKind, admittedEnvironment?.dockerEndpoint);
+  // A sudo-off agent is exec'd into by numeric UID, never by an image-mapped
+  // account name (see AgentContainerPrivilegePlan.execUser).
+  const docker = createContainerRuntime(runtimeKind, admittedEnvironment?.dockerEndpoint, {
+    defaultExecUser: agentPrivileges.execUser,
+  });
+  // Disclose, once per bundle, when container root is real host root on this
+  // daemon. Read-only probe; a nested-Docker admission already recorded the
+  // outer daemon's facts. Such bundles scan their read-write host mounts for
+  // setuid/setgid and root-owned entries after each turn and at teardown; an
+  // unreadable classification is treated as host root.
+  let containerRootIsHostRoot = false;
+  if (runtimeKind === 'docker' && !useTcp) {
+    const userNamespace = await warnWhenContainerRootIsHostRoot(
+      admittedEnvironment?.server,
+      undefined,
+      agentPrivileges.agentSudo,
+    );
+    containerRootIsHostRoot = userNamespace === undefined || userNamespace === 'host-root';
+  }
 
   // §8.2 step 1: admit the secure nested Docker-workload bundle — create its
   // host-owned lease before any proxy or outer resource is created. Placed
@@ -1120,13 +1415,17 @@ export async function prepareDockerInfrastructure(
   const containerIdentity = resolveContainerIdentity(runtimeKind === 'docker' && !useTcp);
   let dockerWorkloadAgentImage: string | undefined;
   let dockerWorkloadImageResolution: AgentImageResolution | undefined;
-  let dockerDesktopSidecarImage: string | undefined;
+  let dockerDesktopSidecarImage: DockerDesktopSidecarImage | undefined;
   let dockerDesktopRelayImageId: string | undefined;
   let admittedDockerWorkload:
     | { readonly handle: DockerWorkloadBundleHandle; readonly bootstrap?: AppleVmDockerWorkloadBootstrapConfig }
     | undefined;
+  // Resolved once per admission: every nested staging path below the home is
+  // canonicalized against this one real path (see canonical-home.ts).
+  let nestedStagingHome: CanonicalIronCurtainHome | undefined;
   if (admitted !== undefined) {
     const { environment, configuration } = admitted;
+    nestedStagingHome = resolveCanonicalIronCurtainHome();
     const toolchainSource =
       preparedImageResolution?.toolchainSource ??
       (await resolveDockerToolchainSource(docker, environment.architecture));
@@ -1141,7 +1440,12 @@ export async function prepareDockerInfrastructure(
     dockerWorkloadAgentImage = await adapter.getImage();
     dockerWorkloadImageResolution = preparedImageResolution;
     if (dockerWorkloadImageResolution === undefined) {
-      const built = await resolveAgentImage(dockerWorkloadAgentImage, docker, toolchainSource);
+      const built = await resolveAgentImage(
+        dockerWorkloadAgentImage,
+        docker,
+        toolchainSource,
+        agentImageBuildOptions(adapter, config.userConfig),
+      );
       dockerWorkloadImageResolution =
         runtimeKind === 'apple-container'
           ? selectedAgentImageResolution(
@@ -1163,6 +1467,7 @@ export async function prepareDockerInfrastructure(
       bundleId,
       workspaceRoot: workspaceDir,
       auditLogPath,
+      home: nestedStagingHome,
       ...(artifact === undefined ? {} : { artifact }),
     });
   }
@@ -1174,6 +1479,10 @@ export async function prepareDockerInfrastructure(
   // credential, provider, and proxy setup so no pre-attestation error can
   // strand a fresh lease.
   let hostOnlyNetwork: HostOnlyNetwork | undefined;
+  const tcpTransport =
+    topology === 'tcp-sidecar'
+      ? { mcpToken: randomBytes(32).toString('hex'), proxyAuthorization: createProxyAuthorization() }
+      : undefined;
   let proxy: DockerProxy | undefined;
   let mitmProxy: MitmProxy | undefined;
   let metricsRuntime: LlmMetricsRuntimeLease | undefined;
@@ -1197,17 +1506,23 @@ export async function prepareDockerInfrastructure(
       );
     }
 
+    // Load or generate the IronCurtain CA for TLS termination
+    const caDir = resolve(getIronCurtainHome(), 'ca');
+    const ca = loadOrCreateCA(caDir);
+    const transportTls = tcpTransport === undefined ? undefined : await createTcpTransportTlsOptions(ca);
+
     proxy = createCodeModeProxy({
       socketPath,
       config,
       listenMode: useTcp ? 'tcp' : 'uds',
       bindHost: topology === 'tcp-hostonly' ? '0.0.0.0' : undefined,
       allowRemoteAddress,
+      requiredTcpToken: tcpTransport?.mcpToken,
+      tls: transportTls,
+      onEscalation,
+      maxLanes,
+      ...(workflowCommit ? { workflowCommit } : {}),
     });
-
-    // Load or generate the IronCurtain CA for TLS termination
-    const caDir = resolve(getIronCurtainHome(), 'ca');
-    const ca = loadOrCreateCA(caDir);
 
     // Resolve package policy exactly once. The strict nested package listener
     // and ordinary package-install proxy, when enabled, share this immutable
@@ -1234,6 +1549,8 @@ export async function prepareDockerInfrastructure(
     }
 
     if (dockerWorkloadConfig?.enabled === true) {
+      if (dockerWorkload === undefined) throw new Error('nested-Docker egress requires an admitted lease');
+      const provenanceLease = dockerWorkload;
       const { createDockerWorkloadEgressListeners } = await import('./docker-workload-egress.js');
       const { PACKAGE_EGRESS_AUDIT_FILENAME } = await import('./package-egress-proxy.js');
       const { createDirectOutboundTransport } = await import('./outbound-transport.js');
@@ -1259,6 +1576,8 @@ export async function prepareDockerInfrastructure(
         ...(proxyAuthorization === undefined ? {} : { requiredProxyAuthorization: proxyAuthorization.header }),
         packagePolicy,
         ...(packageMode ? { packageAuditLogPath: resolve(bundleDir, PACKAGE_EGRESS_AUDIT_FILENAME) } : {}),
+        // Every completed pull lands in the lease's durable provenance log.
+        recordRegistryPullProvenance: (record) => provenanceLease.recordRegistryPull(record),
       });
       if (listeners !== undefined) {
         try {
@@ -1413,11 +1732,24 @@ export async function prepareDockerInfrastructure(
       bundleId: String(bundleId),
       providerProfileId,
     };
+    // One budget per bundle, enforced by its MITM proxy on every completion
+    // request whatever proxy credential it carries, and independent of
+    // statistics persistence. Its limits are this bundle's config: the
+    // session's for standalone and PTY bundles, the workflow's effective
+    // budget for a shared workflow bundle (all of its lanes together).
+    const budgetGate = createBudgetGate(budgetGateOptionsFor(config.userConfig, agentKind, getBundleShortId(bundleId)));
     const captureProxyOptions = captureWriter ? { capture: captureWriter } : {};
+    // Opt-in policy-evaluated egress (docs/designs/mitm-egress-policy.md):
+    // destinations that are neither providers nor registries are decided by
+    // the sandbox's coordinator, attached below once the Code Mode proxy is up.
+    const policyEvaluatedEgress = config.userConfig.egressPolicy?.enabled === true;
+    const egressProxyOptions = policyEvaluatedEgress ? { policyEvaluatedEgress: true } : {};
 
-    const activeMitmProxy = useTcp
+    const mitmTcpBind = useTcp ? resolveMitmTcpBind(topology, allowRemoteAddress) : undefined;
+    const activeMitmProxy = mitmTcpBind
       ? createMitmProxy({
           listenPort: 0,
+          listenHost: mitmTcpBind.listenHost,
           ca,
           providers: providerMappings,
           registries,
@@ -1425,10 +1757,14 @@ export async function prepareDockerInfrastructure(
           controlPort: 0,
           initialTokenSessionId: routingId,
           agentKind,
-          allowRemoteAddress,
+          allowRemoteAddress: mitmTcpBind.allowRemoteAddress,
+          requiredProxyAuthorization: tcpTransport?.proxyAuthorization.header,
+          transportTls,
           statisticsEnabled: metricsCapable,
+          budgetGate,
           ...proxyAttributionOptions,
           ...captureProxyOptions,
+          ...egressProxyOptions,
         })
       : createMitmProxy({
           socketPath: getBundleMitmProxySocketPath(bundleId),
@@ -1440,8 +1776,10 @@ export async function prepareDockerInfrastructure(
           initialTokenSessionId: routingId,
           agentKind,
           statisticsEnabled: metricsCapable,
+          budgetGate,
           ...proxyAttributionOptions,
           ...captureProxyOptions,
+          ...egressProxyOptions,
         });
     mitmProxy = activeMitmProxy;
 
@@ -1453,7 +1791,8 @@ export async function prepareDockerInfrastructure(
       logger.info(
         hostOnlyNetwork
           ? `MITM proxy listening on ${hostOnlyNetwork.gateway}:${mitmAddr.port} (0.0.0.0, subnet-guarded)`
-          : `MITM proxy listening on 127.0.0.1:${mitmAddr.port}`,
+          : `MITM proxy listening on ${mitmAddr.host ?? mitmTcpBind?.listenHost ?? '127.0.0.1'}:${mitmAddr.port} ` +
+              '(loopback, Docker Desktop host-gateway sources only)',
       );
     } else {
       logger.info(`MITM proxy listening on ${mitmAddr.socketPath}`);
@@ -1462,7 +1801,7 @@ export async function prepareDockerInfrastructure(
       topology === 'tcp-hostonly'
         ? `http://${hostOnlyNetwork?.gateway ?? '127.0.0.1'}:${mitmAddr.port ?? 0}`
         : topology === 'tcp-sidecar'
-          ? `http://${DOCKER_HOST_GATEWAY}:${mitmAddr.port ?? 0}`
+          ? tcpSidecarProxyUrl({ topology, tcpTransport }, mitmAddr.port ?? 0)
           : 'http://127.0.0.1:18080';
     // apple-container's `-v <sock>` vsock relay propagates the host
     // socket's mode bits to the guest side (owner is always root there),
@@ -1482,12 +1821,35 @@ export async function prepareDockerInfrastructure(
           : undefined;
     if (controlAddr) {
       config.mitmControlAddr = controlAddr;
+      // The control API answers only requests carrying this per-bundle token;
+      // it reaches the in-process control client and the virtual proxy-tool
+      // relay through the config, never the container.
+      config.mitmControlToken = mitmAddr.controlToken;
       logger.info(`MITM control API at ${controlAddr}`);
     }
 
     // Start Code Mode proxy AFTER mitmControlAddr is set so the sandbox
     // registers the proxy virtual server for network domain management.
     await proxy.start();
+
+    // Policy-evaluated egress: the sandbox's coordinator now exists, so the
+    // MITM can ask it. Until this point the MITM refused every destination
+    // that needs a decision (no container is running yet anyway); failing
+    // here, rather than running without a decider, keeps that fail-closed.
+    if (policyEvaluatedEgress) {
+      const egressAuthorizer = proxy.getEgressAuthorizer?.() ?? null;
+      if (egressAuthorizer === null) {
+        throw new Error('egressPolicy is enabled but the session coordinator offers no egress authorizer');
+      }
+      activeMitmProxy.setEgressAuthorizer(egressAuthorizer);
+      logger.info('MITM egress: destinations outside the provider and registry allowlists are policy-evaluated');
+      if (config.userConfig.egressPolicy?.allowedHosts.includes('*') === true) {
+        logger.warn(
+          'MITM egress: egressPolicy.allowedHosts contains "*": every host name on ports 443 and 80 is ' +
+            'reachable without approval (each decision is still audited)',
+        );
+      }
+    }
     if (useTcp && proxy.port !== undefined) {
       logger.info(
         hostOnlyNetwork
@@ -1579,10 +1941,11 @@ export async function prepareDockerInfrastructure(
       if (
         dockerDesktopSidecarImage === undefined ||
         dockerDesktopResources === undefined ||
-        dockerWorkloadImageResolution?.immutableImageId === undefined
+        dockerWorkloadImageResolution?.immutableImageId === undefined ||
+        nestedStagingHome === undefined
       ) {
         throw new Error(
-          'Docker Desktop nested-Docker preparation is missing its daemon image, immutable agent image, or resources',
+          'Docker Desktop nested-Docker preparation is missing its daemon image, immutable agent image, resources, or staging home',
         );
       }
       const { requireDockerDesktopSidecarRuntime, startDockerDesktopSidecar } =
@@ -1614,7 +1977,12 @@ export async function prepareDockerInfrastructure(
         runtime: requireDockerDesktopSidecarRuntime(docker),
         sidecarImage: dockerDesktopSidecarImage,
         identity: containerIdentity,
-        hostConfigDirectory: resolve(hostOnlyDir, 'daemon'),
+        // Canonical: the identity files staged here are bind-mount sources.
+        hostConfigDirectory: canonicalPathBelowHome(
+          nestedStagingHome,
+          resolve(hostOnlyDir, 'daemon'),
+          'nested daemon host configuration directory',
+        ),
         clientManifest: loadClientToolchainManifest(
           getFrozenClientToolchainManifestPath(),
           admitted.environment.architecture,
@@ -1688,7 +2056,9 @@ export async function prepareDockerInfrastructure(
     // normal build cache.
     const agentImage = dockerWorkloadAgentImage ?? (await adapter.getImage());
     const imageResolution =
-      dockerWorkloadImageResolution ?? preparedImageResolution ?? (await resolveAgentImage(agentImage, docker));
+      dockerWorkloadImageResolution ??
+      preparedImageResolution ??
+      (await resolveAgentImage(agentImage, docker, undefined, agentImageBuildOptions(adapter, config.userConfig)));
     assertPreparedImageResolution(
       imageResolution,
       agentImage,
@@ -1696,11 +2066,32 @@ export async function prepareDockerInfrastructure(
     );
     const agentBuildHash = imageResolution.buildHash;
     const image = imageResolution.imageRef;
-    // Surface the (unpinned) agent CLI version baked into the image so silent
-    // version drift on rebuild is visible in logs (issue #367). Keyed by build
-    // hash so a same-process rebuild re-logs the possibly-changed version.
-    await logResolvedAgentVersion(docker, image, agentBuildHash, adapter.versionProbe);
-    const workflowDependencyMounts = prepareWorkflowDependencyMounts(agentBuildHash, scriptsDir, getIronCurtainHome());
+    // Check the agent CLI version baked into the image against the range
+    // qualified with this release, once per build and process; a version
+    // outside it (an override, or drift) is logged as a warning (issue #367).
+    await checkAgentCliVersion({
+      runtime: docker,
+      image,
+      buildHash: agentBuildHash,
+      versionProbe: adapter.versionProbe,
+      support: adapter.cliVersion,
+    });
+    // Plan only: the shared base is verified or rebuilt, and this run's
+    // writable layer seeded, in createSessionContainers before the agent
+    // container exists. Run layers live with the workflow run (keyed by
+    // workflowId) so resume re-mounts the same layer.
+    const workflowDependencyLayers: WorkflowDependencyLayers =
+      workflowDependencyManifests === undefined
+        ? {}
+        : planWorkflowDependencyLayers({
+            agentBuildHash,
+            manifests: workflowDependencyManifests,
+            ironcurtainHome: getIronCurtainHome(),
+            runDependencyRoot:
+              workflowRunDir !== undefined
+                ? workflowRunDependencyRoot(workflowRunDir)
+                : resolve(bundleDir, 'workflow-deps'),
+          });
 
     // Set up conversation state directory if the adapter supports resume
     const conversationStateConfig = adapter.getConversationStateConfig?.();
@@ -1733,22 +2124,29 @@ export async function prepareDockerInfrastructure(
     };
 
     let scriptsMount: PreContainerInfrastructure['scriptsMount'];
-    if (scriptsDir !== undefined && existsSync(scriptsDir)) {
-      scriptsMount = { hostDir: scriptsDir, target: CONTAINER_SCRIPTS_DIR };
-      logger.info(`Staged workflow scripts available at ${scriptsDir}`);
+    if (stagedScriptsDir !== undefined) {
+      const hostDir = requireStagedWorkflowScripts(workflowRunDir, stagedScriptsDir);
+      scriptsMount = { hostDir, target: CONTAINER_SCRIPTS_DIR };
+      logger.info(`Staged workflow scripts available at ${hostDir}`);
     }
 
     return {
       bundleId,
+      ...(options.onHostPrivilegedFiles ? { onHostPrivilegedFiles: options.onHostPrivilegedFiles } : {}),
       workflowId,
+      workflowRunDir,
       scope,
       bundleDir,
       workspaceDir,
+      ...(config.readOnlyWorkspace === undefined ? {} : { readOnlyWorkspace: config.readOnlyWorkspace }),
       escalationDir,
       auditLogPath,
       proxy,
       mitmProxy: activeMitmProxy,
       docker,
+      containerRootIsHostRoot,
+      ...(agentPrivileges.execUser === undefined ? {} : { agentExecUser: agentPrivileges.execUser }),
+      agentSudo: agentPrivileges.agentSudo,
       adapter,
       ca,
       fakeKeys,
@@ -1759,6 +2157,7 @@ export async function prepareDockerInfrastructure(
       runtimeKind,
       topology,
       useTcp,
+      ...(tcpTransport === undefined ? {} : { tcpTransport }),
       hostOnlyNetwork,
       socketsDir,
       mitmAddr,
@@ -1769,7 +2168,7 @@ export async function prepareDockerInfrastructure(
       conversationStateConfig,
       skillsMount,
       scriptsMount,
-      ...workflowDependencyMounts,
+      ...workflowDependencyLayers,
       dockerWorkload,
       dockerWorkloadBootstrap,
       dockerDesktopAgentAccess,
@@ -1812,6 +2211,7 @@ export async function prepareDockerInfrastructure(
       },
       captureWriter,
       metricsRuntime,
+      budgetGate,
     };
   } catch (error) {
     // §8.3: an admitted Docker-workload lease must not outlive the failed
@@ -1887,8 +2287,13 @@ export async function createDockerInfrastructure(
     scriptsDir,
     {
       providerProfileName,
+      workflowRunDir: options?.workflowRunDir,
       preparedImageResolution: options?.preparedImageResolution,
       proxyAgentKind: workflowId !== undefined ? 'workflow' : 'batch',
+      onEscalation: options?.onEscalation,
+      onHostPrivilegedFiles: options?.onHostPrivilegedFiles,
+      maxLanes: options?.maxLanes,
+      ...(options?.workflowCommit ? { workflowCommit: options.workflowCommit } : {}),
     },
   );
 
@@ -1897,9 +2302,10 @@ export async function createDockerInfrastructure(
 
 /**
  * Finalizes a prepared bundle into a running `DockerInfrastructure`: creates
- * the session containers and provisions workflow dependencies. The shared
- * Apple Docker-workload bootstrap activates an admitted lease immediately
- * before returning from the agent-blocking bootstrap.
+ * the session containers (which first readies any workflow dependency layers,
+ * see `createSessionContainers`). The shared Apple Docker-workload bootstrap
+ * activates an admitted lease immediately before returning from the
+ * agent-blocking bootstrap.
  *
  * On any failure an admitted Docker-workload bundle is torn down FIRST (§8.3):
  * `teardown()` removes the ledgered outer resources with absence proofs, so it
@@ -1918,9 +2324,7 @@ export async function assembleDockerInfrastructure(
   let containerResources: ContainerResources | undefined;
   try {
     containerResources = await createSessionContainers(core, config, options);
-    const infra = { ...core, ...containerResources };
-    await provisionWorkflowDependencies(infra, config.userConfig.packageInstall.enabled);
-    return infra;
+    return { ...core, ...containerResources };
   } catch (error) {
     // A create-session failure already revoked these authorities before its
     // partial VM cleanup. Once container resources were returned, this layer
@@ -1932,7 +2336,8 @@ export async function assembleDockerInfrastructure(
     // §8.3: tear the ledgered workload resources down first, then the ordinary
     // transport/network, and release the managed-resource lease. A create that failed mid-flight already cleaned
     // up its own partial containers/sidecar/network inside
-    // createSessionContainers; this covers the later activate()/provision steps.
+    // createSessionContainers (workflow dependency provisioning included); this
+    // covers any step that fails after it returned.
     await destroyBundleOuterResources({
       docker: core.docker,
       dockerWorkload: core.dockerWorkload,
@@ -1950,6 +2355,18 @@ export async function assembleDockerInfrastructure(
   }
 }
 
+/** What `destroyDockerInfrastructure` found while it tore a bundle down. */
+export interface DockerInfrastructureTeardown {
+  /**
+   * The findings of the final host-mount privilege scan (host-root Docker
+   * daemons only), made after the container was gone, as the notice to show
+   * the user: everything setuid/setgid or root-owned the agent left in its
+   * read-write host mounts. Undefined when the bundle has no scanner or the
+   * scan found nothing.
+   */
+  readonly privilegedFiles?: HostPrivilegedFilesDiagnostic;
+}
+
 /**
  * Tears down a fully-formed `DockerInfrastructure` bundle: main container,
  * TCP-mode sidecar and internal network (if present), MITM proxy, and Code
@@ -1961,9 +2378,11 @@ export async function assembleDockerInfrastructure(
  * error-recovery paths depend on this function never throwing.
  *
  * The companion to `createDockerInfrastructure()`: anything the former
- * allocates, this function releases.
+ * allocates, this function releases. Resolves with what the teardown found
+ * for the user (see {@link DockerInfrastructureTeardown}): the session or
+ * workflow that owned the bundle reports it.
  */
-export async function destroyDockerInfrastructure(infra: DockerInfrastructure): Promise<void> {
+export async function destroyDockerInfrastructure(infra: DockerInfrastructure): Promise<DockerInfrastructureTeardown> {
   // Revoke optional nested-daemon egress authority before touching the VM so
   // no new package/registry request can begin during exact outer teardown.
   await stopDockerWorkloadEgressBestEffort(infra.dockerWorkloadEgress, 'destroyDockerInfrastructure');
@@ -2017,6 +2436,18 @@ export async function destroyDockerInfrastructure(infra: DockerInfrastructure): 
     ?.release()
     .catch((err: unknown) => logger.warn(`destroyDockerInfrastructure: metrics flush failed: ${errorMessage(err)}`));
 
+  // Final setuid/setgid sweep of the agent's read-write host mounts (host-root
+  // daemons only): the container is gone, so nothing can re-plant behind it.
+  // Runs before the runtime root (the sockets dir) is removed so root-owned
+  // entries there are reported rather than just failing the removal. Its
+  // findings, all of them (also those a turn's scan reported already: this
+  // is what is left), go back to the caller for the user.
+  const finalScan = await infra.privilegedFileScanner?.scan('session end').catch((err: unknown) => {
+    logger.warn(`destroyDockerInfrastructure: host-mount privilege scan failed: ${errorMessage(err)}`);
+    return undefined;
+  });
+  const privilegedFiles = hostPrivilegedFilesNotice(finalScan, 'all');
+
   // CA and fake keys are intentionally absent: neither owns any
   // process-level resources. CA material is persisted in ~/.ironcurtain/ca/
   // and reused across sessions; fake keys are just strings in a Map that
@@ -2026,12 +2457,14 @@ export async function destroyDockerInfrastructure(infra: DockerInfrastructure): 
   // proxies already unlink their own socket files during `stop()`, and
   // the coordinator unlinks `ctrl.sock` from its control-server shutdown,
   // but the subdirectories (`sockets/` + `host/`) remain. Best-effort
-  // only: a stale dir from a crashed run gets cleaned up on the next
-  // bundle startup via `mkdirSync({recursive})`, and the contents
+  // only. Nothing else removes this tree: a crashed run's directory stays
+  // until a bundle with the same 12-character id prefix starts again
+  // (`ensureSecureBundleDir` reuses it, it does not empty it). The contents
   // (empty once sockets are unlinked) carry no sensitive data.
   removeBundleRuntimeRoot(infra.bundleId, 'destroyDockerInfrastructure');
 
   logger.info(`Destroyed Docker infrastructure (container=${infra.containerId.substring(0, 12)})`);
+  return privilegedFiles === undefined ? {} : { privilegedFiles };
 }
 
 /** Best-effort removal of the host-only per-bundle socket directory tree. */
@@ -2085,11 +2518,12 @@ export function buildDockerOwnershipLabels(options: {
   // owner. Do not mint a second process-owner lease for the same resources:
   // after a coordinator SIGKILL the detached watchdog would remove the runtime
   // objects, leaving no generic object from which startup GC could discover
-  // and retire that redundant owner token.
+  // and retire that redundant owner token. Every other bundle, Docker or
+  // Apple Container, carries the process-owner labels so an interrupted or
+  // crashed session's container (on Apple, a whole VM) is reclaimed by the
+  // next startup reconciliation or `ironcurtain gc --runtime ...`.
   const managedLabels =
-    options.runtimeKind === 'docker' && options.dockerWorkload === undefined
-      ? managedResourceLabels(options.bundleId)
-      : undefined;
+    options.dockerWorkload === undefined ? managedResourceLabels(options.bundleId, options.runtimeKind) : undefined;
   const labels = managedLabels
     ? Object.fromEntries(Object.entries(managedLabels).filter(([key]) => key !== 'ironcurtain.bundle'))
     : undefined;
@@ -2131,8 +2565,9 @@ function launchesNestedDaemonComponent(spec: LedgeredOuterCreateSpec): boolean {
 /**
  * Precommit one outer resource to the Docker-workload lease, run the caller's
  * create with the caller-selected name + merged ownership labels, then record the
- * runtime-returned immutable ID (§8.2 step 1). Daemon/VM-role creates first
- * prove the watchdog is fresh (§8.2 step 4).
+ * runtime-returned immutable ID (§8.2 step 1) and, where the watchdog measures
+ * it, bind the container's runtime-owned storage file. Daemon/VM-role creates
+ * first prove the watchdog is fresh (§8.2 step 4).
  *
  * `create` receives that precommitted name and the merged labels and returns the
  * immutable ID (for networks, read it back via `listNetworks` — `createNetwork`
@@ -2152,6 +2587,9 @@ export async function ledgerOuterResourceCreate(
     const labels = spec.baseLabels ? { ...spec.baseLabels, ...registration.labels } : registration.labels;
     const { id, expanded } = await create(spec.requestedName, labels);
     registration.observed(id, expanded);
+    // Still under the create claim, so the watchdog never samples a ledgered
+    // container whose runtime storage it cannot locate.
+    await registration.bindStorage();
     await spec.adjudicateObserved?.(id);
     return { id };
   });
@@ -2397,12 +2835,20 @@ export function selectOuterContainerResources(
 }
 
 /**
- * Partition one aggregate Docker Desktop nested-workload envelope. The fixed
- * daemon, session transport, and enabled fixed-relay reserves are charged
- * first; the agent receives the exact remainder. PID limits are partitioned
- * the same way, so every outer container stays within the operator-selected
- * envelope. Apple keeps its existing single-VM envelope and does not call this
- * helper.
+ * Partition one aggregate Docker Desktop nested-workload envelope across the
+ * nested daemon (the sidecar that runs dockerd, BuildKit and every inner
+ * container), the session transport, every enabled fixed relay, and the
+ * agent, so their sum never exceeds the operator-selected envelope.
+ *
+ * The transport and relay reserves are fixed and charged first. The daemon
+ * then receives at least `dockerWorkload.resources.daemonShare` (default half)
+ * of the session's memory, CPU and PID budget, rounded up to a whole MiB,
+ * millicpu and PID, and never less than its own floor, but never so much that
+ * the agent drops below its floor; the agent receives the exact remainder. `hostResources` is the capacity the aggregate is clamped
+ * to: callers pass the Docker Desktop VM's (`docker info` NCPU and MemTotal)
+ * when the daemon reported it, since that VM, not the host, runs every outer
+ * container. Apple keeps its existing single-VM envelope and does not call
+ * this helper.
  */
 export function selectDockerDesktopResourcePartition(
   userConfig: Pick<ResolvedUserConfig, 'dockerResources' | 'dockerWorkload'>,
@@ -2413,81 +2859,207 @@ export function selectDockerDesktopResourcePartition(
     throw new Error('Docker Desktop resource partition requires an enabled nested-Docker workload');
   }
   const aggregate = selectOuterContainerResources(userConfig, hostResources);
-  const memoryMb = aggregate.memoryMb;
-  const cpus = aggregate.cpus;
-  if (memoryMb === undefined || cpus === undefined) {
+  if (aggregate.memoryMb === undefined || aggregate.cpus === undefined) {
     throw new Error('Docker Desktop nested Docker requires finite aggregate memory and CPU limits');
   }
-  const transport = tcpTransport
-    ? {
-        memoryMb: DOCKER_DESKTOP_TRANSPORT_MEMORY_MB,
-        cpus: DOCKER_DESKTOP_TRANSPORT_CPUS,
-        pidsLimit: DOCKER_DESKTOP_TRANSPORT_PIDS,
-      }
-    : { memoryMb: 0, cpus: 0, pidsLimit: 0 };
+  const { daemonShare, pids } = userConfig.dockerWorkload.resources;
+  const memoryMb = Math.floor(aggregate.memoryMb);
+  // Tolerate binary rounding of a decimal setting (0.29 * 1000 = 289.99...).
+  const millicpus = Math.floor(aggregate.cpus * 1000 + 1e-6);
+  const totalPids = pids.desired;
+
   const networkAccess = userConfig.dockerWorkload.networkAccess;
   const relayCount = networkAccess === 'packages' ? 2 : networkAccess === 'images' ? 1 : 0;
-  const relayMemoryMb = (relayCount * DESKTOP_RELAY_PROFILE.memoryBytes) / (1024 * 1024);
-  const relayCpus = (relayCount * DESKTOP_RELAY_PROFILE.nanoCpus) / 1_000_000_000;
-  const relayPids = relayCount * DESKTOP_RELAY_PROFILE.pidsLimit;
-  const minimumMemoryMb =
-    DOCKER_DESKTOP_SIDECAR_MEMORY_MB + transport.memoryMb + DOCKER_DESKTOP_MIN_AGENT_MEMORY_MB + relayMemoryMb;
-  const minimumCpus = DOCKER_DESKTOP_SIDECAR_CPUS + transport.cpus + DOCKER_DESKTOP_MIN_AGENT_CPUS + relayCpus;
-  const totalPids = userConfig.dockerWorkload.resources.pids.desired;
-  const sidecarPids = totalPids - DOCKER_DESKTOP_AGENT_PIDS - transport.pidsLimit - relayPids;
-  if (sidecarPids < 16) {
+  const transport = tcpTransport
+    ? {
+        memoryMb: DOCKER_DESKTOP_RELAY_MEMORY_MB,
+        millicpus: DOCKER_DESKTOP_RELAY_MILLICPUS,
+        pidsLimit: DESKTOP_RELAY_PROFILE.pidsLimit,
+      }
+    : { memoryMb: 0, millicpus: 0, pidsLimit: 0 };
+  const reserve = {
+    memoryMb: transport.memoryMb + relayCount * DOCKER_DESKTOP_RELAY_MEMORY_MB,
+    millicpus: transport.millicpus + relayCount * DOCKER_DESKTOP_RELAY_MILLICPUS,
+    pids: transport.pidsLimit + relayCount * DESKTOP_RELAY_PROFILE.pidsLimit,
+  };
+
+  const minimumMemoryMb = DOCKER_DESKTOP_MIN_SIDECAR_MEMORY_MB + reserve.memoryMb + DOCKER_DESKTOP_MIN_AGENT_MEMORY_MB;
+  const minimumMillicpus =
+    DOCKER_DESKTOP_MIN_SIDECAR_MILLICPUS + reserve.millicpus + DOCKER_DESKTOP_MIN_AGENT_MILLICPUS;
+  if (totalPids - reserve.pids - DOCKER_DESKTOP_MIN_AGENT_PIDS < DOCKER_DESKTOP_MIN_SIDECAR_PIDS) {
     throw new Error('Docker Desktop nested Docker PID envelope cannot cover every outer container');
   }
-  if (memoryMb < minimumMemoryMb || cpus < minimumCpus) {
+  if (memoryMb < minimumMemoryMb || millicpus < minimumMillicpus) {
     throw new Error(
       `Docker Desktop nested Docker ${networkAccess} mode requires at least ${minimumMemoryMb} MiB and ` +
-        `${minimumCpus} CPU in dockerWorkload.resources`,
+        `${minimumMillicpus / 1000} CPU in dockerResources (the nested-Docker session envelope)`,
     );
   }
+  // At least the configured share, rounded up to a whole unit (the epsilon
+  // absorbs binary noise in an exact product such as 10 * 0.7), unless the
+  // agent's floor needs part of it.
+  const daemonPortion = (total: number, floor: number, agentFloor: number, reserved: number): number =>
+    Math.min(Math.max(Math.ceil(total * daemonShare - 1e-9), floor), total - reserved - agentFloor);
+  const sidecar = {
+    memoryMb: daemonPortion(
+      memoryMb,
+      DOCKER_DESKTOP_MIN_SIDECAR_MEMORY_MB,
+      DOCKER_DESKTOP_MIN_AGENT_MEMORY_MB,
+      reserve.memoryMb,
+    ),
+    millicpus: daemonPortion(
+      millicpus,
+      DOCKER_DESKTOP_MIN_SIDECAR_MILLICPUS,
+      DOCKER_DESKTOP_MIN_AGENT_MILLICPUS,
+      reserve.millicpus,
+    ),
+    pidsLimit: daemonPortion(totalPids, DOCKER_DESKTOP_MIN_SIDECAR_PIDS, DOCKER_DESKTOP_MIN_AGENT_PIDS, reserve.pids),
+  };
   return {
-    sidecar: {
-      memoryMb: DOCKER_DESKTOP_SIDECAR_MEMORY_MB,
-      cpus: DOCKER_DESKTOP_SIDECAR_CPUS,
-      pidsLimit: sidecarPids,
-    },
+    sidecar: { memoryMb: sidecar.memoryMb, cpus: sidecar.millicpus / 1000, pidsLimit: sidecar.pidsLimit },
     transport: {
       memoryMb: transport.memoryMb,
-      cpus: transport.cpus,
+      cpus: transport.millicpus / 1000,
       pidsLimit: transport.pidsLimit,
     },
     agent: {
-      memoryMb: memoryMb - DOCKER_DESKTOP_SIDECAR_MEMORY_MB - transport.memoryMb - relayMemoryMb,
-      cpus: cpus - DOCKER_DESKTOP_SIDECAR_CPUS - transport.cpus - relayCpus,
-      pidsLimit: DOCKER_DESKTOP_AGENT_PIDS,
+      memoryMb: memoryMb - reserve.memoryMb - sidecar.memoryMb,
+      cpus: (millicpus - reserve.millicpus - sidecar.millicpus) / 1000,
+      pidsLimit: totalPids - reserve.pids - sidecar.pidsLimit,
     },
   };
 }
 
-/** Apply the partitioned limits to the pre-existing macOS TCP transport sidecar. */
+function openFilesUlimit(limit: number): DockerUlimit {
+  return { name: 'nofile', soft: limit, hard: limit };
+}
+
+/**
+ * Resource limits for the macOS TCP transport sidecar: the partitioned share
+ * when a nested-Docker envelope applies, otherwise the fixed small
+ * {@link TRANSPORT_SIDECAR_LIMITS}. The sidecar is never left unbounded.
+ */
 export function buildDockerDesktopTransportCreateLimits(partition: DockerDesktopResourcePartition | undefined): {
-  readonly resources?: EffectiveDockerResources;
-  readonly trustedCreateOptions?: DockerTrustedCreateOptions;
+  readonly resources: EffectiveDockerResources;
+  readonly trustedCreateOptions: DockerTrustedCreateOptions;
 } {
-  if (partition === undefined) return {};
+  if (partition === undefined) {
+    return {
+      resources: { memoryMb: TRANSPORT_SIDECAR_LIMITS.memoryMb, cpus: TRANSPORT_SIDECAR_LIMITS.cpus },
+      trustedCreateOptions: {
+        pidsLimit: TRANSPORT_SIDECAR_LIMITS.pidsLimit,
+        ulimits: [openFilesUlimit(TRANSPORT_SIDECAR_LIMITS.openFilesLimit)],
+      },
+    };
+  }
   return {
     resources: { memoryMb: partition.transport.memoryMb, cpus: partition.transport.cpus },
-    trustedCreateOptions: { pidsLimit: partition.transport.pidsLimit },
+    trustedCreateOptions: {
+      pidsLimit: partition.transport.pidsLimit,
+      ulimits: [openFilesUlimit(DESKTOP_RELAY_PROFILE.openFilesLimit)],
+    },
   };
 }
 
-/** Merge Docker-runtime volume suppression, any Desktop API capability, and the agent PID share. */
+/** Operator-configured per-container bounds that are not part of the memory/CPU envelope. */
+export interface AgentContainerBounds {
+  /** `dockerResources.pidsLimit`; null means the operator explicitly disabled the cgroup pids ceiling. */
+  readonly pidsLimit: number | null;
+}
+
+/**
+ * Merge Docker-runtime volume suppression, any Desktop API capability, and the
+ * agent's process and descriptor bounds. On Docker the pids ceiling is the
+ * nested-Docker partition's agent share when one applies, otherwise the
+ * configured `dockerResources.pidsLimit`; the open-files ulimit is always
+ * applied. apple-container runs each agent in its own VM and rejects Docker
+ * create options, so it receives neither.
+ */
 export function buildDockerAgentTrustedCreateOptions(
   runtimeKind: ContainerRuntimeKind,
   namedVolumeMounts: readonly DockerNamedVolumeMount[],
   partition: DockerDesktopResourcePartition | undefined,
+  bounds: AgentContainerBounds,
+  securityOptions: readonly string[] = [],
 ): DockerTrustedCreateOptions | undefined {
-  const shadowsInheritedDockerVolume = runtimeKind === 'docker';
-  if (!shadowsInheritedDockerVolume && namedVolumeMounts.length === 0 && partition === undefined) return undefined;
+  const dockerRuntime = runtimeKind === 'docker';
+  if (!dockerRuntime && securityOptions.length > 0) {
+    // planAgentContainerPrivileges refuses sudo-off on other runtimes; never
+    // drop a requested no-new-privileges silently.
+    throw new Error(`agent security options are Docker-only (runtime: ${runtimeKind})`);
+  }
+  if (!dockerRuntime && namedVolumeMounts.length === 0 && partition === undefined) return undefined;
+  const pidsLimit = partition?.agent.pidsLimit ?? (dockerRuntime ? (bounds.pidsLimit ?? undefined) : undefined);
   return {
     ...(namedVolumeMounts.length === 0 ? {} : { namedVolumeMounts }),
-    ...(shadowsInheritedDockerVolume ? { tmpfs: [DOCKER_AGENT_VOLUME_SHADOW.specification] } : {}),
-    ...(partition === undefined ? {} : { pidsLimit: partition.agent.pidsLimit }),
+    ...(dockerRuntime ? { tmpfs: [DOCKER_AGENT_VOLUME_SHADOW.specification] } : {}),
+    ...(pidsLimit === undefined ? {} : { pidsLimit }),
+    ...(dockerRuntime ? { ulimits: [openFilesUlimit(AGENT_OPEN_FILES_LIMIT)] } : {}),
+    ...(securityOptions.length === 0 ? {} : { securityOptions: [...securityOptions] }),
   };
+}
+
+/**
+ * Reads the configured agent pids ceiling. The resolved config always carries
+ * the field; a partially built config (hand-assembled by a caller or a test)
+ * falls back to the shipped default rather than to "unbounded".
+ */
+function resolveAgentContainerBounds(userConfig: Pick<ResolvedUserConfig, 'dockerResources'>): AgentContainerBounds {
+  const { pidsLimit } = userConfig.dockerResources as Partial<ResolvedUserConfig['dockerResources']>;
+  return { pidsLimit: pidsLimit === undefined ? USER_CONFIG_DEFAULTS.dockerResources.pidsLimit : pidsLimit };
+}
+
+/**
+ * Linux Docker agent containers inherit the host identity through the UID
+ * remap; refuse a root host identity before any image build or container
+ * work (audit finding DINF-23). macOS Docker Desktop (TCP transport) and
+ * apple-container do not remap and are unaffected.
+ */
+export function assertLinuxDockerHostIdentity(runtimeKind: ContainerRuntimeKind, useTcp: boolean): void {
+  if (runtimeKind !== 'docker' || useTcp) return;
+  assertAgentHostIdentityIsNotRoot(resolveContainerIdentity(true));
+}
+
+/**
+ * Logs {@link HOST_ROOT_EXPOSURE_WARNING} when the Linux Docker daemon maps
+ * container root to host root and agents keep sudo (with `agentSudo: false`
+ * nothing in the container can become root, so an info line suffices). Uses
+ * the admitted workload's recorded server facts when present; otherwise probes
+ * `docker info` once. Never throws: this is a disclosure, not an admission
+ * check. Returns the classification it logged (undefined when the daemon's
+ * security options were unreadable).
+ */
+export async function warnWhenContainerRootIsHostRoot(
+  recordedFacts: DockerServerFacts | undefined,
+  probe: () => Promise<DockerServerFacts | undefined> = probeDockerServerFacts,
+  agentSudo = true,
+): Promise<DockerUserNamespaceMode | undefined> {
+  const facts = recordedFacts ?? (await probe());
+  if (facts === undefined) {
+    logger.warn('[docker] Could not read Docker security options; cannot tell whether container root is host root');
+    return undefined;
+  }
+  const mode = classifyDockerUserNamespace(facts.securityOptions);
+  if (mode === 'host-root' && agentSudo) {
+    logger.warn(HOST_ROOT_EXPOSURE_WARNING);
+  } else if (mode === 'host-root') {
+    logger.info(
+      '[docker] Container root is host root on this daemon, but agent sudo is disabled (agentSudo: false): agent ' +
+        'containers run with no-new-privileges and without file-privilege capabilities.',
+    );
+  } else {
+    logger.info(`[docker] Container root is isolated from host root (${mode})`);
+  }
+  return mode;
+}
+
+async function probeDockerServerFacts(): Promise<DockerServerFacts | undefined> {
+  try {
+    const availability = await checkDockerAvailable(undefined, true);
+    return availability.available ? availability.server : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 interface DockerWorkloadAdmissionForSessionOptions {
@@ -2497,6 +3069,8 @@ interface DockerWorkloadAdmissionForSessionOptions {
   readonly bundleId: BundleId;
   readonly workspaceRoot: string;
   readonly auditLogPath: string;
+  /** The home resolved once for this admission; staging paths below it are canonicalized against it. */
+  readonly home: CanonicalIronCurtainHome;
   /** Required only for Apple's same-VM daemon; Docker Desktop has no archive bootstrap. */
   readonly artifact?: SelectedAgentArtifact;
 }
@@ -2514,11 +3088,12 @@ async function admitDockerWorkloadForSession(options: DockerWorkloadAdmissionFor
 }> {
   const { admitDockerWorkloadBundle } = await import('../docker-workload/infrastructure.js');
   const { createJsonlDockerWorkloadAuditSink } = await import('../docker-workload/lifecycle-evidence.js');
+  const { resolveResourceWatchdogSupervisorEntrypoint } =
+    await import('../docker-workload/resource-watchdog-supervisor.js');
   assertNestedDaemonBackendImplemented(options.runtimeKind);
   if ((options.runtimeKind === 'apple-container') !== (options.artifact !== undefined)) {
     throw new Error('selected-agent archive staging is required only for the Apple same-VM nested daemon');
   }
-  const packageRoot = getIronCurtainPackageRoot();
   const handle = await admitDockerWorkloadBundle({
     runtime: options.runtime,
     runtimeKind: options.runtimeKind,
@@ -2530,18 +3105,17 @@ async function admitDockerWorkloadForSession(options: DockerWorkloadAdmissionFor
     workspaceRoot: options.workspaceRoot,
     configuration: options.dockerWorkload,
     watchdogPolicyTemplatePath: getFrozenWatchdogPolicyTemplatePath(),
-    watchdogSupervisorEntrypointPath: resolve(
-      packageRoot,
-      'dist',
-      'docker-workload',
-      'resource-watchdog-supervisor-main.js',
-    ),
+    // The entrypoint beside the running supervisor module: the source under
+    // tsx, the build under dist. A source run never launches a stale build.
+    watchdogSupervisorEntrypointPath: resolveResourceWatchdogSupervisorEntrypoint(),
     auditSink: createJsonlDockerWorkloadAuditSink(options.auditLogPath),
   });
   if (options.artifact === undefined) return { handle };
   try {
     const bootstrap = stageAppleVmDockerWorkloadBootstrap({
-      leaseStagingRoot: handle.stagingRoot,
+      // Canonical, so a symlinked home passes the private-directory checks and
+      // the staged archive mount names its real location.
+      leaseStagingRoot: canonicalPathBelowHome(options.home, handle.stagingRoot, 'Docker-workload lease staging root'),
       artifact: options.artifact,
     });
     return { handle, bootstrap };
@@ -2551,42 +3125,9 @@ async function admitDockerWorkloadForSession(options: DockerWorkloadAdmissionFor
   }
 }
 
-/**
- * Returns the `user` override and env vars needed for runtime UID
- * remapping on Linux (issue #232). When the host UID is not 1000, the
- * baked codespace user (UID 1000) cannot write to bind-mounted
- * directories owned by the host UID. To fix this without committing to
- * a hardcoded UID in the image, the host launches the container as
- * `0:0` and passes `IRONCURTAIN_AGENT_UID` / `IRONCURTAIN_AGENT_GID`
- * so the entrypoint (running as root) can renumber the codespace
- * account before dropping privileges via `runuser`.
- *
- * When `skipRemap` is true this returns an empty mapping so the
- * container runs as the baked `codespace` user from the Dockerfile.
- * Skipped on macOS Docker Desktop (VirtioFS handles UID translation
- * transparently and `--user 0:0` would defeat it) AND on apple-container
- * (virtiofs presents host files as root; the existing sessions work
- * without the Linux renumber-and-drop dance) — i.e., remap is Linux
- * Docker only. Callers pass `runtimeKind === 'apple-container' || useTcp`
- * so apple-container's `uds` topology does not accidentally trip the
- * Linux-only remap.
- *
- * Exported for testability.
- */
-export function buildAgentUidRemap(skipRemap: boolean): {
-  readonly user: string | undefined;
-  readonly env: Record<string, string>;
-} {
-  if (skipRemap) return { user: undefined, env: {} };
-  const { uid, gid } = resolveContainerIdentity(true);
-  return {
-    user: '0:0',
-    env: {
-      IRONCURTAIN_AGENT_UID: String(uid),
-      IRONCURTAIN_AGENT_GID: String(gid),
-    },
-  };
-}
+// The Linux UID-remap decision lives with the rest of the agent identity and
+// privilege plan; re-exported for existing callers.
+export { buildAgentUidRemap } from './agent-privileges.js';
 
 /** In-container mount root for the UDS proxies (both runtimes). */
 export const CONTAINER_SOCKETS_DIR = '/run/ironcurtain';
@@ -2826,6 +3367,19 @@ export interface ContainerResources {
   readonly containerName: string;
   readonly sidecarContainerId?: string;
   readonly internalNetwork?: string;
+  /**
+   * Why the workflow snapshot offered as `baseImageOverride` was not used
+   * (the agent container started from the agent image instead). Absent when
+   * none was offered or it was used.
+   */
+  readonly snapshotRefusal?: string;
+  /**
+   * Present when container root is host root (`containerRootIsHostRoot`):
+   * scans the agent container's read-write host mounts for setuid/setgid and
+   * root-owned entries. Sessions run it after each agent turn, and
+   * `destroyDockerInfrastructure` once more after the container is gone.
+   */
+  readonly privilegedFileScanner?: HostMountPrivilegeScanner;
 }
 
 /** Shared agent identity, sudo capabilities, limits and nested-Docker wiring for batch and PTY. */
@@ -2834,36 +3388,68 @@ export function buildAgentContainerConfig(
     PreContainerInfrastructure,
     | 'runtimeKind'
     | 'useTcp'
+    | 'tcpTransport'
     | 'dockerWorkload'
     | 'dockerWorkloadBootstrap'
     | 'dockerDesktopAgentAccess'
     | 'dockerDesktopResources'
   >,
-  userConfig: Pick<ResolvedUserConfig, 'dockerResources' | 'dockerWorkload'>,
+  userConfig: Pick<ResolvedUserConfig, 'dockerResources' | 'dockerWorkload'> &
+    Partial<Pick<ResolvedUserConfig, 'agentSudo'>>,
   config: DockerContainerConfig,
 ): DockerContainerConfig {
   const wiring = resolveNestedDockerAgentWiring(core);
-  const uidRemap = buildAgentUidRemap(core.runtimeKind === 'apple-container' || core.useTcp);
+  const privileges = planBundleAgentPrivileges(core, userConfig);
   const resources = core.dockerDesktopResources?.agent ?? selectOuterContainerResources(userConfig);
   // UDS sessions need no ordinary transport network. Online nested Docker
   // creates the agent directly on its isolated relay network; Docker cannot
   // attach another network to a container initially created on `none`.
   const egressNetwork = !core.useTcp ? core.dockerDesktopAgentAccess?.outerEgressNetworkName : undefined;
+  const env = { ...config.env, ...wiring.env, ...privileges.env };
+  const privateEnv = { ...config.privateEnv };
+  if (core.tcpTransport !== undefined) {
+    if (!/^[a-f0-9]{64}$/.test(core.tcpTransport.mcpToken)) throw new Error('Invalid MCP TCP transport token');
+    privateEnv.IRONCURTAIN_MCP_TCP_TOKEN = core.tcpTransport.mcpToken;
+    if (Object.hasOwn(env, 'HTTP_PROXY')) privateEnv.HTTP_PROXY = env.HTTP_PROXY;
+    if (Object.hasOwn(env, 'HTTPS_PROXY')) privateEnv.HTTPS_PROXY = env.HTTPS_PROXY;
+    delete env.HTTP_PROXY;
+    delete env.HTTPS_PROXY;
+  }
   return {
     ...config,
     network: egressNetwork ?? config.network,
     extraHosts: egressNetwork === undefined ? config.extraHosts : [],
-    env: { ...config.env, ...wiring.env, ...uidRemap.env },
-    user: uidRemap.user,
+    env,
+    ...(Object.keys(privateEnv).length === 0 ? {} : { privateEnv }),
+    user: privileges.user,
     resources: { memoryMb: resources.memoryMb, cpus: resources.cpus },
-    capAdd: ['SETUID', 'SETGID', 'CHOWN', 'FOWNER', 'DAC_OVERRIDE', 'AUDIT_WRITE'],
+    capAdd: privileges.capAdd,
     fullyVisibleProc: wiring.appleNestedDaemon !== undefined,
     trustedCreateOptions: buildDockerAgentTrustedCreateOptions(
       core.runtimeKind,
       wiring.namedVolumeMounts,
       core.dockerDesktopResources,
+      resolveAgentContainerBounds(userConfig),
+      privileges.securityOptions,
     ),
   };
+}
+
+/** The agent may use this bundle's proxy; other local clients need its credential. */
+export function tcpSidecarProxyUrl(
+  core: Pick<PreContainerInfrastructure, 'topology' | 'tcpTransport'>,
+  port: number,
+): string {
+  if (
+    core.topology !== 'tcp-sidecar' ||
+    core.tcpTransport === undefined ||
+    !Number.isSafeInteger(port) ||
+    port < 1 ||
+    port > 65_535
+  ) {
+    throw new Error('TCP sidecar requires its per-bundle transport credentials and proxy port');
+  }
+  return proxyAuthorizedUrl(`http://${DOCKER_HOST_GATEWAY}:${port}`, core.tcpTransport.proxyAuthorization);
 }
 
 /**
@@ -2886,19 +3472,69 @@ export async function attachDockerDesktopAgentEgressNetwork(
 }
 
 export interface CreateDockerInfrastructureOptions {
+  /** Deliver findings before a successful session or workflow bundle can own them. */
+  readonly onHostPrivilegedFiles?: (notice: HostPrivilegedFilesDiagnostic) => void;
+  /** Actual workflow run root used to validate scripts before reads and mounts. */
+  readonly workflowRunDir?: string;
   /**
-   * Optional immutable image ref used only for the main container's
-   * `docker create`. The normal agent image is still ensured first so
-   * workflow dependency caches keep their base-image hash.
+   * Optional immutable image ref (a workflow snapshot) used only for the main
+   * container's `docker create`. The normal agent image is still ensured first
+   * so workflow dependency caches keep their base-image hash, and a workflow
+   * dependency base is only ever provisioned from that normal image: a
+   * snapshot's writable layer came from an agent-controlled container.
+   * Used only when {@link baseImageAgentBuildHash} names the agent build this
+   * bundle resolved and the image carries that build's label, and, for a
+   * bundle without agent sudo, when {@link baseImageAgentSudo} is `false`;
+   * otherwise the agent container starts fresh and `snapshotRefusal` says why.
    */
   readonly baseImageOverride?: string;
+  /**
+   * Agent image build the {@link baseImageOverride} snapshot was committed
+   * from (`ContainerSnapshotRef.agentBuildHash`). Required for the snapshot to
+   * be used: the flattened snapshot carries that build's entrypoint scripts
+   * and agent CLI, which must match what this host code expects.
+   */
+  readonly baseImageAgentBuildHash?: string;
+  /**
+   * Whether the agent of the {@link baseImageOverride} snapshot's container had
+   * sudo (`ContainerSnapshotRef.agentSudo`); absent when the snapshot does not
+   * record it. A bundle planned with `agentSudo: false` uses only a snapshot
+   * recorded as `false`.
+   */
+  readonly baseImageAgentSudo?: boolean;
   /** Exact CLI preflight result, threaded into this one session without re-resolution. */
   readonly preparedImageResolution?: AgentImageResolution;
+  /**
+   * In-process escalation handler for the bundle's coordinator (see
+   * `PrepareDockerInfrastructureOptions.onEscalation`). Workflow bundles
+   * only.
+   */
+  readonly onEscalation?: EscalationPromptFn;
+  /**
+   * Aborts container setup (a Ctrl-C during startup): the readiness wait ends
+   * early, no later setup step starts, and the partial resources are torn
+   * down before the abort reason propagates.
+   */
+  readonly signal?: AbortSignal;
+  /**
+   * Most agent lanes expected to share the bundle's coordinator at once
+   * (see `PrepareDockerInfrastructureOptions.maxLanes`). Workflow bundles
+   * only.
+   */
+  readonly maxLanes?: number;
+  /**
+   * Target of the bundle coordinator's `workflow_commit` tool (see
+   * `PrepareDockerInfrastructureOptions.workflowCommit`). Workflow runs only.
+   */
+  readonly workflowCommit?: WorkflowCommitHandler;
 }
 
 /**
  * Creates and starts the main agent container (plus TCP-mode sidecar and
- * internal network on macOS). Cleans up any partially-created resources
+ * internal network on macOS). A workflow bundle with runtime dependencies first
+ * readies its per-run dependency layers, building a missing or changed shared
+ * base in a short-lived provisioning container that is removed before the agent
+ * container is created. Cleans up any partially-created resources
  * on failure so callers get all-or-nothing semantics.
  *
  * Exported for testability: tests exercise the mount/env configuration and
@@ -2910,9 +3546,11 @@ export async function createSessionContainers(
   config: IronCurtainConfig,
   options?: CreateDockerInfrastructureOptions,
 ): Promise<ContainerResources> {
-  if (core.runtimeKind === 'docker') {
-    await reconcileIronCurtainDockerResourcesBestEffort(core.docker, 'session startup');
-  }
+  // Crash recovery for both runtimes: Apple VMs carry the same owner labels.
+  await reconcileIronCurtainDockerResourcesBestEffort(core.docker, 'session startup', {
+    runtimeKind: core.runtimeKind,
+  });
+  options?.signal?.throwIfAborted();
 
   // The ordinary TCP transport can safely retry with another network because
   // every attempt owns only its container, sidecar, and network. An admitted
@@ -2926,10 +3564,81 @@ export async function createSessionContainers(
     {
       maxAttempts,
       description: 'Internal Docker network',
-      reconcile: () => reconcileIronCurtainDockerResourcesBestEffort(core.docker, 'internal network retry'),
+      reconcile: () =>
+        reconcileIronCurtainDockerResourcesBestEffort(core.docker, 'internal network retry', {
+          runtimeKind: core.runtimeKind,
+        }),
     },
     (excludedSubnets, attempt) => createSessionContainersAttempt(core, config, options, excludedSubnets, attempt),
   );
+}
+
+/**
+ * Decides whether the agent container is created from the offered workflow
+ * snapshot. A flattened snapshot carries the entrypoint scripts and agent CLI
+ * of the image build its container ran, so it is used only when that build is
+ * the one this bundle resolved now: the build hash the checkpoint recorded
+ * must equal the bundle's, and the image must still exist with that build's
+ * label. A snapshot from another build (an IronCurtain upgrade or downgrade, a
+ * pin bump, a CLI override), or one recorded before snapshots carried a build
+ * hash, is refused: the scope starts from a fresh container, while its
+ * workspace and dependency layers (on the host) carry over. The snapshot must
+ * be named by the immutable image ID the checkpoint records, so the image
+ * whose label is checked here is the one `docker create` uses.
+ *
+ * A bundle planned without agent sudo (`agentSudo: false`) also refuses a
+ * snapshot that does not record its agent as sudo-off (an older snapshot
+ * records nothing, which counts as sudo on). Such a container runs as UID 1000
+ * alone and takes its groups from the image's /etc/passwd and /etc/group, and
+ * an agent that had root in the snapshotted container may have added itself
+ * to any group there (root, disk, ...), which it would keep.
+ *
+ * `doctor --upgrade` predicts this decision for resumable runs
+ * (`checkWorkflowSnapshots` in src/doctor/upgrade-checks.ts); keep the two in
+ * step.
+ */
+export async function selectResumableSnapshot(
+  core: Pick<PreContainerInfrastructure, 'docker' | 'imageResolution'>,
+  options:
+    | Pick<CreateDockerInfrastructureOptions, 'baseImageOverride' | 'baseImageAgentBuildHash' | 'baseImageAgentSudo'>
+    | undefined,
+  privileges: Pick<AgentContainerPrivilegePlan, 'agentSudo'>,
+): Promise<{ readonly image?: string; readonly refusal?: string }> {
+  const image = options?.baseImageOverride;
+  if (image === undefined || image === '') return {};
+  // A tag could be re-pointed between this check and the create.
+  if (!isImmutableImageId(image)) {
+    return { refusal: 'the snapshot is not named by an immutable image ID' };
+  }
+  const recorded: unknown = options?.baseImageAgentBuildHash;
+  const current = core.imageResolution?.buildHash;
+  if (recorded === undefined) {
+    return { refusal: 'the snapshot does not record the agent image build it was taken from' };
+  }
+  if (current === undefined) return { refusal: 'the agent image build of this bundle is unknown' };
+  if (recorded !== current) {
+    return {
+      refusal:
+        `the snapshot was taken from agent image build ${shortBuildHash(recorded)}, ` +
+        `and this IronCurtain runs build ${shortBuildHash(current)}`,
+    };
+  }
+  // Anything but an exact `false` (absent, or damaged on disk) counts as sudo on.
+  const recordedSudo: unknown = options?.baseImageAgentSudo;
+  if (!privileges.agentSudo && recordedSudo !== false) {
+    return {
+      refusal:
+        recordedSudo === true
+          ? 'the snapshot was taken while the agent had sudo, and agentSudo is now false'
+          : 'the snapshot does not record that the agent ran without sudo, and agentSudo is now false',
+    };
+  }
+  const inspected = await core.docker.inspectImage(image);
+  if (inspected === undefined) return { refusal: 'the snapshot image no longer exists' };
+  if (inspected.labels[IMAGE_BUILD_HASH_LABEL] !== current) {
+    return { refusal: 'the snapshot image is not labeled with the agent image build it was recorded with' };
+  }
+  return { image };
 }
 
 async function createSessionContainersAttempt(
@@ -2951,6 +3660,10 @@ async function createSessionContainersAttempt(
   let sidecarContainerId: string | undefined;
   let internalNetwork: string | undefined;
   let allocatedNetworkSubnet: string | undefined;
+  // Set once the agent container's mounts are final, before it is created, so
+  // a start that fails after the entrypoint ran (as root in the default mode,
+  // possibly from a resumed snapshot image) is still swept below.
+  let privilegedFileScanner: HostMountPrivilegeScanner | undefined;
 
   try {
     // Remove stale main container from a crashed previous session (same session
@@ -2959,10 +3672,16 @@ async function createSessionContainersAttempt(
     // nested egress listeners before any outer cleanup can run.
     await core.docker.removeStaleContainer(mainContainerName);
 
-    const resumableBaseImage =
-      options?.baseImageOverride && (await core.docker.imageExists(options.baseImageOverride))
-        ? options.baseImageOverride
-        : undefined;
+    // The plan the agent container is created with (buildAgentContainerConfig).
+    const snapshotSelection = await selectResumableSnapshot(
+      core,
+      options,
+      planBundleAgentPrivileges(core, config.userConfig),
+    );
+    const resumableBaseImage = snapshotSelection.image;
+    if (snapshotSelection.refusal !== undefined) {
+      logger.warn(`[docker] Not resuming from workflow snapshot: ${snapshotSelection.refusal}; starting fresh`);
+    }
     // Docker can create directly from the selected immutable ID, closing the
     // tag-replacement window between artifact capture and the ledgered create.
     // Apple cannot, so its stopped-create adjudication below remains the
@@ -2970,11 +3689,17 @@ async function createSessionContainersAttempt(
     // when present, continues to take precedence for resume.
     const mainImage = resumableBaseImage ?? resolveNestedDockerOuterAgentImage(core, core.image);
 
+    // A read-only workspace session (a read-only workflow state or scope)
+    // mounts the workspace read-only, and every other host directory it
+    // shares with the run's read-write containers too; it writes its
+    // declared outputs through the filesystem MCP server, which the policy
+    // engine confines to them.
+    const workspaceReadOnly = core.readOnlyWorkspace !== undefined || config.readOnlyWorkspace !== undefined;
     // Base mounts shared by TCP and UDS modes: the sandbox as the
     // workspace and the orientation dir. Mode-specific mounts (apt proxy
     // config, sockets dir, conversation state) are appended below.
     const mounts: { source: string; target: string; readonly: boolean }[] = [
-      buildContainerWorkspaceMount(core.workspaceDir),
+      buildContainerWorkspaceMount(core.workspaceDir, { readonly: workspaceReadOnly }),
       { source: core.orientationDir, target: '/etc/ironcurtain', readonly: true },
     ];
     // Same-VM nested daemon (§4.4 variant 1): present only for an admitted
@@ -2991,6 +3716,7 @@ async function createSessionContainersAttempt(
       ...core.adapter.buildEnv(config, core.fakeKeys),
       ...core.adapter.buildBatchEnv?.(config, core.fakeKeys),
       ...buildRuntimeTrustEnv(),
+      ...buildPackageClientEnv(),
       ...nestedDockerWiring.env,
     };
     let network: string | null;
@@ -3000,6 +3726,10 @@ async function createSessionContainersAttempt(
     // start instead of bind-mounted — see writeAptProxyConfigViaExec for
     // the virtiofs constraints that make the bind mount unworkable.
     let execAptProxyUrl: string | undefined;
+    // The MITM endpoint this topology exposes in-container; the workflow
+    // dependency provisioner reuses it so registry traffic stays on this
+    // bundle's proxy.
+    let transportProxyUrl: string;
 
     if (core.topology === 'tcp-hostonly') {
       // Apple container host-only mode: the agent VM reaches the host
@@ -3017,6 +3747,7 @@ async function createSessionContainersAttempt(
         HTTP_PROXY: proxyUrl,
       };
       execAptProxyUrl = proxyUrl;
+      transportProxyUrl = proxyUrl;
 
       network = core.hostOnlyNetwork.name;
       // Report the host-only network as `internalNetwork` so the standard
@@ -3029,17 +3760,18 @@ async function createSessionContainersAttempt(
       // because Docker Desktop VMs don't forward gateway traffic.
       const mcpPort = core.proxy.port;
       const mitmPort = core.mitmAddr.port;
-      const proxyUrl = `http://${DOCKER_HOST_GATEWAY}:${mitmPort}`;
+      const proxyUrl = tcpSidecarProxyUrl(core, mitmPort);
 
       env = {
         ...env,
         HTTPS_PROXY: proxyUrl,
         HTTP_PROXY: proxyUrl,
       };
+      transportProxyUrl = proxyUrl;
 
       // Write apt proxy config so sudo apt-get routes through the MITM proxy
       const aptProxyPath = resolve(core.orientationDir, 'apt-proxy.conf');
-      writeFileSync(aptProxyPath, renderAptProxyConfig(proxyUrl));
+      stageAptProxyConfig(aptProxyPath, proxyUrl);
       mounts.push({ source: aptProxyPath, target: '/etc/apt/apt.conf.d/90-ironcurtain-proxy', readonly: true });
 
       const baseNetworkName = getInternalNetworkName(shortId);
@@ -3056,15 +3788,16 @@ async function createSessionContainersAttempt(
       network = networkName;
       logger.info(`Allocated internal Docker network ${networkName} at ${allocatedNetwork.subnet}`);
 
-      // Ensure the socat image is available
-      const socatImage = 'alpine/socat';
-      if (!(await core.docker.imageExists(socatImage))) {
-        logger.info(`Pulling ${socatImage}...`);
-        await core.docker.pullImage(socatImage);
-      }
+      // The sidecar relays every tool call and the agent's CONNECT streams,
+      // so it runs only from the locally built, build-hash-labelled image,
+      // addressed by immutable ID (transport-sidecar-image.ts).
+      const sidecarImageId = await ensureTransportSidecarImage(core.docker, (message) => {
+        logger.info(message);
+      });
 
-      // Create socat sidecar on the default bridge (can reach the host gateway)
+      // The secondary bridge exists solely for the fixed host-facing forwards.
       const sidecarName = `${CONTAINER_NAME_PREFIX}sidecar-${shortId}`;
+      const sidecarIp = tcpTransportSidecarAddress(allocatedNetwork.subnet);
 
       // Remove stale sidecar from a crashed previous session (TCP mode only).
       await core.docker.removeStaleContainer(sidecarName);
@@ -3075,29 +3808,36 @@ async function createSessionContainersAttempt(
         baseLabels: bundleLabels.labels,
         create: (requestedName, labels) =>
           core.docker.create({
-            image: socatImage,
+            image: sidecarImageId,
             name: requestedName,
-            network: 'bridge',
-            mounts: [],
+            network: networkName,
+            ipv4Address: sidecarIp,
+            mounts: [tcpTransportHostCaMount(core.orientationDir)],
             env: {},
             entrypoint: '/bin/sh',
-            ...buildDockerDesktopTransportCreateLimits(core.dockerDesktopResources),
+            // Read-only, unprivileged, no new privileges, on the transport
+            // share of the Docker Desktop resource partition.
+            ...hardenTransportSidecarCreate(buildDockerDesktopTransportCreateLimits(core.dockerDesktopResources)),
             ...bundleLabels,
             labels,
             command: [
               '-c',
-              quote(['socat', `TCP-LISTEN:${mcpPort},fork,reuseaddr`, `TCP:${DOCKER_HOST_GATEWAY}:${mcpPort}`]) +
+              quote([
+                'socat',
+                tcpTransportListenEndpoint(sidecarIp, mcpPort, allocatedNetwork.subnet),
+                tcpTransportUpstreamEndpoint(mcpPort),
+              ]) +
                 ' & ' +
-                quote(['socat', `TCP-LISTEN:${mitmPort},fork,reuseaddr`, `TCP:${DOCKER_HOST_GATEWAY}:${mitmPort}`]) +
+                quote([
+                  'socat',
+                  tcpTransportListenEndpoint(sidecarIp, mitmPort, allocatedNetwork.subnet),
+                  tcpTransportUpstreamEndpoint(mitmPort),
+                ]) +
                 ' & wait',
             ],
           }),
       });
-      await core.docker.start(sidecarContainerId);
-
-      // Connect sidecar to the internal network so the app container can reach it
-      await core.docker.connectNetwork(networkName, sidecarContainerId);
-      const sidecarIp = await core.docker.getContainerIp(sidecarContainerId, networkName);
+      await startTcpTransportSidecar(core.docker, sidecarContainerId, networkName, sidecarIp, allocatedNetwork.subnet);
       extraHosts = [`${DOCKER_HOST_GATEWAY}:${sidecarIp}`];
       logger.info(`Sidecar ${sidecarName} bridging ports ${mcpPort},${mitmPort} at ${sidecarIp}`);
     } else {
@@ -3109,6 +3849,7 @@ async function createSessionContainersAttempt(
         HTTPS_PROXY: udsProxyUrl,
         HTTP_PROXY: udsProxyUrl,
       };
+      transportProxyUrl = udsProxyUrl;
       network = null;
 
       // Write apt proxy config so sudo apt-get routes through the MITM
@@ -3122,7 +3863,7 @@ async function createSessionContainersAttempt(
         execAptProxyUrl = udsProxyUrl;
       } else {
         const aptProxyPathUds = resolve(core.orientationDir, 'apt-proxy.conf');
-        writeFileSync(aptProxyPathUds, renderAptProxyConfig(udsProxyUrl));
+        stageAptProxyConfig(aptProxyPathUds, udsProxyUrl);
         mounts.push({
           source: aptProxyPathUds,
           target: '/etc/apt/apt.conf.d/90-ironcurtain-proxy',
@@ -3165,22 +3906,41 @@ async function createSessionContainersAttempt(
     }
 
     if (core.scriptsMount) {
-      mounts.push({ source: core.scriptsMount.hostDir, target: core.scriptsMount.target, readonly: true });
+      const source = requireStagedWorkflowScripts(core.workflowRunDir, core.scriptsMount.hostDir);
+      mounts.push({ source, target: core.scriptsMount.target, readonly: true });
     }
-    if (core.workflowPythonVenvMount) {
-      mounts.push({
-        source: core.workflowPythonVenvMount.hostDir,
-        target: core.workflowPythonVenvMount.target,
-        readonly: false,
-      });
+
+    // Workflow runtime dependencies (see workflow-dependency-cache.ts). The
+    // content-keyed shared base is verified, or rebuilt in a dedicated
+    // short-lived provisioning container, and this run's own writable layer is
+    // seeded from it. All of that finishes before the agent container exists:
+    // the bind-mount sources are then final, and no agent turn can observe the
+    // base or a partially seeded layer. Only the run layer is mounted here; the
+    // shared base never enters an agent container.
+    const dependencyLayers = listWorkflowDependencyLayers(core);
+    if (dependencyLayers.length > 0) {
+      const provisionerTransport: WorkflowDependencyProvisionerTransport = {
+        network: network ?? 'none',
+        extraHosts,
+        proxyUrl: transportProxyUrl,
+        allocatedNetworkSubnet,
+        bundleLabels,
+      };
+      await ensureWorkflowDependencyLayers(dependencyLayers, (request) =>
+        runWorkflowDependencyProvisioner(core, config, provisionerTransport, request),
+      );
+      // The run layer is shared by every bundle of the run, and the
+      // read-write scopes' deterministic states and agents execute what is
+      // installed there: a read-only scope may use it but never change it.
+      for (const layer of dependencyLayers) {
+        mounts.push({ source: layer.hostDir, target: layer.target, readonly: workspaceReadOnly });
+      }
     }
-    if (core.workflowNodeModulesMount) {
-      mounts.push({
-        source: core.workflowNodeModulesMount.hostDir,
-        target: core.workflowNodeModulesMount.target,
-        readonly: false,
-      });
-    }
+
+    // Host-root daemons only: the agent's read-write host mounts are swept for
+    // setuid/setgid and root-owned entries after each turn, at teardown, and
+    // after a failed start below. `mounts` is final from here on.
+    privilegedFileScanner = createBundlePrivilegedFileScanner(core, mounts);
 
     // Build the agent container create args for a given name + resolved labels.
     // `labels` is the base bundle labels in the ordinary case and the base merged
@@ -3188,7 +3948,7 @@ async function createSessionContainersAttempt(
     // itself lives in createLedgeredAgentContainer, so this closure just forwards.
     const agentStartup = prepareDockerAgentStartup(
       ['sleep', 'infinity'],
-      core.runtimeKind === 'docker' && !core.useTcp,
+      planBundleAgentPrivileges(core, config.userConfig).startupProbeUser,
     );
     const createMainContainer = (name: string, labels: Readonly<Record<string, string>> | undefined): Promise<string> =>
       core.docker.create(
@@ -3197,17 +3957,16 @@ async function createSessionContainersAttempt(
           name,
           network: network ?? 'none',
           mounts,
-          env: {
-            ...env,
-            // Do NOT override PATH here. Docker `-e PATH=...` REPLACES the image's
-            // PATH (it does not append), which would discard the base image's real
-            // PATH — including the NVM directory where `node`/`npm` live on the x86
-            // devcontainer base. Bare-`node` workflow helpers would then fail to
-            // resolve. The workflow venv bin is instead prepended to the live
-            // `$PATH` at exec time (see buildWorkflowExecCommand), which is
-            // base-image-agnostic and preserves the image's own PATH.
-            ...(core.workflowNodeModulesMount ? { NODE_PATH: core.workflowNodeModulesMount.target } : {}),
-          },
+          // Do NOT override PATH here. Docker `-e PATH=...` REPLACES the image's
+          // PATH (it does not append), which would discard the base image's real
+          // PATH — including the NVM directory where `node`/`npm` live on the x86
+          // devcontainer base. Bare-`node` workflow helpers would then fail to
+          // resolve. The workflow venv bin is instead prepended to the live
+          // `$PATH` at exec time (see buildWorkflowExecCommand), which is
+          // base-image-agnostic and preserves the image's own PATH. NODE_PATH is
+          // likewise set only on those deterministic helper execs, so the agent's
+          // own Node processes never resolve modules from the workflow layer.
+          env,
           command: [...agentStartup.command],
           ...bundleLabels,
           labels,
@@ -3237,9 +3996,11 @@ async function createSessionContainersAttempt(
     });
 
     await attachDockerDesktopAgentEgressNetwork(core, mainContainerId);
+    options?.signal?.throwIfAborted();
     await core.docker.start(mainContainerId);
     logger.info(`Container started: ${mainContainerId.substring(0, 12)}`);
-    await agentStartup.waitUntilReady(core.docker, mainContainerId);
+    await agentStartup.waitUntilReady(core.docker, mainContainerId, { signal: options?.signal });
+    options?.signal?.throwIfAborted();
 
     // The Desktop sidecar is already adjudicated. Initialize and verify
     // package-build state in the blocked agent, then finalize the lease. Apple
@@ -3278,7 +4039,13 @@ async function createSessionContainersAttempt(
         throw new Error('tcp-sidecar bundle is missing its MITM proxy port');
       }
       try {
-        await checkInternalNetworkConnectivity(core.docker, mainContainerId, core.proxy.port, core.mitmAddr.port);
+        await checkInternalNetworkConnectivity(
+          core.docker,
+          mainContainerId,
+          core.proxy.port,
+          core.mitmAddr.port,
+          core.tcpTransport,
+        );
       } catch (error) {
         if (error instanceof InternalNetworkConnectivityError) {
           throw new InternalNetworkConnectivityError(error.message, allocatedNetworkSubnet);
@@ -3286,6 +4053,9 @@ async function createSessionContainersAttempt(
         throw error;
       }
     }
+    // An interrupt during the checks ends setup here, as in the PTY path,
+    // instead of after the (possibly long) Apple nested-Docker activation.
+    options?.signal?.throwIfAborted();
 
     // Same-VM activation: the container that just started IS the daemon
     // component. Bootstrap/adjudicate dockerd, preflight the pinned client,
@@ -3309,6 +4079,8 @@ async function createSessionContainersAttempt(
       containerName: mainContainerName,
       sidecarContainerId,
       internalNetwork,
+      ...(privilegedFileScanner === undefined ? {} : { privilegedFileScanner }),
+      ...(snapshotSelection.refusal === undefined ? {} : { snapshotRefusal: snapshotSelection.refusal }),
     };
   } catch (err) {
     // Revoke nested egress before removing a partial outer VM. This ordering is
@@ -3319,12 +4091,25 @@ async function createSessionContainersAttempt(
     // All three resources are assigned as soon as `docker.create()` returns
     // (before any subsequent start or connectivity check), so failures at
     // any point inside the try block clean up whatever was created.
-    await cleanupContainers(core.docker, {
+    const cleanup = await cleanupContainers(core.docker, {
       containerId: mainContainerId ?? null,
       sidecarContainerId: sidecarContainerId ?? null,
       networkName: internalNetwork ?? null,
     });
-    if (core.runtimeKind === 'docker') releaseManagedResourceLease(core.bundleId);
+    // Delete the owner lease only on proven absence; otherwise leave a
+    // released tombstone so reconciliation (the retry's included) reclaims
+    // the partial resources while this process is still alive. A retry mints
+    // a fresh lease.
+    await finalizeManagedResourceLease(core.bundleId, { runtime: core.docker, teardownVerified: cleanup.verified });
+    // The agent container existed, so its entrypoint may have run against the
+    // host mounts: sweep them now that it is gone, as at a session end. Never
+    // throws (nor does the lease finalization above), so the original failure
+    // still propagates.
+    if (mainContainerId !== undefined) {
+      const report = await privilegedFileScanner?.scan('failed session start');
+      const notice = deliverHostPrivilegedFilesNotice(report, core.onHostPrivilegedFiles);
+      throw includeHostPrivilegedFilesInFailure(err, notice);
+    }
     throw err;
   }
 }
@@ -3338,35 +4123,48 @@ export async function checkInternalNetworkConnectivity(
   containerId: string,
   mcpPort: number,
   mitmPort: number,
+  credentials: TcpTransportCredentials | undefined,
+  verifyMcp = true,
 ): Promise<void> {
-  const mcpResult = await docker.exec(
-    containerId,
-    [
-      '/bin/sh',
-      '-c',
-      `printf 'IRONCURTAIN_HEALTH/1\\n' | socat -T5 - TCP:${DOCKER_HOST_GATEWAY}:${mcpPort},connect-timeout=5 | grep -q '^IRONCURTAIN_OK/1'`,
-    ],
-    // Allow a small buffer above socat's 5s connect-timeout for docker exec/process startup overhead.
-    6_000,
-  );
-  if (mcpResult.exitCode !== 0) {
-    throw new InternalNetworkConnectivityError(
-      `Internal network connectivity check failed: MCP round-trip exited ${mcpResult.exitCode}; ` +
-        `the sidecar could not reach the host proxy.`,
+  if (credentials === undefined || !/^[a-f0-9]{64}$/.test(credentials.mcpToken)) {
+    throw new Error('TCP sidecar readiness requires per-bundle transport credentials');
+  }
+  const environment = {
+    ...(verifyMcp ? { IRONCURTAIN_MCP_TCP_TOKEN: credentials.mcpToken } : {}),
+    IRONCURTAIN_HTTP_PROXY_AUTHORIZATION: credentials.proxyAuthorization.header,
+  };
+  if (verifyMcp) {
+    const mcpResult = await docker.exec(
+      containerId,
+      ['node', '/usr/local/bin/ironcurtain-mcp-bridge.mjs', '--health', `${DOCKER_HOST_GATEWAY}:${mcpPort}`],
+      // Allow a small buffer above socat's 5s connect-timeout for docker exec/process startup overhead.
+      6_000,
+      undefined,
+      undefined,
+      environment,
     );
+    if (mcpResult.exitCode !== 0) {
+      throw new InternalNetworkConnectivityError(
+        `Internal network connectivity check failed: MCP round-trip exited ${mcpResult.exitCode}; ` +
+          `the sidecar could not reach the host proxy.`,
+      );
+    }
   }
 
   const healthRequest =
     'GET http://ironcurtain.invalid/__ironcurtain/health HTTP/1.1\\r\\n' +
-    'Host: ironcurtain.invalid\\r\\nConnection: close\\r\\n\\r\\n';
+    'Host: ironcurtain.invalid\\r\\nProxy-Authorization: %s\\r\\nConnection: close\\r\\n\\r\\n';
   const mitmResult = await docker.exec(
     containerId,
     [
       '/bin/sh',
       '-c',
-      `printf '${healthRequest}' | socat -T5 - TCP:${DOCKER_HOST_GATEWAY}:${mitmPort},connect-timeout=5 | grep -q 'IRONCURTAIN_OK/1'`,
+      `printf '${healthRequest}' "$IRONCURTAIN_HTTP_PROXY_AUTHORIZATION" | socat -T5 - TCP:${DOCKER_HOST_GATEWAY}:${mitmPort},connect-timeout=5 | grep -q 'IRONCURTAIN_OK/1'`,
     ],
     6_000,
+    undefined,
+    undefined,
+    environment,
   );
   if (mitmResult.exitCode !== 0) {
     throw new InternalNetworkConnectivityError(
@@ -3394,7 +4192,9 @@ export async function checkDockerContainerWritableStorage(
   );
   if (result.exitCode === 0) return;
 
-  const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.exitCode}`;
+  const detail = toDisplayText(result.stderr.trim() || result.stdout.trim() || `exit ${result.exitCode}`, {
+    maxLength: 2048,
+  });
   const guidance = /ENOSPC|no space left on device/i.test(detail)
     ? 'Docker storage may be full; inspect it with `docker system df` and reclaim unused data or increase the disk limit.'
     : 'Inspect the container state, Docker daemon logs, and filesystem permissions.';
@@ -3421,12 +4221,16 @@ export async function writeAptProxyConfigViaExec(
   const content = renderAptProxyConfig(proxyUrl);
   const aptWrite = await docker.exec(
     containerId,
-    ['sh', '-c', 'printf %s "$1" > /etc/apt/apt.conf.d/90-ironcurtain-proxy', 'sh', content],
+    ['sh', '-c', 'printf %s "$IRONCURTAIN_APT_PROXY_CONFIG" > /etc/apt/apt.conf.d/90-ironcurtain-proxy'],
     10_000,
     'root',
+    undefined,
+    { IRONCURTAIN_APT_PROXY_CONFIG: content },
   );
   if (aptWrite.exitCode !== 0) {
-    throw new Error(`Failed to write apt proxy config in container (exit=${aptWrite.exitCode}): ${aptWrite.stderr}`);
+    throw new Error(
+      `Failed to write apt proxy config in container (exit=${aptWrite.exitCode}): ${toDisplayText(aptWrite.stderr, { maxLength: 2048 })}`,
+    );
   }
 }
 
@@ -3611,16 +4415,28 @@ export async function ensureDockerImage(
   const { registerBuiltinAdapters, getAgent } = await import('./agent-registry.js');
   const { createContainerRuntime, resolveRuntimeKind } = await import('./container-runtime.js');
 
-  await registerBuiltinAdapters(userConfig);
+  await registerBuiltinAdapters();
   const adapter = getAgent(agentId);
   const image = await adapter.getImage();
   const runtimeKind = admittedRuntimeKind ?? (await resolveRuntimeKind(userConfig.containerRuntime));
+  // Same host-identity refusal as prepareDockerInfrastructure, placed before
+  // the image build this preflight exists to run.
+  const { resolveNetworkTopology } = await import('./network-topology.js');
+  const topology = resolveNetworkTopology(
+    runtimeKind,
+    admittedEnvironment === undefined ? undefined : admittedEnvironment.egressTransport === 'tcp',
+  );
+  assertLinuxDockerHostIdentity(runtimeKind, topology !== 'uds');
   const docker = createContainerRuntime(runtimeKind, admittedEnvironment?.dockerEndpoint);
   let toolchainSource: DockerToolchainSource | undefined;
   if (admitted !== undefined) {
     toolchainSource = await resolveDockerToolchainSource(docker, admitted.environment.architecture);
     if (runtimeKind === 'docker') {
-      selectDockerDesktopResourcePartition(userConfig, undefined, admitted.environment.egressTransport === 'tcp');
+      selectDockerDesktopResourcePartition(
+        userConfig,
+        dockerDesktopVmCapacity(admitted.environment),
+        admitted.environment.egressTransport === 'tcp',
+      );
       await ensureDockerDesktopSidecarImage(docker, toolchainSource);
       if (admitted.configuration.networkAccess !== 'offline') {
         await ensureDockerDesktopRelayImage(docker);
@@ -3628,7 +4444,7 @@ export async function ensureDockerImage(
     }
   }
   const resolved: AgentImageResolution = {
-    ...(await resolveAgentImage(image, docker, toolchainSource)),
+    ...(await resolveAgentImage(image, docker, toolchainSource, agentImageBuildOptions(adapter, userConfig))),
     ...(admittedEnvironment === undefined ? {} : { dockerWorkloadEnvironment: admittedEnvironment }),
   };
   if (userConfig.dockerWorkload?.enabled === true && runtimeKind === 'apple-container') {
@@ -3663,7 +4479,7 @@ async function resolveAdmittedDockerWorkload(
       throw new Error('Prepared nested-Docker runtime changed');
     return { configuration: workload, environment: preparedEnvironment };
   }
-  const environment = await assertAdmittedDockerWorkloadRuntimeAvailable(runtimeKind);
+  const environment = await assertAdmittedDockerWorkloadRuntimeAvailable(runtimeKind, workload.networkAccess);
   return { configuration: workload, environment };
 }
 
@@ -3685,28 +4501,45 @@ function selectedAgentImageResolution(
   };
 }
 
-/** Pin the outer agent by immutable image ID without manufacturing an inner-daemon transport archive. */
+/**
+ * Pin the outer agent by immutable image ID without manufacturing an
+ * inner-daemon transport archive. Inspects the exact build (`imageRef`, its
+ * build tag) rather than the moving alias; the pinned resolution names the
+ * logical image, as the nested-Docker identity checks expect.
+ */
 async function immutableAgentImageResolution(
   built: AgentImageResolution,
   runtime: Pick<ContainerRuntime, 'inspectImage'>,
 ): Promise<AgentImageResolution> {
-  const inspected = await runtime.inspectImage(built.logicalName);
-  if (inspected === undefined) throw new Error(`prepared agent image is absent: ${built.logicalName}`);
+  const inspected = await runtime.inspectImage(built.imageRef);
+  if (inspected === undefined) throw new Error(`prepared agent image is absent: ${built.imageRef}`);
   if (SHA256_IMAGE_ID.exec(inspected.id) === null) {
     throw new Error(`prepared agent image has an invalid immutable ID: ${inspected.id}`);
   }
-  if (inspected.labels['ironcurtain.build-hash'] !== built.buildHash) {
-    throw new Error(`prepared agent image build hash changed after preparation: ${built.logicalName}`);
+  if (inspected.labels[IMAGE_BUILD_HASH_LABEL] !== built.buildHash) {
+    throw new Error(`prepared agent image build hash changed after preparation: ${built.imageRef}`);
   }
-  return { ...built, immutableImageId: inspected.id };
+  return { ...built, imageRef: built.logicalName, immutableImageId: inspected.id };
 }
 
-function assertPreparedImageResolution(
+/**
+ * Checks that an image resolution names the selected agent and, for a
+ * nested-Docker runtime, is pinned the way that runtime requires. Exported for
+ * tests.
+ */
+export function assertPreparedImageResolution(
   resolution: AgentImageResolution,
   expectedLogicalName: string,
   runtimeKind: ContainerRuntimeKind | undefined,
 ): void {
-  if (resolution.logicalName !== expectedLogicalName || resolution.imageRef !== expectedLogicalName) {
+  if (resolution.logicalName !== expectedLogicalName) {
+    throw new Error(`prepared agent image does not match selected agent: ${expectedLogicalName}`);
+  }
+  // Ordinary sessions create from the exact build tag of the resolved build
+  // (or the logical name on a runtime without tagging); nested-Docker
+  // resolutions name the logical image and pin an immutable ID below.
+  const exactBuild = isImageBuildTagOf(resolution.imageRef, expectedLogicalName, resolution.buildHash);
+  if (resolution.imageRef !== expectedLogicalName && (runtimeKind !== undefined || !exactBuild)) {
     throw new Error(`prepared agent image does not match selected agent: ${expectedLogicalName}`);
   }
   if (runtimeKind === undefined) return;
@@ -3748,6 +4581,7 @@ async function buildImageFromCleanContext(
   dockerfile: string,
   labels: Record<string, string>,
   buildArgs?: Readonly<Record<string, string>>,
+  buildOptions?: ImageBuildOptions,
 ): Promise<void> {
   const tmpContext = mkdtempSync(resolve(tmpdir(), 'ironcurtain-build-'));
   try {
@@ -3756,49 +4590,9 @@ async function buildImageFromCleanContext(
       if (!entry.isFile()) throw new Error(`unsupported Docker build-context entry: ${entry.name}`);
       copyFileSync(resolve(dockerDir, entry.name), resolve(tmpContext, entry.name));
     }
-    await docker.buildImage(image, resolve(tmpContext, dockerfile), tmpContext, labels, buildArgs);
+    await docker.buildImage(image, resolve(tmpContext, dockerfile), tmpContext, labels, buildArgs, buildOptions);
   } finally {
     rmSync(tmpContext, { recursive: true, force: true });
-  }
-}
-
-/**
- * `${image}@${buildHash}` keys whose baked CLI version has already been logged
- * this process, so the diagnostic probe (a throwaway `docker run --version`)
- * runs at most once per built image rather than on every session/workflow-state.
- * Keyed by build hash — not the tag alone — so a same-process rebuild (which
- * keeps the `:latest` tag but changes `ironcurtain.build-hash`) re-probes and
- * re-logs the possibly-changed version, which is the whole point of surfacing
- * drift.
- */
-const loggedAgentVersions = new Set<string>();
-
-/**
- * Best-effort: log the agent CLI version baked into `image`. The agent CLI is
- * installed UNPINNED in the Docker image, so any change to a hashed build input
- * (Dockerfile / *.sh) rebuilds the image and can silently pull a newer agent —
- * see issue #367, where a Claude Code minor bump flipped subagents to run in the
- * background, breaking the one-shot `claude -p` workflow model. Surfacing the
- * resolved version makes that drift visible. Skipped when the adapter defines no
- * probe or the runtime can't run an ephemeral container; never throws.
- */
-async function logResolvedAgentVersion(
-  runtime: ContainerRuntime,
-  image: string,
-  buildHash: string,
-  versionProbe: readonly string[] | undefined,
-): Promise<void> {
-  if (!versionProbe || versionProbe.length === 0 || !runtime.probeImageVersion) return;
-  const cacheKey = `${image}@${buildHash}`;
-  if (loggedAgentVersions.has(cacheKey)) return;
-  loggedAgentVersions.add(cacheKey);
-  try {
-    const version = await runtime.probeImageVersion(image, versionProbe);
-    if (version) {
-      logger.info(`[docker] ${image} agent version (unpinned): ${version}`);
-    }
-  } catch {
-    // Diagnostic only — never disturb infra prep.
   }
 }
 
@@ -3810,30 +4604,130 @@ interface AgentImageBuildSpec {
   readonly baseBuildHash: string;
   readonly agentDockerfile: string;
   readonly agentBuildHash: string;
+  /** Build args selecting an overridden agent CLI version (none for the pin). */
+  readonly cliBuildArgs: Readonly<Record<string, string>>;
 }
 
-/** Resolve an agent image through exactly one trusted image mode. */
+/** Inputs of an agent image build beyond the checked-in Dockerfiles. */
+export interface AgentImageBuildOptions {
+  /**
+   * Build args selecting an overridden agent CLI version
+   * (`resolveAgentCliBuildArgs`). Folded into the agent build hash; absent or
+   * empty for the pinned version.
+   */
+  readonly cliBuildArgs?: Readonly<Record<string, string>>;
+}
+
+/** The CLI-version build args for `adapter` under `userConfig`'s `agentCliVersions`. */
+export function agentImageBuildOptions(
+  adapter: Pick<AgentAdapter, 'cliVersion'>,
+  userConfig: Pick<ResolvedUserConfig, 'agentCliVersions'>,
+): AgentImageBuildOptions {
+  return { cliBuildArgs: resolveAgentCliBuildArgs(adapter.cliVersion, userConfig.agentCliVersions) };
+}
+
+/**
+ * Resolve an agent image through exactly one trusted image mode. The image is
+ * built (when absent) under its build tag, and `imageRef` is that tag when the
+ * runtime can tag images: containers are created from the exact build this
+ * resolution checked, never from the moving `:latest` alias.
+ */
 export async function resolveAgentImage(
   image: string,
   docker: ContainerRuntime,
   toolchainSource?: DockerToolchainSource,
+  buildOptions?: AgentImageBuildOptions,
 ): Promise<AgentImageResolution> {
-  const spec = computeAgentImageBuildSpec(image, toolchainSource);
-  const buildHash = await ensureImageFromSpec(image, docker, spec);
+  const spec = computeAgentImageBuildSpec(image, toolchainSource, buildOptions);
+  const imageRef = await ensureImageFromSpec(image, docker, spec);
   return {
     mode: 'build-if-stale',
     logicalName: image,
-    imageRef: image,
-    buildHash,
+    imageRef,
+    buildHash: spec.agentBuildHash,
     ...(toolchainSource === undefined ? {} : { toolchainSource }),
   };
 }
 
-/** Resolve the purpose-built Desktop daemon image through the normal hash-label cache. */
+/** Which images `ironcurtain images rebuild` rebuilds without the layer cache. */
+export type AgentImageRebuildScope = 'agent' | 'agent-and-base';
+
+/**
+ * Rebuilds an agent image (and, for `agent-and-base`, its base) without the
+ * build cache, so a `latest` CLI override or the base's packages are fetched
+ * again, then points the build tag and the logical alias at the new image.
+ * The build hash is unchanged: the inputs did not change. With
+ * `toolchainSource`, the nested-Docker build of the image is rebuilt (its
+ * base embeds that Docker toolchain).
+ */
+export async function rebuildAgentImage(
+  image: string,
+  docker: ContainerRuntime,
+  scope: AgentImageRebuildScope,
+  buildOptions?: AgentImageBuildOptions,
+  toolchainSource?: DockerToolchainSource,
+): Promise<AgentImageResolution> {
+  const spec = computeAgentImageBuildSpec(image, toolchainSource, buildOptions);
+  const imageRef = await ensureImageFromSpec(image, docker, spec, scope);
+  return {
+    mode: 'build-if-stale',
+    logicalName: image,
+    imageRef,
+    buildHash: spec.agentBuildHash,
+    ...(toolchainSource === undefined ? {} : { toolchainSource }),
+  };
+}
+
+/** The base and agent image identities this checkout expects for `image` (no runtime access). */
+export interface AgentImageBuildDescription {
+  readonly logicalName: string;
+  readonly buildHash: string;
+  readonly buildTag: string;
+  readonly dockerfile: string;
+  readonly base: {
+    readonly logicalName: string;
+    readonly buildHash: string;
+    readonly buildTag: string;
+    readonly dockerfile: string;
+  };
+}
+
+/**
+ * Describes the build of `image` for status reporting: the ordinary build, or
+ * with `toolchainSource` the nested-Docker build sessions resolve for that
+ * Docker toolchain (its identity is part of the base build hash).
+ */
+export function describeAgentImageBuild(
+  image: string,
+  buildOptions?: AgentImageBuildOptions,
+  toolchainSource?: DockerToolchainSource,
+): AgentImageBuildDescription {
+  const spec = computeAgentImageBuildSpec(image, toolchainSource, buildOptions);
+  return {
+    logicalName: image,
+    buildHash: spec.agentBuildHash,
+    buildTag: imageBuildTag(image, spec.agentBuildHash),
+    dockerfile: spec.agentDockerfile,
+    base: {
+      logicalName: spec.baseImage,
+      buildHash: spec.baseBuildHash,
+      buildTag: imageBuildTag(spec.baseImage, spec.baseBuildHash),
+      dockerfile: spec.baseDockerfile,
+    },
+  };
+}
+
+/**
+ * Resolve the purpose-built Desktop daemon image through the normal hash-label
+ * cache, then pin it: the result is the immutable ID the tag named at that
+ * moment, verified to carry this recipe's build hash and the daemon role. The
+ * sidecar is later created from that ID, so another install retagging the
+ * shared tag cannot swap the daemon build mid-preparation.
+ */
 export async function ensureDockerDesktopSidecarImage(
   runtime: ContainerRuntime,
   toolchainSource: DockerToolchainSource,
-): Promise<string> {
+): Promise<DockerDesktopSidecarImage> {
   const contextDirectory = resolve(getIronCurtainPackageRoot(), 'docker', 'nested-daemon');
   const dockerfilePath = resolve(contextDirectory, 'Dockerfile');
   const buildHash = computeDockerBuildHash(
@@ -3841,25 +4735,32 @@ export async function ensureDockerDesktopSidecarImage(
     ['Dockerfile', 'entrypoint.sh', 'runtime-shim/main.go'],
     JSON.stringify(toolchainSource),
   );
-  if (!(await isImageStale(DOCKER_DESKTOP_SIDECAR_IMAGE, runtime, buildHash))) {
-    return DOCKER_DESKTOP_SIDECAR_IMAGE;
+  if (await isImageStale(DOCKER_DESKTOP_SIDECAR_IMAGE, runtime, buildHash)) {
+    logger.info('Building Docker Desktop nested-daemon image...');
+    await runtime.buildImage(
+      DOCKER_DESKTOP_SIDECAR_IMAGE,
+      dockerfilePath,
+      contextDirectory,
+      {
+        'ironcurtain.build-hash': buildHash,
+      },
+      { IRONCURTAIN_DOCKER_SOURCE: toolchainSource.reference },
+    );
+    logger.info('Docker Desktop nested-daemon image built successfully');
   }
-
-  logger.info('Building Docker Desktop nested-daemon image...');
-  await runtime.buildImage(
+  return assertDockerDesktopSidecarImage(
+    await runtime.inspectImage(DOCKER_DESKTOP_SIDECAR_IMAGE),
+    { buildHash },
     DOCKER_DESKTOP_SIDECAR_IMAGE,
-    dockerfilePath,
-    contextDirectory,
-    {
-      'ironcurtain.build-hash': buildHash,
-    },
-    { IRONCURTAIN_DOCKER_SOURCE: toolchainSource.reference },
   );
-  logger.info('Docker Desktop nested-daemon image built successfully');
-  return DOCKER_DESKTOP_SIDECAR_IMAGE;
 }
 
-/** Build and resolve the small fixed-target relay through the normal image cache. */
+/**
+ * Build and resolve the small fixed-target relay through the normal image cache.
+ * The build hash covers the Dockerfile (whose Go builder names an exact
+ * release), main.go and go.mod, so a Go toolchain bump, which edits the
+ * Dockerfile and go.mod, rebuilds relay images already on users' machines.
+ */
 export async function ensureDockerDesktopRelayImage(runtime: ContainerRuntime): Promise<string> {
   const contextDirectory = resolve(getIronCurtainPackageRoot(), 'docker', 'nested-relay');
   const dockerfilePath = resolve(contextDirectory, 'Dockerfile');
@@ -3883,7 +4784,11 @@ export async function ensureDockerDesktopRelayImage(runtime: ContainerRuntime): 
   return inspected.id;
 }
 
-function computeAgentImageBuildSpec(image: string, toolchainSource?: DockerToolchainSource): AgentImageBuildSpec {
+function computeAgentImageBuildSpec(
+  image: string,
+  toolchainSource?: DockerToolchainSource,
+  buildOptions?: AgentImageBuildOptions,
+): AgentImageBuildSpec {
   const packageRoot = getIronCurtainPackageRoot();
   const dockerDir = resolve(packageRoot, 'docker');
 
@@ -3894,11 +4799,12 @@ function computeAgentImageBuildSpec(image: string, toolchainSource?: DockerToolc
       : 'Dockerfile.base';
 
   // Agent images are CA-neutral. Session-specific public trust is staged in
-  // the read-only orientation mount by stageRuntimeTrust().
-  const baseImage = 'ironcurtain-base:latest';
+  // the read-only orientation mount by stageRuntimeTrust(). `:latest` is the
+  // moving alias; builds live under their build tags (imageBuildTag).
+  const baseImage = BASE_IMAGE_LOGICAL_NAME;
   const baseBuildHash = computeDockerBuildHash(
     dockerDir,
-    [baseDockerfile],
+    [baseDockerfile, 'mcp-bridge.mjs'],
     toolchainSource === undefined ? undefined : JSON.stringify(toolchainSource),
   );
 
@@ -3908,53 +4814,128 @@ function computeAgentImageBuildSpec(image: string, toolchainSource?: DockerToolc
   if (!existsSync(agentDockerfilePath)) {
     throw new Error(`Dockerfile not found for agent "${agentName}": ${agentDockerfilePath}`);
   }
-  const agentBuildHash = computeDockerBuildHash(dockerDir, [agentDockerfile], baseBuildHash);
-  return { dockerDir, baseDockerfile, baseImage, baseBuildHash, agentDockerfile, agentBuildHash, toolchainSource };
+  // The CLI-version override is a build input the Dockerfile does not show,
+  // so it is folded into the hash: changing it rebuilds the image, and
+  // workflow snapshots of the other build are not resumed.
+  const cliBuildArgs = buildOptions?.cliBuildArgs ?? {};
+  const agentBuildHash = computeDockerBuildHash(dockerDir, [agentDockerfile], baseBuildHash, cliBuildArgs);
+  return {
+    dockerDir,
+    baseDockerfile,
+    baseImage,
+    baseBuildHash,
+    agentDockerfile,
+    agentBuildHash,
+    toolchainSource,
+    cliBuildArgs,
+  };
 }
 
 /** Exact build hash recorded on the current checked-in agent image. */
-export function computeAgentImageBuildHash(image: string): string {
-  return computeAgentImageBuildSpec(image).agentBuildHash;
+export function computeAgentImageBuildHash(image: string, buildOptions?: AgentImageBuildOptions): string {
+  return computeAgentImageBuildSpec(image, undefined, buildOptions).agentBuildHash;
 }
 
+/**
+ * Makes sure an agent image of `spec`'s build is present and returns the
+ * reference to create containers from (its build tag when the runtime can
+ * tag). `rebuild` forces a cache-less build of the agent, or of the base and
+ * the agent.
+ */
 async function ensureImageFromSpec(
   image: string,
   docker: ContainerRuntime,
   spec: AgentImageBuildSpec,
+  rebuild?: AgentImageRebuildScope,
 ): Promise<string> {
   // The agent hash incorporates the base hash. A current selected agent is
   // therefore self-sufficient even when the base tag was not staged (the
-  // selected OCI archive already carries its base layers).
-  if (!(await isImageStale(image, docker, spec.agentBuildHash))) return spec.agentBuildHash;
-
-  await ensureBaseImage(
-    spec.baseImage,
+  // selected OCI archive already carries its base layers): the base is only
+  // resolved when the agent must be built.
+  return ensureImageBuild(
     docker,
-    spec.dockerDir,
-    spec.baseDockerfile,
-    spec.baseBuildHash,
-    spec.toolchainSource,
+    image,
+    spec.agentBuildHash,
+    async (agentTag) => {
+      const baseRef = await ensureImageBuild(
+        docker,
+        spec.baseImage,
+        spec.baseBuildHash,
+        async (baseTag) => {
+          logger.info('Building base Docker image (this may take a while on first run)...');
+          await buildImageFromCleanContext(
+            docker,
+            baseTag,
+            spec.dockerDir,
+            spec.baseDockerfile,
+            { [IMAGE_BUILD_HASH_LABEL]: spec.baseBuildHash },
+            spec.toolchainSource === undefined
+              ? undefined
+              : { IRONCURTAIN_DOCKER_SOURCE: spec.toolchainSource.reference },
+            rebuild === 'agent-and-base' ? { noCache: true } : undefined,
+          );
+          logger.info('Base Docker image built successfully');
+        },
+        rebuild === 'agent-and-base',
+      );
+      logger.info(`Building Docker image ${agentTag}...`);
+      await buildImageFromCleanContext(
+        docker,
+        agentTag,
+        spec.dockerDir,
+        spec.agentDockerfile,
+        { [IMAGE_BUILD_HASH_LABEL]: spec.agentBuildHash },
+        // The exact base build just resolved, never the moving alias.
+        { ...spec.cliBuildArgs, IRONCURTAIN_BASE_IMAGE: baseRef },
+        rebuild === undefined ? undefined : { noCache: true },
+      );
+      logger.info(`Docker image ${agentTag} built successfully`);
+    },
+    rebuild !== undefined,
   );
-  logger.info(`Building Docker image ${image}...`);
-  await buildImageFromCleanContext(docker, image, spec.dockerDir, spec.agentDockerfile, {
-    'ironcurtain.build-hash': spec.agentBuildHash,
-  });
-  logger.info(`Docker image ${image} built successfully`);
-
-  return spec.agentBuildHash;
 }
 
-export function computeWorkflowDependencyHash(agentBuildHash: string, scriptsDir: string): string {
-  const hash = createHash('sha256');
-  hash.update(`agent:${agentBuildHash}\n`);
-  for (const manifest of ['requirements.txt', 'package.json', 'package-lock.json']) {
-    const manifestPath = resolve(scriptsDir, manifest);
-    if (!existsSync(manifestPath)) continue;
-    hash.update(`file:${manifest}\n`);
-    hash.update(readFileSync(manifestPath));
-    hash.update('\n');
+/**
+ * Returns the reference of an image of `buildHash` under `logicalName`'s
+ * repository, calling `build(tag)` first when none is present or `rebuild` is
+ * set. With a runtime that can tag images, the image lives under its build tag
+ * ({@link imageBuildTag}) and the logical alias is pointed at it afterwards; an
+ * image from before build tags existed is adopted when its label matches. A
+ * runtime without tagging keeps the logical tag as the only reference.
+ * Every reuse is decided by the full `ironcurtain.build-hash` label, never by
+ * the tag alone.
+ */
+async function ensureImageBuild(
+  docker: ContainerRuntime,
+  logicalName: string,
+  buildHash: string,
+  build: (tag: string) => Promise<void>,
+  rebuild: boolean,
+): Promise<string> {
+  if (docker.tagImage === undefined) {
+    if (rebuild || (await isImageStale(logicalName, docker, buildHash))) await build(logicalName);
+    return logicalName;
   }
-  return hash.digest('hex');
+  const buildTag = imageBuildTag(logicalName, buildHash);
+  let current = !rebuild && !(await isImageStale(buildTag, docker, buildHash));
+  if (!rebuild && !current && !(await isImageStale(logicalName, docker, buildHash))) {
+    // Built before build tags existed: adopt it. Re-check the label through
+    // the new tag, since the alias may have been re-pointed in between.
+    await docker.tagImage(logicalName, buildTag);
+    current = !(await isImageStale(buildTag, docker, buildHash));
+  }
+  if (!current) {
+    await build(buildTag);
+    if (await isImageStale(buildTag, docker, buildHash)) {
+      throw new Error(`Docker image ${buildTag} does not carry the build hash it was just built from`);
+    }
+  }
+  // Keep the moving alias on the build this checkout resolved last: manual
+  // `docker run`, doctor's resource probe and the nested-Docker artifact
+  // capture (which re-verifies the label) address it by name. A rebuild keeps
+  // the hash, so the alias's label cannot tell the old image from the new.
+  if (rebuild || (await isImageStale(logicalName, docker, buildHash))) await docker.tagImage(buildTag, logicalName);
+  return buildTag;
 }
 
 /**
@@ -3970,8 +4951,19 @@ export function computeWorkflowDependencyHash(agentBuildHash: string, scriptsDir
  * prepends the workflow venv bin (for bare `python`) and the installed Node
  * package bins (`node_modules/.bin`).
  *
- * Returns the original command unchanged when neither dependency mount is
+ * `NODE_PATH` is exported here too, and only here: deterministic helpers
+ * `require()` the workflow's Node packages from `/workflow-scripts`, but the
+ * agent's own Node processes (the agent CLI itself) must not resolve modules
+ * from the run's writable dependency layer, so the container env never sets it.
+ *
+ * Returns the original command unchanged when neither dependency layer is
  * present, so non-dependency workflows keep the plain exec path.
+ *
+ * The orchestrator runs the result under the in-container wall clock
+ * (`runBoundedContainerCommand` in `turn-timeout.ts`), which goes outside
+ * this wrapper: `/usr/bin/timeout` is named by absolute path, so the PATH
+ * this shell sets cannot shadow it, and it bounds the shell and the command
+ * alike.
  *
  * Shell-safety: the only interpolated values are the hardcoded container
  * constants `WORKFLOW_PYTHON_VENV_DIR` / `WORKFLOW_NODE_MODULES_DIR`. The
@@ -3988,211 +4980,283 @@ export function buildWorkflowExecCommand(
   if (bundle.workflowNodeModulesMount) prefixDirs.push(`${WORKFLOW_NODE_MODULES_DIR}/.bin`);
   if (prefixDirs.length === 0 || command.length === 0) return command;
 
-  const pathPrefix = prefixDirs.join(':');
+  const exports = [`export PATH=${prefixDirs.join(':')}:"$PATH"`];
+  if (bundle.workflowNodeModulesMount) exports.push(`export NODE_PATH=${WORKFLOW_NODE_MODULES_DIR}`);
   // `exec "$@"` runs the original argv verbatim; the leading `sh` is $0.
-  return ['/bin/sh', '-lc', `export PATH=${pathPrefix}:"$PATH"; exec "$@"`, 'sh', ...command];
+  return ['/bin/sh', '-lc', `${exports.join('; ')}; exec "$@"`, 'sh', ...command];
 }
 
-interface WorkflowDependencyMounts {
-  readonly workflowPythonVenvMount?: PreContainerInfrastructure['workflowPythonVenvMount'];
-  readonly workflowNodeModulesMount?: PreContainerInfrastructure['workflowNodeModulesMount'];
+/**
+ * Transport facts the dependency provisioner reuses from the agent container's
+ * plan, so its registry traffic flows only through this bundle's MITM proxy:
+ * the same network (`none` for UDS), host aliases and in-container proxy URL.
+ */
+interface WorkflowDependencyProvisionerTransport {
+  readonly network: string;
+  readonly extraHosts: readonly string[] | undefined;
+  readonly proxyUrl: string;
+  readonly allocatedNetworkSubnet: string | undefined;
+  readonly bundleLabels: ReturnType<typeof buildBundleLabels>;
 }
 
-function prepareWorkflowDependencyMounts(
-  agentBuildHash: string,
-  scriptsDir: string | undefined,
-  ironcurtainHome: string,
-): WorkflowDependencyMounts {
-  if (scriptsDir === undefined || !existsSync(scriptsDir)) return {};
+/** Bound on each in-container dependency install. */
+const WORKFLOW_DEPENDENCY_INSTALL_TIMEOUT_MS = 1_200_000;
 
-  const requirementsPath = resolve(scriptsDir, 'requirements.txt');
-  const packageJsonPath = resolve(scriptsDir, 'package.json');
-  const packageLockPath = resolve(scriptsDir, 'package-lock.json');
-  const hasPythonManifest = existsSync(requirementsPath);
-  const hasNodeManifest = existsSync(packageJsonPath);
-  if (!hasPythonManifest && !hasNodeManifest) return {};
-
-  const dependencyHash = computeWorkflowDependencyHash(agentBuildHash, scriptsDir);
-  const cacheRoot = resolve(ironcurtainHome, 'workflow-deps', dependencyHash.slice(0, 24));
-  mkdirSync(cacheRoot, { recursive: true, mode: 0o700 });
-
-  let workflowPythonVenvMount: PreContainerInfrastructure['workflowPythonVenvMount'];
-  let workflowNodeModulesMount: PreContainerInfrastructure['workflowNodeModulesMount'];
-  if (hasPythonManifest) {
-    const hostDir = resolve(cacheRoot, 'python-venv');
-    mkdirSync(hostDir, { recursive: true, mode: 0o700 });
-    workflowPythonVenvMount = {
-      hostDir,
-      target: WORKFLOW_PYTHON_VENV_DIR,
-      cacheKey: dependencyHash,
-    };
-  }
-  if (hasNodeManifest) {
-    const hostDir = resolve(cacheRoot, 'node_modules');
-    mkdirSync(hostDir, { recursive: true, mode: 0o700 });
-    workflowNodeModulesMount = {
-      hostDir,
-      target: WORKFLOW_NODE_MODULES_DIR,
-      cacheKey: dependencyHash,
-      hasPackageLock: existsSync(packageLockPath),
-    };
-  }
-  return {
-    ...(workflowPythonVenvMount ? { workflowPythonVenvMount } : {}),
-    ...(workflowNodeModulesMount ? { workflowNodeModulesMount } : {}),
-  };
-}
-
-async function provisionWorkflowDependencies(
-  infra: DockerInfrastructure,
-  packageInstallEnabled: boolean,
+/**
+ * Builds the requested shared dependency bases in a dedicated, short-lived
+ * provisioning container that no agent ever shares. Called by
+ * `ensureWorkflowDependencyLayers` with the bundle's lock held, before the
+ * agent container exists.
+ *
+ * Isolation of the provisioning container:
+ * - started from the pristine agent image (`core.image`), never from a
+ *   workflow snapshot (`baseImageOverride`), whose writable layer a previous
+ *   run's agent controlled;
+ * - no workspace, conversation state, skills, scripts, nested-Docker wiring or
+ *   adapter environment (so no fake provider keys); the manifests arrive as the
+ *   exact hashed bytes on a read-only mount, the trust store as the public CA
+ *   certificate only;
+ * - registry egress only through this bundle's MITM proxy: in UDS topologies
+ *   only the MITM socket is mounted (not the Code Mode proxy socket), in TCP
+ *   topologies it joins the bundle's internal network with the same host alias.
+ *   That network's sidecar also forwards the Code Mode proxy port, which has no
+ *   per-session credential, so on TCP topologies install scripts could reach
+ *   the policy-mediated tool-call path; the agent container, where these
+ *   installs used to run, has the same reach and more.
+ *
+ * The container is removed before this returns, and its absence is confirmed:
+ * packages' install scripts run in it, and a process they left behind must not
+ * be able to write a base after the host has recorded its manifest.
+ */
+async function runWorkflowDependencyProvisioner(
+  core: PreContainerInfrastructure,
+  config: IronCurtainConfig,
+  transport: WorkflowDependencyProvisionerTransport,
+  request: WorkflowDependencyProvisionRequest,
 ): Promise<void> {
-  if (!infra.workflowPythonVenvMount && !infra.workflowNodeModulesMount) return;
+  if (core.dockerWorkload !== undefined) {
+    // prepareDockerInfrastructure rejects this combination; never create an
+    // unledgered container inside an admitted nested-Docker lease.
+    throw new Error('workflow dependency provisioning is not supported in an admitted nested-Docker bundle');
+  }
 
-  // Runtime provisioning installs through the MITM registry proxy, which is
-  // only wired when packageInstall is enabled (see prepareDockerInfrastructure
-  // — `registries`/`packageValidation` are left undefined otherwise). The
-  // mounts above only exist when the workflow actually ships a
-  // requirements.txt / package.json, so reaching here with package install
-  // disabled means the run genuinely needs deps it can never fetch under
-  // `--network=none`. Fail fast with an actionable message rather than letting
-  // `uv pip install` / `npm install` die with an opaque network error.
-  if (!packageInstallEnabled) {
-    throw new Error(
-      'This workflow requires installing dependencies at runtime ' +
-        '(a requirements.txt and/or package.json is present in its scripts), ' +
-        'but packageInstall is disabled. Enable packageInstall in your IronCurtain ' +
-        'config to run workflows that declare runtime dependencies.',
+  const trustDir = resolve(request.scratchDir, 'trust');
+  mkdirSync(trustDir, { mode: 0o700 });
+  stageRuntimeTrust(trustDir, core.ca.certPem);
+
+  const mounts: { source: string; target: string; readonly: boolean }[] = [
+    { source: trustDir, target: '/etc/ironcurtain', readonly: true },
+    { source: request.manifestsDir, target: WORKFLOW_DEPENDENCY_MANIFESTS_DIR, readonly: true },
+  ];
+  if (!core.useTcp) {
+    // The entrypoint bridges this socket to the in-container proxy URL.
+    mounts.push({
+      source: resolve(core.socketsDir, 'mitm-proxy.sock'),
+      target: `${CONTAINER_SOCKETS_DIR}/mitm-proxy.sock`,
+      readonly: false,
+    });
+  }
+  for (const layer of request.layers) {
+    mounts.push({ source: layer.baseDir, target: layer.target, readonly: false });
+  }
+
+  const name = `${CONTAINER_NAME_PREFIX}deps-${getBundleShortId(core.bundleId)}`;
+  const privileges = planBundleAgentPrivileges({ ...core, dockerWorkload: undefined }, config.userConfig);
+  const startup = prepareDockerAgentStartup(['sleep', 'infinity'], privileges.startupProbeUser);
+  let containerId: string | undefined;
+  let failure: Error | undefined;
+  try {
+    await core.docker.removeStaleContainer(name);
+    containerId = await core.docker.create(
+      buildAgentContainerConfig(
+        {
+          runtimeKind: core.runtimeKind,
+          useTcp: core.useTcp,
+          dockerWorkload: undefined,
+          dockerWorkloadBootstrap: undefined,
+          dockerDesktopAgentAccess: undefined,
+          dockerDesktopResources: core.dockerDesktopResources,
+        },
+        config.userConfig,
+        {
+          image: core.image,
+          name,
+          network: transport.network,
+          mounts,
+          env: {
+            ...buildRuntimeTrustEnv(),
+            ...buildPackageClientEnv(),
+            ...(core.tcpTransport === undefined
+              ? {
+                  HTTPS_PROXY: transport.proxyUrl,
+                  HTTP_PROXY: transport.proxyUrl,
+                }
+              : {}),
+          },
+          ...(core.tcpTransport === undefined
+            ? {}
+            : {
+                privateEnv: {
+                  HTTPS_PROXY: transport.proxyUrl,
+                  HTTP_PROXY: transport.proxyUrl,
+                },
+              }),
+          command: [...startup.command],
+          bundleLabel: transport.bundleLabels.bundleLabel,
+          labels: transport.bundleLabels.labels,
+          extraHosts: transport.extraHosts === undefined ? undefined : [...transport.extraHosts],
+        },
+      ),
     );
-  }
+    await core.docker.start(containerId);
+    await startup.waitUntilReady(core.docker, containerId);
 
-  if (infra.workflowPythonVenvMount) {
-    await provisionWorkflowPythonDependencies(infra);
-  }
-  if (infra.workflowNodeModulesMount) {
-    await provisionWorkflowNodeDependencies(infra);
-  }
-}
-
-async function provisionWorkflowPythonDependencies(infra: DockerInfrastructure): Promise<void> {
-  const mount = infra.workflowPythonVenvMount;
-  if (!mount) return;
-  const sentinel = `${mount.target}/.ironcurtain-provisioned-${mount.cacheKey}`;
-  const command = [
-    'set -eu',
-    `if [ -f ${quote([sentinel])} ]; then exit 0; fi`,
-    `find ${quote([mount.target])} -mindepth 1 -maxdepth 1 -exec rm -rf {} +`,
-    `UV_NATIVE_TLS=1 uv venv ${quote([mount.target])}`,
-    `VIRTUAL_ENV=${quote([mount.target])} UV_NATIVE_TLS=1 uv pip install -r ${quote([`${CONTAINER_SCRIPTS_DIR}/requirements.txt`])}`,
-    `touch ${quote([sentinel])}`,
-  ].join('\n');
-
-  // Serialize concurrent provisioning of this content-keyed cache across runs.
-  // The lock is host-side because in-container flock does not propagate across
-  // containers on a Docker Desktop bind mount; the in-shell sentinel check
-  // provides the short-circuit, the host lock makes the second run wait for the
-  // first so it observes the populated cache instead of racing on the clean.
-  await withProvisionLock(mount.hostDir, async () => {
-    logger.info(`Provisioning workflow Python dependencies into ${mount.target}`);
-    const result = await infra.docker.exec(
-      infra.containerId,
-      ['/bin/sh', '-lc', command],
-      1_200_000,
-      'codespace',
-      CONTAINER_WORKSPACE_DIR,
-    );
-    if (result.exitCode !== 0) {
-      throw new Error(`Workflow Python dependency provisioning failed: ${result.stderr || result.stdout}`);
+    if (core.topology === 'tcp-hostonly' && core.hostOnlyNetwork !== undefined && core.proxy.port !== undefined) {
+      await checkHostOnlyConnectivity(core.docker, containerId, core.hostOnlyNetwork.gateway, core.proxy.port);
+    } else if (core.useTcp && core.proxy.port !== undefined && core.mitmAddr.port !== undefined) {
+      try {
+        await checkInternalNetworkConnectivity(
+          core.docker,
+          containerId,
+          core.proxy.port,
+          core.mitmAddr.port,
+          core.tcpTransport,
+          false,
+        );
+      } catch (error) {
+        if (error instanceof InternalNetworkConnectivityError) {
+          throw new InternalNetworkConnectivityError(error.message, transport.allocatedNetworkSubnet);
+        }
+        throw error;
+      }
     }
-  });
-}
 
-async function provisionWorkflowNodeDependencies(infra: DockerInfrastructure): Promise<void> {
-  const mount = infra.workflowNodeModulesMount;
-  if (!mount) return;
-  const sentinel = `${mount.target}/.ironcurtain-provisioned-${mount.cacheKey}`;
-  const installCommand = mount.hasPackageLock ? 'npm ci --omit=dev' : 'npm install --omit=dev';
-  const command = [
-    'set -eu',
-    `if [ -f ${quote([sentinel])} ]; then exit 0; fi`,
-    'tmp="$(mktemp -d)"',
-    'cleanup() { rm -rf "$tmp"; }',
-    'trap cleanup EXIT',
-    `cp ${quote([`${CONTAINER_SCRIPTS_DIR}/package.json`])} "$tmp/package.json"`,
-    mount.hasPackageLock ? `cp ${quote([`${CONTAINER_SCRIPTS_DIR}/package-lock.json`])} "$tmp/package-lock.json"` : '',
-    'cd "$tmp"',
-    installCommand,
-    `find ${quote([mount.target])} -mindepth 1 -maxdepth 1 -exec rm -rf {} +`,
-    `cp -a node_modules/. ${quote([mount.target])}/`,
-    `touch ${quote([sentinel])}`,
-  ]
-    .filter(Boolean)
-    .join('\n');
-
-  // Host-side serialization of this content-keyed cache (see the Python path
-  // for the bind-mount-flock rationale).
-  await withProvisionLock(mount.hostDir, async () => {
-    logger.info(`Provisioning workflow Node dependencies into ${mount.target}`);
-    const result = await infra.docker.exec(
-      infra.containerId,
-      ['/bin/sh', '-lc', command],
-      1_200_000,
-      'codespace',
-      CONTAINER_WORKSPACE_DIR,
-    );
-    if (result.exitCode !== 0) {
-      throw new Error(`Workflow Node dependency provisioning failed: ${result.stderr || result.stdout}`);
+    for (const layer of request.layers) {
+      const label = layer.kind === 'python-venv' ? 'Python' : 'Node';
+      logger.info(`Provisioning workflow ${label} dependency base into ${layer.target} (container ${name})`);
+      const result = await core.docker.exec(
+        containerId,
+        ['/bin/sh', '-lc', buildWorkflowDependencyProvisionScript(layer)],
+        WORKFLOW_DEPENDENCY_INSTALL_TIMEOUT_MS,
+        // A sudo-off bundle (agentSudo: false) execs by numeric UID only.
+        privileges.execUser ?? 'codespace',
+        '/tmp',
+      );
+      if (result.exitCode !== 0) {
+        throw new Error(
+          `Workflow ${label} dependency provisioning failed: ${toDisplayText(result.stderr || result.stdout, { maxLength: 4096 })}`,
+        );
+      }
     }
-  });
-}
+  } catch (error) {
+    failure = error instanceof Error ? error : new Error(String(error));
+  }
 
-async function ensureBaseImage(
-  baseImage: string,
-  docker: ContainerRuntime,
-  dockerDir: string,
-  dockerfile: string,
-  buildHash: string,
-  toolchainSource?: DockerToolchainSource,
-): Promise<void> {
-  if (!(await isImageStale(baseImage, docker, buildHash))) return;
-
-  logger.info('Building base Docker image (this may take a while on first run)...');
-
-  await buildImageFromCleanContext(
-    docker,
-    baseImage,
-    dockerDir,
-    dockerfile,
-    {
-      'ironcurtain.build-hash': buildHash,
-    },
-    toolchainSource === undefined ? undefined : { IRONCURTAIN_DOCKER_SOURCE: toolchainSource.reference },
-  );
-  logger.info('Base Docker image built successfully');
+  if (containerId !== undefined) {
+    await core.docker.remove(containerId);
+    if (await core.docker.containerExists(containerId)) {
+      failure ??= new Error(
+        `Workflow dependency provisioning container ${name} could not be removed; refusing to trust the base it wrote`,
+      );
+    }
+  }
+  // Package install scripts ran here with the agent's privileges against the
+  // host-backed base directories. Where container root is host root, sweep
+  // them like an agent's mounts now that the container is gone, before the
+  // caller records the base (so the record matches the stripped tree).
+  const report = await createBundlePrivilegedFileScanner(core, mounts)?.scan('workflow dependency provisioning');
+  const notice = deliverHostPrivilegedFilesNotice(report, core.onHostPrivilegedFiles);
+  if (failure !== undefined) throw includeHostPrivilegedFilesInFailure(failure, notice);
 }
 
 async function isImageStale(image: string, docker: ContainerRuntime, expectedHash: string): Promise<boolean> {
-  const storedHash = await docker.getImageLabel(image, 'ironcurtain.build-hash');
+  const storedHash = await docker.getImageLabel(image, IMAGE_BUILD_HASH_LABEL);
   return storedHash !== expectedHash;
 }
 
-export function computeDockerBuildHash(dockerDir: string, dockerfiles: string[], parentHash?: string): string {
+/**
+ * Content hash of one image recipe: the staleness key stamped as
+ * `ironcurtain.build-hash`.
+ *
+ * `inputs` are paths relative to `dockerDir`. Every listed input must exist,
+ * so a typo or a moved file fails loudly instead of silently dropping out of
+ * the key. A listed directory is hashed recursively. Top-level entries keep the
+ * established scan (listed files, every `*.sh`, and the Apple relay for the
+ * arm64 base), so existing images keep their hashes; nested inputs such as
+ * `runtime-shim/main.go`, which a Dockerfile COPYs from a subdirectory, are
+ * hashed after it. The parent image's hash follows, then `buildArgs`: build
+ * args that select inputs the Dockerfiles do not show (the agent CLI version
+ * override). Pins written as ARG defaults are part of the Dockerfile text, so
+ * bumping one changes the hash.
+ */
+export function computeDockerBuildHash(
+  dockerDir: string,
+  inputs: readonly string[],
+  parentHash?: string,
+  buildArgs?: Readonly<Record<string, string>>,
+): string {
   const hash = createHash('sha256');
+  const listed = new Set(inputs.map((input) => validateDockerBuildInput(dockerDir, input)));
 
   const files = readdirSync(dockerDir).sort();
   for (const file of files) {
-    const isAppleVmRelayInput = file === 'apple-vm-egress-relay.mjs' && dockerfiles.includes('Dockerfile.base.arm64');
-    if (dockerfiles.includes(file) || file.endsWith('.sh') || isAppleVmRelayInput) {
-      hash.update(`file:${file}\n`);
-      hash.update(readFileSync(resolve(dockerDir, file)));
-    }
+    const isAppleVmRelayInput = file === 'apple-vm-egress-relay.mjs' && listed.has('Dockerfile.base.arm64');
+    if (listed.has(file) || file.endsWith('.sh') || isAppleVmRelayInput) hashDockerBuildInput(hash, dockerDir, file);
+  }
+  for (const input of [...listed].filter((candidate) => candidate.includes('/')).sort()) {
+    hashDockerBuildInput(hash, dockerDir, input);
   }
 
   if (parentHash) {
     hash.update(`parent:${parentHash}\n`);
   }
 
+  // Sorted so the hash does not depend on object key order; absent when no
+  // override applies, so the default build keeps its Dockerfile-only hash.
+  for (const [name, value] of Object.entries(buildArgs ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+    hash.update(`build-arg:${name}=${value}\n`);
+  }
+
   return hash.digest('hex');
+}
+
+/** Normalize one listed build input and prove it exists inside the build context. */
+function validateDockerBuildInput(dockerDir: string, input: string): string {
+  const normalized = input
+    .split('/')
+    .filter((segment) => segment !== '' && segment !== '.')
+    .join('/');
+  if (
+    normalized === '' ||
+    isAbsolute(input) ||
+    normalized.split('/').includes('..') ||
+    normalized !== relative(dockerDir, resolve(dockerDir, normalized))
+  ) {
+    throw new Error(`Docker build input must be a relative path inside the build context: ${input}`);
+  }
+  let stats;
+  try {
+    stats = lstatSync(resolve(dockerDir, normalized));
+  } catch (error) {
+    throw new Error(`Docker build input is missing: ${resolve(dockerDir, normalized)}`, { cause: error });
+  }
+  if (!stats.isFile() && !stats.isDirectory()) {
+    throw new Error(`Docker build input must be a regular file or directory: ${resolve(dockerDir, normalized)}`);
+  }
+  return normalized;
+}
+
+/** Fold one input into the hash; directories contribute every regular file below them in sorted order. */
+function hashDockerBuildInput(hash: ReturnType<typeof createHash>, dockerDir: string, relativePath: string): void {
+  const path = resolve(dockerDir, relativePath);
+  const stats = lstatSync(path);
+  if (stats.isDirectory()) {
+    for (const child of readdirSync(path).sort()) hashDockerBuildInput(hash, dockerDir, `${relativePath}/${child}`);
+    return;
+  }
+  if (!stats.isFile()) throw new Error(`Docker build input must be a regular file or directory: ${path}`);
+  hash.update(`file:${relativePath}\n`);
+  hash.update(readFileSync(path));
 }
 
 /**

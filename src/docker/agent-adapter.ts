@@ -7,10 +7,12 @@
  */
 
 import type { DockerAuthKind, IronCurtainConfig } from '../config/types.js';
+import { USER_CONFIG_DEFAULTS, type ResolvedResourceBudgetConfig } from '../config/user-config.js';
 import type { DockerWorkloadNetworkAccess } from '../docker-workload/config.js';
 import type { ProviderConfig } from './provider-config.js';
 import type { ServerListing } from '../types/server-listing.js';
 import type { AuthMethod } from './oauth-credentials.js';
+import type { AgentCliVersionSupport } from './agent-cli-version.js';
 
 /**
  * The workspace directory inside Docker containers. The host sandbox
@@ -99,6 +101,19 @@ export interface AgentResponse {
     readonly kind: TransientFailureKind;
     readonly rawMessage: string;
   };
+  /**
+   * The agent CLI's own identifier for the conversation this turn ran in,
+   * for CLIs that mint one instead of accepting the caller's
+   * `buildCommand` `sessionId` (Codex reports it as the `thread_id` of its
+   * `thread.started` event). Adapters validate its shape before reporting it.
+   *
+   * The session records it against its agent conversation id (see
+   * `recordStoredConversation` in `conversation-state.ts`) and hands it back
+   * as `buildCommand` `agentThreadId` so later turns, and later sessions that
+   * continue the same conversation, resume that thread. Agent-controlled
+   * output: it can only select a conversation inside the same agent's state.
+   */
+  readonly agentThreadId?: string;
 }
 
 /**
@@ -106,6 +121,27 @@ export interface AgentResponse {
  * source of truth so adding a new kind only requires editing one file.
  */
 export type TransientFailureKind = 'degenerate_response' | 'upstream_5xx' | 'upstream_api_error';
+
+/**
+ * Maps the per-turn step budget to the agent CLI's own agentic-turn cap
+ * (`claude -p --max-turns`, `GOOSE_MAX_TURNS`). `null` (operator disabled
+ * the step limit) yields undefined so no cap is passed. A session config
+ * always carries a resolved budget; a partially built one (hand-assembled by
+ * a caller or a test) falls back to the shipped default rather than to
+ * "uncapped".
+ */
+export function resolveMaxAgentTurns(config: {
+  readonly userConfig?: { readonly resourceBudget?: Pick<ResolvedResourceBudgetConfig, 'maxSteps'> };
+}): number | undefined {
+  const resourceBudget = config.userConfig?.resourceBudget;
+  const maxSteps =
+    resourceBudget === undefined ? USER_CONFIG_DEFAULTS.resourceBudget.maxSteps : resourceBudget.maxSteps;
+  if (maxSteps === null) return undefined;
+  if (!Number.isSafeInteger(maxSteps) || maxSteps <= 0) {
+    throw new Error(`resourceBudget.maxSteps must be a positive integer, got ${String(maxSteps)}`);
+  }
+  return maxSteps;
+}
 
 /**
  * Human-readable description of a transient-failure kind, used in
@@ -128,6 +164,24 @@ export function describeTransientFailureKind(kind: TransientFailureKind): string
  * Branded agent identifier to prevent mixing with other string types.
  */
 export type AgentId = string & { readonly __brand: 'AgentId' };
+
+/**
+ * Where an agent CLI keeps its conversation transcripts inside the mounted
+ * conversation-state directory. The host decides from the transcripts
+ * themselves whether a conversation exists (a PTY snapshot's `resumable`, a
+ * batch turn's resume-or-start choice), never from whether the directory is
+ * non-empty: the seeds and settings files make every directory non-empty.
+ * The probes live in `conversation-state.ts`.
+ *
+ *   - `'claude-projects'`: Claude Code, `projects/<cwd-hash>/<conversation-id>.jsonl`.
+ *     The CLI accepts the caller's conversation id (`--session-id`).
+ *   - `'codex-rollouts'`: Codex, `sessions/YYYY/MM/DD/rollout-<timestamp>-<thread-id>.jsonl`.
+ *     The CLI mints the thread id and reports it in `thread.started`.
+ *   - `'goose-sessions'`: Goose, the session store (`sessions.db`, or the
+ *     `.jsonl` files of older releases) under `~/.local/share/goose/sessions/`.
+ *     Sessions are named by the caller (`--name`).
+ */
+export type ConversationTranscriptLayout = 'claude-projects' | 'codex-rollouts' | 'goose-sessions';
 
 /**
  * Configuration for persisting an agent's conversation state across
@@ -161,10 +215,14 @@ export interface ConversationStateConfig {
 
   /**
    * CLI flag(s) the agent uses to continue a previous conversation.
-   * Appended to the PTY command on resume (e.g., ['--continue']).
-   * If empty, the agent handles resume via presence of state files alone.
+   * Passed to the PTY start script on resume (`IRONCURTAIN_RESUME_FLAGS`,
+   * e.g. ['--continue']). Each must match `--[a-z0-9-]+`. Empty when the
+   * script resumes by id instead (Codex: `IRONCURTAIN_RESUME_ID`).
    */
   readonly resumeFlags: readonly string[];
+
+  /** Where the CLI keeps transcripts in this directory (see {@link ConversationTranscriptLayout}). */
+  readonly transcriptLayout: ConversationTranscriptLayout;
 }
 
 /**
@@ -192,6 +250,13 @@ export interface OrientationContext {
   /** Container network mode: 'none' (Linux UDS) or 'bridge' (macOS TCP). */
   readonly networkMode: 'none' | 'bridge';
   /**
+   * True when the workspace is mounted read-only (a read-only workflow state
+   * or scope, `IronCurtainConfig.readOnlyWorkspace`): the agent reads it with
+   * its own tools and writes its declared outputs through the filesystem MCP
+   * tool, which policy confines to them.
+   */
+  readonly workspaceReadOnly?: boolean;
+  /**
    * Admitted nested-Docker capability for this session. Absent for ordinary
    * sessions and for configured workloads that failed admission.
    */
@@ -201,6 +266,17 @@ export interface OrientationContext {
     /** Admitted network authority for image resolution and fixed package repositories. */
     readonly networkAccess: DockerWorkloadNetworkAccess;
   };
+}
+
+/** Per-turn options for {@link AgentAdapter.buildCommand}; each field is described there. */
+export interface AgentCommandOptions {
+  readonly sessionId: string;
+  readonly firstTurn: boolean;
+  readonly agentThreadId?: string;
+  readonly agentModelId?: string;
+  readonly modelOverride?: string;
+  readonly providerProfile?: import('../config/user-config.js').ResolvedProviderProfile;
+  readonly maxAgentTurns?: number;
 }
 
 /**
@@ -228,11 +304,20 @@ export interface AgentAdapter {
   /**
    * Command that prints the installed agent CLI version, run against the built
    * image via {@link ContainerRuntime.probeImageVersion} (e.g.
-   * `['claude', '--version']`). The agent CLI is installed UNPINNED in the image,
-   * so infra prep logs the resolved version to surface silent drift on rebuild
-   * (issue #367). Omit to skip version logging for this adapter.
+   * `['claude', '--version']`). Infra prep checks the result once per image
+   * build against {@link cliVersion} and logs it, as a warning when it is
+   * outside the qualified range (a CLI bump can change semantics: issue #367).
+   * Omit to skip the check for this adapter.
    */
   readonly versionProbe?: readonly string[];
+
+  /**
+   * The Dockerfile build arg that pins this agent's CLI, the pinned version and
+   * the range qualified with this release (see `agent-cli-version.ts`). The
+   * `agentCliVersions` config override, where the adapter allows one, selects
+   * another version through the same build arg.
+   */
+  readonly cliVersion?: AgentCliVersionSupport;
 
   /**
    * Generates the MCP client configuration file that tells
@@ -264,21 +349,32 @@ export interface AgentAdapter {
    *   - firstTurn: true when this is the first turn of a fresh
    *     conversation state; false when resuming an existing
    *     conversation. Adapters that don't distinguish may ignore.
+   *   - agentThreadId: the CLI-minted conversation id an earlier turn
+   *     reported for `sessionId` (see `AgentResponse.agentThreadId`), when
+   *     one was recorded. Only adapters whose CLI mints its own id (Codex)
+   *     read it; they resume it only when `firstTurn` is false.
+   *   - agentModelId: the per-session config's qualified agent model
+   *     (`config.agentModelId`: `--model`, a workflow model, the persona's
+   *     `agentModelId` or the global one, as `buildSessionConfig` resolved
+   *     it), the session default when no `modelOverride` applies. Passed
+   *     per call because the registry keeps one adapter instance per
+   *     process while a daemon reloads config for every session: adapters
+   *     never capture config at construction (one persona's model must not
+   *     leak into a later session of the same daemon).
+   *     Adapters whose CLI does not take IronCurtain's agent model (Codex
+   *     and Goose choose theirs through their own config) ignore it.
    *   - modelOverride: qualified model ID ("provider:model-name") to use
-   *     for this turn instead of the adapter's captured default. Adapters
+   *     for this turn instead of the session default. Adapters
    *     that cannot switch models per-turn (e.g., Goose reads `GOOSE_MODEL`
    *     at container start) must document their limitation.
+   *   - maxAgentTurns: upper bound on agentic turns (LLM round-trips) for
+   *     this one invocation, derived from `resourceBudget.maxSteps` via
+   *     {@link resolveMaxAgentTurns}. Defence in depth only: a compromised
+   *     agent can call the proxy directly, so the host still enforces the
+   *     wall clock and the between-turn budget. Adapters whose CLI has no
+   *     native cap ignore it.
    */
-  buildCommand(
-    message: string,
-    systemPrompt: string,
-    options: {
-      readonly sessionId: string;
-      readonly firstTurn: boolean;
-      readonly modelOverride?: string;
-      readonly providerProfile?: import('../config/user-config.js').ResolvedProviderProfile;
-    },
-  ): readonly string[];
+  buildCommand(message: string, systemPrompt: string, options: AgentCommandOptions): readonly string[];
 
   /**
    * Builds the system prompt to append to the agent's default system prompt.
@@ -377,10 +473,11 @@ export interface AgentAdapter {
   detectCredential?(config: IronCurtainConfig): AuthMethod | undefined;
 
   /**
-   * Error message to show when no credentials are detected.
+   * Error message to show when no credentials are detected, for the
+   * per-session config (Goose names the session's configured provider).
    * When not set, the default Anthropic-oriented message is used.
    */
-  readonly credentialHelpText?: string;
+  credentialHelpText?(config: IronCurtainConfig): string;
 
   /**
    * Returns the conversation state configuration for this agent.

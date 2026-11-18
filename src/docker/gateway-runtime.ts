@@ -4,16 +4,66 @@ import type { IronCurtainConfig } from '../config/types.js';
 import {
   getGatewayDefinition,
   resolveGatewayModel,
+  type GatewayDefinition,
   type GatewayProfile,
   type GatewayProtocol,
+  type GatewaySanitizerId,
 } from '../config/provider-definitions.js';
 import { cloneProviderPreference } from '../config/provider-preference.js';
 import { gatewayProfile } from '../config/gateway-client.js';
+import type { BuiltInLlmProtocol } from './llm-observation/completion-endpoint.js';
 import { anthropicRequestRewriter } from './provider-config.js';
 import type { ProviderConfig, RequestBodyRewriter } from './provider-config.js';
+import {
+  createOpenRouterRequestSanitizer,
+  rejectRequest,
+  sanitizedEndpointsFor,
+  type RequestSanitizer,
+} from './request-sanitizers/index.js';
 import type { AuthMethod } from './oauth-credentials.js';
 
-/** Auxiliary IDs are harness facts, not provider facts. Main client selections are never remapped. */
+/** The completion wire protocol each gateway protocol speaks. */
+const GATEWAY_WIRE_PROTOCOLS: Readonly<Record<GatewayProtocol, BuiltInLlmProtocol>> = {
+  messages: 'anthropic-messages',
+  responses: 'openai-responses',
+  chat: 'openai-chat-completions',
+};
+
+/** Gateway sanitizer factories by `GatewayDefinition.gatewaySanitizer`, given the profile's own models. */
+const GATEWAY_SANITIZERS: Readonly<
+  Record<GatewaySanitizerId, (configuredModels: readonly string[]) => RequestSanitizer>
+> = {
+  openrouter: (configuredModels) => createOpenRouterRequestSanitizer({ configuredModels }),
+};
+
+/**
+ * The models a profile names itself (model-map targets, per-agent models, the
+ * profile model) plus the gateway's default: the models a gateway sanitizer
+ * treats as chosen by the user rather than by the agent.
+ */
+function profileModels(profile: GatewayProfile, definition: GatewayDefinition): readonly string[] {
+  const perAgent = Object.values(profile.perAgent).filter((model): model is string => model !== undefined);
+  return [
+    ...profile.modelMap.map((rule) => rule.model),
+    ...perAgent,
+    ...(profile.model === undefined ? [] : [profile.model]),
+    definition.defaultModel(profile),
+  ];
+}
+
+/** The gateway's own request sanitizer for this profile, when its definition declares one. */
+function gatewaySanitizerFor(profile: GatewayProfile, definition: GatewayDefinition): RequestSanitizer | undefined {
+  const id = definition.gatewaySanitizer;
+  return id === undefined ? undefined : GATEWAY_SANITIZERS[id](profileModels(profile, definition));
+}
+
+/**
+ * Auxiliary IDs are harness facts, not provider facts. Main client selections are never remapped.
+ *
+ * A completion request without a string `model` is rejected (local 400)
+ * rather than forwarded unmapped: on a proxy-selected gateway the provider
+ * would otherwise pick a model the profile never approved.
+ */
 export function makeGatewayRequestRewriter(
   profile: GatewayProfile,
   protocol: GatewayProtocol,
@@ -22,7 +72,7 @@ export function makeGatewayRequestRewriter(
   auxiliaryModels: readonly string[] = [],
 ): RequestBodyRewriter {
   return (body, context) => {
-    if (definition.modelSelection === 'proxy' && typeof body.model !== 'string') return null;
+    if (typeof body.model !== 'string') return rejectRequest('the request must name its model as a string');
     const filtered =
       protocol === 'messages' && definition.filterMessagesTools ? anthropicRequestRewriter(body, context) : null;
     const current = filtered?.modified ?? body;
@@ -111,6 +161,14 @@ export function makeGatewayProvider(
   const snapshot = routingSnapshot(profile);
   const paths = definition.proxyPaths(snapshot)[protocol];
   const path = paths.completion;
+  const wireProtocol = GATEWAY_WIRE_PROTOCOLS[protocol];
+  // Every POST route of a protocol carries that protocol's body (e.g. the
+  // messages count_tokens sibling), so each one is sanitized: by the
+  // protocol's sanitizer, behind the gateway's own when the definition
+  // declares one (OpenRouter). The sanitizer runs after the rewriter, so it
+  // sees the mapped model. The binding is independent of `rewriter`: a
+  // caller-supplied rewriter cannot opt out.
+  const postPaths = [path, ...paths.additional.filter((endpoint) => endpoint.method === 'POST').map((e) => e.path)];
   return {
     id: definition.id,
     host: definition.host,
@@ -124,12 +182,7 @@ export function makeGatewayProvider(
       {
         method: 'POST',
         path,
-        protocol:
-          protocol === 'messages'
-            ? 'anthropic-messages'
-            : protocol === 'responses'
-              ? 'openai-responses'
-              : 'openai-chat-completions',
+        protocol: wireProtocol,
         capabilities: {
           metricsSupport: protocol === 'chat' ? 'partial' : 'full',
           streamingUsageNegotiation: protocol === 'chat' ? 'client_or_agent_adapter' : 'none',
@@ -139,6 +192,7 @@ export function makeGatewayProvider(
     ],
     rewriteEndpoints: [path],
     requestRewriter: rewriter ?? makeGatewayRequestRewriter(snapshot, protocol, agent, definition, auxiliaryModels),
+    sanitizedEndpoints: sanitizedEndpointsFor(wireProtocol, postPaths, gatewaySanitizerFor(snapshot, definition)),
   };
 }
 

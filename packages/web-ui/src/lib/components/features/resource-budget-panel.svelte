@@ -1,6 +1,19 @@
 <script lang="ts">
   import type { WorkflowBudgetDto } from '$lib/types.js';
-  import { BUDGET_LIMITS, budgetUsage, formatLimit, limitProgress } from './resource-budget-helpers.js';
+  import {
+    BUDGET_LIMITS,
+    RUN_LIMITS,
+    budgetUsage,
+    formatBudgetUsage,
+    formatLimit,
+    formatRunUsage,
+    formatRunValue,
+    highestRunProgress,
+    limitProgress,
+    runLimit,
+    runUsage,
+  } from './resource-budget-helpers.js';
+  import { formatWorkflowTokens } from './usage-format.js';
   import { Badge } from '$lib/components/ui/badge/index.js';
   import Gauge from 'phosphor-svelte/lib/Gauge';
   import CaretDown from 'phosphor-svelte/lib/CaretDown';
@@ -9,11 +22,20 @@
   let expanded = $state(false);
   const detailsId = $props.id();
   const highestProgress = $derived.by(() => {
-    if (preview || !budget.recorded) return 0;
+    if (preview) return 0;
+    // The run-wide ceiling is shown even for legacy runs: it comes from the
+    // run's definition and the checkpoint's usage, not the saved limits.
+    const run = highestRunProgress(budget);
+    if (!budget.recorded) return run;
     return Math.max(
+      run,
       ...BUDGET_LIMITS.map(({ key }) => limitProgress(budgetUsage(budget, key), budget.limits[key]) ?? 0),
     );
   });
+  const hasRunCeiling = $derived(RUN_LIMITS.some(({ key }) => runLimit(budget, key) !== null));
+  const runTokensDetail = $derived(
+    budget.workflowUsage ? formatWorkflowTokens(budget.workflowUsage).detail : undefined,
+  );
 </script>
 
 <section
@@ -47,7 +69,8 @@
       </span>
       {#if !budget.recorded}
         <Badge variant="warning">Historical limits unknown</Badge>
-      {:else if highestProgress >= budget.limits.warnThresholdPercent}
+      {/if}
+      {#if highestProgress >= budget.limits.warnThresholdPercent}
         <Badge variant="warning">{highestProgress >= 100 ? 'Limit reached' : 'Near limit'}</Badge>
       {/if}
       <CaretDown
@@ -60,8 +83,71 @@
     {#if !preview && (budget.activeSessionCount ?? 0) > 1}
       <p class="text-xs text-muted-foreground" data-testid="budget-sampled-note">
         Usage samples one active agent session. Each session uses these limits independently; usage is not aggregated
-        across parallel sessions.
+        across parallel sessions. The whole-run totals below cover all of them.
       </p>
+    {/if}
+    {#if preview && hasRunCeiling}
+      <p class="text-xs text-muted-foreground" data-testid="workflow-ceiling-preview">
+        Run ceiling:
+        {RUN_LIMITS.filter(({ key }) => runLimit(budget, key) !== null)
+          .map(({ key, label }) => `${label.toLowerCase()} ${formatRunValue(key, runLimit(budget, key) ?? 0)}`)
+          .join(' · ')}
+      </p>
+    {/if}
+    {#if !preview && budget.workflowUsage}
+      {@const runUsageDto = budget.workflowUsage}
+      <div class="rounded-lg border border-border p-3 space-y-3" data-testid="workflow-run-totals">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <span class="text-xs font-semibold">Whole run</span>
+          <span class="text-[11px] text-muted-foreground">
+            {hasRunCeiling ? 'Run ceiling (settings.workflowBudget)' : 'No run ceiling set'} · all sessions, lanes and resumes
+          </span>
+        </div>
+        <div class="grid grid-cols-1 min-[460px]:grid-cols-3 gap-3">
+          {#each RUN_LIMITS as item (item.key)}
+            {@const limit = runLimit(budget, item.key)}
+            {@const progress = limitProgress(runUsage(runUsageDto, item.key), limit)}
+            {@const warning = progress !== undefined && progress >= budget.limits.warnThresholdPercent}
+            <div
+              class={`space-y-1 rounded-md p-2 ${warning ? 'bg-amber-500/5' : ''}`}
+              data-testid={`workflow-run-${item.key}`}
+            >
+              <span class="text-xs text-muted-foreground">{item.label}</span>
+              <p class="text-sm font-semibold tabular-nums" class:text-amber-600={warning}>
+                {formatRunUsage(runUsageDto, item.key)}{warning
+                  ? progress! >= 100
+                    ? ' · Limit reached'
+                    : ' · Near limit'
+                  : ''}
+              </p>
+              <p class="text-[11px] text-muted-foreground">
+                {limit === null ? 'No ceiling' : `Ceiling ${formatRunValue(item.key, limit)}`}
+              </p>
+              {#if progress !== undefined}
+                <div
+                  role="progressbar"
+                  aria-label={`Run ${item.label.toLowerCase()} usage`}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={Math.min(100, Math.round(progress))}
+                  aria-valuetext={`${Math.round(progress)}% of the run ceiling`}
+                  class="h-1.5 overflow-hidden rounded-full bg-muted"
+                >
+                  <div
+                    class="h-full rounded-full transition-all"
+                    class:bg-amber-500={warning}
+                    class:bg-primary={!warning}
+                    style={`width: ${Math.min(100, Math.max(0, progress))}%`}
+                  ></div>
+                </div>
+              {/if}
+            </div>
+          {/each}
+        </div>
+        {#if runTokensDetail}
+          <p class="text-[11px] text-muted-foreground" data-testid="workflow-run-tokens-detail">{runTokensDetail}</p>
+        {/if}
+      </div>
     {/if}
     {#if !budget.recorded && !preview}
       <p
@@ -91,7 +177,7 @@
           {#if !preview && item.key !== 'maxSessionSeconds'}
             <div class="space-y-1.5 pt-1">
               <p class="text-xs tabular-nums" class:text-amber-600={warning}>
-                {used === undefined ? 'Usage unavailable' : `${formatLimit(item.key, used)} used`}{warning
+                {formatBudgetUsage(budget, item.key, used)}{warning
                   ? progress! >= 100
                     ? ' · Limit reached'
                     : ' · Near limit'
@@ -122,8 +208,9 @@
     </div>
     <p class="text-xs leading-relaxed text-muted-foreground">
       Configured limits apply to agent turns and cumulative recovery checks. The cost threshold gates recovery turns and
-      can be exceeded by a completed turn. Usage reflects the active or last agent session; total workflow tokens cover
-      all sessions. The timeout restarts for each turn.
+      can be exceeded by a completed turn. Usage reflects the active or last agent session. The timeout restarts for
+      each turn. A run ceiling is checked against the whole run before each state and lane step; reaching it stops the
+      run, which resumes once the limit in its definition is raised.
     </p>
   </div>
 </section>

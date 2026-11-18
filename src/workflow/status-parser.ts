@@ -2,6 +2,18 @@ import YAML from 'yaml';
 import { z } from 'zod';
 import type { AgentOutput, AgentTransitionDefinition } from './types.js';
 import { CONFIDENCE_VALUES } from './types.js';
+import { WORKFLOW_COMMIT_CALLABLE } from '../trusted-process/workflow-commit-tool.js';
+
+/*
+ * Two status protocols exist. An agent whose coordinator offers the
+ * coordinator-owned `workflow_commit` tool (every orchestrator-run agent
+ * state in production) commits through it, and the orchestrator reads the
+ * recorded commit instead of parsing text: see the commit-tool section at
+ * the end of this file and `src/workflow/workflow-commit.ts`. The YAML
+ * `agent_status` block parsed here remains the protocol of sessions whose
+ * coordinator does not offer the tool (the `workflow run-state` debugging
+ * command, test doubles).
+ */
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -373,5 +385,93 @@ export function buildInvalidVerdictReprompt(
     'Please revise your response and use one of the valid verdicts above.',
     '',
     'Include the required `agent_status` YAML block with your chosen verdict in your revised response.',
+  ].join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Commit-tool protocol
+// ---------------------------------------------------------------------------
+
+/**
+ * Prompt input for an agent that commits through `workflow_commit`: the id
+ * of its open invocation (see `WorkflowCommitChannel.open`). Every prompt of
+ * that invocation (first visit, re-visit, recovery, replacement, artifact
+ * retry) carries the same id.
+ */
+export interface WorkflowCommitPrompt {
+  readonly invocationId: string;
+}
+
+/** Shared paragraphs of every commit-tool instruction block. */
+function commitToolPreamble(commit: WorkflowCommitPrompt, verdictExample: string): string[] {
+  return [
+    `When all your work is finished, commit this state's result by calling \`${WORKFLOW_COMMIT_CALLABLE}\` (run it with your code execution tool, like any other tool) as your LAST action, then end your turn:`,
+    '',
+    '```',
+    `${WORKFLOW_COMMIT_CALLABLE}({`,
+    `  invocation: ${JSON.stringify(commit.invocationId)},`,
+    `  verdict: ${JSON.stringify(verdictExample)},`,
+    '  notes: "brief summary of what was done",',
+    '  handoff: "your output for the next state",',
+    '});',
+    '```',
+    '',
+    `Your invocation id for this state is \`${commit.invocationId}\`. This state has NOT committed until that call succeeds: ending your turn without it does not finish the state, and you will be asked to continue. Do not call it before your work is complete; the first accepted commit is final.`,
+    '',
+    `This run does not read \`agent_status\` YAML blocks. Wherever your instructions ask for the agent_status block or its fields (verdict, notes), give them to \`${WORKFLOW_COMMIT_CALLABLE}\` instead, and put the output your role asks you to hand to the next agent (a directive, findings, a summary of your report) in \`handoff\`.`,
+  ];
+}
+
+const COMMIT_NOTES_FIELD = '- notes: brief summary passed to the next agent as context';
+const COMMIT_HANDOFF_FIELD =
+  '- handoff: everything the next state should receive from you as your output. It is recorded with the commit, so it reaches the next state even if your final message is cut short. When omitted, your final message is passed on instead.';
+
+/**
+ * Commit-tool counterpart of {@link MINIMAL_STATUS_INSTRUCTIONS} and
+ * {@link buildConditionalStatusInstructions}: the same verdict guidance,
+ * told as a `workflow.commit` call instead of a YAML block.
+ */
+export function buildCommitToolInstructions(
+  transitions: readonly AgentTransitionDefinition[],
+  guardLabels: Readonly<Record<string, string>>,
+  commit: WorkflowCommitPrompt,
+): string {
+  const verdictValues = extractVerdictValues(transitions);
+  const lines =
+    verdictValues.length > 0
+      ? [
+          ...commitToolPreamble(commit, verdictValues[0]),
+          '',
+          'Fields:',
+          `- verdict: determines what happens next. Set this to exactly one of: ${verdictValues.map((v) => `\`${v}\``).join(', ')}`,
+          COMMIT_NOTES_FIELD,
+          COMMIT_HANDOFF_FIELD,
+        ]
+      : [
+          ...commitToolPreamble(commit, 'completed'),
+          '',
+          'Fields:',
+          '- verdict: a free-form label summarizing your outcome (e.g. completed, needs_revision, inconclusive). It does not affect routing for this state but is logged for diagnostics.',
+          COMMIT_NOTES_FIELD,
+          COMMIT_HANDOFF_FIELD,
+        ];
+  appendGuardDescriptions(lines, transitions, guardLabels);
+  return lines.join('\n');
+}
+
+/**
+ * The continuation sent when a turn ended without an accepted
+ * `workflow_commit` for the open invocation. The state has not committed,
+ * so the agent is told to carry on with its work (a turn whose tool call was
+ * lost upstream ends exactly like a finished one) and to commit when done;
+ * it is never told to wrap up.
+ */
+export function buildMissingCommitReprompt(commit: WorkflowCommitPrompt, statusInstructions: string): string {
+  return [
+    `Your turn ended, but this state has not committed: there was no accepted \`${WORKFLOW_COMMIT_CALLABLE}\` call for invocation \`${commit.invocationId}\`.`,
+    '',
+    `If you still have work to do, continue it now. When the state's work is complete, commit its result with \`${WORKFLOW_COMMIT_CALLABLE}\` as your last action.`,
+    '',
+    statusInstructions,
   ].join('\n');
 }

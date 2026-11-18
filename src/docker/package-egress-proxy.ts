@@ -5,7 +5,10 @@
  * credential-swap, wildcard, dynamic-domain, or raw-passthrough mode. Every
  * client request must match one fixed package host and one parsed install
  * route. Redirects are validated and returned to the client; this listener
- * never follows one or delegates dialing to another proxy.
+ * never follows a client route's redirect or delegates dialing to another
+ * proxy. The only redirect it follows is on its own derived metadata read:
+ * PyPI's JSON API redirect to the same project's display-name spelling
+ * (`pypiJsonApiRedirectPath` in ./registry-proxy.ts).
  */
 
 import { constants, type Stats } from 'node:fs';
@@ -29,7 +32,18 @@ import {
   parseNpmUrl,
   parsePypiSimpleUrl,
   parsePypiTarballUrl,
+  pypiJsonApiPath,
+  pypiJsonApiRedirectPath,
 } from './registry-proxy.js';
+import {
+  createCargoVersionTimeReader,
+  createNpmVersionTimeReader,
+  createPypiFileTimeReader,
+  formatByteCeiling,
+  pypiDistributionFileKey,
+  RegistryMetadataError,
+  type StreamingMetadataReader,
+} from './registry-metadata.js';
 import {
   createPackageEgressLedger,
   DEFAULT_PACKAGE_EGRESS_LIMITS,
@@ -77,6 +91,7 @@ export const PACKAGE_EGRESS_AUDIT_REASON_CODES = [
   'policy-disabled',
   'client-metadata-unfiltered',
   'derived-metadata-fetched',
+  'derived-metadata-redirected',
   'derived-metadata-failed',
   'debian-curated-epoch',
   'policy-allow',
@@ -177,7 +192,12 @@ export const PACKAGE_EGRESS_HEALTH_REQUEST =
 const HEALTH_URL = 'http://ironcurtain.invalid/__ironcurtain/package-egress/health';
 const HEALTH_HOST = 'ironcurtain.invalid';
 const FIXED_USER_AGENT = 'IronCurtain-Package-Egress/1';
-const CREDENTIAL_HEADERS = new Set([
+/**
+ * Credential headers for package registries. This listener refuses a request
+ * that carries one. The standard registry proxy (`registry-proxy.ts`) never
+ * forwards one: its tests check this set against the headers it forwards.
+ */
+export const CREDENTIAL_HEADERS: ReadonlySet<string> = new Set([
   'authorization',
   'cookie',
   'npm-authorization',
@@ -201,7 +221,6 @@ const RESPONSE_HEADERS = new Set([
   'vary',
 ]);
 const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
-const MAX_DERIVED_METADATA_BYTES = 16 * 1024 * 1024;
 const MAX_AUDIT_REASON_CHARACTERS = 256;
 const MAX_AUDIT_FILE_BYTES = 16 * 1024 * 1024;
 
@@ -837,31 +856,15 @@ export function createPackageEgressProxy(options: CreatePackageEgressProxyOption
         decision.reason,
       );
     } else {
-      const derivedRoute = derivedMetadataRoute(pkg);
-      let publishedAt: Date | undefined;
-      try {
-        const body = await fetchDerivedMetadata(derivedRoute, client);
-        publishedAt = parseRequestedVersionTimestamp(pkg, body);
-        await appendAuditDecision(
-          derivedRoute,
-          'GET',
-          'derived',
-          'allow',
-          'derived-metadata-fetched',
-          'Source-owned metadata for the exact requested version was fetched',
-        );
-      } catch (error) {
-        await appendAuditDecision(
-          derivedRoute,
-          'GET',
-          'derived',
-          'deny',
-          'derived-metadata-failed',
-          boundedAuditReason(packageErrorMessage(error)),
-        );
-        throw error;
+      // An allowlisted package, or a policy without a quarantine, allows the
+      // artifact whatever its age: no derived metadata is needed or fetched.
+      const withoutMetadata = options.policy.validator.validate(pkg, undefined);
+      if (withoutMetadata.status === 'allow') {
+        decision = withoutMetadata;
+      } else {
+        const publishedAt = await derivePublishedAt(pkg, route, client);
+        decision = options.policy.validator.validate(pkg, publishedAt === undefined ? undefined : { publishedAt });
       }
-      decision = options.policy.validator.validate(pkg, publishedAt === undefined ? undefined : { publishedAt });
       await appendAuditDecision(
         route,
         exactMethod,
@@ -874,7 +877,78 @@ export function createPackageEgressProxy(options: CreatePackageEgressProxyOption
     if (decision.status !== 'allow') throw new PackageEgressError(403, decision.reason);
   }
 
-  async function fetchDerivedMetadata(route: PackageEgressRoute, client: ClientContext): Promise<Buffer> {
+  /**
+   * The publish time of one artifact from its source-owned metadata, with one
+   * audit record per derived request. The PyPI JSON API answers a project
+   * name spelled other than the project's display name with a redirect to it
+   * (`/pypi/django/json` to `/pypi/Django/json`); that one redirect, to the
+   * same project's JSON API on pypi.org (`pypiJsonApiRedirectPath`), is
+   * audited and read as a second derived request, which the per-client
+   * derived ceiling of two admits. Any other redirect fails closed with 502.
+   */
+  async function derivePublishedAt(
+    pkg: PackageIdentity,
+    artifact: PackageEgressRoute,
+    client: ClientContext,
+  ): Promise<Date | undefined> {
+    const first = await auditedDerivedRead(derivedMetadataRoute(pkg), artifact, client, true);
+    if (first.kind === 'published') return first.publishedAt;
+    const second = await auditedDerivedRead(first.route, artifact, client, false);
+    if (second.kind === 'published') return second.publishedAt;
+    throw new PackageEgressError(502, 'package metadata redirected more than once');
+  }
+
+  async function auditedDerivedRead(
+    route: PackageEgressRoute,
+    artifact: PackageEgressRoute,
+    client: ClientContext,
+    mayRedirect: boolean,
+  ): Promise<DerivedMetadataOutcome> {
+    try {
+      const outcome = await fetchDerivedPublishedAt(route, artifact, client, mayRedirect);
+      await appendAuditDecision(
+        route,
+        'GET',
+        'derived',
+        'allow',
+        outcome.kind === 'published' ? 'derived-metadata-fetched' : 'derived-metadata-redirected',
+        outcome.kind === 'published'
+          ? 'Source-owned metadata for the exact requested artifact was fetched'
+          : "Source-owned metadata redirected to the same project's canonical name",
+      );
+      return outcome;
+    } catch (error) {
+      await appendAuditDecision(
+        route,
+        'GET',
+        'derived',
+        'deny',
+        'derived-metadata-failed',
+        boundedAuditReason(packageErrorMessage(error)),
+      );
+      throw error;
+    }
+  }
+
+  /**
+   * Fetches the source-owned metadata for one artifact and returns that
+   * artifact's publish time: `time[version]` of an npm packument whose
+   * `versions` lists it, the `upload_time_iso_8601` of the PyPI file whose
+   * URL path is exactly the artifact's, or a crate version's `pubtime`. The
+   * document is scanned as it streams and never buffered, so its size is
+   * bounded only by the metadata ceiling and the request and session ledger.
+   * An artifact the metadata does not list fails closed with 403. With
+   * `mayRedirect`, a PyPI JSON API redirect to the same project
+   * ({@link derivedMetadataRedirect}) is returned instead of failing; its body
+   * is never read.
+   */
+  async function fetchDerivedPublishedAt(
+    route: PackageEgressRoute,
+    artifact: PackageEgressRoute,
+    client: ClientContext,
+    mayRedirect: boolean,
+  ): Promise<DerivedMetadataOutcome> {
+    const reader = derivedMetadataReader(artifact);
     let lease: PackageEgressUpstreamLease;
     try {
       lease = client.lease.admitDerived();
@@ -886,31 +960,41 @@ export function createPackageEgressProxy(options: CreatePackageEgressProxyOption
       operation.destroy();
       throw new PackageEgressError(413, 'package egress derived request exceeds its byte ceiling');
     }
+    // Derived metadata is read as it streams and never buffered (EGR-6), so
+    // this bounds the bytes one decision may spend, not memory.
+    const ceiling = Math.min(limits.maxDerivedMetadataBytes, limits.maxBytesPerRequest);
+    const tooLarge = (): PackageEgressError =>
+      new PackageEgressError(413, `package metadata exceeds the ${formatByteCeiling(ceiling)} metadata ceiling`);
     try {
       const response = await openUpstream('GET', route, operation);
       const status = response.statusCode ?? 502;
-      if (status !== 200) throw new PackageEgressError(502, `package metadata upstream returned status ${status}`);
+      const redirect = status !== 200 && mayRedirect ? derivedMetadataRedirect(route, response) : undefined;
+      if (status !== 200 && redirect === undefined) {
+        throw new PackageEgressError(502, `package metadata upstream returned status ${status}`);
+      }
       const headerBytes = estimateIncomingResponseHeaderBytes(response);
       if (!lease.charge(headerBytes)) {
         throw new PackageEgressError(413, 'package egress derived response headers exceed a byte ceiling');
       }
+      if (redirect !== undefined) return { kind: 'redirect', route: redirect };
       const declared = parseDeclaredLength(response.headersDistinct['content-length']);
-      if (declared !== undefined && declared > Math.min(MAX_DERIVED_METADATA_BYTES, limits.maxBytesPerRequest)) {
-        throw new PackageEgressError(413, 'package egress derived metadata exceeds its byte ceiling');
-      }
-      const chunks: Buffer[] = [];
+      if (declared !== undefined && declared > ceiling) throw tooLarge();
       let bytes = 0;
       for await (const rawChunk of response) {
         resetIdleTimer(client);
         assertClientActive(client);
         const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk as Uint8Array);
         bytes += chunk.length;
-        if (bytes > MAX_DERIVED_METADATA_BYTES || !lease.charge(chunk.length) || bytes > limits.maxBytesPerRequest) {
-          throw new PackageEgressError(413, 'package egress derived metadata exceeds its byte ceiling');
+        if (bytes > ceiling) throw tooLarge();
+        if (!lease.charge(chunk.length)) {
+          throw new PackageEgressError(413, 'package metadata exceeds the per-request or session byte ceiling');
         }
-        chunks.push(chunk);
+        reader.write(chunk);
       }
-      return Buffer.concat(chunks, bytes);
+      const time = reader.finish();
+      return { kind: 'published', publishedAt: time === undefined ? undefined : new Date(time) };
+    } catch (error) {
+      throw error instanceof RegistryMetadataError ? derivedMetadataError(error) : error;
     } finally {
       operation.destroy();
     }
@@ -1289,7 +1373,7 @@ function derivedMetadataRoute(pkg: PackageIdentity): PackageEgressRoute {
       return {
         ecosystem: 'pypi',
         host: 'pypi.org',
-        path: `/pypi/${pkg.name}/json`,
+        path: pypiJsonApiPath(pkg.name),
         kind: 'metadata',
         package: pkg,
       };
@@ -1306,72 +1390,60 @@ function derivedMetadataRoute(pkg: PackageIdentity): PackageEgressRoute {
   }
 }
 
-function parseRequestedVersionTimestamp(pkg: PackageIdentity, body: Buffer): Date | undefined {
-  if (pkg.version === undefined) throw new PackageEgressError(502, 'package artifact omitted its exact version');
-  if (pkg.registry === 'cargo') {
-    let found = false;
-    let timestamp: Date | undefined;
-    for (const rawLine of body.toString('utf8').split('\n')) {
-      const line = rawLine.trim();
-      if (line === '') continue;
-      const entry = parseJsonRecord(line, 'Cargo sparse-index line');
-      if (entry.vers !== pkg.version) continue;
-      if (found) throw new PackageEgressError(502, 'package metadata repeated the requested Cargo version');
-      found = true;
-      timestamp = parseOptionalTimestamp(entry.pubtime);
-    }
-    if (!found) throw new PackageEgressError(403, 'requested package version is absent from Cargo metadata');
-    return timestamp;
-  }
+/** A derived metadata read: the artifact's publish time, or the one redirect it may follow. */
+type DerivedMetadataOutcome =
+  | { readonly kind: 'published'; readonly publishedAt: Date | undefined }
+  | { readonly kind: 'redirect'; readonly route: PackageEgressRoute };
 
-  const document = parseJsonRecord(body.toString('utf8'), 'package metadata');
-  if (pkg.registry === 'npm') {
-    const versions = asRecord(document.versions);
-    if (versions === undefined || !Object.hasOwn(versions, pkg.version)) {
-      throw new PackageEgressError(403, 'requested package version is absent from npm metadata');
-    }
-    const timestamps = asRecord(document.time);
-    return timestamps === undefined ? undefined : parseOptionalTimestamp(timestamps[pkg.version]);
-  }
-  if (pkg.registry === 'pypi') {
-    const releases = asRecord(document.releases);
-    const files = releases?.[pkg.version];
-    if (!Array.isArray(files)) {
-      throw new PackageEgressError(403, 'requested package version is absent from PyPI metadata');
-    }
-    let earliest: Date | undefined;
-    for (const file of files) {
-      const record = asRecord(file);
-      const observed = parseOptionalTimestamp(record?.upload_time_iso_8601);
-      if (observed !== undefined && (earliest === undefined || observed < earliest)) earliest = observed;
-    }
-    return earliest;
-  }
-  throw new PackageEgressError(500, 'unsupported package metadata ecosystem');
+/**
+ * The derived route a PyPI JSON API answer redirects to, when it is the one
+ * redirect a derived read follows: a 301, 302, 307 or 308 whose single
+ * `Location` names the same project's JSON API on the same host
+ * (`pypiJsonApiRedirectPath`). Undefined for every other answer.
+ */
+function derivedMetadataRedirect(
+  route: PackageEgressRoute,
+  response: http.IncomingMessage,
+): PackageEgressRoute | undefined {
+  const pkg = route.package;
+  const locations = response.headersDistinct.location;
+  if (route.ecosystem !== 'pypi' || pkg === undefined || locations?.length !== 1) return undefined;
+  const path = pypiJsonApiRedirectPath(response.statusCode ?? 0, locations[0], route.host, pkg.name);
+  return path === undefined ? undefined : { ...route, path };
 }
 
-function parseJsonRecord(text: string, label: string): Record<string, unknown> {
-  let value: unknown;
-  try {
-    value = JSON.parse(text);
-  } catch (error) {
-    throw new PackageEgressError(502, `${label} is not valid JSON`, { cause: error });
+/**
+ * The streaming reader that finds one artifact's publish time in its derived
+ * metadata. npm and crates.io are gated per version. PyPI is gated per file:
+ * a release can gain files long after it was published, so the file whose
+ * `files.pythonhosted.org` path is exactly the artifact's (a sidecar is gated
+ * with its file) supplies its own upload time.
+ */
+function derivedMetadataReader(artifact: PackageEgressRoute): StreamingMetadataReader<number | undefined> {
+  const pkg = artifact.package;
+  if (pkg?.version === undefined) throw new PackageEgressError(502, 'package artifact omitted its exact version');
+  switch (pkg.registry) {
+    case 'npm':
+      return createNpmVersionTimeReader(pkg.version);
+    case 'pypi':
+      return createPypiFileTimeReader(pypiDistributionFileKey(artifact.path));
+    case 'cargo':
+      return createCargoVersionTimeReader(pkg.version);
+    case 'debian':
+      throw new PackageEgressError(500, 'Debian package policy does not use derived metadata');
   }
-  const record = asRecord(value);
-  if (record === undefined) throw new PackageEgressError(502, `${label} is not a JSON object`);
-  return record;
 }
 
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
-function parseOptionalTimestamp(value: unknown): Date | undefined {
-  if (typeof value !== 'string') return undefined;
-  const timestamp = new Date(value);
-  return Number.isFinite(timestamp.getTime()) ? timestamp : undefined;
+/** An artifact the metadata does not list is a policy denial (403); unreadable metadata is an upstream failure. */
+function derivedMetadataError(error: RegistryMetadataError): PackageEgressError {
+  switch (error.code) {
+    case 'absent':
+      return new PackageEgressError(403, error.message, { cause: error });
+    case 'limit':
+      return new PackageEgressError(413, error.message, { cause: error });
+    case 'malformed':
+      return new PackageEgressError(502, error.message, { cause: error });
+  }
 }
 
 function boundedAuditReason(reason: string): string {
@@ -1406,6 +1478,19 @@ function hasMalformedPercentEncoding(value: string): boolean {
   return false;
 }
 
+/**
+ * True unless a `.deb` path is spelled the way APT spells it. apt quotes `+`
+ * and `~` across the whole request URI as lowercase `%2b` and `%7e`, so
+ * `g++-12` arrives as `g%2b%2b-12_12.2.0-14_amd64.deb` and the pool directory
+ * of `libsigc++-2.0` as `libsigc%2b%2b-2.0`. Those two encodings are admitted
+ * in the pool directory, the package name and the version, and `%3a` (the
+ * epoch separator) in the version only; the literal characters are refused,
+ * so each artifact has exactly one accepted spelling. Every other escape
+ * (case variants, double encoding, encoded separators, dots or delimiters)
+ * and any escape in the architecture field fails. The exact path is
+ * forwarded; the package identity comes from the once-decoded file name
+ * (`parseDebianPackageUrl`), which also validates the name.
+ */
 function hasNonCanonicalDebianArtifactEncoding(path: string): boolean {
   const filenameStart = path.lastIndexOf('/') + 1;
   const filename = path.slice(filenameStart);
@@ -1414,12 +1499,12 @@ function hasNonCanonicalDebianArtifactEncoding(path: string): boolean {
   if (firstUnderscore < 1 || lastUnderscore <= firstUnderscore) return true;
   const versionStart = filenameStart + firstUnderscore + 1;
   const versionEnd = filenameStart + lastUnderscore;
-  if (/[+~:]/u.test(path.slice(versionStart, versionEnd))) return true;
+  if (/[+~]/u.test(path) || path.slice(versionStart, versionEnd).includes(':')) return true;
   for (let index = 0; index < path.length; index += 1) {
     if (path[index] !== '%') continue;
-    if (index < versionStart || index + 3 > versionEnd) return true;
+    if (index + 3 > versionEnd) return true;
     const encoded = path.slice(index, index + 3);
-    if (encoded !== '%2b' && encoded !== '%7e' && encoded !== '%3a') return true;
+    if (encoded !== '%2b' && encoded !== '%7e' && !(encoded === '%3a' && index >= versionStart)) return true;
     index += 2;
   }
   return false;
@@ -1773,11 +1858,20 @@ function listenOnSocket(server: http.Server, path: string): Promise<void> {
   });
 }
 
+/**
+ * Loopback-only TCP bind. The only TCP topology for this listener is Docker
+ * Desktop on macOS, whose host-gateway relay delivers container traffic to
+ * the host as loopback, so a wider bind would only expose the listener to the
+ * LAN (and trigger macOS firewall prompts). The connection-source guard and
+ * per-bundle proxy credential stay on top as defense in depth.
+ */
+const PACKAGE_EGRESS_TCP_LISTEN_HOST = '127.0.0.1';
+
 function listenOnTcp(server: http.Server, port: number): Promise<number> {
   return new Promise((resolve, reject) => {
     const onError = (error: Error): void => reject(error);
     server.once('error', onError);
-    server.listen(port, '0.0.0.0', () => {
+    server.listen(port, PACKAGE_EGRESS_TCP_LISTEN_HOST, () => {
       server.off('error', onError);
       const address = server.address();
       if (address === null || typeof address === 'string') {

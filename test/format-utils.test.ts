@@ -4,7 +4,12 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { formatDuration, formatRelativeTime, describeCronExpression } from '../src/cron/format-utils.js';
+import {
+  formatDuration,
+  formatRelativeTime,
+  describeCronExpression,
+  formatFailureStreak,
+} from '../src/cron/format-utils.js';
 
 // ---------------------------------------------------------------------------
 // formatDuration
@@ -54,6 +59,17 @@ describe('formatDuration', () => {
 // ---------------------------------------------------------------------------
 // formatRelativeTime
 // ---------------------------------------------------------------------------
+
+describe('formatFailureStreak', () => {
+  it('counts the failures in a row', () => {
+    expect(formatFailureStreak(1)).toBe('1 consecutive failure');
+    expect(formatFailureStreak(3)).toBe('3 consecutive failures');
+  });
+
+  it('shows a streak at the counting cap as open-ended', () => {
+    expect(formatFailureStreak(100)).toBe('100+ consecutive failures');
+  });
+});
 
 describe('formatRelativeTime', () => {
   const BASE = new Date('2026-03-06T09:00:00');

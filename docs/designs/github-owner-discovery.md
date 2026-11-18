@@ -1,6 +1,7 @@
 # Design: GitHub Owner Discovery for Policy Customization
 
-**Status:** Proposed
+**Status (2026-11-14):** Implemented (`src/pipeline/github-identity.ts`).
+
 **Date:** 2026-02-27
 **Author:** IronCurtain Engineering
 **Depends on:** Constitution Customizer (`constitution-customizer.md`), GitHub MCP server configuration

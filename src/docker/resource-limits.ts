@@ -44,13 +44,16 @@ export interface EffectiveDockerResources {
   readonly cpus: number | undefined;
 }
 
+/** The memory/CPU envelope the clamp operates on; the pids ceiling is not host-clamped. */
+export type ConfiguredDockerEnvelope = Pick<ResolvedDockerResourcesConfig, 'memoryMb' | 'cpus'>;
+
 /** Result of clamping configured limits against host capacity. */
 export interface ClampedDockerResources {
   readonly effective: EffectiveDockerResources;
   /** True if any clamp actually changed a value (for logging). */
   readonly clamped: boolean;
   /** The pre-clamp values (for diagnostics). */
-  readonly requested: ResolvedDockerResourcesConfig;
+  readonly requested: ConfiguredDockerEnvelope;
   /** The host capacity snapshot used for clamping. */
   readonly host: HostResources;
 }
@@ -99,7 +102,7 @@ export function getHostResources(): HostResources {
  *     never produce a request Docker would reject for being too small.
  */
 export function clampDockerResources(
-  configured: ResolvedDockerResourcesConfig,
+  configured: ConfiguredDockerEnvelope,
   host: HostResources = getHostResources(),
 ): ClampedDockerResources {
   const cpus = configured.cpus === null ? undefined : clampCpus(configured.cpus, host);
@@ -200,10 +203,10 @@ export async function isImagePresent(
  * parser knows Docker's error phrasing; Apple container failures fall
  * through to the generic stderr rendering).
  *
- * NOTE on `/usr/bin/true`: every Linux base image we ship (including
- * `alpine/socat`) has this at this path. We prefer the absolute path over
- * the shell builtin `true` so we don't depend on the image setting a
- * particular SHELL.
+ * NOTE on `/usr/bin/true`: every Linux base image we ship (including the
+ * alpine-based transport sidecar) has this at this path. We prefer the
+ * absolute path over the shell builtin `true` so we don't depend on the
+ * image setting a particular SHELL.
  */
 export async function probeDockerResources(
   image: string,

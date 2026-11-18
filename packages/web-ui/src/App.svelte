@@ -31,6 +31,8 @@
   import Workflows from './routes/Workflows.svelte';
   import Personas from './routes/Personas.svelte';
   import Settings from './routes/Settings.svelte';
+  import { describeSessionNotice } from './lib/session-notices.js';
+  import { SafeText } from '$lib/components/ui/safe-text/index.js';
 
   import { Button } from '$lib/components/ui/button/index.js';
   import { Input } from '$lib/components/ui/input/index.js';
@@ -195,6 +197,12 @@
       await resolveEscalation(escalationId, decision, whitelistSelection);
     } catch (err) {
       console.error('Failed to resolve escalation from modal:', err);
+      // Keep the dialog on screen so the modal can show why. When the failed
+      // escalation was the last one (ESCALATION_EXPIRED: the daemon announces
+      // the expiry before it sends the error reply), the empty-queue effect
+      // above has already closed the modal, and closing silently would look
+      // exactly like a successful approval of a call that was in fact denied.
+      escalationModalOpen = true;
       throw err;
     }
     // The escalation.resolved event may have already closed the modal via
@@ -346,12 +354,13 @@
               {appState.escalationCount}
             </Badge>
           {/if}
-          {#if item.id === 'workflows' && appState.pendingGates.size > 0}
+          {#if item.id === 'workflows' && appState.pendingGates.size + appState.pendingWorkflowEscalations.size > 0}
+            <!-- Human decisions waiting in workflows: gates plus blocked tool calls. -->
             <Badge
               variant="warning"
               class="ml-auto px-1.5 font-mono font-semibold min-w-[18px] text-center text-[10px] leading-none"
             >
-              {appState.pendingGates.size}
+              {appState.pendingGates.size + appState.pendingWorkflowEscalations.size}
             </Badge>
           {/if}
           {#if item.id === 'sessions' && appState.activeSessionCount > 0}
@@ -479,6 +488,25 @@
     </div>
 
     <main class="flex-1 min-h-0 overflow-y-auto">
+      {#each appState.retainedHostNotices ?? [] as entry (entry.key)}
+        {@const described = describeSessionNotice(entry.notice)}
+        <div role="alert" class="m-4 rounded-md border border-destructive bg-destructive/10 p-3 text-sm">
+          <strong><SafeText text={`Session #${entry.label}: ${described.title}`} /></strong>
+          <pre class="whitespace-pre-wrap"><SafeText text={described.detail} multiline /></pre>
+          <Button
+            variant="outline"
+            size="sm"
+            onclick={() => {
+              appState.retainedHostNotices = appState.retainedHostNotices.filter((held) => held.key !== entry.key);
+            }}>Dismiss warning</Button
+          >
+        </div>
+      {/each}
+      {#if appState.reviewRefreshError}
+        <div role="alert" class="m-4 rounded border border-warning/40 p-3 text-sm">
+          {appState.reviewRefreshError}
+        </div>
+      {/if}
       {#if appState.currentView === 'dashboard'}
         <Dashboard />
       {:else if appState.currentView === 'statistics'}

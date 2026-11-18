@@ -3,8 +3,9 @@
     WorkflowDetailDto,
     WorkflowSummaryDto,
     HumanGateRequestDto,
-    MessageLogEntry,
+    MessageLogEntryDto,
     WorkflowBudgetDto,
+    WorkflowEscalationDto,
   } from '$lib/types.js';
   import {
     appState,
@@ -12,10 +13,14 @@
     getWorkflowDetail,
     getWorkflowBudget,
     resolveWorkflowGate,
+    syncWorkflowGateFromDetail,
+    resolveWorkflowEscalation,
     getWorkflowFileTree,
     getWorkflowFileContent,
     getWorkflowArtifacts,
+    getWorkflowArtifactFile,
     getWorkflowMessageLog,
+    getWorkflowMessageLogEntry,
     getWorkflowReadme,
   } from '$lib/stores.svelte.js';
   import { RpcError } from '$lib/ws-client.js';
@@ -27,8 +32,10 @@
   import { Alert } from '$lib/components/ui/alert/index.js';
   import { Spinner } from '$lib/components/ui/spinner/index.js';
   import ResourceBudgetPanel from '$lib/components/features/resource-budget-panel.svelte';
+  import { formatWorkflowTokens } from '$lib/components/features/usage-format.js';
   import StateMachineGraph from '$lib/components/features/state-machine-graph.svelte';
   import GateReviewPanel from '$lib/components/features/gate-review-panel.svelte';
+  import WorkflowEscalationPanel from '$lib/components/features/workflow-escalation-panel.svelte';
   import WorkspaceBrowser from '$lib/components/features/workspace-browser.svelte';
   import MessageLogTimeline from '$lib/components/features/message-log-timeline.svelte';
   import WorkflowReadmeModal from '$lib/components/features/workflow-readme-modal.svelte';
@@ -71,7 +78,7 @@
   // Message-log section state. The list is collapsed initially and only
   // fetched once expanded (lazy load — D5 cursor pagination).
   let messageLogExpanded = $state(false);
-  let messageLogEntries = $state<MessageLogEntry[]>([]);
+  let messageLogEntries = $state<MessageLogEntryDto[]>([]);
   let messageLogLoading = $state(false);
   let messageLogHasMore = $state(false);
   let messageLogError = $state('');
@@ -136,7 +143,11 @@
           // making an unavailable budget hide the rest of the workflow.
           void refreshBudget();
         }
-        if (d.gate) appState.pendingGates = new Map(appState.pendingGates).set(d.gate.gateId, d.gate);
+        // The fresh detail is the server's view of this workflow's gate: it
+        // replaces any stale entry (a dismissal missed while disconnected)
+        // instead of being merged beside it. getWorkflowDetail has already
+        // done the same for the workflow's pending tool-call escalations.
+        syncWorkflowGateFromDetail(id, d);
       })
       .catch((err) => {
         if (cancelled || version !== fetchVersion) return;
@@ -224,6 +235,14 @@
   // confidence field is optional.
   const latestVerdict = $derived(detail?.latestVerdict);
 
+  // Run-wide tokens with their tracking quality: "Unavailable" when LLM
+  // statistics are off, "≥N" for a lower bound, a note when nothing has been
+  // observed yet. A daemon without the usage record only has the plain total.
+  const runTokens = $derived.by((): { value: string; detail?: string } => {
+    if (detail?.usage) return formatWorkflowTokens(detail.usage);
+    return { value: (detail?.context.totalTokens ?? 0).toLocaleString() };
+  });
+
   function formatConfidence(value: number | undefined): string | undefined {
     if (value === undefined || value === null) return undefined;
     if (Number.isNaN(value)) return undefined;
@@ -244,10 +263,43 @@
     gate && detail?.stateGraph ? detail.stateGraph.states.find((s) => s.id === gate.stateName)?.description : undefined,
   );
 
-  async function handleGateResolve(event: string, prompt?: string): Promise<void> {
+  // Tool calls blocked on a human decision. The store rebuilds them from each
+  // detail fetch (this view's and the reconnect refresh's, which also clear
+  // ones that ended while we were disconnected) and keeps them live with the
+  // workflow.escalation_* events.
+  const toolCallEscalations = $derived(
+    [...appState.pendingWorkflowEscalations.values()].filter((e) => e.workflowId === workflowId),
+  );
+  let resolvingEscalationId = $state<string | null>(null);
+
+  async function handleEscalationResolve(
+    escalation: WorkflowEscalationDto,
+    decision: 'approved' | 'denied',
+    whitelistSelection?: number,
+  ): Promise<void> {
+    resolveError = '';
+    resolvingEscalationId = escalation.escalationId;
+    try {
+      await resolveWorkflowEscalation(
+        workflowId,
+        escalation.escalationId,
+        decision,
+        decision === 'approved' ? whitelistSelection : undefined,
+      );
+      const next = new Map(appState.pendingWorkflowEscalations);
+      next.delete(escalation.escalationId);
+      appState.pendingWorkflowEscalations = next;
+    } catch (err) {
+      resolveError = `Failed to resolve the tool-call escalation: ${err instanceof Error ? err.message : String(err)}`;
+    } finally {
+      resolvingEscalationId = null;
+    }
+  }
+
+  async function handleGateResolve(gateId: string, event: string, prompt?: string): Promise<void> {
     resolveError = '';
     try {
-      await resolveWorkflowGate(workflowId, event, prompt);
+      await resolveWorkflowGate(workflowId, gateId, event, prompt);
     } catch (err) {
       resolveError = `Failed to resolve gate: ${err instanceof Error ? err.message : String(err)}`;
     }
@@ -315,18 +367,44 @@
   {:else if error}
     <Alert variant="destructive">{error}</Alert>
   {:else if detail}
-    {#if gate && summary.phase === 'waiting_human'}
-      <GateReviewPanel
-        {gate}
-        {workflowId}
-        workflowName={summary.name}
-        stateDescription={gateStateDescription}
-        refreshSignal={workspaceRefreshSignal}
-        onResolve={handleGateResolve}
-        fetchArtifacts={getWorkflowArtifacts}
-        fetchFileTree={getWorkflowFileTree}
-        fetchFileContent={getWorkflowFileContent}
+    {#if toolCallEscalations.length > 0}
+      <WorkflowEscalationPanel
+        escalations={toolCallEscalations}
+        busyId={resolvingEscalationId}
+        onresolve={handleEscalationResolve}
       />
+    {/if}
+    {#if gate && summary.phase === 'waiting_human'}
+      <!--
+        One panel instance per raise. The gate shown can switch to a new raise
+        without the panel unmounting in between (reconnect rebuild, the re-read
+        after a stale refusal, a gate_raised evicting a missed dismissal). Keyed
+        on the raise id, the new raise starts from scratch: no artifact content
+        cached for the earlier raise, no half-confirmed abort or feedback draft
+        that a click would then submit against a raise the user did not review.
+      -->
+      {#key gate.gateId}
+        <GateReviewPanel
+          {gate}
+          {workflowId}
+          workflowName={summary.name}
+          stateDescription={gateStateDescription}
+          refreshSignal={workspaceRefreshSignal}
+          layoutSignal={JSON.stringify([
+            toolCallEscalations.map((escalation) => escalation.escalationId),
+            resolveError,
+            budgetError,
+            appState.workflowReviewErrors.get(workflowId),
+            appState.refreshErrors.workflows,
+          ])}
+          reviewAvailable={!appState.workflowReviewErrors.has(workflowId) && !appState.refreshErrors.workflows}
+          onResolve={handleGateResolve}
+          fetchArtifacts={getWorkflowArtifacts}
+          fetchArtifactFile={getWorkflowArtifactFile}
+          fetchFileTree={getWorkflowFileTree}
+          fetchFileContent={getWorkflowFileContent}
+        />
+      {/key}
     {/if}
 
     {#if showErrorCallout}
@@ -380,12 +458,17 @@
             <p class="text-lg font-semibold tabular-nums">{detail.context.round}/{detail.context.maxRounds}</p>
           </CardContent>
         </Card>
-        <Card>
+        <Card data-testid="workflow-tokens-card">
           <CardContent>
             <p class="flex items-center gap-1.5 text-xs text-muted-foreground mb-1">
               <Lightning size={14} weight="duotone" /> Total Tokens
             </p>
-            <p class="text-lg font-semibold tabular-nums">{detail.context.totalTokens.toLocaleString()}</p>
+            <p class="text-lg font-semibold tabular-nums" data-testid="workflow-total-tokens">{runTokens.value}</p>
+            {#if runTokens.detail}
+              <p class="text-[11px] text-muted-foreground" data-testid="workflow-token-breakdown">
+                {runTokens.detail}
+              </p>
+            {/if}
           </CardContent>
         </Card>
         <Card>
@@ -527,6 +610,7 @@
               loading={messageLogLoading}
               hasMore={messageLogHasMore}
               onLoadOlder={loadOlderMessages}
+              fetchFullEntry={(ref) => getWorkflowMessageLogEntry(workflowId, ref)}
             />
           {/if}
         </CardContent>

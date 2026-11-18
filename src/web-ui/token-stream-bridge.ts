@@ -12,6 +12,7 @@ import type { WebSocket as WsWebSocket } from 'ws';
 import type { SessionId } from '../session/types.js';
 import { getTokenStreamBus } from '../docker/token-stream-bus.js';
 import type { TokenStreamEvent } from '../docker/token-stream-types.js';
+import { isBackpressured } from './ws-backpressure.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -286,7 +287,13 @@ export class TokenStreamBridge {
       recipients = merged;
     }
 
-    this.sender.sendToSubscribers(recipients, 'session.token_stream', { label, events });
+    // A client that has stopped reading keeps its place on the subscription
+    // but skips this batch: token deltas are display-only, so dropping them
+    // for a stalled tab is better than queueing megabytes behind it.
+    const ready = withoutBackpressured(recipients);
+    if (ready.size === 0) return;
+
+    this.sender.sendToSubscribers(ready, 'session.token_stream', { label, events });
   }
 
   /**
@@ -313,4 +320,16 @@ export class TokenStreamBridge {
       this.timers.delete(label);
     }
   }
+}
+
+/** The subset of `clients` whose send buffer is below the backpressure threshold (the input when all are). */
+function withoutBackpressured(clients: ReadonlySet<WsWebSocket>): ReadonlySet<WsWebSocket> {
+  let filtered: Set<WsWebSocket> | undefined;
+  for (const client of clients) {
+    if (isBackpressured(client)) {
+      filtered ??= new Set(clients);
+      filtered.delete(client);
+    }
+  }
+  return filtered ?? clients;
 }

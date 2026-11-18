@@ -71,6 +71,28 @@ describe('SessionSidebar', () => {
     });
   });
 
+  it('disables a persona whose compiled policy is stale (the daemon would refuse it)', async () => {
+    const loadPersonasFn = vi
+      .fn<() => Promise<PersonaListItem[]>>()
+      .mockResolvedValue([
+        makePersona({ name: 'coder', compiled: true }),
+        makePersona({ name: 'edited', compiled: true, stale: 'constitution' }),
+      ]);
+    render(SessionSidebar, { props: makeProps({ loadPersonasFn }) });
+
+    const personaSelect = screen.getByTestId('launch-persona') as HTMLSelectElement;
+    await waitFor(() => {
+      expect(Array.from(personaSelect.options).some((option) => option.value === 'edited')).toBe(true);
+    });
+    const options = Array.from(personaSelect.options);
+    const edited = options.find((option) => option.value === 'edited');
+    expect(edited?.disabled).toBe(true);
+    expect(edited?.textContent).toMatch(/\(policy stale\)/);
+    const coder = options.find((option) => option.value === 'coder');
+    expect(coder?.disabled).toBe(false);
+    expect(coder?.textContent).not.toMatch(/stale/);
+  });
+
   it('does not create when selecting launch options and submits only from start session', async () => {
     const oncreate = vi.fn<(opts: CreateSessionOptions) => void>();
     render(SessionSidebar, {
@@ -136,6 +158,61 @@ describe('SessionSidebar', () => {
     await fireEvent.click(screen.getByTestId('session-item-3'));
 
     expect(onselect).toHaveBeenCalledWith(3);
+  });
+
+  it('marks partial session token totals and omits tokens when they cannot be observed', () => {
+    const budget = mockSession(5).budget;
+    render(SessionSidebar, {
+      props: makeProps({
+        sessions: new Map([
+          [
+            5,
+            mockSession(5, {
+              turnCount: 2,
+              budget: {
+                ...budget,
+                totalTokens: 4200,
+                tokenTrackingStatus: 'partial',
+                observedExchanges: 3,
+                incompleteExchanges: 1,
+              },
+            }),
+          ],
+          [6, mockSession(6, { budget: { ...budget, totalTokens: 1500 } })],
+          [
+            7,
+            mockSession(7, {
+              budget: { ...budget, tokenTrackingAvailable: false, tokenTrackingStatus: 'unavailable' },
+            }),
+          ],
+          [8, mockSession(8, { budget: { ...budget, tokenTrackingStatus: 'partial', observedExchanges: 0 } })],
+        ]),
+      }),
+    });
+
+    expect(screen.getByTestId('session-usage-5').textContent).toContain(`≥${(4200).toLocaleString()} tokens`);
+    expect(screen.getByTestId('session-usage-6').textContent).toContain(`${(1500).toLocaleString()} tokens`);
+    expect(screen.getByTestId('session-usage-6').textContent).not.toContain('≥');
+    expect(screen.getByTestId('session-usage-7').textContent).not.toContain('tokens');
+    expect(screen.getByTestId('session-usage-8').textContent).toContain('no exchanges observed yet');
+  });
+
+  it('shows the session cost with its source: unknown, a lower bound, or the amount', () => {
+    const budget = mockSession(1).budget;
+    render(SessionSidebar, {
+      props: makeProps({
+        sessions: new Map([
+          [1, mockSession(1, { budget: { ...budget, estimatedCostUsd: 0, costSource: 'unknown' } })],
+          [2, mockSession(2, { budget: { ...budget, estimatedCostUsd: 0.4, costSource: 'partial' } })],
+          [3, mockSession(3, { budget: { ...budget, estimatedCostUsd: 1.25 } })],
+        ]),
+      }),
+    });
+
+    expect(screen.getByTestId('session-usage-1').textContent).toContain('unknown');
+    expect(screen.getByTestId('session-usage-1').textContent).not.toContain('$0.00');
+    expect(screen.getByTestId('session-usage-2').textContent).toContain('≥ $0.40');
+    expect(screen.getByTestId('session-usage-3').textContent).toContain('$1.25');
   });
 
   it('shows a live stopping state for sessions awaiting process exit', () => {

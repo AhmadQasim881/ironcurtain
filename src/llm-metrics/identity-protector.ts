@@ -10,6 +10,8 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  renameSync,
+  rmSync,
   unlinkSync,
   writeSync,
 } from 'node:fs';
@@ -23,13 +25,29 @@ import type { GatewayRouteAttempt, LlmExchangeCompleted, LlmModelIdentity, Sourc
 const IDENTITY_KEY_BYTES = 32;
 const HMAC_BYTES = 16;
 const IDENTITY_KEY_FILENAME = 'identity.key';
+/** How often a running protector looks for a rotated key file (one lstat). */
+const KEY_RECHECK_INTERVAL_MS = 2_000;
 
 export type StatisticsIdentityNamespace =
   'agent' | 'correlation' | 'conversation' | 'model' | 'persona' | 'profile' | 'provider' | 'route' | 'state';
 
-export interface PersistenceIdentityProtector {
-  /** Stable local pseudonym. Raw input and the key are never exposed. */
+/**
+ * Built-in agent adapter ids. They are public product names (the Docker
+ * agent registry's built-ins), so rows store them raw; any other agent id is
+ * still pseudonymized. Keep in sync with `registerBuiltinAdapters()`.
+ */
+export const PUBLIC_AGENT_IDS: readonly string[] = Object.freeze(['claude-code', 'codex', 'goose']);
+const PUBLIC_AGENT_ID_SET: ReadonlySet<string> = new Set(PUBLIC_AGENT_IDS);
+
+/** A local pseudonym as stored in statistics rows. */
+export const PROTECTED_LABEL_PATTERN = /^hmac:[a-f0-9]{32}$/;
+
+export interface StatisticsLabelProtector {
+  /** Stable local pseudonym under the current key. Raw input and the key are never exposed. */
   protectLabel(namespace: StatisticsIdentityNamespace, value: string): string;
+}
+
+export interface PersistenceIdentityProtector extends StatisticsLabelProtector {
   /** Immutable copy suitable for durable enqueue. The live event remains untouched. */
   protectExchange(exchange: LlmExchangeCompleted): LlmExchangeCompleted;
 }
@@ -55,13 +73,23 @@ function ensureStatisticsDirectory(statisticsDirectory: string): void {
   chmodSync(statisticsDirectory, 0o700);
 }
 
-function readIdentityKey(keyPath: string): Buffer {
+interface IdentityKey {
+  readonly key: Buffer;
+  /** Identity of the key file the key was read from, to notice a rotation. */
+  readonly fileIdentity: string;
+}
+
+function fileIdentity(status: { readonly dev: number; readonly ino: number; readonly size: number }): string {
+  return `${status.dev}:${status.ino}:${status.size}`;
+}
+
+function readIdentityKey(keyPath: string): IdentityKey {
   const status = lstatSync(keyPath);
   if (!status.isFile() || status.isSymbolicLink()) throw new Error('Statistics identity key must be a regular file');
   chmodSync(keyPath, 0o600);
   const key = readFileSync(keyPath);
   if (key.length !== IDENTITY_KEY_BYTES) throw new Error('Statistics identity key has an invalid length');
-  return key;
+  return { key, fileIdentity: fileIdentity(status) };
 }
 
 function writeCompleteFile(path: string, contents: Buffer): void {
@@ -80,15 +108,16 @@ function writeCompleteFile(path: string, contents: Buffer): void {
  * Losing processes observe EEXIST only after the winning inode is fully
  * written and fsynced, so readers can never see a partially initialized key.
  */
-function loadOrCreateIdentityKey(statisticsDirectory: string): Buffer {
+function candidateKeyPath(statisticsDirectory: string): string {
+  return join(statisticsDirectory, `.${IDENTITY_KEY_FILENAME}.${process.pid}.${randomBytes(12).toString('hex')}.tmp`);
+}
+
+function loadOrCreateIdentityKey(statisticsDirectory: string): IdentityKey {
   ensureStatisticsDirectory(statisticsDirectory);
   const keyPath = getLlmStatisticsIdentityKeyPath(statisticsDirectory);
   if (existsSync(keyPath)) return readIdentityKey(keyPath);
 
-  const candidatePath = join(
-    statisticsDirectory,
-    `.${IDENTITY_KEY_FILENAME}.${process.pid}.${randomBytes(12).toString('hex')}.tmp`,
-  );
+  const candidatePath = candidateKeyPath(statisticsDirectory);
   writeCompleteFile(candidatePath, randomBytes(IDENTITY_KEY_BYTES));
   try {
     try {
@@ -100,6 +129,36 @@ function loadOrCreateIdentityKey(statisticsDirectory: string): Buffer {
     unlinkSync(candidatePath);
   }
   return readIdentityKey(keyPath);
+}
+
+/**
+ * Replace the identity key with a fresh one: a complete, fsynced inode
+ * atomically renamed over the old key. Labels derived afterwards cannot be
+ * linked to labels derived from the old key, so this is part of an explicit
+ * statistics reset (after the rows are deleted). Running protectors pick the
+ * new key up within a few seconds.
+ */
+export function rotateLlmStatisticsIdentityKey(statisticsDirectory: string): void {
+  ensureStatisticsDirectory(statisticsDirectory);
+  const keyPath = getLlmStatisticsIdentityKeyPath(statisticsDirectory);
+  if (existsSync(keyPath)) {
+    const status = lstatSync(keyPath);
+    if (!status.isFile() || status.isSymbolicLink()) throw new Error('Statistics identity key must be a regular file');
+  }
+  const candidatePath = candidateKeyPath(statisticsDirectory);
+  writeCompleteFile(candidatePath, randomBytes(IDENTITY_KEY_BYTES));
+  try {
+    renameSync(candidatePath, keyPath);
+  } catch (error) {
+    rmSync(candidatePath, { force: true });
+    throw error;
+  }
+  const directory = openSync(statisticsDirectory, constants.O_RDONLY);
+  try {
+    fsyncSync(directory);
+  } finally {
+    closeSync(directory);
+  }
 }
 
 function recognizedPublicOrigin(value: string | null): string | null {
@@ -163,20 +222,61 @@ function protectRouteAttempt(
   };
 }
 
+function labelDigest(key: Buffer, namespace: StatisticsIdentityNamespace, value: string): string {
+  const digest = createHmac('sha256', key)
+    .update(namespace, 'utf8')
+    .update('\0', 'utf8')
+    .update(value, 'utf8')
+    .digest()
+    .subarray(0, HMAC_BYTES)
+    .toString('hex');
+  return `hmac:${digest}`;
+}
+
+/**
+ * The current key, re-read when the key file is replaced (a statistics reset
+ * rotates it). A missing key is recreated; an unreadable one throws, and the
+ * previous key is dropped rather than kept, so no record is protected with a
+ * key that should no longer be used. A clock that moved backwards forces a
+ * re-check instead of postponing it.
+ */
+function keyHolder(load: () => IdentityKey | undefined, keyPath: string): () => Buffer | undefined {
+  let current = load();
+  let checkedAt = Date.now();
+  return () => {
+    const now = Date.now();
+    if (now >= checkedAt && now - checkedAt < KEY_RECHECK_INTERVAL_MS) return current?.key;
+    checkedAt = now;
+    try {
+      let identity: string | undefined;
+      try {
+        identity = fileIdentity(lstatSync(keyPath));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      if (identity === undefined || identity !== current?.fileIdentity) current = load();
+    } catch (error) {
+      current = undefined;
+      throw error;
+    }
+    return current?.key;
+  };
+}
+
 export function createPersistenceIdentityProtector(statisticsDirectory: string): PersistenceIdentityProtector {
-  const key = loadOrCreateIdentityKey(statisticsDirectory);
+  const currentKey = keyHolder(
+    () => loadOrCreateIdentityKey(statisticsDirectory),
+    getLlmStatisticsIdentityKeyPath(statisticsDirectory),
+  );
   const protectLabel = (namespace: StatisticsIdentityNamespace, value: string): string => {
-    const digest = createHmac('sha256', key)
-      .update(namespace, 'utf8')
-      .update('\0', 'utf8')
-      .update(value, 'utf8')
-      .digest()
-      .subarray(0, HMAC_BYTES)
-      .toString('hex');
-    return `hmac:${digest}`;
+    const key = currentKey();
+    if (key === undefined) throw new Error('Statistics identity key is unavailable');
+    return labelDigest(key, namespace, value);
   };
   const always = (namespace: StatisticsIdentityNamespace, value: string | null): string | null =>
     value === null ? null : protectLabel(namespace, value);
+  const agent = (value: string | null): string | null =>
+    value === null ? null : PUBLIC_AGENT_ID_SET.has(value) ? value : protectLabel('agent', value);
   const safeModel = (value: string | null): string | null =>
     value === null ? null : (asIdentifier(value) ?? protectLabel('model', value));
   const safeCorrelation = (value: string | null): string | null =>
@@ -194,7 +294,7 @@ export function createPersistenceIdentityProtector(statisticsDirectory: string):
           agentConversationId: always('conversation', exchange.attribution.agentConversationId),
           stateId: always('state', exchange.attribution.stateId),
           personaId: always('persona', exchange.attribution.personaId),
-          agentId: always('agent', exchange.attribution.agentId),
+          agentId: agent(exchange.attribution.agentId),
         }),
         route: Object.freeze({
           ...exchange.route,
@@ -229,6 +329,24 @@ export function createPersistenceIdentityProtector(statisticsDirectory: string):
   });
 }
 
+/**
+ * Label-only access to an existing key, for read paths that must not create
+ * one (`ironcurtain statistics summary`). Undefined when no key exists yet:
+ * then no stored row carries a pseudonym from it either.
+ */
+export function loadStatisticsLabelProtector(statisticsDirectory: string): StatisticsLabelProtector | undefined {
+  const keyPath = getLlmStatisticsIdentityKeyPath(statisticsDirectory);
+  if (!existsSync(keyPath)) return undefined;
+  const currentKey = keyHolder(() => (existsSync(keyPath) ? readIdentityKey(keyPath) : undefined), keyPath);
+  return Object.freeze({
+    protectLabel: (namespace: StatisticsIdentityNamespace, value: string): string => {
+      const key = currentKey();
+      if (key === undefined) throw new Error('Statistics identity key is unavailable');
+      return labelDigest(key, namespace, value);
+    },
+  });
+}
+
 /** Wrap every runtime-exposed durable enqueue without changing live bus events. */
 export function protectLlmMetricsRepository(
   repository: LlmMetricsRepository,
@@ -242,6 +360,9 @@ export function protectLlmMetricsRepository(
     snapshotMaxSequence: () => repository.snapshotMaxSequence(),
     scan: (query) => repository.scan(query),
     dimensionValues: (dimension, query) => repository.dimensionValues(dimension, query),
+    aggregate: (query) => repository.aggregate(query),
+    distribution: (query) => repository.distribution(query),
+    sessionTotals: (query) => repository.sessionTotals(query),
     deleteBefore: (cutoffMs, options) => repository.deleteBefore(cutoffMs, options),
   };
   return Object.freeze(protectedRepository);

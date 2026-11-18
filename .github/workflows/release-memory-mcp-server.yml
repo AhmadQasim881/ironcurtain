@@ -1,5 +1,12 @@
 name: Release memory-mcp-server
 
+# Split like release.yml so that no job that runs dependency, build or test
+# code holds a credential that can publish or write (BLD-4): build and test
+# are read-only, publish holds only id-token: write behind the protected
+# `npm-publish` Environment and installs nothing, and release-notes holds
+# contents: write. As in release.yml, build and publish restore no Actions
+# cache. A tag must be memory-mcp-server/v<package.json version>.
+
 on:
   push:
     tags:
@@ -12,65 +19,189 @@ on:
         default: false
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
+
+env:
+  # Exact release toolchain; see release.yml. Node 24.22.2 bundles npm 11.19.1
+  # (trusted publishing needs >= 11.5.1). memory-mcp-server does not use
+  # isolated-vm, but the root install does, and Node 24 has its prebuild.
+  NODE_VERSION: '24.22.2'
+  NPM_VERSION: '11.19.1'
+  # safe-chain, pinned by publication date (see release.yml).
+  SAFE_CHAIN_BEFORE: '2026-10-01'
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      tarball: ${{ steps.pack.outputs.tarball }}
+      sha256: ${{ steps.pack.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v7
         with:
-          # Node 24 has an isolated-vm 7.0.1 prebuild. memory-mcp-server doesn't
-          # use isolated-vm, so pin a supported prebuilt line for the root install.
-          node-version: 24
-          cache: npm
-          registry-url: https://registry.npmjs.org
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
 
-      - name: Resolve release tag and version
+      - name: Resolve release tag and check it matches package.json
         id: meta
         run: |
-          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
-            tag="$GITHUB_REF_NAME"
-          else
-            pkg_version="$(node -p "require('./packages/memory-mcp-server/package.json').version")"
-            tag="memory-mcp-server/v${pkg_version}"
+          version="$(node -p "require('./packages/memory-mcp-server/package.json').version")"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::packages/memory-mcp-server/package.json version '$version' is not a plain semver version"
+            exit 1
           fi
-          version="${tag#memory-mcp-server/}"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag="$GITHUB_REF_NAME"
+            if [ "$tag" != "memory-mcp-server/v$version" ]; then
+              echo "::error::tag $tag does not match package.json version $version (expected memory-mcp-server/v$version)"
+              exit 1
+            fi
+          else
+            tag="memory-mcp-server/v$version"
+          fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Releasing $tag (npm publish uses the version in package.json)"
+          echo "Releasing $tag"
 
-      - name: Install Aikido safe-chain for supply chain protection
-        run: npm install -g @aikidosec/safe-chain && safe-chain setup
+      - name: Install Aikido safe-chain (pinned)
+        run: |
+          npm install --global @aikidosec/safe-chain --before="$SAFE_CHAIN_BEFORE"
+          safe-chain setup-ci
 
-      - name: Upgrade npm for OIDC trusted publishing support
-        run: npm install -g npm@latest
-
-      - run: npm ci
-
-      - name: Lint
-        run: npm run lint --workspace packages/memory-mcp-server
-
-      - name: Format check
-        run: npm run format:check --workspace packages/memory-mcp-server
-
+      # tsc needs no dependency lifecycle script, so none runs in the job that
+      # makes the tarball.
+      - name: Install dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
       - name: Build
         run: npm run build --workspace packages/memory-mcp-server
 
+      - name: Pack the npm tarball
+        id: pack
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          dest="$RUNNER_TEMP/npm-package"
+          mkdir -p "$dest"
+          npm pack --workspace packages/memory-mcp-server --ignore-scripts --pack-destination "$dest"
+          tarball="provos-memory-mcp-server-$VERSION.tgz"
+          if [ "$(ls -A "$dest")" != "$tarball" ]; then
+            echo "::error::expected exactly $tarball in $dest, found: $(ls -A "$dest" | tr '\n' ' ')"
+            exit 1
+          fi
+          sha256="$(sha256sum "$dest/$tarball" | cut -d' ' -f1)"
+          echo "Packed $tarball sha256=$sha256"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+      - name: Upload the tarball for the publish job
+        uses: actions/upload-artifact@v7
+        with:
+          name: npm-package
+          path: ${{ runner.temp }}/npm-package/${{ steps.pack.outputs.tarball }}
+          if-no-files-found: error
+          retention-days: 7
+
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Install Aikido safe-chain (pinned)
+        run: |
+          npm install --global @aikidosec/safe-chain --before="$SAFE_CHAIN_BEFORE"
+          safe-chain setup-ci
+      # Retried as in ci.yml: some dependencies' postinstall scripts download
+      # native binaries from a CDN, which intermittently fails on runners.
+      - name: Install dependencies (retry on transient network failure)
+        run: |
+          for attempt in 1 2 3; do
+            if npm ci --foreground-scripts; then exit 0; fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::npm ci attempt $attempt failed; cleaning and retrying in 15s"
+              rm -rf node_modules
+              sleep 15
+            fi
+          done
+          echo "::error::npm ci failed after 3 attempts"
+          exit 1
+      - name: Lint
+        run: npm run lint --workspace packages/memory-mcp-server
+      - name: Format check
+        run: npm run format:check --workspace packages/memory-mcp-server
+      - name: Build
+        run: npm run build --workspace packages/memory-mcp-server
       - name: Test
         run: npm test --workspace packages/memory-mcp-server
 
-      - name: Publish to npm
-        if: ${{ !inputs.dry_run }}
-        run: npm publish --workspace packages/memory-mcp-server --provenance
-
-      - name: Create GitHub Release
-        if: ${{ !inputs.dry_run }}
+  publish:
+    needs: [build, test]
+    # A tag push, or a manual run on the default branch that is not a dry run.
+    if: ${{ !inputs.dry_run && (github.ref_type == 'tag' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) }}
+    runs-on: ubuntu-latest
+    # Configure this Environment with required reviewers; its approval gates
+    # the only job that can mint an npm publish token. It is shared with
+    # release.yml, so its deployment rules must allow the v* and
+    # memory-mcp-server/v* tags and, for a manual release, the default branch.
+    environment:
+      name: npm-publish
+      url: https://www.npmjs.com/package/@provos/memory-mcp-server/v/${{ needs.build.outputs.version }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Check npm supports trusted publishing
         run: |
-          gh release create "${{ steps.meta.outputs.tag }}" \
-            --title "memory-mcp-server ${{ steps.meta.outputs.version }}" \
-            --generate-notes
+          actual="$(npm --version)"
+          if [ "$actual" != "$NPM_VERSION" ]; then
+            echo "::error::expected npm $NPM_VERSION (bundled with Node $NODE_VERSION), found $actual"
+            exit 1
+          fi
+      - name: Download the tarball the build job packed
+        uses: actions/download-artifact@v8
+        with:
+          name: npm-package
+          path: ${{ runner.temp }}/npm-package
+      - name: Verify the tarball checksum
+        env:
+          TARBALL: ${{ needs.build.outputs.tarball }}
+          SHA256: ${{ needs.build.outputs.sha256 }}
+        run: echo "$SHA256  $RUNNER_TEMP/npm-package/$TARBALL" | sha256sum --check --strict
+      - name: Publish to npm
+        env:
+          TARBALL: ${{ needs.build.outputs.tarball }}
+        run: npm publish "$RUNNER_TEMP/npm-package/$TARBALL" --provenance --ignore-scripts --access public
+
+  release-notes:
+    needs: [build, publish]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # --target only matters for a manual run, where the tag does not exist
+      # yet: it is created on the commit that was built and published.
+      - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: >-
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA"
+          --title "memory-mcp-server v$VERSION" --generate-notes

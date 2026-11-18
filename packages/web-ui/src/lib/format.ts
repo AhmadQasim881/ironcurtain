@@ -1,3 +1,16 @@
+import type { BudgetCostSource } from './types.js';
+
+/**
+ * A session or run cost: `$1.23`, `≥ $1.23` when only part of the exchanges
+ * reported a cost (a lower bound), or `unknown` when none did. A Docker
+ * session without any cost source must not read as a free `$0.00`.
+ */
+export function formatCostUsd(usd: number, source?: BudgetCostSource): string {
+  if (source === 'unknown') return 'unknown';
+  const amount = `$${usd.toFixed(2)}`;
+  return source === 'partial' ? `≥ ${amount}` : amount;
+}
+
 /**
  * Formats an ISO timestamp as a compact relative string. Entries older than a
  * week fall back to a locale date; invalid inputs use a neutral placeholder.

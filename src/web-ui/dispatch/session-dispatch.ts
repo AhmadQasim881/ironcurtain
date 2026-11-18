@@ -27,13 +27,12 @@ import {
 import { tokenStreamDispatch } from './token-stream-dispatch.js';
 import { ptyDispatch } from './pty-dispatch.js';
 import { WebSessionTransport } from '../web-session-transport.js';
+import { endManagedSession } from '../web-session-teardown.js';
 import { loadConfig } from '../../config/index.js';
 import { getWorkspaceLabel, scanResumableSessions, validateResumeSession } from '../../pty/session-scanner.js';
 import { createStandaloneSession } from '../../session/index.js';
 import { shouldAutoSaveMemory } from '../../memory/auto-save.js';
 import { BudgetExhaustedError } from '../../types/errors.js';
-import type { SessionId } from '../../session/types.js';
-import { getTokenStreamBus } from '../../docker/token-stream-bus.js';
 import * as logger from '../../logger.js';
 
 // ---------------------------------------------------------------------------
@@ -122,8 +121,7 @@ export async function sessionDispatch(
         ctx.ptySessionManager.end(label);
         return;
       }
-      const endManaged = ctx.sessionManager.get(label);
-      await endManagedSession(ctx, label, endManaged?.session.getInfo().id, 'user_ended');
+      await endManagedSession(ctx, label, 'user_ended');
       return;
     }
     case 'sessions.send': {
@@ -167,23 +165,6 @@ export async function sessionDispatch(
 /** Clean up session queue entry when session ends. */
 function cleanupSessionQueue(ctx: DispatchContext, label: number): void {
   ctx.sessionQueues.delete(label);
-}
-
-/**
- * Ends a managed session through the full teardown sequence. `session.ended`
- * is emitted last, after the session is gone from the manager, per the
- * ordering contract on `WebEventMap['session.ended']`.
- */
-async function endManagedSession(
-  ctx: DispatchContext,
-  label: number,
-  sessionId: SessionId | undefined,
-  reason: string,
-): Promise<void> {
-  await ctx.sessionManager.end(label);
-  if (sessionId) getTokenStreamBus().endSession(sessionId);
-  cleanupSessionQueue(ctx, label);
-  ctx.eventBus.emit('session.ended', { label, reason });
 }
 
 function listSessions(ctx: DispatchContext): SessionDto[] {
@@ -329,17 +310,13 @@ async function createWebSession(
     managed.runPromise = runPromise;
   }
 
-  const sessionId = session.getInfo().id;
+  // run() resolves when the transport is closed. In the normal case that close
+  // came from endManagedSession (via SessionManager.end), whose teardown is
+  // still in flight when this callback runs; the helper then simply joins it.
+  // Only a transport closed by some other path performs a teardown here, so a
+  // web session is never closed twice and `session.ended` is emitted once.
   runPromise
-    .then(() => {
-      const m = ctx.sessionManager.get(label);
-      if (m) {
-        ctx.sessionManager.end(label).catch((err: unknown) => {
-          logger.error(`[WebUI] Failed to clean up session #${label}: ${String(err)}`);
-        });
-      }
-      getTokenStreamBus().endSession(sessionId);
-    })
+    .then(() => endManagedSession(ctx, label, 'transport_closed'))
     .catch((err: unknown) => {
       logger.error(`[WebUI] Transport #${label} error: ${String(err)}`);
     })
@@ -383,7 +360,7 @@ function sendToSession(ctx: DispatchContext, label: number, text: string): { acc
       }
     } catch (err) {
       if (err instanceof BudgetExhaustedError) {
-        await endManagedSession(ctx, label, managed.session.getInfo().id, `Budget exhausted: ${err.message}`);
+        await endManagedSession(ctx, label, `Budget exhausted: ${err.message}`);
       } else {
         const message = err instanceof Error ? err.message : String(err);
         ctx.eventBus.emit('session.output', { label, text: `Error: ${message}`, turnNumber });

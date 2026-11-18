@@ -21,7 +21,8 @@ import {
   type ClientState,
   type ProxiedTool,
 } from '../src/trusted-process/tool-call-pipeline.js';
-import type { CompiledPolicyFile, ToolAnnotationsFile } from '../src/pipeline/types.js';
+import type { CompiledPolicyFile } from '../src/pipeline/types.js';
+import { withInputSchemas } from './fixtures/test-policy.js';
 import type { McpRoot } from '../src/trusted-process/mcp-client-manager.js';
 
 /**
@@ -36,6 +37,9 @@ import type { McpRoot } from '../src/trusted-process/mcp-client-manager.js';
  *
  * This test uses a real `@modelcontextprotocol/server-filesystem` and
  * routes through `handleCallTool` so the retry code path is exercised.
+ * The tool map deliberately omits `list_allowed_directories`: with it,
+ * the pipeline reads the server's roots back after the refresh (see
+ * test/roots-toctou.test.ts) and there is no race left to retry.
  */
 describe('MCP roots-expansion race -- handleCallTool retry', () => {
   const RAW_DIR_A = `/tmp/ironcurtain-roots-race-a-${process.pid}`;
@@ -166,7 +170,7 @@ describe('MCP roots-expansion race -- handleCallTool retry', () => {
       ],
     };
 
-    const toolAnnotations: ToolAnnotationsFile = {
+    const toolAnnotations = withInputSchemas({
       generatedAt: 'test-fixture',
       servers: {
         filesystem: {
@@ -182,7 +186,7 @@ describe('MCP roots-expansion race -- handleCallTool retry', () => {
           ],
         },
       },
-    };
+    });
 
     const policyEngine = new PolicyEngine(
       compiledPolicy,
@@ -237,7 +241,7 @@ describe('MCP roots-expansion race -- handleCallTool retry', () => {
     // This call triggers:
     // 1. Policy engine evaluates → escalate (DIR_B outside sandbox)
     // 2. Escalation file written → auto-approver writes response
-    // 3. Root expanded for DIR_B → addRootToClient sends rootsListChanged
+    // 3. Root expanded for DIR_B → addRootsToClient sends rootsListChanged
     // 4. Tool call issued → may get "access denied" (race condition)
     // 5. isRootsRaceError check → retry after ROOTS_RACE_RETRY_DELAY_MS
     const result = await handleCallTool('read_file', { path: `${DIR_B}/secret.txt` }, deps);

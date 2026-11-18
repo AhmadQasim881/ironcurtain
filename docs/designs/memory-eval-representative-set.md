@@ -1,11 +1,13 @@
 # A Representative Eval Set for Memory Hybrid-Fusion Retrieval — Feasibility & Proposal
 
-Status: **Proposal + feasibility assessment** (2026-06-21). NOT an implementation. Scopes whether we
+**Status (2026-11-14):** Proposal (2026-06-21): a feasibility assessment, not implemented.
+
+Scope: **Proposal + feasibility assessment** (2026-06-21). NOT an implementation. Scopes whether we
 can synthesize a *production-representative* retrieval eval from Claude Code session logs to fix the
 metadata-flatness bug that broke the first ASI-Evolve dogfood. Every load-bearing claim is grounded
 in `file:line` or a measured artifact.
 
-Read-with: [`evolve-memory-fusion-dogfood.md`](./evolve-memory-fusion-dogfood.md) (the harness we
+Read-with: [`evolve-memory-fusion-dogfood.md`](../../.claude/agent-memory/clean-implementer/evolve-memory-fusion-dogfood.md) (kept in the agent memory, not under `docs/designs/`; the harness we
 already built — reuse it), [`evolve-target-workloads.md`](./evolve-target-workloads.md) §2 (why this
 dogfood exists).
 

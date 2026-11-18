@@ -1,4 +1,11 @@
-import { HOST_MODEL_ROLES } from './user-config.js';
+import {
+  DOCKER_MIN_PIDS_LIMIT,
+  HOST_MODEL_ROLES,
+  USER_CONFIG_DEFAULTS,
+  hostRoleModelId,
+  resolveProviderProfile,
+  type HostModelRole,
+} from './user-config.js';
 /**
  * Interactive configuration editor for IronCurtain.
  *
@@ -8,12 +15,10 @@ import { HOST_MODEL_ROLES } from './user-config.js';
  */
 
 import * as p from '@clack/prompts';
-import { readFileSync } from 'node:fs';
-import { resolve, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import {
   loadUserConfig,
   loadRequestedDockerWorkloadConfig,
+  loadSavedSandboxPolicy,
   saveUserConfig,
   validateModelId,
   ESCALATION_TIMEOUT_MIN,
@@ -26,7 +31,11 @@ import {
   SESSION_MODES,
   CONTAINER_RUNTIMES,
   NATIVE_PROFILE_NAME,
+  POLICY_ON_STALE_MODES,
+  LLM_INTERACTION_LOG_MODES,
   maskApiKey,
+  resolveLlmInteractionLogMode,
+  type PolicyOnStale,
   type UserConfig,
   type ResolvedUserConfig,
   type ResolvedProviderProfile,
@@ -35,25 +44,35 @@ import {
   type DockerAgent,
   type SessionModeKind,
   type ContainerRuntimeSetting,
+  type LlmInteractionLogMode,
 } from './user-config.js';
 import { getUserConfigPath } from './paths.js';
 import {
+  describeGatewayModelIdProblem,
   getGatewayDefinition,
   getProviderEditorDescriptors,
   providerDefaultMapSummary,
   type ProviderEditorDescriptor,
 } from './provider-definitions.js';
+import { findHostModelRoutingWarnings } from './model-provider.js';
 import { resolvedGatewayToInput, type GatewayProfileInput } from './provider-editor.js';
 import { providerProfileSchema } from './user-config.js';
 import { listProviderModels } from './provider-catalog.js';
 import { catalogEnforces, type ModelCatalogResult, type ModelCatalogSource } from './openrouter-catalog.js';
 import type { MCPServerConfig } from './types.js';
+import { collectDeclaredEnvVars, loadBuiltinMcpServers, loadMcpServers } from './mcp-servers-overlay.js';
+import {
+  SANDBOX_POLICIES,
+  defaultSandboxPolicy,
+  readSandboxPolicyEnv,
+  type SandboxAvailabilityPolicy,
+} from './sandbox-policy.js';
 import {
   DOCKER_WORKLOAD_PACKAGE_NETWORK_WARNING,
   type DockerWorkloadNetworkAccess,
 } from '../docker-workload/config.js';
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
+import { unsupportedNestedDockerHostReason } from '../docker-workload/environment.js';
+import { checkHelp, parseArgsStrict, type CommandSpec } from '../cli-help.js';
 
 /** Known model options for selection prompts. */
 const KNOWN_MODELS: { value: string; label: string }[] = [
@@ -201,6 +220,8 @@ export function computeDiff(
     'preferredDockerAgent',
     'preferredMode',
     'containerRuntime',
+    'sandboxPolicy',
+    'agentSudo',
   ] as const;
   for (const key of topLevelKeys) {
     if (key in pending && pending[key] !== undefined && pending[key] !== resolved[key]) {
@@ -213,18 +234,21 @@ export function computeDiff(
     'autoCompact',
     'autoApprove',
     'auditRedaction',
+    'observability',
+    'taintEscalation',
+    'contentAssessment',
     'memory',
     'dockerResources',
     'snapshot',
     'statistics',
     'hostModelProfiles',
+    'policy',
   ] as const;
   for (const section of nestedSections) {
     const pendingSection = pending[section];
     if (!pendingSection) continue;
     const resolvedSection = (resolved[section] ?? {}) as Record<string, unknown>;
     for (const [subKey, subValue] of Object.entries(pendingSection)) {
-      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- defensive: runtime data from spread objects
       if (subValue !== undefined && subValue !== resolvedSection[subKey]) {
         diffs.push([`${section}.${subKey}`, { from: resolvedSection[subKey], to: subValue }]);
       }
@@ -501,12 +525,165 @@ async function handleModels(resolved: ResolvedUserConfig, pending: UserConfig): 
   }
 }
 
+/** Labels for the OS sandbox policy choices. */
+const SANDBOX_POLICY_LABELS: Readonly<Record<SandboxAvailabilityPolicy, { label: string; hint: string }>> = {
+  enforce: {
+    label: 'Enforce (recommended)',
+    hint: 'servers that need an OS sandbox do not start when bubblewrap/socat/ripgrep are missing',
+  },
+  warn: {
+    label: 'Warn',
+    hint: 'such servers run WITHOUT OS containment, with a warning at session start',
+  },
+};
+
+/**
+ * The environment variable overriding sandboxPolicy and the value it forces,
+ * if any (an invalid value already failed config load).
+ */
+function sandboxPolicyEnvOverride():
+  { readonly policy: SandboxAvailabilityPolicy; readonly source: string } | undefined {
+  try {
+    return readSandboxPolicyEnv();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The editor works on the sandboxPolicy saved in config.json, not on the
+ * effective value: with IRONCURTAIN_SANDBOX_POLICY / SANDBOX_POLICY set,
+ * `loadUserConfig()` reports the environment's value, so choosing that value
+ * would look unchanged and never be saved, and unsetting the variable later
+ * would silently bring back the old saved value. Without an override the
+ * two are the same.
+ */
+function withSavedSandboxPolicy(resolved: ResolvedUserConfig): ResolvedUserConfig {
+  if (sandboxPolicyEnvOverride() === undefined) return resolved;
+  return { ...resolved, sandboxPolicy: loadSavedSandboxPolicy() ?? defaultSandboxPolicy() };
+}
+
+/** Menu hint for the OS sandbox policy (the saved value), noting an environment override. */
+function sandboxPolicyHint(current: SandboxAvailabilityPolicy): string {
+  const override = sandboxPolicyEnvOverride();
+  return override ? `${current} (overridden by ${override.source}=${override.policy})` : current;
+}
+
+async function promptSandboxPolicy(resolved: ResolvedUserConfig, pending: UserConfig): Promise<void> {
+  const current = pending.sandboxPolicy ?? resolved.sandboxPolicy;
+  const override = sandboxPolicyEnvOverride();
+  if (override) {
+    p.log.warn(
+      `${override.source}=${override.policy} is set in the environment and overrides the value saved here ` +
+        'until it is unset.',
+    );
+  }
+  const selected = await p.select({
+    message: `OS sandbox policy (platform default: ${defaultSandboxPolicy()}):`,
+    options: SANDBOX_POLICIES.map((policy) => ({
+      value: policy,
+      label: SANDBOX_POLICY_LABELS[policy].label,
+      hint: policy === current ? `${SANDBOX_POLICY_LABELS[policy].hint} (current)` : SANDBOX_POLICY_LABELS[policy].hint,
+    })),
+    initialValue: current,
+  });
+  if (isCancelled(selected)) return;
+  const policy = selected as SandboxAvailabilityPolicy;
+  if (policy !== current) {
+    pending.sandboxPolicy = policy;
+  }
+}
+
+/** Labels for the stale-policy choices (`policy.onStale`). */
+const POLICY_ON_STALE_LABELS: Readonly<Record<PolicyOnStale, { label: string; hint: string }>> = {
+  warn: {
+    label: 'Warn (default)',
+    hint: 'sessions start on a stale compiled policy, with a warning naming the command that rebuilds it',
+  },
+  refuse: {
+    label: 'Refuse',
+    hint: 'sessions and workflow policy swaps fail until the stale policy is recompiled',
+  },
+};
+
+/** The effective `policy.onStale` (pending edit, else the resolved value). */
+function currentPolicyOnStale(resolved: ResolvedUserConfig, pending: UserConfig): PolicyOnStale {
+  return pending.policy?.onStale ?? resolved.policy?.onStale ?? 'warn';
+}
+
+async function promptPolicyOnStale(resolved: ResolvedUserConfig, pending: UserConfig): Promise<void> {
+  const current = currentPolicyOnStale(resolved, pending);
+  const selected = await p.select({
+    message:
+      'When a compiled policy may be stale (older policy compiler, other policy-engine semantics or tool ' +
+      'annotations, or no provenance record):',
+    options: POLICY_ON_STALE_MODES.map((mode) => ({
+      value: mode,
+      label: POLICY_ON_STALE_LABELS[mode].label,
+      hint: mode === current ? `${POLICY_ON_STALE_LABELS[mode].hint} (current)` : POLICY_ON_STALE_LABELS[mode].hint,
+    })),
+    initialValue: current,
+  });
+  if (isCancelled(selected)) return;
+  const mode = selected as PolicyOnStale;
+  if (mode !== current) {
+    pending.policy = { ...pending.policy, onStale: mode };
+  }
+}
+
+const LLM_INTERACTION_LOG_LABELS: Readonly<Record<LlmInteractionLogMode, { label: string; hint: string }>> = {
+  off: { label: 'Off', hint: 'write no LLM interaction logs' },
+  metadata: {
+    label: 'Metadata (recommended)',
+    hint: 'sizes, timings and token counts; no prompt or response text',
+  },
+  full: {
+    label: 'Full',
+    hint: 'complete prompts and responses, redacted like audit.jsonl',
+  },
+};
+
+/** The LLM interaction log mode the menus show: the pending choice, else the saved one. */
+function currentLlmInteractionLog(resolved: ResolvedUserConfig, pending: UserConfig): LlmInteractionLogMode {
+  return pending.observability?.llmInteractionLog ?? resolveLlmInteractionLogMode(resolved);
+}
+
+async function promptLlmInteractionLog(resolved: ResolvedUserConfig, pending: UserConfig): Promise<void> {
+  const current = currentLlmInteractionLog(resolved, pending);
+  const selected = await p.select({
+    message: 'What should sessions log about each LLM call (llm-interactions.jsonl, auto-approve-llm.jsonl)?',
+    options: LLM_INTERACTION_LOG_MODES.map((mode) => ({
+      value: mode,
+      label: LLM_INTERACTION_LOG_LABELS[mode].label,
+      hint:
+        mode === current ? `${LLM_INTERACTION_LOG_LABELS[mode].hint} (current)` : LLM_INTERACTION_LOG_LABELS[mode].hint,
+    })),
+    initialValue: current,
+  });
+  if (isCancelled(selected)) return;
+  const mode = selected as LlmInteractionLogMode;
+  if (mode !== current) {
+    pending.observability = { ...pending.observability, llmInteractionLog: mode };
+  }
+}
+
 async function handleSecurity(resolved: ResolvedUserConfig, pending: UserConfig): Promise<void> {
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- interactive loop exited via return
   while (true) {
     const currentTimeout = pending.escalationTimeoutSeconds ?? resolved.escalationTimeoutSeconds;
     const currentAutoApproveEnabled = pending.autoApprove?.enabled ?? resolved.autoApprove.enabled;
     const currentAutoApproveModel = pending.autoApprove?.modelId ?? resolved.autoApprove.modelId;
+    const currentSandboxPolicy = pending.sandboxPolicy ?? resolved.sandboxPolicy;
+    const currentOnStale = currentPolicyOnStale(resolved, pending);
+    const currentAgentSudo = pending.agentSudo ?? resolved.agentSudo;
+    const currentTaintEscalation = taintEscalationEnabled(resolved, pending);
+    const assessmentDefaults = USER_CONFIG_DEFAULTS.contentAssessment;
+    const currentAssessmentEnabled =
+      pending.contentAssessment?.enabled ?? resolved.contentAssessment?.enabled ?? assessmentDefaults.enabled;
+    const currentAssessmentLlm =
+      pending.contentAssessment?.llmCheck ?? resolved.contentAssessment?.llmCheck ?? assessmentDefaults.llmCheck;
+    const currentAssessmentModel =
+      pending.contentAssessment?.llmModelId ?? resolved.contentAssessment?.llmModelId ?? assessmentDefaults.llmModelId;
 
     const field = await p.select({
       message: 'Security',
@@ -526,12 +703,109 @@ async function handleSecurity(resolved: ResolvedUserConfig, pending: UserConfig)
           label: 'Auto-approve model',
           hint: formatModelShort(currentAutoApproveModel),
         },
+        {
+          value: 'sandboxPolicy',
+          label: 'OS sandbox policy',
+          hint: sandboxPolicyHint(currentSandboxPolicy),
+        },
+        {
+          value: 'policyOnStale',
+          label: 'Stale compiled policies',
+          hint: currentOnStale,
+        },
+        {
+          value: 'llmInteractionLog',
+          label: 'LLM interaction log',
+          hint: currentLlmInteractionLog(resolved, pending),
+        },
+        {
+          value: 'agentSudo',
+          label: 'Passwordless sudo for container agents',
+          hint: currentAgentSudo ? 'on' : 'off (no-new-privileges)',
+        },
+        {
+          value: 'taintEscalation',
+          label: 'Taint escalation (outbound tools need a human after untrusted content is read)',
+          hint: currentTaintEscalation ? 'on' : 'off',
+        },
+        {
+          value: 'contentAssessmentEnabled',
+          label: 'Outbound content checks (encoded-data detection)',
+          hint: currentAssessmentEnabled ? 'on' : 'off',
+        },
+        {
+          value: 'contentAssessmentLlm',
+          label: 'Outbound content LLM check',
+          hint: currentAssessmentLlm ? (currentAssessmentEnabled ? 'on' : 'on (needs content checks)') : 'off',
+        },
+        {
+          value: 'contentAssessmentModel',
+          label: 'Outbound content LLM check model',
+          hint: formatModelShort(currentAssessmentModel),
+        },
         { value: 'back', label: 'Back' },
       ],
     });
     if (isCancelled(field) || field === 'back') return;
 
-    if (field === 'timeout') {
+    if (field === 'contentAssessmentEnabled') {
+      const enabled = await p.confirm({
+        message:
+          'Check outbound content (messages, comments, commit messages, URLs) for encoded or hidden data? ' +
+          'Suspicious content escalates to you for approval.',
+        initialValue: currentAssessmentEnabled,
+      });
+      if (isCancelled(enabled)) continue;
+      if (enabled !== currentAssessmentEnabled) {
+        pending.contentAssessment = { ...pending.contentAssessment, enabled: enabled as boolean };
+      }
+    } else if (field === 'contentAssessmentLlm') {
+      const enabled = await p.confirm({
+        message:
+          'Also ask a model whether outbound content is intelligible? Adds an LLM call per checked message; ' +
+          'takes effect only with the outbound content checks on.',
+        initialValue: currentAssessmentLlm,
+      });
+      if (isCancelled(enabled)) continue;
+      if (enabled !== currentAssessmentLlm) {
+        pending.contentAssessment = { ...pending.contentAssessment, llmCheck: enabled as boolean };
+      }
+    } else if (field === 'contentAssessmentModel') {
+      const newModel = await promptModelId('Select outbound content check model:', currentAssessmentModel);
+      if (newModel !== undefined && newModel !== currentAssessmentModel) {
+        pending.contentAssessment = { ...pending.contentAssessment, llmModelId: newModel };
+      }
+    } else if (field === 'sandboxPolicy') {
+      await promptSandboxPolicy(resolved, pending);
+    } else if (field === 'policyOnStale') {
+      await promptPolicyOnStale(resolved, pending);
+    } else if (field === 'llmInteractionLog') {
+      await promptLlmInteractionLog(resolved, pending);
+    } else if (field === 'agentSudo') {
+      const enabled = await p.confirm({
+        message:
+          'Give container agents passwordless sudo? On Linux Docker without rootless mode or userns-remap, ' +
+          'container root is host root on bind mounts. Off runs agents with no-new-privileges and no ' +
+          'file-privilege capabilities (on Linux this needs IronCurtain to run as UID 1000).',
+        initialValue: currentAgentSudo,
+      });
+      if (isCancelled(enabled)) continue;
+      if (enabled !== currentAgentSudo) {
+        pending.agentSudo = enabled as boolean;
+      }
+    } else if (field === 'taintEscalation') {
+      const enabled = await p.confirm({
+        message:
+          'Enable taint escalation? Once the agent reads web pages, mail, calendar events, shared files or ' +
+          'GitHub content, every send, post, push or share needs your approval for the rest of the session ' +
+          '(no auto-approval or /approve+ patterns).',
+        initialValue: currentTaintEscalation,
+      });
+      if (isCancelled(enabled)) continue;
+      if (enabled !== currentTaintEscalation) {
+        pending.taintEscalation = { ...pending.taintEscalation, enabled: enabled as boolean };
+      }
+    } else if (field === 'timeout') {
       const input = await p.text({
         message: `Escalation timeout in seconds (${ESCALATION_TIMEOUT_MIN}-${ESCALATION_TIMEOUT_MAX}):`,
         placeholder: String(currentTimeout),
@@ -572,6 +846,7 @@ async function handleMemory(resolved: ResolvedUserConfig, pending: UserConfig): 
   while (true) {
     const currentEnabled = pending.memory?.enabled ?? resolved.memory.enabled;
     const currentAutoSave = pending.memory?.autoSave ?? resolved.memory.autoSave;
+    const currentOfflineModels = pending.memory?.offlineModels ?? resolved.memory.offlineModels;
 
     const field = await p.select({
       message: 'Memory',
@@ -585,6 +860,11 @@ async function handleMemory(resolved: ResolvedUserConfig, pending: UserConfig): 
           value: 'autoSave',
           label: 'Auto-save session summary to memory',
           hint: currentAutoSave ? 'on' : 'off',
+        },
+        {
+          value: 'offlineModels',
+          label: 'Offline models (never download the embedding models)',
+          hint: currentOfflineModels ? 'on' : 'off',
         },
         { value: 'back', label: 'Back' },
       ],
@@ -609,9 +889,22 @@ async function handleMemory(resolved: ResolvedUserConfig, pending: UserConfig): 
       if (enabled !== currentAutoSave) {
         pending.memory = { ...pending.memory, autoSave: enabled as boolean };
       }
+    } else if (field === 'offlineModels') {
+      const enabled = await p.confirm({
+        message:
+          'Never let the memory server download its models? They must already be in ~/.ironcurtain/models ' +
+          '(run `ironcurtain memory prefetch` first).',
+        initialValue: currentOfflineModels,
+      });
+      if (isCancelled(enabled)) continue;
+      if (enabled !== currentOfflineModels) {
+        pending.memory = { ...pending.memory, offlineModels: enabled as boolean };
+      }
     }
   }
 }
+
+const BYTES_PER_GIB = 1024 * 1024 * 1024;
 
 async function handleSnapshot(resolved: ResolvedUserConfig, pending: UserConfig): Promise<void> {
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- interactive loop exited via return
@@ -619,6 +912,9 @@ async function handleSnapshot(resolved: ResolvedUserConfig, pending: UserConfig)
     const currentEnabled = pending.snapshot?.enabled ?? resolved.snapshot.enabled;
     const currentMaxAge = pending.snapshot?.maxAgeDays ?? resolved.snapshot.maxAgeDays;
     const currentSweep = pending.snapshot?.sweepIntervalHours ?? resolved.snapshot.sweepIntervalHours;
+    const currentMaxBytes =
+      pending.snapshot?.maxBytes !== undefined ? pending.snapshot.maxBytes : resolved.snapshot.maxBytes;
+    const currentMaxGiB = currentMaxBytes === null ? null : currentMaxBytes / BYTES_PER_GIB;
 
     const field = await p.select({
       message: 'Container Snapshots',
@@ -634,6 +930,11 @@ async function handleSnapshot(resolved: ResolvedUserConfig, pending: UserConfig)
           hint: currentMaxAge === null ? 'unbounded' : String(currentMaxAge),
         },
         { value: 'sweepIntervalHours', label: 'GC sweep interval (hours)', hint: String(currentSweep) },
+        {
+          value: 'maxGiB',
+          label: 'Max container size to snapshot (GiB)',
+          hint: currentMaxGiB === null ? 'no cap' : `${currentMaxGiB} GiB`,
+        },
         { value: 'back', label: 'Back' },
       ],
     });
@@ -675,6 +976,19 @@ async function handleSnapshot(resolved: ResolvedUserConfig, pending: UserConfig)
       const newVal = Number(input);
       if (newVal !== currentSweep) {
         pending.snapshot = { ...pending.snapshot, sweepIntervalHours: newVal };
+      }
+    } else if (field === 'maxGiB') {
+      const next = await promptNullableNumber({
+        message: 'Largest container to snapshot (a larger one stops without a snapshot)',
+        current: currentMaxGiB,
+        validate: (n) => (n > 0 ? undefined : 'Must be a positive number of GiB'),
+        format: (n) => (n === null ? 'no cap' : `${n} GiB`),
+      });
+      if (next !== undefined && next !== currentMaxGiB) {
+        pending.snapshot = {
+          ...pending.snapshot,
+          maxBytes: next === null ? null : Math.max(1, Math.round(next * BYTES_PER_GIB)),
+        };
       }
     }
   }
@@ -725,6 +1039,14 @@ async function handleStatistics(resolved: ResolvedUserConfig, pending: UserConfi
   }
 }
 
+/** Container-mode scope notes shown beside the token and cost caps (see handleResourceLimits). */
+const TOKEN_CAVEAT = 'container mode: per agent container, enforced at the proxy mid-turn too';
+const COST_CAVEAT = 'container mode: list-price estimate per agent container, enforced at the proxy';
+
+function withContainerBudgetCaveat(display: string, value: number | null, caveat: string): string {
+  return value === null ? display : `${display} (${caveat})`;
+}
+
 async function handleResourceLimits(resolved: ResolvedUserConfig, pending: UserConfig): Promise<void> {
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- interactive loop exited via return
   while (true) {
@@ -733,14 +1055,31 @@ async function handleResourceLimits(resolved: ResolvedUserConfig, pending: UserC
     const field = await p.select({
       message: 'Resource Limits',
       options: [
-        { value: 'maxTotalTokens', label: 'Max tokens', hint: formatTokens(budget.maxTotalTokens) },
+        // Container (Docker) mode enforces tokens and cost at the MITM budget
+        // gate, for each agent container as a whole (all lanes of a shared
+        // workflow container together, a terminal session for its lifetime)
+        // and mid-turn too; cost is a list-price estimate. Say so next to the
+        // values: the scope differs from the builtin agent's per-turn caps.
+        {
+          value: 'maxTotalTokens',
+          label: 'Max tokens',
+          hint: withContainerBudgetCaveat(formatTokens(budget.maxTotalTokens), budget.maxTotalTokens, TOKEN_CAVEAT),
+        },
         {
           value: 'maxSteps',
           label: 'Max steps',
           hint: budget.maxSteps === null ? 'disabled' : String(budget.maxSteps),
         },
         { value: 'maxSessionSeconds', label: 'Session timeout', hint: formatSeconds(budget.maxSessionSeconds) },
-        { value: 'maxEstimatedCostUsd', label: 'Cost cap', hint: formatCost(budget.maxEstimatedCostUsd) },
+        {
+          value: 'maxEstimatedCostUsd',
+          label: 'Cost cap',
+          hint: withContainerBudgetCaveat(
+            formatCost(budget.maxEstimatedCostUsd),
+            budget.maxEstimatedCostUsd,
+            COST_CAVEAT,
+          ),
+        },
         { value: 'warnThresholdPercent', label: 'Warning threshold', hint: `${budget.warnThresholdPercent}%` },
         { value: 'back', label: 'Back' },
       ],
@@ -911,9 +1250,9 @@ async function handleWebSearch(resolved: ResolvedUserConfig, pending: UserConfig
     p.note(`Get an API key at ${WEB_SEARCH_PROVIDER_URLS[provider]}`, WEB_SEARCH_PROVIDER_LABELS[provider]);
 
     const currentKey = resolved.webSearch[provider]?.apiKey;
-    const apiKey = await p.text({
-      message: `${WEB_SEARCH_PROVIDER_LABELS[provider]} API key:`,
-      placeholder: currentKey ? '(keep current)' : 'Enter API key',
+    // Masked: a typed key must not stay readable in scrollback or a screen share.
+    const apiKey = await p.password({
+      message: `${WEB_SEARCH_PROVIDER_LABELS[provider]} API key${currentKey ? ' (leave blank to keep the current key)' : ''}:`,
       validate: (val) => {
         if (!val && !currentKey) return 'API key is required';
         return undefined;
@@ -1027,9 +1366,8 @@ async function addProfile(resolved: ResolvedUserConfig, pending: UserConfig): Pr
   if (isCancelled(type)) return;
   const descriptor = getGatewayDefinition(type as string).editor;
   p.note(`${descriptor.description}\nDefault map: ${providerDefaultMapSummary(descriptor)}.`, descriptor.label);
-  const apiKey = await p.text({
-    message: `${descriptor.label} API key (${descriptor.credentialPlaceholder}):`,
-    placeholder: `set via ${descriptor.credentialEnv} env, or leave blank`,
+  const apiKey = await p.password({
+    message: `${descriptor.label} API key (${descriptor.credentialPlaceholder}; leave blank to use the ${descriptor.credentialEnv} env):`,
     validate: () => undefined,
   });
   if (isCancelled(apiKey)) return;
@@ -1164,9 +1502,8 @@ async function editProfileField(field: string, profile: PendingProfile): Promise
     return isCancelled(plan) ? undefined : { ...profile, plan: plan as string };
   }
   if (field === 'apiKey') {
-    const apiKey = await p.text({
-      message: `${descriptor.label} API key (${descriptor.credentialPlaceholder}):`,
-      placeholder: `leave blank to clear the stored key and use ${descriptor.credentialEnv} env`,
+    const apiKey = await p.password({
+      message: `${descriptor.label} API key (${descriptor.credentialPlaceholder}; leave blank to clear the stored key and use ${descriptor.credentialEnv} env):`,
       validate: () => undefined,
     });
     if (isCancelled(apiKey)) return undefined;
@@ -1208,8 +1545,64 @@ async function editHostModelProfiles(resolved: ResolvedUserConfig, pending: User
         ...Object.keys(currentProfiles(resolved, pending)).map((name) => ({ value: name, label: name })),
       ],
     });
-    if (!isCancelled(selected)) pending.hostModelProfiles = { ...bindings, [role as string]: selected as string };
+    if (isCancelled(selected)) continue;
+    pending.hostModelProfiles = { ...bindings, [role as string]: selected as string };
+    const warning = hostRoleBindingWarning(resolved, pending, role as HostModelRole, selected as string);
+    if (warning !== undefined) p.log.warn(warning);
   }
+}
+
+/**
+ * Why binding host `role` to profile `profileName` would send the gateway a
+ * model ID it cannot route (see `describeGatewayModelIdProblem`), judged on
+ * the pending edits; undefined when it would not or the profile is native.
+ */
+function hostRoleBindingWarning(
+  resolved: ResolvedUserConfig,
+  pending: UserConfig,
+  role: HostModelRole,
+  profileName: string,
+): string | undefined {
+  if (profileName === NATIVE_PROFILE_NAME) return undefined;
+  const input = currentProfiles(resolved, pending)[profileName] as PendingProfile | undefined;
+  if (input === undefined) return undefined;
+  const parsed = providerProfileSchema.safeParse(input);
+  if (!parsed.success) return undefined;
+  const profile = resolveProviderProfile(parsed.data);
+  if (profile.type === 'native') return undefined;
+  const modelId = hostRoleModelId(
+    {
+      agentModelId: pending.agentModelId ?? resolved.agentModelId,
+      policyModelId: pending.policyModelId ?? resolved.policyModelId,
+      prefilterModelId: pending.prefilterModelId ?? resolved.prefilterModelId,
+      autoCompact: { ...resolved.autoCompact, ...definedFields(pending.autoCompact) },
+      autoApprove: { ...resolved.autoApprove, ...definedFields(pending.autoApprove) },
+      contentAssessment: {
+        ...(resolved.contentAssessment ?? USER_CONFIG_DEFAULTS.contentAssessment),
+        ...definedFields(pending.contentAssessment),
+      },
+    },
+    role,
+  );
+  const problem = describeGatewayModelIdProblem(profile, modelId);
+  return problem === undefined ? undefined : `Host role "${role}" (profile "${profileName}"): ${problem}`;
+}
+
+/** The fields of `value` that are not undefined, for overlaying pending edits on resolved values. */
+function definedFields<T extends object>(value: T | undefined): Partial<T> {
+  if (value === undefined) return {};
+  return Object.fromEntries(Object.entries(value).filter(([, field]) => field !== undefined)) as Partial<T>;
+}
+
+/** After a save: warn about every host role whose gateway would get a model ID it cannot route. */
+function warnHostModelRouting(): void {
+  let saved: ResolvedUserConfig;
+  try {
+    saved = loadUserConfig({ readOnly: true });
+  } catch {
+    return;
+  }
+  for (const warning of findHostModelRoutingWarnings(saved)) p.log.warn(warning.message);
 }
 
 // ─── Slug autocomplete (OpenRouter model catalog) ────────────
@@ -1464,18 +1857,25 @@ function providerPreferenceSummary(pref: PendingProfile['providerPreference'] | 
 
 // ─── Server Credentials ──────────────────────────────────────
 
-/** Loads server names from mcp-servers.json for the credential editor. */
-function loadServerNames(): string[] {
+/**
+ * Loads the configured MCP servers for the credential editor: the package's
+ * servers with the user's mcp-servers.json layered over them. When the user
+ * file is invalid, says so and falls back to the package's servers alone.
+ */
+function loadServerConfigs(): Record<string, MCPServerConfig> {
   try {
-    const mcpServersPath = resolve(__dirname, 'mcp-servers.json');
-    const mcpServers = JSON.parse(readFileSync(mcpServersPath, 'utf-8')) as Record<string, MCPServerConfig>;
-    return Object.keys(mcpServers);
-  } catch {
-    return [];
+    return loadMcpServers().servers;
+  } catch (err) {
+    p.log.warn(err instanceof Error ? err.message : String(err));
+    try {
+      return loadBuiltinMcpServers();
+    } catch {
+      return {};
+    }
   }
 }
 
-interface CredentialHint {
+export interface CredentialHint {
   envVar: string;
   description: string;
   signupUrl?: string;
@@ -1492,8 +1892,34 @@ const SERVER_CREDENTIAL_HINTS: Partial<Record<string, CredentialHint[]>> = {
   ],
 };
 
+/**
+ * The credentials to prompt for when editing `serverName`'s: the variables
+ * its configuration declares (`collectDeclaredEnvVars`: `-e NAME` arguments,
+ * credential-like or empty-valued `env` keys), described by the known hints
+ * where there is one, plus any other known hint for the server. Empty means
+ * the server declares nothing; the editor then offers a free-form entry.
+ * The masked prompt names the variable and adds the description in
+ * parentheses, so a derived description does not repeat the name.
+ */
+export function credentialPromptsFor(serverName: string, serverConfig: MCPServerConfig | undefined): CredentialHint[] {
+  const known = SERVER_CREDENTIAL_HINTS[serverName] ?? [];
+  const declared = serverConfig ? collectDeclaredEnvVars(serverConfig) : [];
+  const prompts: CredentialHint[] = declared.map(
+    (envVar) =>
+      known.find((hint) => hint.envVar === envVar) ?? {
+        envVar,
+        description: `for the ${serverName} server`,
+      },
+  );
+  for (const hint of known) {
+    if (!declared.includes(hint.envVar)) prompts.push(hint);
+  }
+  return prompts;
+}
+
 async function handleServerCredentials(resolved: ResolvedUserConfig, pending: UserConfig): Promise<void> {
-  const serverNames = loadServerNames();
+  const serverConfigs = loadServerConfigs();
+  const serverNames = Object.keys(serverConfigs);
 
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- interactive loop exited via return
   while (true) {
@@ -1516,19 +1942,26 @@ async function handleServerCredentials(resolved: ResolvedUserConfig, pending: Us
     if (isCancelled(selected) || selected === 'back') return;
 
     const serverName = selected as string;
-    const hints = SERVER_CREDENTIAL_HINTS[serverName];
+    // Derived from what the server's configuration declares (its `-e NAME`
+    // arguments and env slots), so servers added in ~/.ironcurtain/mcp-servers.json
+    // get the same guided prompts as the built-ins.
+    const hints = credentialPromptsFor(
+      serverName,
+      Object.hasOwn(serverConfigs, serverName) ? serverConfigs[serverName] : undefined,
+    );
     const existingCreds = currentCreds[serverName] ?? {};
 
-    if (hints) {
-      // Guided flow for known servers
+    if (hints.length > 0) {
+      // Guided flow for the declared (or known) credentials
       for (const hint of hints) {
         const currentValue = existingCreds[hint.envVar];
         if (hint.signupUrl) {
           p.note(`Get a token at ${hint.signupUrl}`, hint.description);
         }
-        const input = await p.text({
-          message: `${hint.envVar}:`,
-          placeholder: currentValue ? '(keep current)' : `Enter ${hint.description}`,
+        const input = await p.password({
+          message: currentValue
+            ? `${hint.envVar} (${hint.description}; leave blank to keep the current value):`
+            : `${hint.envVar} (${hint.description}):`,
           validate: (val) => {
             if (!val && !currentValue) return `${hint.envVar} is required`;
             return undefined;
@@ -1545,7 +1978,7 @@ async function handleServerCredentials(resolved: ResolvedUserConfig, pending: Us
         }
       }
     } else {
-      // Generic flow for unknown servers
+      // Generic flow for servers that declare no credentials
       const action = await p.select({
         message: `Credentials for ${serverName}`,
         options: [
@@ -1561,7 +1994,8 @@ async function handleServerCredentials(resolved: ResolvedUserConfig, pending: Us
       });
       if (isCancelled(envVar)) continue;
 
-      const value = await p.text({
+      // The variable name is shown as typed; only the value (the secret) is masked.
+      const value = await p.password({
         message: `Value for ${envVar as string}:`,
         validate: (val) => (!val ? 'Value is required' : undefined),
       });
@@ -1791,7 +2225,12 @@ async function handleDockerAgent(
   }
 }
 
-/** Submenu for the user-facing secure nested-Docker policy choices. */
+/**
+ * Submenu for the user-facing secure nested-Docker policy choices. On a host
+ * where admission can never succeed (see `unsupportedNestedDockerHostReason`)
+ * the feature can be turned off but not on: while it is on, every Docker agent
+ * session would fail admission.
+ */
 async function handleNestedDocker(
   resolved: ResolvedUserConfig,
   pending: UserConfig,
@@ -1801,12 +2240,23 @@ async function handleNestedDocker(
     'Requires macOS or WSL2 with Docker Desktop, or Apple Container on Apple silicon. Native Linux Engine is not yet qualified.',
     'Availability',
   );
+  const unsupportedHost = unsupportedNestedDockerHostReason();
+  if (unsupportedHost !== undefined && currentNestedDocker(resolved, pending, requestedDockerWorkload).enabled) {
+    p.log.warn(
+      `${unsupportedHost} Nested Docker is turned on, so every Docker agent session on this host fails until you turn it off.`,
+    );
+  }
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- interactive loop exited via return
   while (true) {
     const current = currentNestedDocker(resolved, pending, requestedDockerWorkload);
     const networkAccessPresentation = DOCKER_NETWORK_ACCESS_PRESENTATION[current.networkAccess];
+    const enabledHint = current.enabled
+      ? 'on'
+      : unsupportedHost === undefined
+        ? 'off'
+        : 'off (not supported on this host)';
     const options: { value: string; label: string; hint?: string; disabled?: boolean }[] = [
-      { value: 'enabled', label: 'Docker inside agent sessions', hint: current.enabled ? 'on' : 'off' },
+      { value: 'enabled', label: 'Docker inside agent sessions', hint: enabledHint },
     ];
     options.push({
       value: 'networkAccess',
@@ -1826,6 +2276,11 @@ async function handleNestedDocker(
     if (isCancelled(field) || field === 'back') return;
 
     if (field === 'enabled') {
+      if (!current.enabled && unsupportedHost !== undefined) {
+        // Refuse before asking: saving it would make every Docker agent session fail admission.
+        p.log.error(`${unsupportedHost} Nested Docker stays off.`);
+        continue;
+      }
       const enabled = await p.confirm({
         message: 'Enable Docker inside agent sessions?',
         initialValue: current.enabled,
@@ -1858,7 +2313,7 @@ async function handleNestedDocker(
   }
 }
 
-/** Submenu for Docker container memory and cpu ceilings. */
+/** Submenu for Docker container memory, cpu and process ceilings. */
 async function handleDockerResources(resolved: ResolvedUserConfig, pending: UserConfig): Promise<void> {
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- interactive loop exited via return
   while (true) {
@@ -1877,10 +2332,32 @@ async function handleDockerResources(resolved: ResolvedUserConfig, pending: User
           label: 'CPU ceiling',
           hint: current.cpus === null ? 'unlimited' : String(current.cpus),
         },
+        {
+          value: 'pidsLimit',
+          label: 'Process ceiling (pids)',
+          hint: current.pidsLimit === null ? 'unlimited' : String(current.pidsLimit),
+        },
         { value: 'back', label: 'Back' },
       ],
     });
     if (isCancelled(field) || field === 'back') return;
+
+    if (field === 'pidsLimit') {
+      const result = await promptNullableNumber({
+        message: 'Process ceiling (pids, Docker --pids-limit):',
+        current: current.pidsLimit,
+        format: (n) => (n === null ? 'unlimited' : String(n)),
+        validate: (n) => {
+          if (!Number.isInteger(n)) return 'Must be an integer';
+          if (n < DOCKER_MIN_PIDS_LIMIT) return `Must be at least ${DOCKER_MIN_PIDS_LIMIT}`;
+          return undefined;
+        },
+      });
+      if (result !== undefined) {
+        pending.dockerResources = { ...(pending.dockerResources ?? {}), pidsLimit: result };
+      }
+      continue;
+    }
 
     if (field === 'memoryMb') {
       const result = await promptNullableNumber({
@@ -1917,7 +2394,8 @@ function dockerResourcesSummary(resolved: ResolvedUserConfig, pending: UserConfi
   const r = { ...resolved.dockerResources, ...(pending.dockerResources ?? {}) };
   const cpu = r.cpus === null ? 'unlimited' : `${r.cpus} cpus`;
   const mem = r.memoryMb === null ? 'unlimited' : `${r.memoryMb} MB`;
-  return `${cpu}, ${mem}`;
+  const pids = r.pidsLimit === null ? 'unlimited pids' : `${r.pidsLimit} pids`;
+  return `${cpu}, ${mem}, ${pids}`;
 }
 
 /** Goose-specific configuration submenu (provider + model). */
@@ -1995,7 +2473,20 @@ function modelsHint(resolved: ResolvedUserConfig, pending: UserConfig): string {
 function securityHint(resolved: ResolvedUserConfig, pending: UserConfig): string {
   const timeout = formatSeconds(pending.escalationTimeoutSeconds ?? resolved.escalationTimeoutSeconds);
   const autoApprove = (pending.autoApprove?.enabled ?? resolved.autoApprove.enabled) ? 'on' : 'off';
-  return `timeout: ${timeout}, auto-approve: ${autoApprove}`;
+  const sandboxPolicy = sandboxPolicyHint(pending.sandboxPolicy ?? resolved.sandboxPolicy);
+  const onStale = currentPolicyOnStale(resolved, pending);
+  const taint = taintEscalationEnabled(resolved, pending) ? 'on' : 'off';
+  const contentChecks =
+    (pending.contentAssessment?.enabled ?? resolved.contentAssessment?.enabled ?? false) ? 'on' : 'off';
+  return (
+    `timeout: ${timeout}, auto-approve: ${autoApprove}, OS sandbox: ${sandboxPolicy}, ` +
+    `stale policies: ${onStale}, taint escalation: ${taint}, content checks: ${contentChecks}`
+  );
+}
+
+/** Taint escalation as it will be saved: the pending edit, else the loaded value (absent = off). */
+function taintEscalationEnabled(resolved: ResolvedUserConfig, pending: UserConfig): boolean {
+  return pending.taintEscalation?.enabled ?? resolved.taintEscalation?.enabled ?? false;
 }
 
 function resourceHint(resolved: ResolvedUserConfig, pending: UserConfig): string {
@@ -2031,8 +2522,9 @@ function serverCredentialsHint(resolved: ResolvedUserConfig, pending: UserConfig
 function memoryHint(resolved: ResolvedUserConfig, pending: UserConfig): string {
   const enabled = pending.memory?.enabled ?? resolved.memory.enabled;
   const autoSave = pending.memory?.autoSave ?? resolved.memory.autoSave;
+  const offlineModels = pending.memory?.offlineModels ?? resolved.memory.offlineModels;
   if (!enabled) return 'off (kill switch)';
-  return `on, auto-save: ${autoSave ? 'on' : 'off'}`;
+  return `on, auto-save: ${autoSave ? 'on' : 'off'}${offlineModels ? ', offline models' : ''}`;
 }
 
 function snapshotHint(resolved: ResolvedUserConfig, pending: UserConfig): string {
@@ -2073,7 +2565,25 @@ function changeCount(
 
 // ─── Main ────────────────────────────────────────────────────
 
-export async function runConfigCommand(): Promise<void> {
+export const configSpec: CommandSpec = {
+  name: 'ironcurtain config',
+  description: 'Edit ~/.ironcurtain/config.json interactively',
+  usage: ['ironcurtain config'],
+  options: [{ flag: 'help', short: 'h', description: 'Show this help message' }],
+  examples: ['ironcurtain config   # Models, security, resource limits, memory, session mode (not API keys)'],
+};
+
+/**
+ * `ironcurtain config`. `--help` is answered first: the editor needs a
+ * terminal, and loading the config creates or backfills config.json.
+ */
+export async function runConfigCommand(args: readonly string[] = []): Promise<void> {
+  const { values } = parseArgsStrict(
+    { args: [...args], options: { help: { type: 'boolean', short: 'h' } } },
+    configSpec.name,
+  );
+  if (checkHelp(values, configSpec)) return;
+
   if (!process.stdin.isTTY) {
     console.error('Error: ironcurtain config requires an interactive terminal (TTY).');
     process.exit(1);
@@ -2081,7 +2591,7 @@ export async function runConfigCommand(): Promise<void> {
 
   let resolved: ResolvedUserConfig;
   try {
-    resolved = loadUserConfig();
+    resolved = withSavedSandboxPolicy(loadUserConfig());
   } catch (err) {
     console.error(`Failed to load config: ${err instanceof Error ? err.message : String(err)}`);
     console.error(`Check ${getUserConfigPath()} for errors.`);
@@ -2187,6 +2697,7 @@ export async function runConfigCommand(): Promise<void> {
 
         if (confirmed) {
           saveUserConfig(pending);
+          warnHostModelRouting();
           p.outro('Configuration saved.');
         } else {
           p.outro('Save cancelled. Changes not written.');

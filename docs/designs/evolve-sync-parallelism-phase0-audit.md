@@ -1,6 +1,6 @@
 # Evolve Sync Parallelism Phase 0 Audit
 
-Status: Phase 0 evidence for `evolve-sync-parallelism-slice.md` sections 5, 5.4, and 14.
+**Status (2026-11-14):** Historical: Phase 0 evidence for `evolve-sync-parallelism-slice.md` sections 5, 5.4 and 14.
 
 ## Binary Verdict
 
@@ -15,14 +15,14 @@ Evidence:
 - `src/trusted-process/tool-call-coordinator.ts:320-355` now runs each tool call through `runSerializedToolCall()`, which holds `callMutex` for the normal policy/audit/breaker/dispatch path and passes a `runEscalationWait` hook into the pipeline.
 - `src/trusted-process/tool-call-pipeline.ts:807-930` now captures escalation context under the mutex, then runs auto-approval or human escalation through that hook. Audit writes, whitelist mutation, roots expansion, circuit-breaker checks, and backend dispatch still happen after the coordinator reacquires `callMutex`.
 - `src/trusted-process/tool-call-coordinator.ts:357-392` tracks active tool calls and suspends admission so `loadPolicy()` / `close()` still drain a whole in-flight call, including the period where the escalation wait is outside `callMutex`.
-- `src/trusted-process/call-circuit-breaker.ts:17-67` scales the effective threshold by `workerCount`, defaulting to `1`. **Prerequisite caveat:** the scaling is applied to a GLOBAL per-`(tool, argsHash)` window, so it grants `threshold × workerCount` headroom to the whole bucket — a single runaway lane then gets `threshold × N` slots, weakening the DoS guard by a factor of N. This is harmless only while `workerCount === 1` (always true in production today). **Per-lane bucketing (key the breaker window by lane id) is a REQUIRED prerequisite before any caller sets `workerCount > 1`.** It is not implementable in Phase 0 (lane ids do not exist yet); see `evolve-sync-parallelism-slice.md` §5.2 item 3.
+- `src/trusted-process/call-circuit-breaker.ts:17-67` scales the effective threshold by `workerCount`, defaulting to `1`. **Prerequisite caveat:** the scaling is applied to a GLOBAL per-`(tool, argsHash)` window, so it grants `threshold × workerCount` headroom to the whole bucket — a single runaway lane then gets `threshold × N` slots, weakening the DoS guard by a factor of N. This is harmless only while `workerCount === 1` (always true in production today). **Per-lane bucketing (key the breaker window by lane id) is a REQUIRED prerequisite before any caller sets `workerCount > 1`.** It is not implementable in Phase 0 (lane ids do not exist yet); see `evolve-sync-parallelism-slice.md` §5.2 item 3. **Superseded (WP-112):** the breaker now keys its window per lane (one host-assigned lane per agent connection to the Code Mode proxy) with the single-lane threshold, and `workerCount` became `maxLanes`, which only sizes an all-lanes bound of `threshold × maxLanes`; nothing multiplies the per-lane threshold any more.
 
 Test evidence:
 
-- `test/tool-call-coordinator.test.ts` drives 41 concurrent `handleStructuredToolCall()` calls through one coordinator with `workerCount: 2`. It asserts JSONL parseability, FIFO audit request order, one-at-a-time backend dispatch, 40 allowed calls, and the 41st denied by the workers-aware circuit breaker. **These calls never escalate**, so this test proves the FIFO/audit/breaker properties only — it does **not** exercise or prove the mutex-release-across-escalation property.
+- `test/tool-call-coordinator.test.ts` drives 41 concurrent `handleStructuredToolCall()` calls through one coordinator with `maxLanes: 2` (originally `workerCount: 2`), alternating between two lanes. It asserts JSONL parseability, FIFO audit request order, one-at-a-time backend dispatch, 40 allowed calls, and the 41st (the first lane's 21st) denied by that lane's circuit-breaker window. **These calls never escalate**, so this test proves the FIFO/audit/breaker properties only — it does **not** exercise or prove the mutex-release-across-escalation property.
 - The mutex-release property is proven by a **dedicated liveness test** (`test/tool-call-coordinator.test.ts`, "does not hold the call mutex while waiting for human escalation"): it parks an agent-path escalation with its human decision deliberately held open, then proves a later allowed call completes *before* the escalation resolves (impossible if the call mutex were held across the wait).
 - `test/tool-call-coordinator.test.ts` further proves `close()`/`loadPolicy()` drain a held-open escalation (the call paused outside the call mutex still blocks the quiesce), that a throwing escalation hook leaks no mutex/admission slot, and that two concurrent auto-approvals run outside the mutex.
-- `test/call-circuit-breaker.test.ts` asserts the effective threshold is `threshold * workerCount`.
+- `test/call-circuit-breaker.test.ts` asserted the effective threshold was `threshold * workerCount`; since WP-112 it asserts per-lane windows (identical calls from 4 lanes do not trip a shared 20-per-60 s window, one lane keeps the single-lane threshold) and the all-lanes bound.
 
 Conclusion: no torn audit entries, cache RMW remains serialized, circuit-breaker counts are workers-aware, and one lane's human escalation no longer freezes unrelated lanes.
 
@@ -60,6 +60,8 @@ Classification: **idempotent for homogeneous lanes; needs serialization for hete
 
 Reasoning: the in-scope evolve lanes are homogeneous (`global` persona), so duplicate concurrent `loadPolicy(global)` calls are redundant but converge on the same coordinator state. Concurrent different personas on one bundle are not safe: the last RPC wins and audit persona stamping becomes nondeterministic. The slice keeps per-batch lanes homogeneous; if heterogeneous lanes are introduced later, policy cycling must move to a batch-level serialized preflight or a per-persona bundle.
 
+Status (WP-39): homogeneity is now enforced rather than assumed. `validateFanOutLaneConcurrency` rejects a shared-container fan-out segment with mixed agent personas at more than one effective lane, and `preMintFanOutScopeBundle` refuses it at runtime before any lane starts. The same preflight performs the single-persona `loadPolicy` once, serially, before the child actors exist (the "batch-level serialized preflight" above), which also removes the duplicate concurrent `loadPolicy(global)` calls. Because a drained lane's in-flight agent turn keeps running after the batch returns, `cyclePolicy` also waits for every live agent turn of another persona on the bundle to finish before it swaps the policy.
+
 ### `messageLog`
 
 Anchors: `src/workflow/orchestrator.ts:634`, `:2081`, `:2096`, `:2173`, `:2191`, `:2203`, `:2234`, `:2259`, `:2272`, `:2463`, `:2692`; writer at `src/workflow/message-log.ts:120`.
@@ -91,6 +93,8 @@ Anchors: `src/workflow/orchestrator.ts:612`, `:1755-1759`, `:2182`, `:2472`.
 Classification: **set-integrity safe; abort semantics need fan-out policy**.
 
 Reasoning: `Set.add` / `Set.delete` are synchronous and safe from torn mutation in one Node process. `abort()` closes the sessions present when it runs, then clears the set. A future fan-out implementation must stop child actors on abort so no lane creates a new session after `abort()` begins; that is part of the child-actor drain/stop policy, not a coordinator kernel blocker.
+
+Update (implemented): `abort()` now aborts the run's stop signal (`instance.stopController`) before its first await and stops every lane `runFanOutSegment` registered in `instance.fanOutChildren`; `executeAgentState` re-checks the signal after each await, so a session that `createSession` returns after the abort is closed at once and never sent a turn.
 
 ### `quotaExhausted` / `transientFailure`
 

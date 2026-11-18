@@ -13,8 +13,8 @@
  *     -> mcp-proxy-server (PolicyEngine + Audit)
  */
 
-import { createConnection, createServer } from 'node:net';
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
+import { createConnection } from 'node:net';
+import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
 import { resolve } from 'node:path';
 import chalk from 'chalk';
 import ora from 'ora';
@@ -22,21 +22,47 @@ import ora from 'ora';
 import type { IronCurtainConfig } from '../config/types.js';
 import { createSessionId, getBundleShortId, type BundleId, type SessionMode } from '../session/types.js';
 import { buildSessionConfig } from '../session/index.js';
-import { loadSessionMetadata, updateSessionMetadata } from '../session/session-metadata.js';
+import { loadResumeSessionMetadata, updateSessionMetadata } from '../session/session-metadata.js';
+import { claimSessionDirectory } from '../session/session-lock.js';
+import { annotationDriftDiagnostics } from '../session/annotation-drift-diagnostics.js';
+import {
+  formatSessionNotice,
+  formatStartupNotice,
+  hostModelDiagnostics,
+  unavailableServerDiagnostics,
+  type StartupNotice,
+} from '../session/startup-notices.js';
 import { buildContainerWorkspaceMount } from './container-workspace.js';
 import { PTY_SOCK_NAME, DEFAULT_PTY_PORT, APPLE_PTY_GUEST_SOCK } from './pty-types.js';
 import type { PtySessionRegistration, SessionSnapshot } from './pty-types.js';
 import { validateResumeSession } from '../pty/session-scanner.js';
 import type { ContainerRuntime } from './types.js';
+import type { ContainerRuntimeKind } from './container-runtime.js';
 import { prepareDockerAgentStartup } from './agent-startup.js';
+import { planBundleAgentPrivileges } from './agent-privileges.js';
+import {
+  createBundlePrivilegedFileScanner,
+  hostPrivilegedFilesNotice,
+  type HostMountPrivilegeScanner,
+} from './host-mount-privilege-scan.js';
 import { createEscalationWatcher, atomicWriteJsonSync } from '../escalation/escalation-watcher.js';
 import type { EscalationWatcher } from '../escalation/escalation-watcher.js';
 import { getSessionDir, getSessionCapturesDir, getPtyRegistryDir, SESSION_STATE_FILENAME } from '../config/paths.js';
 import * as logger from '../logger.js';
-import { acquireProcessLock, ProcessLockBusyError, type ProcessLockHandle } from '../docker-workload/process-lock.js';
+import type { ProcessLockHandle } from '../docker-workload/process-lock.js';
 import { buildDockerClaudeMd } from './claude-md-seed.js';
+import type { ConversationTranscriptLayout } from './agent-adapter.js';
+import { buildPtyConversationEnv, hasStoredTranscript, syncConversationStateClaudeMd } from './conversation-state.js';
 import { getInternalNetworkName } from './platform.js';
 import { destroyBundleOuterResources } from './container-lifecycle.js';
+import { ensureTransportSidecarImage, hardenTransportSidecarCreate } from './transport-sidecar-image.js';
+import {
+  tcpTransportSidecarAddress,
+  tcpTransportListenEndpoint,
+  tcpTransportUpstreamEndpoint,
+  tcpTransportHostCaMount,
+  startTcpTransportSidecar,
+} from './tcp-transport-sidecar.js';
 import {
   buildAgentContainerConfig,
   buildAgentUidRemap,
@@ -54,20 +80,25 @@ import {
   resolveNestedDockerAgentWiring,
   resolveNestedDockerOuterAgentImage,
   stopDockerWorkloadEgress,
+  tcpSidecarProxyUrl,
   type AgentImageResolution,
 } from './docker-infrastructure.js';
 import { appleVmDockerWorkloadArtifactMount } from '../docker-workload/apple-private-docker.js';
 import type { DockerWorkloadBundleHandle } from '../docker-workload/infrastructure.js';
-import { buildRuntimeTrustEnv, renderAptProxyConfig } from './runtime-trust.js';
+import { buildRuntimeTrustEnv, stageAptProxyConfig } from './runtime-trust.js';
+import { buildPackageClientEnv } from './package-client-env.js';
 import { errorMessage } from '../utils/error-message.js';
 import {
+  finalizeManagedResourceLease,
   InternalNetworkConnectivityError,
   reconcileIronCurtainDockerResourcesBestEffort,
-  releaseManagedResourceLease,
   withInternalNetworkAllocationRetry,
 } from './docker-resource-lifecycle.js';
 import type { MetricsInvocationLease } from '../llm-metrics/attribution-registry.js';
 import type { LlmMetricsRuntimeLease } from '../llm-metrics/runtime.js';
+import { createPtyResizeQueue, type PtyResizeQueue } from './pty-resize-queue.js';
+import { createHostTerminalOutput, drainPendingTerminalInput, type HostTerminalOutput } from './pty-host-terminal.js';
+import { installShutdownSignals, shutdownSignalOf, type ShutdownSignal } from '../utils/shutdown-signals.js';
 
 export interface PtySessionOptions {
   readonly config: IronCurtainConfig;
@@ -81,12 +112,31 @@ export interface PtySessionOptions {
   /** Persona name. Used to build CLAUDE.md and system prompt augmentation. */
   readonly persona?: string;
   /**
+   * Explicit user override (`--allow-stale-policy`): run a persona whose
+   * compiled policy no longer matches its constitution. Without it a stale
+   * persona is refused. Applies to resumed sessions too.
+   */
+  readonly allowStalePolicy?: boolean;
+  /**
+   * Task scope (`--task-scoped`) compiled by the CLI entry point for a new
+   * session. Ignored on resume: the session's own task scope is restored
+   * from its metadata (see `buildSessionConfig`).
+   */
+  readonly taskPolicyDir?: string;
+  /**
    * Per-session provider-profile selection (OpenRouter integration §9.7).
    * Resolved to the active profile in infra prep. On resume, the persisted
    * snapshot name wins over this field (a conflicting flag is warn-ignored
    * upstream in src/index.ts).
    */
   readonly providerProfileName?: string;
+  /**
+   * `--model` from the command line. It takes precedence over the persona's
+   * `agentModelId`, which takes precedence over the global `agentModelId`;
+   * `buildSessionConfig` resolves the three into the session config, whose
+   * agent model the adapter's container environment carries.
+   */
+  readonly agentModelOverride?: string;
   /**
    * Trajectory-capture override: CLI flag wins over `userConfig.capture.enabled`.
    * `true` forces capture on for this run, `undefined` falls through to config.
@@ -165,20 +215,6 @@ function classifyExitStatus(exitCode: number | null): SessionSnapshot['status'] 
   return 'crashed';
 }
 
-/**
- * Checks whether a conversation state directory contains files,
- * indicating the agent wrote conversation data that can be resumed.
- */
-function hasConversationState(stateDir: string): boolean {
-  if (!existsSync(stateDir)) return false;
-  try {
-    const entries = readdirSync(stateDir);
-    return entries.length > 0;
-  } catch {
-    return false;
-  }
-}
-
 /** The resume verdict for an ended PTY session, with the reason when it is refused. */
 export interface SnapshotResumability {
   readonly resumable: boolean;
@@ -195,16 +231,25 @@ export interface SnapshotResumability {
  * that no longer exists. Forcing `resumable: false` here is what keeps PTY mode
  * in sync with the batch path, which rejects a resume whose session metadata
  * records a Docker workload (`applyResumeMetadata` in `src/session/index.ts`).
+ *
+ * Otherwise a session is resumable only when the state directory holds a real
+ * transcript of the adapter's layout (`hasStoredTranscript`). The directory
+ * is never empty (seeds such as `projects/`, `sessions/` and `logs/`, settings
+ * and CLAUDE.md), so its mere contents say nothing about a conversation.
  */
 export function resolveSnapshotResumability(input: {
   readonly conversationStateDir: string | undefined;
+  readonly transcriptLayout: ConversationTranscriptLayout | undefined;
   readonly dockerWorkloadAdmitted: boolean;
 }): SnapshotResumability {
   if (input.dockerWorkloadAdmitted) {
     return { resumable: false, reason: 'nested Docker-workload daemon state is ephemeral' };
   }
-  if (input.conversationStateDir === undefined || !hasConversationState(input.conversationStateDir)) {
+  if (input.conversationStateDir === undefined || input.transcriptLayout === undefined) {
     return { resumable: false, reason: 'no conversation state was recorded' };
+  }
+  if (!hasStoredTranscript(input.conversationStateDir, input.transcriptLayout)) {
+    return { resumable: false, reason: 'no conversation transcript was recorded' };
   }
   return { resumable: true, reason: undefined };
 }
@@ -221,31 +266,80 @@ function writeSessionSnapshot(sessionDir: string, snapshot: SessionSnapshot): vo
  * Claude Code, attaches the terminal, and blocks until the session ends.
  */
 export async function runPtySession(options: PtySessionOptions): Promise<void> {
-  const resumeClaim = options.resumeSessionId
-    ? acquireResumeSessionClaim(options.resumeSessionId, options.config.protectedPaths)
-    : undefined;
-  let retryDocker: ContainerRuntime | undefined;
+  // Interrupts are handled before anything is allocated and for every network
+  // allocation attempt: Node's default SIGINT/SIGTERM/SIGHUP action would end
+  // the process without the teardown in runPtySessionAttempt's finally,
+  // leaking the container, sidecar, network and owner lease. The first signal
+  // aborts setup (or ends the attached session); a second SIGINT or SIGTERM
+  // forces exit. A closed terminal or multiplexer PTY delivers SIGHUP twice
+  // and then fails every write with EIO, so a repeated SIGHUP is ignored and
+  // stdio errors are swallowed while the teardown runs.
+  // Once the terminal is attached in raw mode, Ctrl-C is forwarded to the
+  // agent as a byte and raises no SIGINT here.
+  const shutdownController = new AbortController();
+  const uninstallShutdownSignals = installShutdownSignals(shutdownController);
+  const { signal } = shutdownController;
+  let resumeClaim: ResumeSessionClaim | undefined;
+  // A fresh session claims the directory its attempt created (a retried
+  // network allocation starts the session again under a new ID); like a
+  // resume's claim, each is held until the session has ended.
+  const freshSessionClaims: ProcessLockHandle[] = [];
+  let retryDocker: { readonly docker: ContainerRuntime; readonly runtimeKind: ContainerRuntimeKind } | undefined;
   try {
+    resumeClaim = options.resumeSessionId
+      ? acquireResumeSessionClaim(options.resumeSessionId, options.config.protectedPaths)
+      : undefined;
+    const resumeSnapshot = resumeClaim?.snapshot;
     await withInternalNetworkAllocationRetry(
       {
         maxAttempts: 4,
         description: 'PTY internal Docker network',
         reconcile: async () => {
-          if (retryDocker)
-            await reconcileIronCurtainDockerResourcesBestEffort(retryDocker, 'PTY internal network retry');
+          if (retryDocker && !signal.aborted) {
+            await reconcileIronCurtainDockerResourcesBestEffort(retryDocker.docker, 'PTY internal network retry', {
+              runtimeKind: retryDocker.runtimeKind,
+            });
+          }
         },
       },
-      (excludedSubnets, attempt) =>
-        runPtySessionAttempt(options, resumeClaim?.snapshot, excludedSubnets, attempt, (docker) => {
-          retryDocker = docker;
-        }),
+      (excludedSubnets, attempt) => {
+        throwIfPtyInterrupted(signal);
+        return runPtySessionAttempt(
+          options,
+          resumeSnapshot,
+          excludedSubnets,
+          attempt,
+          signal,
+          (docker, runtimeKind) => {
+            retryDocker = { docker, runtimeKind };
+          },
+          (claim) => freshSessionClaims.push(claim),
+        );
+      },
     );
   } finally {
+    for (const claim of freshSessionClaims) releaseResumeSessionLock(claim);
     releaseResumeSessionLock(resumeClaim?.lock);
+    uninstallShutdownSignals();
   }
 }
 
-const RESUME_SESSION_LOCK_FILENAME = 'resume.lock';
+/**
+ * Raised when a shutdown signal interrupts PTY setup. Callers match the
+ * `PTY_INTERRUPTED` code (not `instanceof`) and exit with the signal's status.
+ */
+export class PtySessionInterruptedError extends Error {
+  readonly code = 'PTY_INTERRUPTED';
+
+  constructor(readonly signal: ShutdownSignal | undefined) {
+    super(`PTY session interrupted${signal ? ` by ${signal}` : ''}`);
+    this.name = 'PtySessionInterruptedError';
+  }
+}
+
+function throwIfPtyInterrupted(signal: AbortSignal): void {
+  if (signal.aborted) throw new PtySessionInterruptedError(shutdownSignalOf(signal));
+}
 
 interface ResumeSessionClaim {
   readonly lock: ProcessLockHandle;
@@ -257,16 +351,10 @@ function acquireResumeSessionClaim(sessionId: string, protectedPaths: string[]):
   if (!existsSync(sessionDir)) {
     throw new Error(`Cannot resume session "${sessionId}": session directory not found`);
   }
-  const lockPath = resolve(sessionDir, RESUME_SESSION_LOCK_FILENAME);
-  let lock: ProcessLockHandle;
-  try {
-    lock = acquireProcessLock(lockPath);
-  } catch (error) {
-    if (error instanceof ProcessLockBusyError) {
-      throw new Error(`Cannot resume session "${sessionId}": session is already being resumed`, { cause: error });
-    }
-    throw error;
-  }
+  // The claim every standalone session holds on its directory, builtin and
+  // batch container sessions included (src/session/session-lock.ts): a
+  // session still running anywhere refuses the resume.
+  const lock = claimSessionDirectory(sessionDir, sessionId, 'resume');
 
   try {
     return { lock, snapshot: validateResumeSession(sessionId, protectedPaths) };
@@ -282,11 +370,12 @@ export function acquireResumeSessionLock(sessionId: string, protectedPaths: stri
 }
 
 /**
- * Releases the resume claim without allowing cleanup damage to replace the
- * session's real outcome. The process-lock implementation deliberately throws
- * when the published inode vanished or was replaced; at PTY teardown we log
- * that integrity signal but never erase the primary Docker error or turn an
- * otherwise completed interactive session into a fatal CLI failure.
+ * Releases a claim on a session directory (a resume's, or a fresh session's)
+ * without allowing cleanup damage to replace the session's real outcome. The
+ * process-lock implementation deliberately throws when the published inode
+ * vanished or was replaced; at PTY teardown we log that integrity signal but
+ * never erase the primary Docker error or turn an otherwise completed
+ * interactive session into a fatal CLI failure.
  */
 export function releaseResumeSessionLock(lock: ProcessLockHandle | undefined): void {
   if (!lock) return;
@@ -294,7 +383,7 @@ export function releaseResumeSessionLock(lock: ProcessLockHandle | undefined): v
     lock.release();
   } catch (error) {
     logger.error(
-      `[PTY] Failed to release resume-session lock ${lock.path}: ${error instanceof Error ? error.message : String(error)}`,
+      `[PTY] Failed to release session lock ${lock.path}: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
 }
@@ -304,7 +393,9 @@ async function runPtySessionAttempt(
   resumeSnapshot: SessionSnapshot | undefined,
   excludedSubnets: ReadonlySet<string>,
   attempt: number,
-  onDockerReady: (docker: ContainerRuntime) => void,
+  signal: AbortSignal,
+  onDockerReady: (docker: ContainerRuntime, runtimeKind: ContainerRuntimeKind) => void,
+  onSessionClaimed: (claim: ProcessLockHandle) => void,
 ): Promise<void> {
   const {
     prepareDockerInfrastructure,
@@ -329,22 +420,48 @@ async function runPtySessionAttempt(
   // the persisted snapshot name wins over any passed flag (which is
   // warn-ignored upstream). Fresh sessions use the passed flag.
   const providerProfileName = isResume ? resumeSnapshot.providerProfileName : options.providerProfileName;
+  // What a resume restores from the session metadata. A metadata file that
+  // is there but cannot be used refuses the resume rather than dropping the
+  // persona and task scope it records (loadResumeSessionMetadata); a
+  // session created before metadata was recorded has none.
+  const resumeMetadata = isResume ? loadResumeSessionMetadata(effectiveSessionId) : undefined;
   // New snapshots carry persona directly. Session metadata is the backwards-
   // compatible source for resumable PTYs created before that field existed.
-  const persona = isResume
-    ? (resumeSnapshot.persona ?? loadSessionMetadata(effectiveSessionId)?.persona)
-    : options.persona;
+  const persona = isResume ? (resumeSnapshot.persona ?? resumeMetadata?.persona) : options.persona;
+  // A resumed task-scoped session keeps the task scope it was created with
+  // (written to its metadata by buildSessionConfig at creation).
+  const taskPolicyDir = isResume ? resumeMetadata?.taskPolicyDir : options.taskPolicyDir;
 
   // Delegate to shared buildSessionConfig() so PTY sessions get the same
   // config patching as standard Docker sessions (persona, memory MCP server
   // injection, server allowlist, policy dir, etc.).
   const dirConfig = buildSessionConfig(options.config, effectiveSessionId, sessionId, {
     resumeSessionId: options.resumeSessionId,
+    // On resume this is the canonical path validateResumeSession() approved
+    // under the resume lock, not the raw string stored in the snapshot.
     workspacePath: isResume ? resumeSnapshot.workspacePath : options.workspacePath,
     persona,
+    ...(options.allowStalePolicy === true ? { allowStalePolicy: true } : {}),
+    ...(taskPolicyDir !== undefined ? { taskPolicyDir } : {}),
+    ...(options.agentModelOverride !== undefined ? { agentModelOverride: options.agentModelOverride } : {}),
     providerProfileName,
     mode: options.mode,
   });
+
+  // A fresh session claims the directory buildSessionConfig() just created,
+  // as builtin and batch container sessions do (src/session/session-lock.ts),
+  // so a --resume of it while it runs is refused and prune sees it as live.
+  // A resume runs under the claim runPtySession() took. runPtySession()
+  // releases either once the session has ended (after this attempt's
+  // teardown and snapshot write).
+  if (!isResume) {
+    try {
+      onSessionClaimed(claimSessionDirectory(sessionDir, effectiveSessionId, 'start'));
+    } catch (error) {
+      logger.release(dirConfig.logClaim);
+      throw error;
+    }
+  }
 
   // Resolve the active-profile name to persist in the snapshot for resume.
   // Docker mode always: PTY sessions are Docker-only. Mirrors the batch
@@ -365,6 +482,7 @@ async function runPtySessionAttempt(
 
   let containerId: string | null = null;
   let sidecarContainerId: string | null = null;
+  let privilegedFileScanner: HostMountPrivilegeScanner | undefined;
   let escalationFileWatcher: EscalationWatcher | null = null;
   let registrationPath: string | null = null;
   let shutdownSpinner: ReturnType<typeof ora> | null = null;
@@ -383,16 +501,13 @@ async function runPtySessionAttempt(
 
   process.on('exit', restoreTerminal);
 
-  // SIGTERM/SIGHUP trigger graceful shutdown by aborting the PTY connection.
-  // This causes attachPty() to resolve, which then falls through to the
-  // finally block for full async cleanup (containers, proxies, files).
-  // SIGHUP is included because node-pty's kill() sends SIGHUP by default.
-  const shutdownController = new AbortController();
-  const handleShutdownSignal = (): void => {
-    shutdownController.abort();
-  };
-  process.on('SIGTERM', handleShutdownSignal);
-  process.on('SIGHUP', handleShutdownSignal);
+  // `signal` is aborted by the SIGINT/SIGTERM/SIGHUP handlers runPtySession
+  // installed before this attempt allocated anything (SIGHUP because
+  // node-pty's kill() sends it). During setup each step below checks it and
+  // the waits end early, so the finally block tears down whatever exists;
+  // while attached it makes attachPty()/execPty() resolve, which falls
+  // through to the same finally block.
+  const checkInterrupted = (): void => throwIfPtyInterrupted(signal);
 
   // Infra variables set inside try, used in finally for cleanup and snapshot
   let proxy: Awaited<ReturnType<typeof prepareDockerInfrastructure>>['proxy'] | null = null;
@@ -420,6 +535,7 @@ async function runPtySessionAttempt(
   let adapterIdForSnapshot: string | null = null;
   let adapterDisplayNameForSnapshot: string | null = null;
   let conversationStateDirForSnapshot: string | undefined;
+  let transcriptLayoutForSnapshot: ConversationTranscriptLayout | undefined;
   let userExited = false;
   let primaryError: Error | undefined;
   let flushError: Error | undefined;
@@ -470,13 +586,15 @@ async function runPtySessionAttempt(
     dockerWorkloadEgress = infra.dockerWorkloadEgress;
 
     // Match standalone batch metadata: persist the admitted lease tuple as
-    // soon as preparation returns, before any PTY-specific callback can fail.
+    // soon as preparation returns, before any PTY-specific callback can fail
+    // (the interrupt checkpoint below included).
     const resolvedDockerWorkload = sessionConfig.userConfig.dockerWorkload;
     if (dockerWorkload && !isResume && resolvedDockerWorkload?.enabled === true) {
       updateSessionMetadata(effectiveSessionId, {
         dockerWorkload: dockerWorkloadSessionMetadata(dockerWorkload, resolvedDockerWorkload, infra.runtimeKind),
       });
     }
+    checkInterrupted();
 
     // PTY sessions are standalone: pin the MITM proxy's token-stream
     // routing ID to this session's ID for the session's lifetime.
@@ -490,6 +608,19 @@ async function runPtySessionAttempt(
     });
     invocationProxyUrl = metricsLease?.proxyUrl;
     metricsRuntime = infra.metricsRuntime;
+
+    // The bundle's budget gate gives a PTY session one session-long
+    // allowance: once the session's cumulative tokens or list-priced cost
+    // reach `resourceBudget.maxTotalTokens` / `maxEstimatedCostUsd`, the MITM
+    // proxy refuses every further completion request with a non-retryable
+    // error the agent shows in the terminal (budget-gate.ts). The session is
+    // left open so the user can still read and save work.
+    infra.budgetGate?.onExhausted((exhaustion) => {
+      logger.warn(
+        `PTY session ${effectiveSessionId}: ${exhaustion.message}; the proxy now refuses every completion ` +
+          'request in this session',
+      );
+    });
 
     // Begin trajectory capture (no-op when disabled). Standalone PTY runs
     // exactly one session through the bundle. The matching flush is in the
@@ -513,7 +644,7 @@ async function runPtySessionAttempt(
       };
     }
 
-    onDockerReady(docker);
+    onDockerReady(docker, infra.runtimeKind);
     const {
       adapter,
       fakeKeys,
@@ -527,20 +658,15 @@ async function runPtySessionAttempt(
       skillsMount,
     } = infra;
 
-    // Write CLAUDE.md into conversation state dir (unconditionally, even on
-    // resume, since persona/memory config may change between sessions).
-    // Clean up stale CLAUDE.md when memory is disabled to avoid leftover rules.
+    // Seed CLAUDE.md into the conversation state dir on every start (even on
+    // resume, since persona/memory config may change between sessions), or
+    // remove a stale one when memory is off or the adapter is not Claude
+    // Code. The dir is the agent's read-write state mount (~/.claude/ for
+    // Claude Code), so the helper (shared with the batch factory) replaces
+    // the entry and never writes through a link or FIFO the agent planted
+    // there in an earlier run.
     if (conversationStateDir) {
-      const claudeMdPath = resolve(conversationStateDir, 'CLAUDE.md');
-      if (claudeMdContent) {
-        writeFileSync(claudeMdPath, claudeMdContent);
-      } else {
-        try {
-          unlinkSync(claudeMdPath);
-        } catch {
-          /* not present */
-        }
-      }
+      syncConversationStateClaudeMd({ conversationStateDir, adapterId: adapter.id, content: claudeMdContent });
     }
 
     // Compose final system prompt with persona/memory augmentation
@@ -551,13 +677,18 @@ async function runPtySessionAttempt(
     adapterIdForSnapshot = adapter.id;
     adapterDisplayNameForSnapshot = adapter.displayName;
     conversationStateDirForSnapshot = conversationStateDir;
+    transcriptLayoutForSnapshot = conversationStateConfig?.transcriptLayout;
 
-    // Validate adapter supports PTY mode. Apple Container prefers its native
-    // interactive exec because the 1.1.0 host-published socket relay can
-    // accept and immediately close a connection without reaching guest socat.
+    // TCP sidecars expose no terminal listener. Native exec also avoids
+    // Apple's unreliable host-published socket relay.
     const socketPtyCommand = adapter.buildPtyCommand?.bind(adapter);
-    const nativePtyExec = infra.runtimeKind === 'apple-container' ? docker.execPty?.bind(docker) : undefined;
+    const requireNativePty = infra.runtimeKind === 'docker' && infra.topology === 'tcp-sidecar';
+    const nativePtyExec =
+      infra.runtimeKind === 'apple-container' || requireNativePty ? docker.execPty?.bind(docker) : undefined;
     const nativePtyCommand = nativePtyExec ? adapter.buildPtyExecCommand?.() : undefined;
+    if (requireNativePty && (nativePtyExec === undefined || nativePtyCommand === undefined)) {
+      throw new Error(`Docker TCP-sidecar PTY requires native interactive exec support for ${adapter.id}`);
+    }
     if (!socketPtyCommand && nativePtyCommand === undefined) {
       throw new Error(`Agent ${adapter.id} does not support PTY mode.`);
     }
@@ -580,9 +711,8 @@ async function runPtySessionAttempt(
           : `/run/ironcurtain/${PTY_SOCK_NAME}`;
     const ptyPort = nativePtyCommand ? undefined : useTcp ? DEFAULT_PTY_PORT : undefined;
 
-    // Native interactive exec needs a stable outer process to attach to. The
-    // Docker transports still run their socat listener as PID 1 exactly as
-    // before.
+    // Native interactive exec needs a stable outer process to attach to.
+    // Linux UDS sessions retain their socat listener.
     let ptyCommand: readonly string[];
     if (nativePtyCommand !== undefined) {
       ptyCommand = ['sleep', 'infinity'];
@@ -608,25 +738,29 @@ async function runPtySessionAttempt(
     });
     let env: Record<string, string>;
     let network: string | null;
+    // Kept in sync with the batch path (createSessionContainers): a
+    // read-only workspace config mounts /workspace read-only here too.
+    const workspaceReadOnly = sessionConfig.readOnlyWorkspace !== undefined;
     let mounts: { source: string; target: string; readonly: boolean }[];
     let extraHosts: string[] | undefined;
     let publishSockets: { hostPath: string; containerPath: string }[] | undefined;
-    let hostPtyPort: number | undefined;
     // apple-container only (both `uds` and the retained `tcp-hostonly`):
     // apt proxy config written into the container via exec after start
     // instead of bind-mounted — see writeAptProxyConfigViaExec.
     let execAptProxyUrl: string | undefined;
     const mainContainerName = `ironcurtain-pty-${shortId}`;
 
-    if (infra.runtimeKind === 'docker') {
-      await reconcileIronCurtainDockerResourcesBestEffort(docker, 'PTY session startup');
-    }
+    // Crash recovery for both runtimes: Apple VMs carry the same owner labels.
+    await reconcileIronCurtainDockerResourcesBestEffort(docker, 'PTY session startup', {
+      runtimeKind: infra.runtimeKind,
+    });
 
     // Remove stale main container from a crashed previous session (same session
     // ID means same deterministic name, which would conflict on docker create).
     // Done before the TCP/UDS branch since the main container name is
     // deterministic in both modes.
     await docker.removeStaleContainer(mainContainerName);
+    checkInterrupted();
 
     // A crashed socat process leaves its UDS inode behind. Resumed sessions
     // reuse the bundle ID (and therefore this pathname), and socat refuses to
@@ -649,6 +783,7 @@ async function runPtySessionAttempt(
       env = {
         ...adapter.buildEnv(sessionConfig, fakeKeys),
         ...buildRuntimeTrustEnv(),
+        ...buildPackageClientEnv(),
         HTTPS_PROXY: invocationProxyUrl ?? proxyUrl,
         HTTP_PROXY: invocationProxyUrl ?? proxyUrl,
       };
@@ -660,7 +795,7 @@ async function runPtySessionAttempt(
       networkName = infra.hostOnlyNetwork.name;
 
       mounts = [
-        buildContainerWorkspaceMount(sandboxDir),
+        buildContainerWorkspaceMount(sandboxDir, { readonly: workspaceReadOnly }),
         { source: orientationDir, target: '/etc/ironcurtain', readonly: true },
       ];
     } else if (useTcp && proxy.port !== undefined && mitmAddr.port !== undefined) {
@@ -668,17 +803,18 @@ async function runPtySessionAttempt(
       const mcpPort = proxy.port;
       const mitmPort = mitmAddr.port;
 
-      const proxyUrl = `http://host.docker.internal:${mitmPort}`;
+      const proxyUrl = tcpSidecarProxyUrl(infra, mitmPort);
       env = {
         ...adapter.buildEnv(sessionConfig, fakeKeys),
         ...buildRuntimeTrustEnv(),
+        ...buildPackageClientEnv(),
         HTTPS_PROXY: invocationProxyUrl ?? proxyUrl,
         HTTP_PROXY: invocationProxyUrl ?? proxyUrl,
       };
 
       // Write apt proxy config so sudo apt-get routes through the MITM proxy
       const aptProxyPath = resolve(orientationDir, 'apt-proxy.conf');
-      writeFileSync(aptProxyPath, renderAptProxyConfig(proxyUrl));
+      stageAptProxyConfig(aptProxyPath, proxyUrl);
 
       const allocatedNetwork = await createDockerSessionTransportNetwork({
         runtime: docker,
@@ -692,65 +828,70 @@ async function runPtySessionAttempt(
       networkName = internalNetworkName;
       logger.info(`Allocated internal Docker network ${internalNetworkName} at ${allocatedNetwork.subnet}`);
 
-      const socatImage = 'alpine/socat';
-      if (!(await docker.imageExists(socatImage))) {
-        logger.info(`Pulling ${socatImage}...`);
-        await docker.pullImage(socatImage);
-      }
+      // Built locally, build-hash-labelled, addressed by immutable ID
+      // (transport-sidecar-image.ts): the sidecar relays every tool call,
+      // the agent's CONNECT streams and the user's terminal.
+      const sidecarImageId = await ensureTransportSidecarImage(docker, (message) => {
+        logger.info(message);
+      });
 
-      // Create socat sidecar: forwards MCP/MITM container→host and PTY host→container.
-      // The PTY socat is reversed because the host connects TO the container's PTY socket.
-      // Docker DNS resolves the main container name on the internal network, and socat
-      // with `fork` only resolves at connection time (so it's fine that main starts later).
+      // Only MCP/MITM need TCP forwards. The user's terminal uses filtered
+      // runtime-native exec, so there is no published PTY listener.
       const sidecarName = `ironcurtain-sidecar-${shortId}`;
+      const sidecarIp = tcpTransportSidecarAddress(allocatedNetwork.subnet);
 
       // Remove stale sidecar from a crashed previous session (TCP mode only).
       await docker.removeStaleContainer(sidecarName);
 
-      // Container-internal PTY port is fixed; host-side port is dynamic to
-      // avoid conflicts when multiple PTY sessions run concurrently.
-      const containerPtyPort = ptyPort ?? DEFAULT_PTY_PORT;
-      hostPtyPort = await findFreePort();
       sidecarContainerId = await createDockerSessionTransportProxy({
         dockerWorkload,
         requestedName: sidecarName,
         baseLabels: resourceLabels,
         create: (requestedName, labels) =>
           infra.docker.create({
-            image: socatImage,
+            image: sidecarImageId,
             name: requestedName,
-            network: 'bridge',
-            mounts: [],
+            network: internalNetworkName,
+            ipv4Address: sidecarIp,
+            mounts: [tcpTransportHostCaMount(orientationDir)],
             env: {},
             entrypoint: '/bin/sh',
-            ...buildDockerDesktopTransportCreateLimits(infra.dockerDesktopResources),
+            // Read-only, unprivileged, no new privileges, on the transport
+            // share of the Docker Desktop resource partition.
+            ...hardenTransportSidecarCreate(buildDockerDesktopTransportCreateLimits(infra.dockerDesktopResources)),
             // PTY sessions are standalone (no workflow/scope), so only the
             // bundle label is emitted. See docs/designs/workflow-session-identity.md §7.
             bundleLabel: bundleId,
             labels,
-            ports: [`127.0.0.1:${hostPtyPort}:${containerPtyPort}`],
             command: [
               '-c',
-              quote(['socat', `TCP-LISTEN:${mcpPort},fork,reuseaddr`, `TCP:host.docker.internal:${mcpPort}`]) +
-                ' & ' +
-                quote(['socat', `TCP-LISTEN:${mitmPort},fork,reuseaddr`, `TCP:host.docker.internal:${mitmPort}`]) +
+              quote([
+                'socat',
+                tcpTransportListenEndpoint(sidecarIp, mcpPort, allocatedNetwork.subnet),
+                tcpTransportUpstreamEndpoint(mcpPort),
+              ]) +
                 ' & ' +
                 quote([
                   'socat',
-                  `TCP-LISTEN:${containerPtyPort},fork,reuseaddr`,
-                  `TCP:${mainContainerName}:${containerPtyPort}`,
+                  tcpTransportListenEndpoint(sidecarIp, mitmPort, allocatedNetwork.subnet),
+                  tcpTransportUpstreamEndpoint(mitmPort),
                 ]) +
                 ' & wait',
             ],
           }),
       });
-      await docker.start(sidecarContainerId);
-      await docker.connectNetwork(internalNetworkName, sidecarContainerId);
-      const sidecarIp = await docker.getContainerIp(sidecarContainerId, internalNetworkName);
+      await startTcpTransportSidecar(
+        docker,
+        sidecarContainerId,
+        internalNetworkName,
+        sidecarIp,
+        allocatedNetwork.subnet,
+      );
       extraHosts = [`host.docker.internal:${sidecarIp}`];
+      checkInterrupted();
 
       mounts = [
-        buildContainerWorkspaceMount(sandboxDir),
+        buildContainerWorkspaceMount(sandboxDir, { readonly: workspaceReadOnly }),
         { source: orientationDir, target: '/etc/ironcurtain', readonly: true },
         { source: aptProxyPath, target: '/etc/apt/apt.conf.d/90-ironcurtain-proxy', readonly: true },
       ];
@@ -760,13 +901,14 @@ async function runPtySessionAttempt(
       env = {
         ...adapter.buildEnv(sessionConfig, fakeKeys),
         ...buildRuntimeTrustEnv(),
+        ...buildPackageClientEnv(),
         HTTPS_PROXY: invocationProxyUrl ?? udsProxyUrl,
         HTTP_PROXY: invocationProxyUrl ?? udsProxyUrl,
       };
       network = null;
 
       mounts = [
-        buildContainerWorkspaceMount(sandboxDir),
+        buildContainerWorkspaceMount(sandboxDir, { readonly: workspaceReadOnly }),
         ...buildUdsSocketMounts(infra.runtimeKind, socketsDir),
         { source: orientationDir, target: '/etc/ironcurtain', readonly: true },
       ];
@@ -785,7 +927,7 @@ async function runPtySessionAttempt(
       } else {
         // Linux Docker: single-file bind mount for the apt proxy config.
         const aptProxyPathUds = resolve(orientationDir, 'apt-proxy.conf');
-        writeFileSync(aptProxyPathUds, renderAptProxyConfig(udsProxyUrl));
+        stageAptProxyConfig(aptProxyPathUds, udsProxyUrl);
         mounts.push({ source: aptProxyPathUds, target: '/etc/apt/apt.conf.d/90-ironcurtain-proxy', readonly: true });
       }
     }
@@ -829,23 +971,31 @@ async function runPtySessionAttempt(
       Object.assign(env, adapter.skills.ptyEnv);
     }
 
-    // Pass resume flags when resuming a session.
-    // Validate each flag to prevent shell injection via adapter misconfiguration.
-    if (isResume && conversationStateConfig && conversationStateConfig.resumeFlags.length > 0) {
-      const SAFE_FLAG = /^--[a-z0-9-]+$/;
-      for (const flag of conversationStateConfig.resumeFlags) {
-        if (!SAFE_FLAG.test(flag)) {
-          throw new Error(`Invalid resume flag: ${flag}`);
-        }
-      }
-      env.IRONCURTAIN_RESUME_FLAGS = conversationStateConfig.resumeFlags.join(' ');
+    // Tell the start script which conversation to start or continue: the
+    // Goose session name, and on resume the validated resume flags and the
+    // Codex thread of the most recently active rollout. The batch path keeps
+    // the same conversations through `findStoredConversation`
+    // (docker-agent-session.ts); both decide from real transcripts.
+    if (conversationStateDir && conversationStateConfig) {
+      Object.assign(
+        env,
+        buildPtyConversationEnv({
+          stateDir: conversationStateDir,
+          stateConfig: conversationStateConfig,
+          sessionId: effectiveSessionId,
+          resume: isResume,
+        }),
+      );
     }
 
     // Build the PTY agent container create args for a given name + resolved
     // labels. `labels` is the base resource labels in the ordinary case and the
     // base merged with the generation ownership label when the create is
     // ledgered — the merge lives in createLedgeredAgentContainer.
-    const agentStartup = prepareDockerAgentStartup(ptyCommand, infra.runtimeKind === 'docker' && !useTcp);
+    const agentStartup = prepareDockerAgentStartup(
+      ptyCommand,
+      planBundleAgentPrivileges(infra, sessionConfig.userConfig).startupProbeUser,
+    );
     const createPtyContainer = (name: string, labels: Readonly<Record<string, string>> | undefined): Promise<string> =>
       infra.docker.create(
         buildAgentContainerConfig(infra, sessionConfig.userConfig, {
@@ -887,10 +1037,15 @@ async function runPtySessionAttempt(
       ],
       create: createPtyContainer,
     });
+    // Host-root daemons only: the agent's read-write host mounts are swept
+    // for setuid/setgid and root-owned entries once the container is gone.
+    privilegedFileScanner = createBundlePrivilegedFileScanner(infra, mounts);
     await attachDockerDesktopAgentEgressNetwork(infra, containerId);
+    checkInterrupted();
     await docker.start(containerId);
     logger.info(`PTY container started: ${containerId.substring(0, 12)}`);
-    await agentStartup.waitUntilReady(docker, containerId);
+    await agentStartup.waitUntilReady(docker, containerId, { signal });
+    checkInterrupted();
 
     // Docker Desktop's daemon sidecar is already adjudicated. Initialize and
     // verify package-build state in the blocked agent, then activate the bundle.
@@ -923,7 +1078,7 @@ async function runPtySessionAttempt(
       await checkHostOnlyConnectivity(docker, containerId, infra.hostOnlyNetwork.gateway, proxy.port);
     } else if (infra.topology === 'tcp-sidecar' && proxy.port !== undefined && mitmAddr.port !== undefined) {
       try {
-        await checkInternalNetworkConnectivity(docker, containerId, proxy.port, mitmAddr.port);
+        await checkInternalNetworkConnectivity(docker, containerId, proxy.port, mitmAddr.port, infra.tcpTransport);
       } catch (error) {
         if (error instanceof InternalNetworkConnectivityError && retryableNetworkSubnet !== undefined) {
           throw new InternalNetworkConnectivityError(error.message, retryableNetworkSubnet);
@@ -931,6 +1086,8 @@ async function runPtySessionAttempt(
         throw error;
       }
     }
+
+    checkInterrupted();
 
     // Same-VM activation: socat may bind the PTY listener while the shared
     // bootstrap adjudicates dockerd, preflights the pinned client, provisions
@@ -950,6 +1107,8 @@ async function runPtySessionAttempt(
         dockerBuildShim: infra.dockerBuildShim,
       });
     }
+
+    checkInterrupted();
 
     // Write session registration for the escalation listener
     registrationPath = writeRegistration(effectiveSessionId, escalationDir, adapter.displayName);
@@ -983,10 +1142,7 @@ async function runPtySessionAttempt(
       const containerIp = await docker.getContainerIp(containerId, infra.hostOnlyNetwork.name);
       ptyTarget = { host: containerIp, port: DEFAULT_PTY_PORT };
     } else if (useTcp) {
-      if (hostPtyPort === undefined) {
-        throw new Error('PTY session misconfiguration: useTcp is true but hostPtyPort was not assigned');
-      }
-      ptyTarget = { host: 'localhost', port: hostPtyPort };
+      throw new Error('TCP-sidecar PTY requires runtime-native interactive exec');
     } else {
       ptyTarget = resolve(socketsDir, PTY_SOCK_NAME);
     }
@@ -1000,25 +1156,44 @@ async function runPtySessionAttempt(
       const readinessTimeoutMs = buildAgentUidRemap(infra.runtimeKind === 'apple-container' || useTcp).user
         ? PTY_READINESS_TIMEOUT_REMAP_MS
         : PTY_READINESS_TIMEOUT_MS;
-      await waitForPtyReady(ptyTarget, readinessTimeoutMs);
+      await waitForPtyReady(ptyTarget, readinessTimeoutMs, signal);
       logger.info('PTY readiness check passed');
     }
+    checkInterrupted();
 
     initSpinner.succeed(chalk.dim(useTcp ? 'PTY relay initialized; connecting to agent' : 'PTY session ready'));
     process.stderr.write('\n');
+
+    // Start-up notices, all already in the session log: host-model features
+    // running differently, MCP servers the proxy's sandbox could not start,
+    // and annotation drift its coordinator found while registering the
+    // backend servers' tools. Printed here, after the spinner and before the
+    // agent's terminal takes over, so they show in the mux pane and the web
+    // UI terminal as well.
+    const startupNotices: StartupNotice[] = [
+      ...hostModelDiagnostics(dirConfig.hostModelNotices),
+      ...unavailableServerDiagnostics(proxy.getUnavailableServers?.() ?? []),
+      ...annotationDriftDiagnostics(proxy.getSchemaDrift?.() ?? []),
+    ];
+    for (const notice of startupNotices) {
+      process.stderr.write(chalk.yellow(`${formatStartupNotice(notice)}\n`));
+    }
+    if (startupNotices.length > 0) process.stderr.write('\n');
 
     // Attach terminal via Node.js PTY proxy. Tests inject a stub via
     // `options.attach` to drive assertions against the live container.
     let exitCode: number;
     if (nativePtyCommand !== undefined && nativePtyExec !== undefined) {
-      exitCode = await nativePtyExec(containerId, nativePtyCommand, shutdownController.signal);
+      // The runtime interposes a host PTY and relays its output through the
+      // same terminal filter as attachPty.
+      exitCode = await nativePtyExec(containerId, nativePtyCommand, signal);
     } else {
       if (ptyTarget === undefined) throw new Error('PTY session misconfiguration: no attach target was assigned');
       exitCode = await (options.attach ?? attachPty)({
         target: ptyTarget,
         containerId,
         runtime: docker,
-        signal: shutdownController.signal,
+        signal,
       });
     }
     ptyExitCode = exitCode;
@@ -1039,18 +1214,23 @@ async function runPtySessionAttempt(
       process.stderr.write(chalk.yellow(`PTY session exited with code ${exitCode}\n`));
     }
   } catch (error) {
-    primaryError = normalizePtyError(error);
-    logger.error(`PTY setup failed: ${primaryError.message}`);
+    if (signal.aborted) {
+      // Whatever step observed the interrupt, report it as one.
+      primaryError =
+        error instanceof PtySessionInterruptedError ? error : new PtySessionInterruptedError(shutdownSignalOf(signal));
+      logger.warn(`PTY setup interrupted: ${errorMessage(error)}`);
+    } else {
+      primaryError = normalizePtyError(error);
+      logger.error(`PTY setup failed: ${primaryError.message}`);
+    }
   } finally {
     // Stop spinner if still running (e.g. error during setup)
     if (initSpinner.isSpinning) {
-      initSpinner.fail(chalk.red('PTY session failed'));
+      initSpinner.fail(chalk.red(signal.aborted ? 'PTY session interrupted' : 'PTY session failed'));
     }
 
     restoreTerminal();
     process.off('exit', restoreTerminal);
-    process.off('SIGTERM', handleShutdownSignal);
-    process.off('SIGHUP', handleShutdownSignal);
 
     // Stop escalation watcher
     escalationFileWatcher?.stop();
@@ -1098,9 +1278,10 @@ async function runPtySessionAttempt(
           context: 'PTY session',
         });
       } else {
-        // Infrastructure never came up: no outer resources, but a managed lease
-        // may have been acquired before the failure (no-op if not).
-        releaseManagedResourceLease(effectiveSessionId);
+        // Infrastructure never came up, so no runtime resource can carry the
+        // bundle's owner token: discard a lease minted before the failure
+        // (no-op if none was).
+        await finalizeManagedResourceLease(effectiveSessionId, { teardownVerified: true });
       }
     } catch (error) {
       const runtimeCleanupError = normalizePtyError(error);
@@ -1112,6 +1293,12 @@ async function runPtySessionAttempt(
       // masking the authoritative resource-cleanup error.
       await mitmProxy?.stop().catch(() => {});
       await proxy?.stop().catch(() => {});
+      // The container is gone, so nothing re-plants behind this final sweep.
+      // Before the runtime root (sockets dir) is removed, so root-owned entries
+      // there are reported rather than only failing the removal. The notice
+      // (counts, first paths, what to do) is the one batch sessions show.
+      const notice = hostPrivilegedFilesNotice(await privilegedFileScanner?.scan('session end'), 'all');
+      if (notice !== undefined) process.stderr.write(chalk.yellow(`${formatSessionNotice(notice)}\n`));
       removeBundleRuntimeRoot(effectiveSessionId as BundleId, 'PTY session');
     }
     await metricsRuntime?.release().catch((err: unknown) => {
@@ -1120,10 +1307,14 @@ async function runPtySessionAttempt(
     // Write session snapshot for resume support
     if (adapterIdForSnapshot) {
       try {
-        const status: SessionSnapshot['status'] = userExited ? 'user-exit' : classifyExitStatus(ptyExitCode);
+        // A shutdown signal (Ctrl-C during setup, SIGTERM/SIGHUP from a
+        // multiplexer) is a deliberate stop, like a clean agent exit.
+        const status: SessionSnapshot['status'] =
+          userExited || signal.aborted ? 'user-exit' : classifyExitStatus(ptyExitCode);
 
         const resumability = resolveSnapshotResumability({
           conversationStateDir: conversationStateDirForSnapshot,
+          transcriptLayout: transcriptLayoutForSnapshot,
           dockerWorkloadAdmitted: dockerWorkload !== undefined,
         });
 
@@ -1151,7 +1342,7 @@ async function runPtySessionAttempt(
     }
 
     logger.info(`PTY session ${effectiveSessionId} ended`);
-    logger.teardown();
+    logger.release(dirConfig.logClaim);
 
     // shutdownSpinner is declared inside try but accessible here via closure
     shutdownSpinner?.succeed(chalk.dim('PTY session ended'));
@@ -1209,13 +1400,27 @@ export async function attachPty(options: PtyProxyOptions): Promise<number> {
   // the host connection is the capability that launches the agent behind the
   // socat listener.
   if (options.signal?.aborted) return 0;
+  // One filtered output for the whole attach, so the terminal modes it saw
+  // are restored once even across TCP retries (only the attempt that
+  // receives data forwards anything).
+  const output = createHostTerminalOutput(process.stdout);
+  try {
+    return await attachPtyWithOutput(options, output);
+  } finally {
+    output.restore();
+    // Still in raw mode here: discard terminal replies that arrive late.
+    await drainPendingTerminalInput(process.stdin);
+  }
+}
+
+async function attachPtyWithOutput(options: PtyProxyOptions, output: HostTerminalOutput): Promise<number> {
   const isTcp = typeof options.target !== 'string';
   if (isTcp) {
     // TCP: poll until the connection succeeds and stays open, then attach.
     // Both pre-connect errors and instant-close indicate "not ready yet".
     const deadline = Date.now() + PTY_READINESS_TIMEOUT_MS;
     while (Date.now() < deadline) {
-      const code = await attachPtyOnce(options, deadline - Date.now());
+      const code = await attachPtyOnce(options, output, deadline - Date.now());
       if (options.signal?.aborted) return 0;
       if (code !== ATTACH_INSTANT_CLOSE && code !== ATTACH_PRE_CONNECT_ERROR) return code;
       logger.info('PTY TCP connection not ready, retrying...');
@@ -1231,7 +1436,7 @@ export async function attachPty(options: PtyProxyOptions): Promise<number> {
   // was actually listening — typically a stale file or a socat that
   // crashed between probe and attach. Surface either outcome instead of
   // silently mapping a startup failure to a successful user exit.
-  const code = await attachPtyOnce(options);
+  const code = await attachPtyOnce(options, output);
   if (options.signal?.aborted) return 0;
   if (code === ATTACH_PRE_CONNECT_ERROR) {
     throw new Error(
@@ -1279,7 +1484,11 @@ async function diagnosePtyStartupClose(options: PtyProxyOptions): Promise<string
  *   ATTACH_INSTANT_CLOSE     — connected, remote closed before data
  *   ATTACH_PRE_CONNECT_ERROR — socket connect itself failed
  */
-function attachPtyOnce(options: PtyProxyOptions, connectTimeoutMs = PTY_READINESS_TIMEOUT_MS): Promise<number> {
+function attachPtyOnce(
+  options: PtyProxyOptions,
+  output: HostTerminalOutput,
+  connectTimeoutMs = PTY_READINESS_TIMEOUT_MS,
+): Promise<number> {
   const conn = connectToTarget(options.target);
 
   const { stdin, stdout } = process;
@@ -1342,35 +1551,14 @@ function attachPtyOnce(options: PtyProxyOptions, connectTimeoutMs = PTY_READINES
       // data) returns -1 without touching the terminal, so the user is never
       // left stuck in raw mode between retry attempts.
       let receivedData = false;
-      const verifyAbort = new AbortController();
-      let isFirstResize = true;
 
+      // Host resize events become serialized, latest-wins resize execs (see
+      // pty-resize-queue.ts), which also verify the size once it settles.
       const runtime = options.runtime;
+      let resizeQueue: PtyResizeQueue | undefined;
       const onResize = (): void => {
         const { columns, rows } = stdout;
-        if (columns && rows && runtime) {
-          if (!isFirstResize) {
-            verifyAbort.abort();
-          }
-          isFirstResize = false;
-          // Route through the active runtime (docker or Apple `container`).
-          // `exec` defaults `--user` to codespace, which is correct whether
-          // the container runs as root (Linux UID-remap path, issue #232) or
-          // as codespace (macOS); re-asserting codespace there is a no-op.
-          void runtime
-            .exec(options.containerId, ['/etc/ironcurtain/resize-pty.sh', String(columns), String(rows)], 5000)
-            .then((res) => {
-              if (res.exitCode !== 0) {
-                logger.warn(`resize-pty.sh failed (exit ${res.exitCode})`);
-                if (res.stderr) {
-                  logger.warn(`resize-pty.sh stderr: ${res.stderr.trim()}`);
-                }
-              }
-            })
-            .catch((err: unknown) => {
-              logger.warn(`resize-pty.sh failed: ${err instanceof Error ? err.message : String(err)}`);
-            });
-        }
+        if (columns && rows) resizeQueue?.request(columns, rows);
       };
 
       // Host -> Container
@@ -1387,10 +1575,21 @@ function attachPtyOnce(options: PtyProxyOptions, connectTimeoutMs = PTY_READINES
         conn.write(data);
       };
 
-      // Container -> Host (untrusted output, displayed directly).
-      // Piped immediately so no data is lost; raw mode and stdin forwarding
-      // are deferred until we confirm the connection is real (first data).
-      conn.pipe(stdout);
+      // Container -> Host. The output is untrusted and reaches the user's
+      // real terminal, so it is filtered (terminal-output-filter.ts) before it
+      // is written. Registered before the first-data handler below so no data
+      // is lost; raw mode and stdin forwarding are deferred until we confirm
+      // the connection is real (first data).
+      const onDrain = (): void => {
+        conn.resume();
+      };
+      const onOutput = (chunk: Buffer): void => {
+        if (!output.write(chunk)) {
+          conn.pause();
+          stdout.once('drain', onDrain);
+        }
+      };
+      conn.on('data', onOutput);
 
       conn.once('data', () => {
         receivedData = true;
@@ -1402,28 +1601,23 @@ function attachPtyOnce(options: PtyProxyOptions, connectTimeoutMs = PTY_READINES
         stdin.resume();
         stdin.on('data', onData);
 
-        // Start resize forwarding and send initial size
+        // Start resize forwarding and send the initial size.
+        if (runtime) resizeQueue = createPtyResizeQueue({ runtime, containerId: options.containerId });
         stdout.on('resize', onResize);
         onResize();
-
-        // Background verify+retry to ensure the initial resize took effect.
-        // Fire-and-forget -- does not block the PTY proxy.
-        // Canceled via verifyAbort when the user resizes the terminal.
-        if (runtime && stdout.columns && stdout.rows) {
-          void verifyInitialPtySize(runtime, options.containerId, stdout.columns, stdout.rows, verifyAbort.signal);
-        }
       });
 
       // Use function declarations (hoisted) so cleanup and onAbort can
       // reference each other without temporal dead zone issues.
       function cleanup(): void {
         stdout.removeListener('resize', onResize);
+        stdout.removeListener('drain', onDrain);
         stdin.removeListener('data', onData);
-        conn.unpipe(stdout);
+        conn.removeListener('data', onOutput);
         if (receivedData) {
           stdin.pause();
         }
-        verifyAbort.abort();
+        resizeQueue?.close();
         options.signal?.removeEventListener('abort', onAbort);
       }
       cleanupConnected = cleanup;
@@ -1442,90 +1636,6 @@ function attachPtyOnce(options: PtyProxyOptions, connectTimeoutMs = PTY_READINES
       });
     });
   });
-}
-
-// --- PTY size verification ---
-
-/** Maximum retries for initial PTY size verification. */
-const PTY_SIZE_VERIFY_RETRIES = 5;
-
-/** Interval between PTY size verification attempts (ms). */
-const PTY_SIZE_VERIFY_INTERVAL_MS = 1_000;
-
-/** Initial delay before first verification attempt (ms). */
-const PTY_SIZE_VERIFY_INITIAL_DELAY_MS = 500;
-
-/**
- * Runs check-pty-size.sh via the active runtime and returns { rows, cols }
- * or null on failure.
- */
-async function checkPtySize(
-  runtime: ContainerRuntime,
-  containerId: string,
-): Promise<{ rows: number; cols: number } | null> {
-  try {
-    // `exec` defaults `--user` to codespace; see the resize callsite for the
-    // issue #232 rationale.
-    const res = await runtime.exec(containerId, ['/etc/ironcurtain/check-pty-size.sh'], 5000);
-    if (res.exitCode !== 0) return null;
-    const parts = res.stdout.trim().split(/\s+/);
-    if (parts.length >= 2) {
-      const rows = parseInt(parts[0], 10);
-      const cols = parseInt(parts[1], 10);
-      if (!isNaN(rows) && !isNaN(cols) && rows > 0 && cols > 0) {
-        return { rows, cols };
-      }
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Background verify+retry loop for initial PTY resize.
- * Non-blocking (fire-and-forget). Aborted when a user resize occurs so it
- * does not fight with legitimate SIGWINCH-driven resizes.
- */
-async function verifyInitialPtySize(
-  runtime: ContainerRuntime,
-  containerId: string,
-  expectedCols: number,
-  expectedRows: number,
-  signal?: AbortSignal,
-): Promise<void> {
-  await new Promise((r) => setTimeout(r, PTY_SIZE_VERIFY_INITIAL_DELAY_MS));
-
-  for (let attempt = 0; attempt < PTY_SIZE_VERIFY_RETRIES; attempt++) {
-    if (signal?.aborted) return;
-
-    const size = await checkPtySize(runtime, containerId);
-    if (size && size.cols === expectedCols && size.rows === expectedRows) {
-      return; // PTY size matches
-    }
-
-    if (signal?.aborted) return;
-
-    // Mismatch or check failed -- try resizing via the active runtime.
-    // `exec` defaults `--user` to codespace; see issue #232.
-    await runtime
-      .exec(containerId, ['/etc/ironcurtain/resize-pty.sh', String(expectedCols), String(expectedRows)], 5000)
-      .catch(() => undefined);
-
-    // Wait before rechecking
-    await new Promise((r) => setTimeout(r, PTY_SIZE_VERIFY_INTERVAL_MS));
-  }
-
-  if (signal?.aborted) return;
-
-  // Final check
-  const finalSize = await checkPtySize(runtime, containerId);
-  if (!finalSize || finalSize.cols !== expectedCols || finalSize.rows !== expectedRows) {
-    logger.warn(
-      `PTY size verification failed after ${PTY_SIZE_VERIFY_RETRIES} retries ` +
-        `(expected ${expectedCols}x${expectedRows}, got ${finalSize ? `${finalSize.cols}x${finalSize.rows}` : 'unknown'})`,
-    );
-  }
 }
 
 // --- Readiness polling ---
@@ -1574,7 +1684,11 @@ export function removeStalePtySocket(path: string): void {
  * directory at the path is not "ready", since the Linux/UDS attach path
  * does not retry on connect failure.
  */
-export async function waitForPtyReady(target: PtyTarget, timeoutMs: number = PTY_READINESS_TIMEOUT_MS): Promise<void> {
+export async function waitForPtyReady(
+  target: PtyTarget,
+  timeoutMs: number = PTY_READINESS_TIMEOUT_MS,
+  signal?: AbortSignal,
+): Promise<void> {
   if (typeof target !== 'string') {
     // macOS TCP path is guarded out at the call site (pty-session.ts ~534);
     // this branch exists only as a defensive no-op so the helper stays total.
@@ -1583,11 +1697,33 @@ export async function waitForPtyReady(target: PtyTarget, timeoutMs: number = PTY
 
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    // An interrupted setup stops waiting at once (rejecting with the
+    // signal's reason) so the session teardown can run.
+    signal?.throwIfAborted();
     if (isSocketPath(target)) return;
-    await new Promise((r) => setTimeout(r, PTY_READINESS_POLL_MS));
+    await abortableDelay(PTY_READINESS_POLL_MS, signal);
   }
 
   throw new Error(`PTY socket did not become ready within ${timeoutMs / 1000}s`);
+}
+
+/** `setTimeout` as a promise that rejects with the signal's reason on abort. */
+function abortableDelay(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    if (signal?.aborted) {
+      rejectPromise(signal.reason instanceof Error ? signal.reason : new Error('aborted'));
+      return;
+    }
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      rejectPromise(signal?.reason instanceof Error ? signal.reason : new Error('aborted'));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolvePromise();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 /**
@@ -1603,33 +1739,6 @@ function isSocketPath(path: string): boolean {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
     throw err;
   }
-}
-
-// --- Port allocation ---
-
-/**
- * Finds a free TCP port on localhost by binding to port 0 and immediately
- * closing the server. Used on macOS to allocate the PTY host port dynamically
- * so multiple PTY sessions can run concurrently.
- *
- * Note: inherent TOCTOU window between discovering the port and Docker
- * binding it. In practice this is extremely unlikely for ephemeral ports.
- */
-function findFreePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const srv = createServer();
-    srv.listen(0, '127.0.0.1', () => {
-      const addr = srv.address();
-      if (!addr || typeof addr === 'string') {
-        srv.close();
-        reject(new Error('Failed to get ephemeral port'));
-        return;
-      }
-      const { port } = addr;
-      srv.close(() => resolve(port));
-    });
-    srv.on('error', reject);
-  });
 }
 
 // --- Registration ---

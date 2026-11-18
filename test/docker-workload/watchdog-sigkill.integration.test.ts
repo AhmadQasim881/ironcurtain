@@ -6,10 +6,12 @@
  * and launches the real detached supervisor through the production spawn path
  * (`launchDetachedResourceWatchdogSupervisor` -> resource-watchdog-supervisor-main).
  * The test then SIGKILLs the coordinator and proves the supervisor is still
- * alive, does not revoke while nothing has tripped, and — once the frozen hard
- * state threshold is breached after the coordinator is dead — revokes the
- * leased container, removes the exact bundle state, closes the lease with a
- * two-inventory cleanup proof, and exits.
+ * alive, does not revoke while nothing has tripped, and — once the Docker
+ * Desktop daemon volume grows past the frozen hard threshold after the
+ * coordinator is dead — revokes the leased containers and volume, removes the
+ * exact bundle state, closes the lease with a two-inventory cleanup proof, and
+ * exits. The volume size reaches the supervisor the production way: the
+ * outer Engine's `system df` report, parsed by DockerManager.
  *
  * Hermetic: no Docker daemon. The supervisor's DockerManager resolves a
  * stateful `docker` stub from PATH; the stub logs every invocation to a JSONL
@@ -53,12 +55,29 @@ const PROXY_CONTAINER_ID = `face${'fedcba9876543210'.repeat(3)}cafe0123456789`;
 const PROXY_CONTAINER_NAME = 'ironcurtain-sigkill-proxy-001';
 const NETWORK_ID = `beef${'0011223344556677'.repeat(3)}feed89abcdef01`;
 const NETWORK_NAME = 'ironcurtain-sigkill-network-001';
+const DAEMON_CONTAINER_ID = `d00d${'89abcdef01234567'.repeat(3)}0123456789abcd`;
+const DAEMON_CONTAINER_NAME = 'ironcurtain-sigkill-nested-daemon-001';
+const VOLUME_NAME = 'ic-dw-daemon-api-sigkill001';
 const LABEL_KEY = 'ironcurtain.workload.generation';
 
 const template: WatchdogPolicyTemplate = {
-  schemaVersion: 1,
-  policyId: 'sigkill-cross-process-watchdog-v1',
-  stateClasses: [{ id: 'daemon-state', relativePath: 'daemon', kind: 'directory', required: true }],
+  schemaVersion: 2,
+  policyId: 'sigkill-cross-process-watchdog-v2',
+  coverage: {
+    docker: {
+      runtimeReserveBytes: 1,
+      stateClasses: [
+        {
+          id: 'desktop-daemon-volume',
+          kind: 'docker-volume',
+          role: 'daemon-api',
+          sampleIntervalMs: 1000,
+          sampleTimeoutMs: 5000,
+          staleAfterMs: 20_000,
+        },
+      ],
+    },
+  },
   sampleIntervalMs: 100,
   sampleTimeoutMs: 500,
   // Generous staleness bound so CI scheduling hiccups cannot fake a
@@ -103,6 +122,8 @@ describe('resource watchdog supervisor across a coordinator SIGKILL', () => {
     const resultPath = join(directory, 'coordinator-result.json');
     const configPath = join(stubDir, 'config.json');
     const logPath = join(stubDir, 'invocations.log');
+    const volumeSizePath = join(stubDir, 'volume-size');
+    writeFileSync(volumeSizePath, '0B\n', { mode: 0o600 });
     const bundleId = 'bundle-sigkill-cross-001';
     const bundleRuntimeRoot = withIronCurtainHome(ironCurtainHome, () => getBundleRuntimeRoot(bundleId as BundleId));
     const neighboringRuntimeRoot = withIronCurtainHome(ironCurtainHome, () =>
@@ -129,6 +150,10 @@ describe('resource watchdog supervisor across a coordinator SIGKILL', () => {
         containerName: CONTAINER_NAME,
         proxyContainerId: PROXY_CONTAINER_ID,
         proxyContainerName: PROXY_CONTAINER_NAME,
+        daemonContainerId: DAEMON_CONTAINER_ID,
+        daemonContainerName: DAEMON_CONTAINER_NAME,
+        volumeName: VOLUME_NAME,
+        volumeSizePath,
         networkId: NETWORK_ID,
         networkName: NETWORK_NAME,
         labelKey: LABEL_KEY,
@@ -138,6 +163,8 @@ describe('resource watchdog supervisor across a coordinator SIGKILL', () => {
         removedMarkerPath: join(stubDir, 'agent-removed.marker'),
         proxyRemovedMarkerPath: join(stubDir, 'proxy-removed.marker'),
         networkRemovedMarkerPath: join(stubDir, 'network-removed.marker'),
+        daemonRemovedMarkerPath: join(stubDir, 'daemon-removed.marker'),
+        volumeRemovedMarkerPath: join(stubDir, 'volume-removed.marker'),
       })}\n`,
       { mode: 0o600 },
     );
@@ -204,15 +231,33 @@ describe('resource watchdog supervisor across a coordinator SIGKILL', () => {
       });
 
       // Negative proof: while the coordinator is alive and heartbeating, the
-      // supervisor neither revokes nor touches the container runtime.
+      // supervisor only measures (VM-disk statfs and Engine volume sizes) and
+      // never revokes.
       const heartbeatBefore = loadDockerWorkloadLease(leasePath).coordinator.heartbeatAt;
       const negativeDeadline = Date.now() + 600;
       while (Date.now() < negativeDeadline) {
         expect(loadResourceWatchdogSupervisorStatus(statusPath).state).toBe('ready');
         expect(loadDockerWorkloadLease(leasePath).status).toBe('active');
-        expect(existsSync(logPath)).toBe(false);
+        expect(readInvocations(logPath).filter((args) => !isMeasurement(args))).toEqual([]);
         await sleep(50);
       }
+      await pollUntil(
+        5000,
+        () => readInvocations(logPath).some((args) => args[0] === 'system' && args[1] === 'df'),
+        () => 'watchdog supervisor never sized the daemon volume through the Engine',
+      );
+      expect(readInvocations(logPath)).toContainEqual([
+        'exec',
+        '--user',
+        '0:0',
+        DAEMON_CONTAINER_ID,
+        '/bin/busybox',
+        'stat',
+        '-f',
+        '-c',
+        '%S %b %f %a',
+        '/home/codespace/.local/share',
+      ]);
       await pollUntil(
         3000,
         () => Date.parse(loadDockerWorkloadLease(leasePath).coordinator.heartbeatAt) > Date.parse(heartbeatBefore),
@@ -236,10 +281,11 @@ describe('resource watchdog supervisor across a coordinator SIGKILL', () => {
         await sleep(50);
       }
 
-      // Breach the frozen hard state threshold now that the coordinator is
-      // dead; the orphaned supervisor must detect and revoke on its own.
+      // Grow the daemon volume past the frozen hard threshold now that the
+      // coordinator is dead; the orphaned supervisor must detect and revoke on
+      // its own.
       const breachedAtMs = Date.now();
-      writeFileSync(join(stateRoot, 'daemon', 'threshold.bin'), Buffer.alloc(2 * 1024 * 1024, 1));
+      writeFileSync(volumeSizePath, '2.1MB\n');
       let status: ResourceWatchdogSupervisorStatus | undefined;
       await pollUntil(
         20_000,
@@ -283,6 +329,16 @@ describe('resource watchdog supervisor across a coordinator SIGKILL', () => {
             observedId: NETWORK_ID,
             removal: expect.objectContaining({ proof: 'immutable-id-absent', identity: NETWORK_ID }),
           }),
+          expect.objectContaining({
+            requestId: 'nested-daemon-001',
+            observedId: DAEMON_CONTAINER_ID,
+            removal: expect.objectContaining({ proof: 'immutable-id-absent', identity: DAEMON_CONTAINER_ID }),
+          }),
+          expect.objectContaining({
+            requestId: 'daemon-api-volume-001',
+            observedId: VOLUME_NAME,
+            removal: expect.objectContaining({ proof: 'immutable-id-absent', identity: VOLUME_NAME }),
+          }),
         ]),
       );
       expect(existsSync(stateRoot)).toBe(false);
@@ -293,10 +349,7 @@ describe('resource watchdog supervisor across a coordinator SIGKILL', () => {
 
       // The docker stub proves the runtime side of revocation was exercised
       // with the exact leased identity.
-      const invocations = readFileSync(logPath, 'utf8')
-        .trim()
-        .split('\n')
-        .map((line) => JSON.parse(line) as string[]);
+      const invocations = readInvocations(logPath);
       expect(
         invocations.some((args) => args[0] === 'container' && args[1] === 'inspect' && args.includes(CONTAINER_ID)),
         JSON.stringify(invocations),
@@ -310,7 +363,13 @@ describe('resource watchdog supervisor across a coordinator SIGKILL', () => {
       expect(invocations).toContainEqual(['stop', '-t', '10', PROXY_CONTAINER_ID]);
       expect(invocations).toContainEqual(['rm', '-f', CONTAINER_ID]);
       expect(invocations).toContainEqual(['rm', '-f', PROXY_CONTAINER_ID]);
+      expect(invocations).toContainEqual(['stop', '-t', '10', DAEMON_CONTAINER_ID]);
+      expect(invocations).toContainEqual(['rm', '-f', DAEMON_CONTAINER_ID]);
+      expect(invocations).toContainEqual(['volume', 'rm', VOLUME_NAME]);
       expect(invocations).toContainEqual(['network', 'rm', NETWORK_ID]);
+      // Revocation is independent of durable writes: every exact container and
+      // the volume are gone before the ledgered pass removes the network.
+      const volumeRemoveIndex = invocations.findIndex((args) => args[0] === 'volume' && args[1] === 'rm');
       const stopIndex = invocations.findIndex((args) => args[0] === 'stop');
       const removeIndex = invocations.findIndex((args) => args[0] === 'rm');
       const networkRemoveIndex = invocations.findIndex((args) => args[0] === 'network' && args[1] === 'rm');
@@ -319,13 +378,24 @@ describe('resource watchdog supervisor across a coordinator SIGKILL', () => {
       );
       expect(stopIndex).toBeLessThan(removeIndex);
       expect(removeIndex).toBeLessThan(networkRemoveIndex);
+      expect(volumeRemoveIndex).toBeLessThan(networkRemoveIndex);
       expect(networkRemoveIndex).toBeLessThan(postRemoveInventoryIndex);
-      expect(invocations[postRemoveInventoryIndex]).toEqual(['container', 'ls', '--all', '--no-trunc', '--quiet']);
+      // Owned inventories are filtered by the daemon to this generation's
+      // label; presence checks inspect the exact observed IDs. Nothing lists
+      // every container on the host.
+      const ownedFilter = ['--filter', `label=${LABEL_KEY}=${GENERATION}`];
+      const ownedContainerInventory = ['container', 'ls', '--all', '--no-trunc', '--quiet', ...ownedFilter];
+      expect(invocations[postRemoveInventoryIndex]).toEqual(ownedContainerInventory);
       expect(invocations.slice(removeIndex + 1)).not.toContainEqual(['inspect', CONTAINER_ID]);
+      expect(invocations.slice(removeIndex + 1)).toContainEqual(['container', 'inspect', CONTAINER_ID]);
       const inventoryCalls = invocations.filter((args) => args[0] === 'container' && args[1] === 'ls');
-      expect(inventoryCalls.length).toBeGreaterThanOrEqual(5);
+      // The final revocation check plus the two cleanup-proof inventories.
+      expect(inventoryCalls.length).toBeGreaterThanOrEqual(3);
       for (const call of inventoryCalls) {
-        expect(call).toEqual(['container', 'ls', '--all', '--no-trunc', '--quiet']);
+        expect(call).toEqual(ownedContainerInventory);
+      }
+      for (const call of invocations.filter((args) => args[0] === 'network' && args[1] === 'ls')) {
+        expect(call).toEqual(['network', 'ls', '--no-trunc', '--quiet', ...ownedFilter]);
       }
 
       // The supervisor exits after completing its duty.
@@ -345,6 +415,25 @@ describe('resource watchdog supervisor across a coordinator SIGKILL', () => {
     }
   }, 60_000);
 });
+
+function readInvocations(logPath: string): readonly string[][] {
+  if (!existsSync(logPath)) return [];
+  return readFileSync(logPath, 'utf8')
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as string[]);
+}
+
+/** Read-only observations the supervisor makes every sample or volume interval. */
+function isMeasurement(args: readonly string[]): boolean {
+  return (
+    (args[0] === 'exec' && args.includes('stat')) ||
+    (args[0] === 'system' && args[1] === 'df') ||
+    (args[0] === 'container' && (args[1] === 'ls' || args[1] === 'inspect')) ||
+    (args[0] === 'volume' && (args[1] === 'ls' || args[1] === 'inspect'))
+  );
+}
 
 function withIronCurtainHome<T>(home: string, operation: () => T): T {
   const previous = process.env.IRONCURTAIN_HOME;

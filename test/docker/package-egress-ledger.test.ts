@@ -22,6 +22,7 @@ describe('package egress ledger', () => {
       maxConcurrentUpstreams: 24,
       maxBytesPerRequest: 2 * 1024 * 1024 * 1024,
       maxSessionBytes: 16 * 1024 * 1024 * 1024,
+      maxDerivedMetadataBytes: 128 * 1024 * 1024,
       absoluteTimeoutMs: 10 * 60_000,
       idleTimeoutMs: 60_000,
       tlsHandshakeMaxBytes: 64 * 1024,

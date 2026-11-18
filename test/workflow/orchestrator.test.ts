@@ -1,11 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, utimesSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { SessionOptions } from '../../src/session/types.js';
 import type { WorkflowDefinition } from '../../src/workflow/types.js';
 import { WorkflowOrchestrator, type WorkflowLifecycleEvent } from '../../src/workflow/orchestrator.js';
 import {
+  resolveActiveGate,
   MockSession,
   approvedResponse,
   rejectedResponse,
@@ -200,10 +201,6 @@ describe('WorkflowOrchestrator', () => {
     }
     cleanupPersonas?.();
     rmSync(tmpDir, { recursive: true, force: true });
-    // Clean up sibling checkpoint directory
-    const baseName = resolve(tmpDir).split('/').pop()!;
-    const ckptDir = resolve(tmpDir, '..', `${baseName}-ckpt`);
-    rmSync(ckptDir, { recursive: true, force: true });
   });
 
   // -----------------------------------------------------------------------
@@ -268,7 +265,7 @@ describe('WorkflowOrchestrator', () => {
     expect(gateRequests[0].acceptedEvents).toContain('APPROVE');
 
     // Approve plan gate
-    orchestrator.resolveGate(workflowId, { type: 'APPROVE' });
+    resolveActiveGate(orchestrator, workflowId, { type: 'APPROVE' });
 
     // Machine enters implement -> review(approved) -> done
     await waitForCompletion(orchestrator, workflowId);
@@ -419,7 +416,7 @@ describe('WorkflowOrchestrator', () => {
     await waitForGate(raiseGate, 1);
 
     // Send FORCE_REVISION with a prompt
-    orchestrator.resolveGate(workflowId, {
+    resolveActiveGate(orchestrator, workflowId, {
       type: 'FORCE_REVISION',
       prompt: 'Focus more on error handling and retry logic',
     });
@@ -441,7 +438,7 @@ describe('WorkflowOrchestrator', () => {
     expect(dismissGate).toHaveBeenCalledTimes(1);
 
     // Approve the second plan gate to let the workflow finish
-    orchestrator.resolveGate(workflowId, { type: 'APPROVE' });
+    resolveActiveGate(orchestrator, workflowId, { type: 'APPROVE' });
     await waitForCompletion(orchestrator, workflowId);
   });
 
@@ -466,20 +463,28 @@ describe('WorkflowOrchestrator', () => {
 
     await waitForGate(raiseGate, 1);
 
-    expect(() => orchestrator.resolveGate(workflowId, { type: 'FORCE_REVISION' })).toThrow(/Feedback is required/);
-    expect(() => orchestrator.resolveGate(workflowId, { type: 'FORCE_REVISION', prompt: '' })).toThrow(
+    expect(() => resolveActiveGate(orchestrator, workflowId, { type: 'FORCE_REVISION' })).toThrow(
       /Feedback is required/,
     );
-    expect(() => orchestrator.resolveGate(workflowId, { type: 'FORCE_REVISION', prompt: '   ' })).toThrow(
+    expect(() => resolveActiveGate(orchestrator, workflowId, { type: 'FORCE_REVISION', prompt: '' })).toThrow(
       /Feedback is required/,
     );
-    expect(() => orchestrator.resolveGate(workflowId, { type: 'REPLAN' })).toThrow(/Feedback is required/);
-    expect(() => orchestrator.resolveGate(workflowId, { type: 'REPLAN', prompt: '\t\n' })).toThrow(
+    expect(() => resolveActiveGate(orchestrator, workflowId, { type: 'FORCE_REVISION', prompt: '   ' })).toThrow(
       /Feedback is required/,
+    );
+    // plan_gate does not accept REPLAN at all: the accepted-event check comes
+    // before the feedback check, so the event is refused outright (with or
+    // without feedback) and never reaches the feedback rule.
+    expect(() => resolveActiveGate(orchestrator, workflowId, { type: 'REPLAN' })).toThrow(/does not accept REPLAN/);
+    expect(() => resolveActiveGate(orchestrator, workflowId, { type: 'REPLAN', prompt: '\t\n' })).toThrow(
+      /does not accept REPLAN/,
+    );
+    expect(() => resolveActiveGate(orchestrator, workflowId, { type: 'REPLAN', prompt: 'redo it' })).toThrow(
+      /does not accept REPLAN/,
     );
 
     // Approve to let the workflow finish cleanly
-    orchestrator.resolveGate(workflowId, { type: 'APPROVE' });
+    resolveActiveGate(orchestrator, workflowId, { type: 'APPROVE' });
     await waitForCompletion(orchestrator, workflowId);
   });
 
@@ -661,7 +666,7 @@ describe('WorkflowOrchestrator', () => {
     expect(sessionFactory).toHaveBeenCalledTimes(3);
 
     // Abort to clean up
-    orchestrator.resolveGate(workflowId, { type: 'ABORT' });
+    resolveActiveGate(orchestrator, workflowId, { type: 'ABORT' });
     await waitForCompletion(orchestrator, workflowId);
   });
 
@@ -749,7 +754,7 @@ describe('WorkflowOrchestrator', () => {
     await waitForGate(raiseGate, 1);
 
     // Send ABORT
-    orchestrator.resolveGate(workflowId, { type: 'ABORT' });
+    resolveActiveGate(orchestrator, workflowId, { type: 'ABORT' });
 
     // Wait for completion
     await waitForCompletion(orchestrator, workflowId);
@@ -1094,6 +1099,81 @@ describe('WorkflowOrchestrator', () => {
   });
 
   // -----------------------------------------------------------------------
+  // Test 14: Persona validation — malformed persona overrides fail fast
+  // -----------------------------------------------------------------------
+
+  /** Overwrites a stubbed persona's persona.json with extra fields. */
+  function writePersonaJson(name: string, extra: Record<string, unknown>): void {
+    const personaDir = resolve(`${tmpDir}-home`, 'personas', name);
+    mkdirSync(personaDir, { recursive: true });
+    writeFileSync(
+      resolve(personaDir, 'persona.json'),
+      JSON.stringify({ name, description: 'test stub', createdAt: '2026-01-01T00:00:00.000Z', ...extra }),
+    );
+  }
+
+  /** `plan` (`planPersona`) -> `code` (`codePersona`) -> done. */
+  function twoStateDef(codePersona: string, planPersona = 'planner'): WorkflowDefinition {
+    return {
+      name: 'override-check-workflow',
+      description: 'The second state uses the persona under test',
+      initial: 'plan',
+      settings: { mode: 'builtin' },
+      states: {
+        plan: {
+          type: 'agent',
+          description: 'Plans',
+          persona: planPersona,
+          prompt: 'You are a planner.',
+          inputs: [],
+          outputs: ['plan'],
+          transitions: [{ to: 'code' }],
+        },
+        code: {
+          type: 'agent',
+          description: 'Writes code',
+          persona: codePersona,
+          prompt: 'You are a coder.',
+          inputs: ['plan'],
+          outputs: ['code'],
+          transitions: [{ to: 'done' }],
+        },
+        done: { type: 'terminal', description: 'Done' },
+      },
+    };
+  }
+
+  it("refuses a workflow whose later state's persona has a malformed agentModelId before any session starts", async () => {
+    writePersonaJson('bad-model', { agentModelId: 123 });
+    const defPath = writeDefinitionFile(tmpDir, twoStateDef('bad-model'));
+    const sessionFactory = vi.fn(async () => createArtifactAwareSession([{ text: approvedResponse('done') }], tmpDir));
+    const orchestrator = new WorkflowOrchestrator(createDeps(tmpDir, { createSession: sessionFactory }));
+    activeOrchestrator = orchestrator;
+
+    const started = orchestrator.start(defPath, 'test task');
+    await expect(started).rejects.toThrow(/Persona "bad-model" has an invalid agentModelId/);
+    await expect(started).rejects.toThrow(/used by state "code"/);
+    expect(sessionFactory).not.toHaveBeenCalled();
+    expect(orchestrator.listActive()).toEqual([]);
+  });
+
+  it('lists every missing persona and every persona with malformed overrides in one error', async () => {
+    writePersonaJson('bad-budget', { resourceBudget: { maxSteps: -1 } });
+    const defPath = writeDefinitionFile(tmpDir, twoStateDef('bad-budget', 'missing-planner'));
+    const orchestrator = new WorkflowOrchestrator(createDeps(tmpDir));
+    activeOrchestrator = orchestrator;
+
+    const message = await orchestrator.start(defPath, 'test task').then(
+      () => expect.fail('should have thrown'),
+      (err: unknown) => (err as Error).message,
+    );
+    expect(message).toContain('"missing-planner" (used by state "plan")');
+    expect(message).toContain('ironcurtain persona create');
+    expect(message).toContain('Persona "bad-budget" has an invalid resourceBudget');
+    expect(message).toContain('ironcurtain persona set bad-budget');
+  });
+
+  // -----------------------------------------------------------------------
   // Agent-session lifecycle events (for token-stream bridge wiring)
   // -----------------------------------------------------------------------
   //
@@ -1180,5 +1260,43 @@ describe('WorkflowOrchestrator', () => {
     expect(ended).toBeDefined();
     expect((started as { sessionId: string }).sessionId).toBe('failing-coder-session');
     expect((ended as { sessionId: string }).sessionId).toBe('failing-coder-session');
+  });
+
+  // -----------------------------------------------------------------------
+  // Agent turns never become trusted user context for the auto-approver
+  // -----------------------------------------------------------------------
+
+  it('sends every agent turn, re-prompts included, as a system-generated turn', async () => {
+    // A state's prompt embeds the previous state's output. Sent as a user
+    // turn, the session would record it as the trusted user context the
+    // auto-approver matches escalations against, so an upstream agent could
+    // authorize escalations in a later state.
+    const defPath = writeDefinitionFile(tmpDir, coderCriticLoopDef);
+    const allSessions: MockSession[] = [];
+    const sessionFactory = vi.fn(async (opts: SessionOptions) => {
+      const session =
+        opts.persona === 'coder'
+          ? createArtifactAwareSession(
+              [{ text: noStatusResponse(), artifacts: ['code'] }, { text: approvedResponse('implemented') }],
+              tmpDir,
+            )
+          : createArtifactAwareSession([{ text: approvedResponse('looks good'), artifacts: ['reviews'] }], tmpDir);
+      allSessions.push(session);
+      return session;
+    });
+
+    const deps = createDeps(tmpDir, { createSession: sessionFactory });
+    const orchestrator = new WorkflowOrchestrator(deps);
+    activeOrchestrator = orchestrator;
+
+    const workflowId = await orchestrator.start(defPath, 'implement the feature');
+    await waitForCompletion(orchestrator, workflowId);
+
+    expect(orchestrator.getStatus(workflowId)?.phase).toBe('completed');
+    const origins = allSessions.flatMap((s) => s.sentOrigins);
+    // The coder's first answer had no status block and was re-prompted, and
+    // the reviewer's prompt carried the coder's output: three turns in all.
+    expect(origins).toHaveLength(3);
+    expect(origins).toEqual(['system', 'system', 'system']);
   });
 });

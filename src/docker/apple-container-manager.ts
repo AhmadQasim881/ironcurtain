@@ -3,12 +3,17 @@
  *
  * Peer implementation to docker-manager.ts for macOS 26+ on Apple silicon
  * (see docs/designs/apple-container-runtime.md). Each container runs in its
- * own lightweight VM; networking uses host-only vmnet networks instead of
- * Docker's bridge + sidecar arrangement.
+ * own lightweight VM, created with `--network none` (loopback only); the host
+ * proxies are reached through Unix sockets that `-v` turns into per-socket
+ * vsock relays (the `uds` topology, see network-topology.ts). The host-only
+ * vmnet network support below backs the retained `tcp-hostonly` topology
+ * that earlier releases used, which no backend selects any more.
  *
  * This module is the only place allowed to spawn the `container` binary,
  * always with argument arrays (no shell strings). Ordinary operations use
- * execFile; runtime-native PTY exec inherits the host terminal via spawn.
+ * execFile; runtime-native PTY exec runs under a host PTY (node-pty) whose
+ * output is filtered before it reaches the user's terminal
+ * (pty-host-terminal.ts).
  *
  * CLI semantics verified against `container` 1.0.0 (with the 1.1.0 UDS and
  * 1.2.1 read-only-path deltas recorded in
@@ -25,15 +30,18 @@
  *     those configs throw instead of being silently dropped.
  */
 
-import { arch, platform, release } from 'node:os';
-import { spawn as spawnChild } from 'node:child_process';
+import { arch, homedir, platform, release } from 'node:os';
+import { lstatSync, realpathSync } from 'node:fs';
+import { isAbsolute, join, resolve } from 'node:path';
 import type {
   ContainerRuntime,
+  ContainerStorageDescriptor,
   DockerContainerConfig,
   DockerContainerInfo,
   DockerExecResult,
   DockerImageInfo,
   DockerNetworkCreateOptions,
+  ImageBuildOptions,
 } from './types.js';
 import * as logger from '../logger.js';
 import type { DockerAvailability } from './docker-probe.js';
@@ -44,6 +52,7 @@ import {
   DEFAULT_EXEC_TIMEOUT_MS,
   PULL_IDLE_TIMEOUT_MS,
   BUILD_IDLE_TIMEOUT_MS,
+  LOGS_IDLE_TIMEOUT_MS,
   IRONCURTAIN_LABEL_BUNDLE,
   IRONCURTAIN_LABEL_WORKFLOW,
   IRONCURTAIN_LABEL_SCOPE,
@@ -52,6 +61,11 @@ import {
 } from './docker-manager.js';
 import { buildContainerExecEnvironmentArgs } from './container-exec-environment.js';
 import { createDockerProgressSink } from './docker-progress-sink.js';
+import { rejectedExecResult, resolvedExecResult } from './exec-deadline.js';
+import { relayHostPty, type HostPtySpawn, type HostTerminalStreams } from './pty-host-terminal.js';
+import { clampPtySize } from '../pty/pty-size.js';
+import { loadNodePty } from '../pty/node-pty-loader.js';
+import { spawnWithIdleTimeout } from './spawn-with-idle-timeout.js';
 
 /** Grace period for `container stop` before the runtime kills the VM. */
 const STOP_TIMEOUT_SECONDS = 10;
@@ -121,10 +135,12 @@ const MIN_PATCH_VERSION = 1;
  * 1.1.0, which is the configuration the nested runtime was qualified against —
  * it is not a new concession, and it is scoped to the one opt-in container
  * that needs it. Ordinary sessions pass none of this and keep the full 1.2.x
- * hardening. The residual exposure is small in any case: the agent holds
- * neither CAP_SYS_ADMIN nor CAP_NET_ADMIN, so it cannot write the sysctls a
- * writable `/proc/sys` nominally offers, and the VM is single-tenant per
- * session.
+ * hardening. The residual exposure stays inside the session's VM, which is
+ * single-tenant per session and is the boundary that holds: the agent holds
+ * neither CAP_SYS_ADMIN nor CAP_NET_ADMIN, which closes the sysctls whose
+ * handlers check for them, but sysctl writes are otherwise checked against
+ * file permissions only, so container root (the agent keeps sudo) can still
+ * change many of the VM kernel's settings through a writable `/proc/sys`.
  */
 export const APPLE_FULLY_VISIBLE_PROC_ARGS: readonly string[] = Object.freeze([
   '--read-only-path',
@@ -138,6 +154,54 @@ export const APPLE_FULLY_VISIBLE_PROC_ARGS: readonly string[] = Object.freeze([
  * commands this backend depends on do not function on macOS 15 (Darwin 24).
  */
 const MIN_DARWIN_MAJOR = 25;
+
+/**
+ * The `container` services keep each container's bundle under
+ * `<application data root>/containers/<id>/`, where `rootfs.ext4` is the
+ * sparse block image the VM uses as its writable root filesystem. It is the
+ * one host file a nested daemon's VFS growth inside the VM lands in.
+ * `container system start --app-root` moves the root; `container system
+ * status` reports it, and the default applies when the report has no root line.
+ */
+export const APPLE_CONTAINER_ROOTFS_IMAGE = 'rootfs.ext4';
+const APPLE_CONTAINER_DEFAULT_APP_ROOT = ['Library', 'Application Support', 'com.apple.container'] as const;
+const APPLE_CONTAINER_APP_ROOT_LINE = /^application data root:\s*(\S.*?)\s*$/mu;
+const APPLE_CONTAINER_ID_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/u;
+
+/** The application data root from `container system status`, or the default under `home`. */
+export function parseAppleContainerAppRoot(statusOutput: string, home: string): string {
+  const reported = APPLE_CONTAINER_APP_ROOT_LINE.exec(statusOutput)?.[1];
+  const root = reported ?? join(home, ...APPLE_CONTAINER_DEFAULT_APP_ROOT);
+  if (!isAbsolute(root)) throw new Error('apple-container application data root must be absolute');
+  return resolve(root);
+}
+
+/**
+ * Pin the rootfs image of one container under a resolved application data
+ * root. The bundle directory and the image must be real (no symlink), owned
+ * by this user, and the path canonical, so the watchdog measures the runtime's
+ * own file and nothing a link could redirect.
+ */
+export function describeAppleContainerRootfs(appRoot: string, containerId: string): ContainerStorageDescriptor {
+  if (!APPLE_CONTAINER_ID_SEGMENT.test(containerId) || containerId.includes('..')) {
+    throw new Error(`apple-container ID is not a safe path segment: ${containerId.slice(0, 64)}`);
+  }
+  const canonicalRoot = realpathSync(appRoot);
+  const bundleDirectory = join(canonicalRoot, 'containers', containerId);
+  const path = join(bundleDirectory, APPLE_CONTAINER_ROOTFS_IMAGE);
+  const uid = process.getuid?.();
+  const directory = lstatSync(bundleDirectory);
+  const image = lstatSync(path);
+  if (
+    !directory.isDirectory() ||
+    !image.isFile() ||
+    (uid !== undefined && (directory.uid !== uid || image.uid !== uid)) ||
+    realpathSync(path) !== path
+  ) {
+    throw new Error(`apple-container rootfs image is not a real runtime-owned file: ${path}`);
+  }
+  return { kind: 'host-file', path, device: image.dev, inode: image.ino };
+}
 
 /** Shape of one element of `container inspect` JSON output (1.0.0). */
 interface AppleContainerInspect {
@@ -479,10 +543,26 @@ export function buildAppleCreateArgs(config: DockerContainerConfig): string[] {
   return args;
 }
 
+/** Apple-specific additions to the shared manager options (tests inject both). */
+export interface CreateAppleContainerManagerOptions extends CreateDockerManagerOptions {
+  /** Host PTY spawner for interactive exec. Defaults to node-pty's `spawn`. */
+  readonly spawnPty?: HostPtySpawn;
+  /** The user's terminal for interactive exec. Defaults to process.stdin/stdout. */
+  readonly terminal?: HostTerminalStreams;
+}
+
+async function loadNodePtySpawn(): Promise<HostPtySpawn> {
+  // node-pty is optional, and its macOS prebuild needs its spawn-helper made
+  // executable; fail with an actionable error instead of falling back to an
+  // unfiltered `stdio: 'inherit'` exec.
+  const nodePty = await loadNodePty({ purpose: 'Apple Container interactive sessions' });
+  return (file, args, options) => nodePty.spawn(file, args, options);
+}
+
 export function createAppleContainerManager(
   execFileFn?: ExecFileFn,
   availabilityProbe: (execFileFn?: ExecFileFn) => Promise<DockerAvailability> = checkAppleContainerAvailable,
-  spawnOpts?: CreateDockerManagerOptions,
+  spawnOpts?: CreateAppleContainerManagerOptions,
 ): ContainerRuntime {
   const exec = execFileFn ?? defaultExecFile;
   const streamOpts = {
@@ -492,7 +572,6 @@ export function createAppleContainerManager(
   };
   const progressSinkFactory = spawnOpts?.progressSinkFactory ?? createDockerProgressSink;
   const runStreamed = makeRunStreamed('container', streamOpts, progressSinkFactory);
-  const spawnPty = spawnOpts?.spawn ?? spawnChild;
 
   const inspectContainer = async (nameOrId: string, timeout: number): Promise<AppleContainerInspect | undefined> => {
     const { stdout } = await exec('container', ['inspect', nameOrId], { timeout });
@@ -546,6 +625,18 @@ export function createAppleContainerManager(
       await exec('container', ['start', nameOrId], { timeout: 60_000 });
     },
 
+    streamContainerLogs(nameOrId: string, sink: NodeJS.WritableStream): Promise<void> {
+      // Without --follow, `container logs` prints the container's stdio log
+      // (not the VM boot log, which needs --boot) and exits.
+      return spawnWithIdleTimeout('container', ['logs', nameOrId], {
+        idleTimeoutMs: LOGS_IDLE_TIMEOUT_MS,
+        operation: 'container logs',
+        spawn: streamOpts.spawn,
+        stdoutSink: sink,
+        stderrSink: sink,
+      });
+    },
+
     async exec(
       nameOrId: string,
       command: readonly string[],
@@ -561,8 +652,13 @@ export function createAppleContainerManager(
       const userArgs = resolvedUser === null ? [] : (['--user', resolvedUser] as const);
       const workdirArgs = workdir === undefined ? [] : (['--workdir', workdir] as const);
       const environmentArgs = buildContainerExecEnvironmentArgs(environment);
+      // Same deadline contract as the Docker manager (see exec-deadline.ts):
+      // a SIGTERM-ed `container exec` client must never read as success, and
+      // a host suspend (monotonic elapsed time) must never read as a timeout.
+      const startedAt = performance.now();
+      let result: DockerExecResult;
       try {
-        const { stdout, stderr } = await exec(
+        const outcome = await exec(
           'container',
           ['exec', ...userArgs, ...workdirArgs, ...environmentArgs, nameOrId, ...command],
           {
@@ -571,61 +667,53 @@ export function createAppleContainerManager(
             ...(environment ? { env: { ...process.env, ...environment } } : {}),
           },
         );
-        return { exitCode: 0, stdout, stderr };
+        result = resolvedExecResult(outcome, timeout, performance.now() - startedAt);
       } catch (err: unknown) {
-        if (isExecError(err)) {
-          if (isExecTimeout(err)) {
-            logger.warn(
-              `[apple-container-manager] exec timed out after ${timeout}ms (killed=${String(err.killed)}, ` +
-                `signal=${err.signal ?? 'none'}): container exec ${nameOrId} ${command[0] ?? ''}`,
-            );
-          }
-          return {
-            exitCode: typeof err.code === 'number' ? err.code : 1,
-            stdout: err.stdout,
-            stderr: err.stderr,
-          };
-        }
-        throw err;
+        if (!isExecError(err)) throw err;
+        result = rejectedExecResult(err, timeout, performance.now() - startedAt);
       }
+      if (result.timedOut === true) {
+        logger.warn(
+          `[apple-container-manager] exec timed out after ${timeout}ms (elapsed ${Math.round(performance.now() - startedAt)}ms): ` +
+            `container exec ${nameOrId} ${command[0] ?? ''}; the in-container process may still be running`,
+        );
+      }
+      return result;
     },
 
-    execPty(
+    async execPty(
       nameOrId: string,
       command: readonly string[],
       signal?: AbortSignal,
       execUser?: string | null,
     ): Promise<number> {
-      if (signal?.aborted) return Promise.resolve(0);
+      if (signal?.aborted) return 0;
 
       // Keep the argument shape explicit instead of routing through execFile:
-      // this process must inherit the real terminal for Apple Container's
-      // runtime-managed PTY and remain attached until the interactive agent
-      // exits. The container itself stays on `--network none`.
+      // Apple Container's runtime-managed PTY stays attached until the
+      // interactive agent exits. The container itself stays on `--network none`.
       const resolvedUser = execUser === undefined ? 'codespace' : execUser;
       const userArgs = resolvedUser === null ? [] : ['--user', resolvedUser];
-      const child = spawnPty('container', ['exec', '--interactive', '--tty', ...userArgs, nameOrId, ...command], {
-        stdio: 'inherit',
-      });
+      const args = ['exec', '--interactive', '--tty', ...userArgs, nameOrId, ...command];
 
-      return new Promise<number>((resolve, reject) => {
-        let settled = false;
-        const settle = (result: { readonly code?: number; readonly error?: Error }): void => {
-          if (settled) return;
-          settled = true;
-          signal?.removeEventListener('abort', onAbort);
-          if (result.error !== undefined) reject(result.error);
-          else resolve(result.code ?? 1);
-        };
-        const onAbort = (): void => {
-          child.kill('SIGTERM');
-        };
-
-        signal?.addEventListener('abort', onAbort, { once: true });
-        child.once('error', (error) => settle({ error }));
-        child.once('close', (code) => settle({ code: signal?.aborted ? 0 : (code ?? 1) }));
-        if (signal?.aborted) onAbort();
+      // `container exec -it` runs under a host PTY instead of inheriting the
+      // user's terminal: its output is the agent's, untrusted, so the relay
+      // filters it (no clipboard writes, titles, hyperlinks or text-echoing
+      // report requests) before it reaches the real terminal, and restores
+      // the terminal modes afterwards. Resizes go to the host PTY, which the
+      // runtime propagates to the guest.
+      const terminal = spawnOpts?.terminal;
+      const spawnTerminal = spawnOpts?.spawnPty ?? (await loadNodePtySpawn());
+      const output = terminal?.output ?? process.stdout;
+      const size = clampPtySize(output.columns ?? 80, output.rows ?? 24);
+      const child = spawnTerminal('container', args, {
+        name: process.env.TERM ?? 'xterm-256color',
+        cols: size.cols,
+        rows: size.rows,
+        cwd: process.cwd(),
+        env: process.env,
       });
+      return relayHostPty(child, { signal, terminal });
     },
 
     async stop(nameOrId: string): Promise<void> {
@@ -697,8 +785,10 @@ export function createAppleContainerManager(
       contextDir: string,
       labels?: Record<string, string>,
       buildArgs?: Readonly<Record<string, string>>,
+      options?: ImageBuildOptions,
     ): Promise<void> {
       const args = ['build', '--progress', 'plain', '-t', tag, '-f', dockerfilePath];
+      if (options?.noCache === true) args.push('--no-cache');
       if (labels) {
         for (const [key, value] of Object.entries(labels)) {
           args.push('--label', `${key}=${value}`);
@@ -902,6 +992,11 @@ export function createAppleContainerManager(
         }
       }
       throw new Error(`No IP address found for container ${containerId} on network ${network}`);
+    },
+
+    async describeContainerStorage(nameOrId: string): Promise<ContainerStorageDescriptor> {
+      const { stdout } = await exec('container', ['system', 'status'], { timeout: 10_000 });
+      return describeAppleContainerRootfs(parseAppleContainerAppRoot(stdout, homedir()), nameOrId);
     },
 
     async containerExists(nameOrId: string): Promise<boolean> {

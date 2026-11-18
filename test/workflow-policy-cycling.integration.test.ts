@@ -18,15 +18,23 @@ import * as http from 'node:http';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { createCodeModeProxy, type DockerProxy } from '../src/docker/code-mode-proxy.js';
 import type { IronCurtainConfig } from '../src/config/types.js';
-import type { CompiledPolicyFile, ToolAnnotationsFile } from '../src/pipeline/types.js';
-import type { AuditEntry } from '../src/types/audit.js';
+import type { CompiledPolicyFile, StoredToolAnnotationsFile } from '../src/pipeline/types.js';
+import { isDispatchingAuditEntry, type AuditEntry } from '../src/types/audit.js';
 import { defaultLoadPolicyRpc } from '../src/workflow/orchestrator.js';
 import { POLICY_LOAD_PATH } from '../src/trusted-process/control-server.js';
+import type {
+  EscalationPromptDetails,
+  EscalationPromptFn,
+  EscalationResult,
+} from '../src/trusted-process/tool-call-coordinator.js';
+import type { ToolCallRequest } from '../src/types/mcp.js';
 import { getBundleAuditLogPath, getBundleControlSocketPath, getBundleRuntimeRoot } from '../src/config/paths.js';
 import type { BundleId } from '../src/session/types.js';
 import { testCompiledPolicy, testToolAnnotations, REAL_TMP } from './fixtures/test-policy.js';
 import { UdsClientTransport } from './helpers/uds-client-transport.js';
 import { isIsolatedVmAvailable } from './helpers/isolated-vm-available.js';
+import { packagedFilesystemServer } from './helpers/filesystem-server.js';
+import { testUserConfig } from './helpers/user-config.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(__dirname, '..');
@@ -44,8 +52,10 @@ const DIR_A = `${WS_ROOT}/dir-a`;
 const DIR_B = `${WS_ROOT}/dir-b`;
 const FILE_A = `${DIR_A}/file.txt`;
 const FILE_B = `${DIR_B}/file.txt`;
-const POLICY_A_DIR = `${TEST_ROOT}/policy-a`;
-const POLICY_B_DIR = `${TEST_ROOT}/policy-b`;
+// Persona-layout policy dirs: validatePolicyDir accepts only the exact
+// compiled-policy directories under the IronCurtain home (TEST_ROOT here).
+const POLICY_A_DIR = `${TEST_ROOT}/personas/policy-a/generated`;
+const POLICY_B_DIR = `${TEST_ROOT}/personas/policy-b/generated`;
 const GENERATED_DIR = `${TEST_ROOT}/generated`;
 const MCP_SOCKET = `${REAL_TMP}/ironcurtain-wf-policy-mcp-${process.pid}.sock`;
 // Synthetic workflow/bundle identifiers pin the audit log and control
@@ -74,7 +84,7 @@ function writePolicyDir(dir: string, policy: CompiledPolicyFile): void {
 function writeTestArtifacts(
   dir: string,
   compiledPolicy: CompiledPolicyFile,
-  toolAnnotations: ToolAnnotationsFile,
+  toolAnnotations: StoredToolAnnotationsFile,
 ): void {
   mkdirSync(dir, { recursive: true });
   writeFileSync(resolve(dir, 'compiled-policy.json'), JSON.stringify(compiledPolicy));
@@ -89,10 +99,15 @@ function writeTestArtifacts(
 function readAuditLines(path: string): AuditEntry[] {
   if (!existsSync(path)) return [];
   const raw = readFileSync(path, 'utf-8');
-  return raw
-    .split('\n')
-    .filter((line) => line.length > 0)
-    .map((line) => JSON.parse(line) as AuditEntry);
+  return (
+    raw
+      .split('\n')
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as AuditEntry)
+      // Outcome records only: every dispatched call is preceded by a
+      // write-ahead `dispatching` record for the same request.
+      .filter((entry) => !isDispatchingAuditEntry(entry))
+  );
 }
 
 /** Finds the most recent audit entry whose `path` argument matches `file`. */
@@ -229,8 +244,7 @@ describe.skipIf(!isIsolatedVmAvailable())('loadPolicy over control socket — en
     mcpServers: {
       filesystem: {
         description: 'Read, write, search, and manage files and directories',
-        command: 'npx',
-        args: ['-y', '@modelcontextprotocol/server-filesystem', WS_ROOT],
+        ...packagedFilesystemServer(WS_ROOT),
         sandbox: false,
       },
     },
@@ -243,39 +257,16 @@ describe.skipIf(!isIsolatedVmAvailable())('loadPolicy over control socket — en
     constitutionPath: resolve(projectRoot, 'src/config/constitution.md'),
     agentModelId: 'anthropic:claude-sonnet-4-6',
     escalationTimeoutSeconds: 300,
-    userConfig: {
-      agentModelId: 'anthropic:claude-sonnet-4-6',
-      policyModelId: 'anthropic:claude-sonnet-4-6',
-      anthropicApiKey: '',
-      googleApiKey: '',
-      openaiApiKey: '',
-      escalationTimeoutSeconds: 300,
-      resourceBudget: {
-        maxTotalTokens: 1_000_000,
-        maxSteps: 200,
-        maxSessionSeconds: 1800,
-        maxEstimatedCostUsd: 5.0,
-        warnThresholdPercent: 80,
-      },
-      autoCompact: {
-        enabled: false,
-        thresholdTokens: 80_000,
-        keepRecentMessages: 10,
-        summaryModelId: 'anthropic:claude-haiku-4-5',
-      },
-      autoApprove: { enabled: false, modelId: 'anthropic:claude-haiku-4-5' },
-      auditRedaction: { enabled: true },
-      serverCredentials: {},
-    },
+    userConfig: testUserConfig(),
   };
 
   beforeAll(async () => {
-    // Make POLICY_A_DIR / POLICY_B_DIR land under a trusted policyDir
-    // root. The coordinator's `loadPolicy` canonicalizes the incoming
-    // path and requires it to live under `$IRONCURTAIN_HOME` or the
-    // package config dir — pointing the home at the test's isolated
-    // TEST_ROOT satisfies the check without leaking into the user's
-    // real `~/.ironcurtain`.
+    // Make POLICY_A_DIR / POLICY_B_DIR persona policy dirs of the home.
+    // The coordinator's `loadPolicy` canonicalizes the incoming path and
+    // accepts only the exact compiled-policy directories under
+    // `$IRONCURTAIN_HOME` (or the package's bundled ones) — pointing the
+    // home at the test's isolated TEST_ROOT satisfies the check without
+    // leaking into the user's real `~/.ironcurtain`.
     process.env.IRONCURTAIN_HOME = TEST_ROOT;
     mkdirSync(TEST_ROOT, { recursive: true });
     mkdirSync(SANDBOX_DIR, { recursive: true });
@@ -436,5 +427,168 @@ describe.skipIf(!isIsolatedVmAvailable())('loadPolicy over control socket — en
     expect(lastA?.persona).toBe('policy-b');
     expect(lastB?.policyDecision.status).toBe('allow');
     expect(lastB?.persona).toBe('policy-b');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Escalations on a workflow bundle's proxy (WP-35: TPM-9, TPM-13).
+//
+// The orchestrator hands a shared-container bundle's proxy an in-process
+// escalation handler (`CodeModeProxyOptions.onEscalation`, threaded through
+// `Sandbox.initialize` into the coordinator). An escalated call then waits
+// for that handler instead of being denied on the spot, and a policy
+// hot-swap (`loadPolicy`) cancels a pending escalation at once -- denied and
+// audited as `cancelled` under the old persona -- instead of waiting out the
+// escalation timeout before it swaps.
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!isIsolatedVmAvailable())('escalations on a workflow bundle proxy', () => {
+  const ESC_ROOT = `${REAL_TMP}/ironcurtain-wf-esc-test-${process.pid}`;
+  const ESC_WS = `${ESC_ROOT}/ws`;
+  const ESC_SANDBOX = `${ESC_WS}/sandbox`;
+  const ESC_DIR_A = `${ESC_WS}/dir-a`;
+  const ESC_DIR_B = `${ESC_WS}/dir-b`;
+  const ESC_FILE_B = `${ESC_DIR_B}/file.txt`;
+  const ESC_POLICY_A = `${ESC_ROOT}/personas/policy-a/generated`;
+  const ESC_POLICY_B = `${ESC_ROOT}/personas/policy-b/generated`;
+  const ESC_GENERATED = `${ESC_ROOT}/generated`;
+  const ESC_MCP_SOCKET = `${REAL_TMP}/ironcurtain-wf-esc-mcp-${process.pid}.sock`;
+  const ESC_WORKFLOW_ID = `wf-esc-${process.pid}`;
+  const ESC_BUNDLE_ID = `bundle-esc-${process.pid}` as unknown as BundleId;
+
+  interface HeldEscalation {
+    readonly request: ToolCallRequest;
+    readonly details: EscalationPromptDetails;
+    readonly settle: (result: EscalationResult) => void;
+  }
+  const held: HeldEscalation[] = [];
+  const onEscalation: EscalationPromptFn = (request, _reason, _context, _candidates, details) =>
+    new Promise<EscalationResult>((settle) => {
+      held.push({ request, details, settle });
+    });
+
+  async function waitForHeld(count: number): Promise<HeldEscalation> {
+    const deadline = Date.now() + 10_000;
+    while (held.length < count) {
+      if (Date.now() > deadline) throw new Error(`timed out waiting for escalation #${count}`);
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    return held[count - 1];
+  }
+
+  function readFileB(client: Client): Promise<unknown> {
+    return client.callTool({
+      name: 'execute_code',
+      arguments: { code: `return filesystem.read_file({ path: "${ESC_FILE_B}" });` },
+    });
+  }
+
+  let proxy: DockerProxy;
+  let auditPath: string;
+  let controlSocket: string;
+
+  beforeAll(async () => {
+    process.env.IRONCURTAIN_HOME = ESC_ROOT;
+    for (const dir of [ESC_SANDBOX, ESC_DIR_A, ESC_DIR_B]) mkdirSync(dir, { recursive: true });
+    writeFileSync(ESC_FILE_B, 'contents-of-file-b');
+    auditPath = getBundleAuditLogPath(ESC_WORKFLOW_ID, ESC_BUNDLE_ID);
+    controlSocket = getBundleControlSocketPath(ESC_BUNDLE_ID);
+    mkdirSync(dirname(auditPath), { recursive: true, mode: 0o700 });
+    mkdirSync(getBundleRuntimeRoot(ESC_BUNDLE_ID), { recursive: true, mode: 0o700 });
+
+    const policyA = buildPolicyAllowingReadsWithin(ESC_DIR_A);
+    writeTestArtifacts(ESC_GENERATED, policyA, testToolAnnotations);
+    writePolicyDir(ESC_POLICY_A, policyA);
+    writePolicyDir(ESC_POLICY_B, buildPolicyAllowingReadsWithin(ESC_DIR_B));
+
+    const config: IronCurtainConfig = {
+      auditLogPath: auditPath,
+      allowedDirectory: ESC_SANDBOX,
+      mcpServers: {
+        filesystem: {
+          description: 'Read, write, search, and manage files and directories',
+          ...packagedFilesystemServer(ESC_WS),
+          sandbox: false,
+        },
+      },
+      protectedPaths: [resolve(projectRoot, 'src/config/constitution.md')],
+      generatedDir: ESC_GENERATED,
+      constitutionPath: resolve(projectRoot, 'src/config/constitution.md'),
+      agentModelId: 'anthropic:claude-sonnet-4-6',
+      // The real default: a policy swap must not have to wait this out.
+      escalationTimeoutSeconds: 300,
+      userConfig: testUserConfig(),
+    };
+
+    proxy = createCodeModeProxy({ socketPath: ESC_MCP_SOCKET, config, listenMode: 'uds', onEscalation });
+    await proxy.start();
+    const swapTarget = proxy.getPolicySwapTarget();
+    if (!swapTarget) throw new Error('policy swap target unexpectedly null');
+    await swapTarget.startControlServer({ socketPath: controlSocket });
+    await defaultLoadPolicyRpc({ socketPath: controlSocket, persona: 'policy-a', policyDir: ESC_POLICY_A });
+  }, 30_000);
+
+  afterAll(async () => {
+    for (const pending of held) pending.settle({ decision: 'denied' });
+    await proxy.stop();
+    rmSync(ESC_ROOT, { recursive: true, force: true });
+    rmSync(ESC_MCP_SOCKET, { force: true });
+    rmSync(controlSocket, { force: true });
+    delete process.env.IRONCURTAIN_HOME;
+  });
+
+  it('waits for the in-process handler instead of denying, and runs the call once approved', async () => {
+    await withClient(ESC_MCP_SOCKET, 'esc-approve', async (client) => {
+      const call = readFileB(client);
+      const escalation = await waitForHeld(1);
+      expect(escalation.request).toMatchObject({ serverName: 'filesystem', toolName: 'read_file' });
+      expect(escalation.request.arguments.path).toBe(ESC_FILE_B);
+      expect(escalation.details.persona).toBe('policy-a');
+      expect(escalation.details.signal.aborted).toBe(false);
+
+      escalation.settle({ decision: 'approved' });
+      const result = JSON.stringify(await call);
+      expect(result).not.toContain('ESCALATION DENIED');
+      expect(result).not.toContain('no escalation handler');
+    });
+
+    const entry = findAudit(
+      readAuditLines(auditPath).filter((e) => e.persona === 'policy-a'),
+      ESC_FILE_B,
+    );
+    expect(entry?.escalationResult).toBe('approved');
+    expect(entry?.policyDecision.reason).toBe('Approved by human during escalation');
+  });
+
+  it('a policy hot-swap cancels a pending escalation promptly, then swaps', async () => {
+    await withClient(ESC_MCP_SOCKET, 'esc-cancel', async (client) => {
+      const call = readFileB(client);
+      const escalation = await waitForHeld(2);
+
+      const started = Date.now();
+      await defaultLoadPolicyRpc({ socketPath: controlSocket, persona: 'policy-b', policyDir: ESC_POLICY_B });
+      // Well under the 300 s escalation timeout the swap used to wait out.
+      expect(Date.now() - started).toBeLessThan(5_000);
+
+      const result = JSON.stringify(await call);
+      expect(result).toContain('Escalation cancelled');
+      expect(result).toContain('policy hot-swap to persona');
+      expect(escalation.details.signal.aborted).toBe(true);
+      expect(escalation.details.signal.reason).toMatchObject({ kind: 'cancelled' });
+
+      // The new policy is live: the same read is now allowed outright.
+      await readFileB(client);
+    });
+    expect(held).toHaveLength(2);
+
+    const entries = readAuditLines(auditPath);
+    const cancelled = entries.filter((e) => e.persona === 'policy-a' && e.escalationResult === 'cancelled');
+    expect(cancelled).toHaveLength(1);
+    expect(cancelled[0].result.status).toBe('denied');
+    const after = findAudit(
+      entries.filter((e) => e.persona === 'policy-b'),
+      ESC_FILE_B,
+    );
+    expect(after?.policyDecision.status).toBe('allow');
   });
 });

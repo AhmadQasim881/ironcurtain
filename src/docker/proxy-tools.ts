@@ -9,25 +9,144 @@
 
 import * as http from 'node:http';
 import type { CompiledRule, StoredToolAnnotation } from '../pipeline/types.js';
+import { classifyHostLiteral, isLocalOrMetadataHostname } from '../net/address-policy.js';
 
 // ---------------------------------------------------------------------------
 // Domain validation
 // ---------------------------------------------------------------------------
 
 const DOMAIN_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i;
-const IP_RE = /^\d{1,3}(\.\d{1,3}){3}$/;
 const DOCKER_INTERNAL_SUFFIX = '.docker.internal';
 
-/** Validates a domain string for use as a passthrough host. */
+/**
+ * Validates a domain string for use as a passthrough host.
+ *
+ * The thrown message echoes the agent's value only when it is already a
+ * printable, bounded string; anything else is described, not quoted, because
+ * the message reaches the agent, the audit log and a human.
+ */
 export function validateDomain(domain: string): void {
   if (domain.length > 253) throw new Error(`Domain too long (${domain.length} > 253)`);
   if (domain.toLowerCase() === 'localhost') {
     throw new Error(`Blocked host: "${domain}"`);
   }
-  if (!DOMAIN_RE.test(domain)) throw new Error(`Invalid domain format: "${domain}"`);
-  if (IP_RE.test(domain)) throw new Error(`IP addresses are not allowed: "${domain}"`);
+  if (!DOMAIN_RE.test(domain)) throw new Error(`Invalid domain format: ${quoteForMessage(domain)}`);
+  // Every IPv4 spelling the resolver or the URL parser reads as an address
+  // (`127.1`, `0x7f.1`, `8.8.2056`), not only the dotted quad, and any name
+  // whose last label is numeric (`1.2.3.4.5`), which no URL can carry as a
+  // hostname. A human must never be shown an address dressed up as a domain.
+  if (classifyHostLiteral(domain).kind !== 'name') throw new Error(`IP addresses are not allowed: "${domain}"`);
   if (domain.toLowerCase().endsWith(DOCKER_INTERNAL_SUFFIX)) {
     throw new Error(`Blocked host: "${domain}" (*.docker.internal is not allowed)`);
+  }
+  // Names that only ever reach the host itself, the LAN or a cloud metadata
+  // service (`*.localhost`, `*.local`, `*.internal`, `*.home.arpa`,
+  // `metadata.google.internal`, ...) are never internet domains, so they are
+  // refused before a human is asked to approve them.
+  if (isLocalOrMetadataHostname(domain)) {
+    throw new Error(`Blocked host: "${domain}" (local or metadata-scoped names are not allowed)`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Passthrough targets: approvals are scoped to one host AND one port
+// ---------------------------------------------------------------------------
+
+/** The port a passthrough approval covers when the agent names none. */
+export const DEFAULT_PASSTHROUGH_PORT = 443;
+
+/**
+ * The only ports a passthrough approval can name. A human approving
+ * `example.com` grants HTTPS to that host; plain HTTP (80) must be requested
+ * explicitly. Nothing else (SSH, SMTP, databases, ...) can be opened through
+ * a domain approval, whatever port the agent later puts in its CONNECT.
+ */
+export const ALLOWED_PASSTHROUGH_PORTS: ReadonlySet<number> = new Set([DEFAULT_PASSTHROUGH_PORT, 80]);
+
+/** Validates the port of a passthrough approval. */
+export function validatePassthroughPort(port: number): void {
+  if (!Number.isInteger(port) || !ALLOWED_PASSTHROUGH_PORTS.has(port)) {
+    throw new Error(
+      `Port ${String(port)} is not allowed for a passthrough domain (only ${[...ALLOWED_PASSTHROUGH_PORTS].join(' and ')})`,
+    );
+  }
+}
+
+/** One passthrough approval: a validated lowercase host and an allowed port. */
+export interface PassthroughTarget {
+  readonly host: string;
+  readonly port: number;
+}
+
+/**
+ * Parse the tool-facing form of a passthrough target: `host` or `host:port`.
+ * The host is validated with {@link validateDomain} and lowercased; the port
+ * defaults to 443 and must be one of {@link ALLOWED_PASSTHROUGH_PORTS}.
+ *
+ * @throws Error when the host or the port is not acceptable.
+ */
+export function parsePassthroughTarget(value: string): PassthroughTarget {
+  const colon = value.lastIndexOf(':');
+  const hostText = colon === -1 ? value : value.slice(0, colon);
+  const portText = colon === -1 ? undefined : value.slice(colon + 1);
+  validateDomain(hostText);
+  let port = DEFAULT_PASSTHROUGH_PORT;
+  if (portText !== undefined) {
+    if (!/^[1-9][0-9]{0,4}$/u.test(portText)) throw new Error(`Invalid port in ${quoteForMessage(value)}`);
+    port = Number(portText);
+  }
+  validatePassthroughPort(port);
+  return { host: hostText.toLowerCase(), port };
+}
+
+/** The canonical `host:port` key an approval is stored and listed under. */
+export function formatPassthroughTarget(host: string, port: number): string {
+  return `${host}:${port}`;
+}
+
+/**
+ * Make the port of a tool argument explicit (`example.com` becomes
+ * `example.com:443`) so the human reviewing the escalation and the approval
+ * whitelist see exactly the scope that will be granted. A value that does not
+ * parse is returned unchanged; {@link validateProxyToolArguments} (before
+ * policy evaluation) and the tool handler (at dispatch) reject it with the
+ * reason.
+ */
+export function qualifyPassthroughTarget(value: string): string {
+  try {
+    const target = parsePassthroughTarget(value);
+    return formatPassthroughTarget(target.host, target.port);
+  } catch {
+    return value;
+  }
+}
+
+/** The value in quotes when it is short printable ASCII; a neutral description otherwise. */
+function quoteForMessage(value: string): string {
+  return value.length <= 80 && /^[\x20-\x7e]*$/.test(value) ? `"${value}"` : `<${value.length}-character value>`;
+}
+
+/**
+ * Validates the arguments of a proxy tool call before policy evaluation, so
+ * that neither the policy engine, the auto-approver nor a human reviewer ever
+ * sees a passthrough target the MITM proxy would reject anyway: a host
+ * {@link validateDomain} refuses (an IP literal, a wildcard, `localhost`, a
+ * `*.docker.internal` or other local or metadata name, malformed text) or a
+ * port no approval can name ({@link parsePassthroughTarget}: only 443, the
+ * default, and 80). Returns the problem, or null when the arguments are
+ * acceptable. The type and presence checks are the pipeline's
+ * (`validateToolArguments`) and the handler's (`requireStringArg`); this only
+ * checks the target's shape.
+ */
+export function validateProxyToolArguments(toolName: string, args: Record<string, unknown>): string | null {
+  if (toolName !== 'add_proxy_domain' && toolName !== 'remove_proxy_domain') return null;
+  const domain = args.domain;
+  if (typeof domain !== 'string') return null;
+  try {
+    parsePassthroughTarget(domain);
+    return null;
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
   }
 }
 
@@ -38,7 +157,7 @@ export function validateDomain(domain: string): void {
 export interface DomainListing {
   /** Statically configured LLM provider hosts (with key swap). */
   readonly providers: readonly string[];
-  /** Dynamically added passthrough hosts (no key swap). */
+  /** Dynamically approved passthrough targets as `host:port` (no key swap). */
   readonly dynamic: readonly string[];
 }
 
@@ -53,13 +172,16 @@ export const proxyToolDefinitions = [
     description:
       'Request access to an additional internet domain through the network proxy. ' +
       'This will be reviewed by a human before being granted. ' +
+      'Access is granted to one host on one port: HTTPS (443) unless the domain names port 80 explicitly. ' +
       'Provide a clear justification for why the domain is needed.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         domain: {
           type: 'string',
-          description: 'The exact domain name to allow (e.g., "api.example.com"). No wildcards.',
+          description:
+            'The exact domain name to allow (e.g., "api.example.com"), optionally with a port ' +
+            '("api.example.com:80"). Only ports 443 (the default) and 80 can be requested. No wildcards.',
         },
         justification: {
           type: 'string',
@@ -75,13 +197,14 @@ export const proxyToolDefinitions = [
     name: 'remove_proxy_domain',
     description:
       'Remove a previously approved domain from the proxy allowlist. ' +
-      'Only dynamically added domains can be removed; built-in provider domains cannot.',
+      'Only dynamically added domains can be removed; built-in provider domains cannot. ' +
+      'Live tunnels to the removed host and port are closed.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         domain: {
           type: 'string',
-          description: 'The domain name to remove.',
+          description: 'The domain name to remove, with the same optional port it was approved with (default 443).',
         },
       },
       required: ['domain'],
@@ -91,7 +214,7 @@ export const proxyToolDefinitions = [
     name: 'list_proxy_domains',
     description:
       'List all domains currently accessible through the network proxy. ' +
-      'Includes both built-in provider domains and dynamically added domains.',
+      'Includes both built-in provider domains and dynamically added domains (listed as host:port).',
     inputSchema: {
       type: 'object' as const,
       properties: {},
@@ -148,6 +271,13 @@ export const proxyPolicyRules: CompiledRule[] = [
     if: { server: ['proxy'], tool: ['add_proxy_domain'] },
     then: 'escalate',
     reason: 'Adding network domains expands the container attack surface and requires human review',
+    // An approved domain becomes a passthrough tunnel to that host on the
+    // approved port (443 unless the agent named 80): no TLS termination, no
+    // credential swap, no endpoint filtering. That is the one decision no
+    // delegate may take: not the LLM auto-approver (a user message that
+    // merely names the domain must not open it), not an /approve+ whitelist
+    // pattern, and not a bulk "approve all".
+    humanOnly: true,
   },
   {
     name: 'proxy-remove-domain-allow',
@@ -172,9 +302,20 @@ export const proxyPolicyRules: CompiledRule[] = [
 // ---------------------------------------------------------------------------
 
 export interface ControlApiClient {
-  addDomain(domain: string): Promise<{ added: boolean }>;
-  removeDomain(domain: string): Promise<{ removed: boolean }>;
+  /** Approve `domain` on `port` (default 443). */
+  addDomain(domain: string, port?: number): Promise<{ added: boolean }>;
+  /** Revoke the approval for `domain` on `port` (default 443). */
+  removeDomain(domain: string, port?: number): Promise<{ removed: boolean }>;
   listDomains(): Promise<DomainListing>;
+}
+
+export interface ControlApiClientOptions {
+  /**
+   * Per-bundle bearer token the control API requires on every request. The
+   * MITM proxy mints it at startup and returns it from `start()`; without it
+   * the control API answers 401.
+   */
+  readonly token?: string;
 }
 
 /**
@@ -182,10 +323,11 @@ export interface ControlApiClient {
  *
  * @param controlAddr - "unix:///path/to/socket" or "http://127.0.0.1:PORT"
  */
-export function createControlApiClient(controlAddr: string): ControlApiClient {
+export function createControlApiClient(controlAddr: string, options: ControlApiClientOptions = {}): ControlApiClient {
   const isUnix = controlAddr.startsWith('unix://');
   const socketPath = isUnix ? controlAddr.slice('unix://'.length) : undefined;
   const baseUrl = isUnix ? 'http://localhost' : controlAddr;
+  const authorization = options.token === undefined ? {} : { Authorization: `Bearer ${options.token}` };
 
   function request(method: string, path: string, body?: unknown): Promise<unknown> {
     return new Promise((resolve, reject) => {
@@ -195,7 +337,7 @@ export function createControlApiClient(controlAddr: string): ControlApiClient {
         hostname: url.hostname,
         port: url.port || undefined,
         path: url.pathname,
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authorization },
         ...(socketPath ? { socketPath } : {}),
       };
 
@@ -227,11 +369,11 @@ export function createControlApiClient(controlAddr: string): ControlApiClient {
   }
 
   return {
-    async addDomain(domain: string): Promise<{ added: boolean }> {
-      return (await request('POST', '/__ironcurtain/domains/add', { domain })) as { added: boolean };
+    async addDomain(domain: string, port: number = DEFAULT_PASSTHROUGH_PORT): Promise<{ added: boolean }> {
+      return (await request('POST', '/__ironcurtain/domains/add', { domain, port })) as { added: boolean };
     },
-    async removeDomain(domain: string): Promise<{ removed: boolean }> {
-      return (await request('POST', '/__ironcurtain/domains/remove', { domain })) as { removed: boolean };
+    async removeDomain(domain: string, port: number = DEFAULT_PASSTHROUGH_PORT): Promise<{ removed: boolean }> {
+      return (await request('POST', '/__ironcurtain/domains/remove', { domain, port })) as { removed: boolean };
     },
     async listDomains(): Promise<DomainListing> {
       return (await request('GET', '/__ironcurtain/domains')) as DomainListing;
@@ -267,19 +409,23 @@ export async function handleVirtualProxyTool(
 ): Promise<unknown> {
   switch (toolName) {
     case 'add_proxy_domain': {
-      const domain = requireStringArg(args, 'domain');
+      const target = parsePassthroughTarget(requireStringArg(args, 'domain'));
       requireStringArg(args, 'justification');
-      validateDomain(domain);
-      const result = await client.addDomain(domain);
+      const result = await client.addDomain(target.host, target.port);
       if (!result.added) {
-        return { status: 'already_accessible', message: 'Domain is already accessible (built-in provider)' };
+        return {
+          status: 'already_accessible',
+          message: 'Domain is already accessible (built-in provider, package registry, or previously approved)',
+          domain: target.host,
+          port: target.port,
+        };
       }
-      return { status: 'added', domain };
+      return { status: 'added', domain: target.host, port: target.port };
     }
     case 'remove_proxy_domain': {
-      const domain = requireStringArg(args, 'domain');
-      const result = await client.removeDomain(domain);
-      return { status: result.removed ? 'removed' : 'not_found', domain };
+      const target = parsePassthroughTarget(requireStringArg(args, 'domain'));
+      const result = await client.removeDomain(target.host, target.port);
+      return { status: result.removed ? 'removed' : 'not_found', domain: target.host, port: target.port };
     }
     case 'list_proxy_domains':
       return client.listDomains();

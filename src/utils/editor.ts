@@ -5,7 +5,7 @@
  * constitution and task editing flows.
  */
 
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -31,15 +31,15 @@ export function openEditorForMultiline(
 ): string | undefined {
   const editor = resolveEditor();
   const prefix = opts?.prefix ?? 'ironcurtain';
-  const tmpFile = join(tmpdir(), `${prefix}-${Date.now()}.md`);
-
   const header = instructions
     .split('\n')
     .map((l) => `# ${l}`)
     .join('\n');
-  writeFileSync(tmpFile, `${header}\n\n${initialContent}`, 'utf-8');
-
+  const scratchDir = mkdtempSync(join(tmpdir(), `${prefix}-`));
+  const tmpFile = join(scratchDir, 'content.md');
   try {
+    chmodSync(scratchDir, 0o700);
+    writeFileSync(tmpFile, `${header}\n\n${initialContent}`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
     const result = spawnSync(editor, [tmpFile], { stdio: 'inherit' });
     if (result.error) throw result.error;
 
@@ -53,7 +53,7 @@ export function openEditorForMultiline(
     return content || undefined;
   } finally {
     try {
-      rmSync(tmpFile);
+      rmSync(scratchDir, { recursive: true, force: true });
     } catch {
       // ignore cleanup errors
     }

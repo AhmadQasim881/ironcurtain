@@ -1,5 +1,7 @@
 # Declarative Guard Conditions (`when` field)
 
+**Status (2026-11-14):** Implemented: agent transitions take a `when` clause matched against the agent's output (`WhenClause` in `src/workflow/types.ts`).
+
 ## Problem
 
 Workflow definitions use string guard names (`"guard": "isApproved"`) to route transitions based on agent output. Each new routing condition requires a new guard function in `guards.ts`, a registry entry in `REGISTERED_GUARDS`, and an adapter in the machine builder's XState guard wrapper. Most guards are trivial field-equality checks against `AgentOutput` (e.g., `isApproved` is `output.verdict === 'approved'`; `isRejected` is `output.verdict === 'rejected'`). This is boilerplate that scales linearly with the number of distinct checks workflow authors need.

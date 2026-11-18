@@ -2,6 +2,20 @@
   "generatedAt": "2026-03-22T20:08:37.921Z",
   "constitutionHash": "3a2fca5ca6489fc9e766b906764c58c082305b74fad84681d5088f16960198df",
   "inputHash": "3be01d05b84bde1648f2e0aafc9354e67e0b3893f5289db3433becd4b2ab49b7",
+  "provenance": {
+    "schemaVersion": 1,
+    "producerVersion": "0.14.0",
+    "policyCompilerEpoch": 1,
+    "engineSemanticsVersion": 2,
+    "verifierVersion": 2,
+    "annotationDigests": {
+      "fetch": "1c71d646cff273da9f9c3c444e843946867ef333209bafeea8367e85a4bae4d6",
+      "filesystem": "068f105632402f13dfa2cbc202b8c603ba9d47fabc4f2440562d2efa4e32e4af",
+      "git": "42eaeeff2739369a7ec8d2dc6782396b4443980f167ef28f2b80cac20c28d207",
+      "github": "f5f0308b6a1e8dc12e2ffaee2a873e1fb5c32e58c3fff77c81426226c66bf8de",
+      "google-workspace": "2d1845afda53c40401df9ea94af347df854c6b6d5f50ac61b973e2cfd36e2af3"
+    }
+  },
   "rules": [
     {
       "name": "allow-web-search",
@@ -20,7 +34,7 @@
     },
     {
       "name": "allow-http-fetch-known-domains",
-      "description": "Permit fetching any URL via HTTP for data gathering, including IP-based URLs.",
+      "description": "Permit fetching URLs on well-known public documentation, code-hosting and reference domains.",
       "principle": "Controlled web access: Fetching URLs from known safe domains is permitted for data gathering.",
       "if": {
         "roles": [
@@ -31,10 +45,23 @@
         ],
         "tool": [
           "http_fetch"
-        ]
+        ],
+        "domains": {
+          "roles": [
+            "fetch-url"
+          ],
+          "allowed": [
+            "*.github.com",
+            "raw.githubusercontent.com",
+            "*.wikipedia.org",
+            "docs.python.org",
+            "stackoverflow.com",
+            "registry.npmjs.org"
+          ]
+        }
       },
-      "then": "allow",
-      "reason": "The constitution permits fetching URLs for data gathering; no domain restrictions are specified, so all URLs including raw IP addresses are allowed."
+      "then": "assess",
+      "reason": "The constitution permits fetching from known safe domains only; any other destination, including raw IP addresses, loopback and file URLs, matches no rule and is denied."
     },
     {
       "name": "allow-read-only-operations",
@@ -137,6 +164,144 @@
       },
       "then": "escalate",
       "reason": "Writing files is a mutation that requires human approval per the constitution; sandbox calls are handled structurally before this rule fires."
+    },
+    {
+      "name": "allow-git-read-operations",
+      "description": "Allow read-only git queries: status, log, diff, show, blame, reflog and changelog analysis.",
+      "principle": "The agent is allowed to read git log, status, diff, and branch information",
+      "if": {
+        "server": [
+          "git"
+        ],
+        "tool": [
+          "git_status",
+          "git_log",
+          "git_diff",
+          "git_show",
+          "git_blame",
+          "git_reflog",
+          "git_changelog_analyze"
+        ]
+      },
+      "then": "allow",
+      "reason": "These tools only read repository state and history, and reading is permitted anywhere."
+    },
+    {
+      "name": "allow-git-list-operations",
+      "description": "Allow the read-only modes of multi-mode git tools: listing branches, tags, remotes, stashes and worktrees, and git clean dry runs.",
+      "principle": "The agent is allowed to read git log, status, diff, and branch information",
+      "if": {
+        "roles": [
+          "read-path"
+        ],
+        "server": [
+          "git"
+        ],
+        "tool": [
+          "git_branch",
+          "git_tag",
+          "git_remote",
+          "git_stash",
+          "git_worktree",
+          "git_clean"
+        ]
+      },
+      "then": "assess",
+      "reason": "Scoped to the read-path role, so only the listing modes are allowed; modes that write or delete history or files fall through to escalation."
+    },
+    {
+      "name": "allow-git-set-working-dir",
+      "description": "Allow setting the git working directory for navigation.",
+      "principle": "The agent is allowed to set the git working directory for navigation",
+      "if": {
+        "roles": [
+          "read-path"
+        ],
+        "server": [
+          "git"
+        ],
+        "tool": [
+          "git_set_working_dir"
+        ]
+      },
+      "then": "allow",
+      "reason": "Navigation only reads the target path; initializing a new repository there (write-path) falls through to escalation."
+    },
+    {
+      "name": "allow-git-clear-working-dir",
+      "description": "Allow clearing the git working directory setting.",
+      "principle": "The agent is allowed to set the git working directory for navigation",
+      "if": {
+        "server": [
+          "git"
+        ],
+        "tool": [
+          "git_clear_working_dir"
+        ]
+      },
+      "then": "allow",
+      "reason": "Clearing the session working directory changes navigation state only and touches no repository."
+    },
+    {
+      "name": "escalate-git-remote-changes",
+      "description": "Require approval before adding, removing, renaming or re-pointing git remotes.",
+      "principle": "The agent must ask for approval before adding, removing, or renaming git remotes",
+      "if": {
+        "server": [
+          "git"
+        ],
+        "tool": [
+          "git_remote"
+        ]
+      },
+      "then": "escalate",
+      "reason": "Changing remotes modifies repository configuration."
+    },
+    {
+      "name": "escalate-git-state-changes",
+      "description": "Require approval before any git operation that modifies repository state or the working tree.",
+      "principle": "The agent must ask for approval before modifying git state (commit, checkout, merge, rebase)",
+      "if": {
+        "server": [
+          "git"
+        ],
+        "tool": [
+          "git_add",
+          "git_commit",
+          "git_checkout",
+          "git_merge",
+          "git_rebase",
+          "git_reset",
+          "git_cherry_pick",
+          "git_branch",
+          "git_tag",
+          "git_stash",
+          "git_clean",
+          "git_worktree",
+          "git_init",
+          "git_set_working_dir"
+        ]
+      },
+      "then": "escalate",
+      "reason": "These operations create, modify or delete commits, refs, files or repositories."
+    },
+    {
+      "name": "escalate-git-network-operations",
+      "description": "Require approval before git operations that contact a remote.",
+      "principle": "The agent must ask for approval before any write, create, delete, or push operation",
+      "if": {
+        "server": [
+          "git"
+        ],
+        "tool": [
+          "git_push",
+          "git_pull",
+          "git_fetch",
+          "git_clone"
+        ]
+      },
+      "then": "escalate",
+      "reason": "Push, pull, fetch and clone transfer data to or from a remote and change local or remote state."
     },
     {
       "name": "allow-github-read-tools",

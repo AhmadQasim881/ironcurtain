@@ -1,7 +1,17 @@
 {
   "generatedAt": "2026-06-24T06:27:30.118Z",
   "constitutionHash": "5303278f22bbac0be70df2fb5c7061cd1e162e54cadaa1f114cda8a760a8b2cf",
-  "inputHash": "0e9ce714fca0eec6065836dd6fc6a24ceba33f4bc505e418545c2a275e9ba0a1",
+  "inputHash": "6674a1fa3e575089af75cde06378e6f19b8b1dd179626c8cbdcf539d568a1ac4",
+  "provenance": {
+    "schemaVersion": 1,
+    "producerVersion": "0.14.0",
+    "policyCompilerEpoch": 1,
+    "engineSemanticsVersion": 2,
+    "verifierVersion": 2,
+    "annotationDigests": {
+      "fetch": "29132f04e6f0a5e4061fc78d6e9907a5a6f82e336f89bbff27d8feae3cb152d6"
+    }
+  },
   "rules": [
     {
       "name": "allow-trusted-news",
@@ -15,7 +25,7 @@
           "allowed": ["@trusted-news-sites"]
         }
       },
-      "then": "allow",
+      "then": "assess",
       "reason": "Trusted news domain."
     },
     {

@@ -17,6 +17,7 @@
 
 import type { TokenStreamEvent } from '../docker/token-stream-types.js';
 import { truncate } from '../mux/mux-renderer.js';
+import { observedField } from './observe-text.js';
 import {
   type AgentPhase,
   type ObserveEventSink,
@@ -306,9 +307,9 @@ function renderStatusBar(layout: TuiLayout, metrics: AggregateMetrics, connectio
     );
   }
 
-  // Model name (truncated)
+  // Model name (untrusted: sanitized, then truncated)
   if (metrics.model) {
-    const truncModel = truncate(metrics.model, STATUS_MODEL_MAX_LEN);
+    const truncModel = truncate(observedField(metrics.model), STATUS_MODEL_MAX_LEN);
     parts.push(`${SGR.STATUS_VALUE}${truncModel}${SGR.RESET}`);
   }
 
@@ -322,7 +323,7 @@ function renderStatusBar(layout: TuiLayout, metrics: AggregateMetrics, connectio
   const pColor = phaseColor[metrics.phase];
   let phaseLabel: string;
   if (metrics.phase === 'tool_use' && metrics.currentToolName) {
-    const truncTool = truncate(metrics.currentToolName, STATUS_TOOL_MAX_LEN);
+    const truncTool = truncate(observedField(metrics.currentToolName), STATUS_TOOL_MAX_LEN);
     phaseLabel = `TOOL: ${truncTool}`;
   } else {
     phaseLabel = metrics.phase.toUpperCase();
@@ -720,7 +721,7 @@ export function createObserveTui(options: ObserveTuiOptions): ObserveTui {
       statusDirty = true;
 
       // Show in status bar (overrides normal metrics display)
-      connectionError = `Connection lost: ${reason}`;
+      connectionError = `Connection lost: ${observedField(reason)}`;
 
       // Start 3-second exit timer (rain keeps draining during this window)
       if (!connectionExitTimer) {

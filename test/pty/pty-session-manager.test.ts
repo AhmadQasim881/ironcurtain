@@ -24,71 +24,20 @@ import {
 } from '../../src/web-ui/pty-session-manager.js';
 import { PTY_KILL_GRACE_MS } from '../../src/pty/pty-bridge.js';
 import type { PtyBridge, PtyBridgeOptions } from '../../src/pty/pty-bridge.js';
-import type { PtySessionRegistration } from '../../src/docker/pty-types.js';
 import type { EscalationRequest } from '../../src/session/types.js';
-import type { EscalationDto } from '../../src/web-ui/web-ui-types.js';
+import { RpcError, type EscalationDto } from '../../src/web-ui/web-ui-types.js';
 import { SessionManager } from '../../src/session/session-manager.js';
 import { WebEventBus } from '../../src/web-ui/web-event-bus.js';
 import { sessionDispatch } from '../../src/web-ui/dispatch/session-dispatch.js';
 import { escalationDispatch } from '../../src/web-ui/dispatch/escalation-dispatch.js';
 import type { DispatchContext } from '../../src/web-ui/dispatch/types.js';
 import type { ControlRequestHandler } from '../../src/daemon/control-socket.js';
+import type { AgentId } from '../../src/docker/agent-adapter.js';
+import { StubBridge } from '../helpers/pty-stub-bridge.js';
 
 // ---------------------------------------------------------------------------
 // Stubs
 // ---------------------------------------------------------------------------
-
-/** Controllable stub PtyBridge: fire onData/onExit/onSessionDiscovered at will. */
-class StubBridge {
-  alive = true;
-  exitCode: number | undefined;
-  readonly sessionId: string | undefined = 'stub-session';
-  escalationDir: string | undefined;
-  readonly pid = 4242;
-  serializeReturn = 'SNAPSHOT';
-
-  private readonly dataCbs: Array<(chunk: string) => void> = [];
-  private readonly exitCbs: Array<(code: number) => void> = [];
-  private readonly sessionCbs: Array<(reg: PtySessionRegistration | null) => void> = [];
-
-  readonly write = vi.fn<(data: string) => void>();
-  readonly resize = vi.fn<(cols: number, rows: number) => void>();
-  readonly kill = vi.fn(() => this.emitExit(0));
-
-  onOutput(): void {}
-  onData(cb: (chunk: string) => void): () => void {
-    this.dataCbs.push(cb);
-    return () => {
-      const i = this.dataCbs.indexOf(cb);
-      if (i !== -1) this.dataCbs.splice(i, 1);
-    };
-  }
-  serialize(): string {
-    return this.serializeReturn;
-  }
-  onExit(cb: (code: number) => void): void {
-    if (!this.alive && this.exitCode !== undefined) cb(this.exitCode);
-    else this.exitCbs.push(cb);
-  }
-  onSessionDiscovered(cb: (reg: PtySessionRegistration | null) => void): void {
-    this.sessionCbs.push(cb);
-  }
-  updateRegistration(): void {}
-
-  // --- test drivers ---
-  emitData(chunk: string): void {
-    for (const cb of [...this.dataCbs]) cb(chunk);
-  }
-  emitExit(code: number): void {
-    if (!this.alive) return;
-    this.alive = false;
-    this.exitCode = code;
-    for (const cb of [...this.exitCbs]) cb(code);
-  }
-  emitDiscovered(reg: PtySessionRegistration | null): void {
-    for (const cb of [...this.sessionCbs]) cb(reg);
-  }
-}
 
 /** Bridge whose kill request is accepted but does not terminate the child. */
 class NonExitingBridge extends StubBridge {
@@ -142,7 +91,7 @@ function makeHarness(overrides: Partial<PtySessionManagerOptions> = {}): Harness
     sender,
     sessionManager: new SessionManager(),
     eventBus,
-    mode: { kind: 'docker', agent: 'claude-code' },
+    mode: { kind: 'docker', agent: 'claude-code' as AgentId },
     daemonId: 'test',
     daemonPid: 1,
     createBridge: async () => {
@@ -207,6 +156,39 @@ describe('PtySessionManager', () => {
       expect(dto.source.persona).toBe('assistant');
     });
 
+    it('carries the OS-sandbox warning naming unsandboxed servers in the session DTO', async () => {
+      const warning =
+        'IronCurtain: OS sandbox unavailable (ripgrep (rg) not found); not starting MCP server(s) that require it: git, google-workspace';
+      const notice = vi.fn(() => warning);
+      const h = makeHarness({ osSandboxNotice: notice });
+
+      const { label } = await h.manager.create();
+
+      expect(notice).toHaveBeenCalledTimes(1);
+      const created = h.events.find((e) => e.event === 'session.created');
+      expect((created?.payload as { osSandboxWarning?: string }).osSandboxWarning).toBe(warning);
+      // Also surfaced by sessions.list (the DTO is rebuilt from the session).
+      expect(h.manager.getDto(label)?.osSandboxWarning).toBe(warning);
+      expect(h.manager.listDtos()[0].osSandboxWarning).toBe(warning);
+    });
+
+    it('omits the OS-sandbox warning when none applies or the check throws', async () => {
+      const quiet = makeHarness({ osSandboxNotice: () => undefined });
+      await quiet.manager.create();
+      const quietDto = quiet.events.find((e) => e.event === 'session.created')?.payload as Record<string, unknown>;
+      expect(quietDto).not.toHaveProperty('osSandboxWarning');
+
+      const failing = makeHarness({
+        osSandboxNotice: () => {
+          throw new Error('config unreadable');
+        },
+      });
+      await failing.manager.create();
+      expect(failing.manager.size).toBe(1);
+      const failingDto = failing.events.find((e) => e.event === 'session.created')?.payload as Record<string, unknown>;
+      expect(failingDto).not.toHaveProperty('osSandboxWarning');
+    });
+
     it('reaps a child that already exited during create (created -> ended, no leak)', async () => {
       // A fast-failing child (missing binary / immediate crash) can exit before
       // create() finishes wiring handlers; the bridge then fires onExit
@@ -243,6 +225,8 @@ describe('PtySessionManager', () => {
       expect(seen[0].muxPid).toBe(1);
       expect(seen[0].cols).toBe(80);
       expect(seen[0].rows).toBe(24);
+      // The browser's xterm answers terminal queries: the headless terminal must not answer too.
+      expect(seen[0].answerTerminalQueries).toBe(false);
     });
 
     it('resumes with the persisted agent and persona without fresh-launch flags', async () => {
@@ -555,6 +539,124 @@ describe('PtySessionManager', () => {
       await h.manager.create();
       vi.advanceTimersByTime(60 * 60 * 1000);
       expect(h.manager.size).toBe(1);
+    });
+
+    // WEB-11: the countdown must measure how long the session has been without
+    // subscribers; other clients' churn must not push the deadline out.
+    it('a disconnect of a client that never attached does not extend the countdown', async () => {
+      const h = makeHarness({ idleTtlMs: 1000 });
+      await h.manager.create();
+
+      vi.advanceTimersByTime(900); // 90% of the TTL with nobody attached
+      h.manager.removeAllForClient(fakeWs()); // an unrelated client disconnects
+      vi.advanceTimersByTime(100); // the ORIGINAL deadline
+
+      expect(h.manager.size).toBe(0);
+      const ended = h.events.filter((e) => e.event === 'session.ended');
+      expect(ended).toHaveLength(1);
+      expect((ended[0].payload as { reason: string }).reason).toBe('idle_reaped');
+    });
+
+    it('a stream of unrelated disconnects never restarts the countdown', async () => {
+      const h = makeHarness({ idleTtlMs: 1000 });
+      await h.manager.create();
+
+      for (let i = 0; i < 5; i++) {
+        vi.advanceTimersByTime(200);
+        h.manager.removeAllForClient(fakeWs());
+      }
+
+      expect(h.manager.size).toBe(0);
+    });
+
+    it('a detach from a client that never attached does not restart the countdown', async () => {
+      const h = makeHarness({ idleTtlMs: 1000 });
+      const { label } = await h.manager.create();
+
+      vi.advanceTimersByTime(900);
+      h.manager.detach(label, fakeWs());
+      vi.advanceTimersByTime(100);
+
+      expect(h.manager.size).toBe(0);
+    });
+
+    it('a disconnecting subscriber arms the countdown only for the sessions it was attached to', async () => {
+      const h = makeHarness({ idleTtlMs: 1000 });
+      const a = await h.manager.create();
+      const b = await h.manager.create(); // never attached: deadline at t=1000
+      const ws = fakeWs();
+      h.manager.attach(a.label, ws);
+
+      vi.advanceTimersByTime(500);
+      h.manager.removeAllForClient(ws); // arms a's countdown at t=500
+
+      vi.advanceTimersByTime(500); // t=1000: b reaped, a still has 500ms left
+      expect(h.manager.has(b.label)).toBe(false);
+      expect(h.manager.has(a.label)).toBe(true);
+
+      vi.advanceTimersByTime(500); // t=1500: a reaped
+      expect(h.manager.has(a.label)).toBe(false);
+    });
+
+    // WEB-5 (server side): keystrokes from a client whose socket dropped (and
+    // that has not re-attached yet) are activity, not idleness.
+    it('input from a client that is not attached restarts the countdown', async () => {
+      const h = makeHarness({ idleTtlMs: 1000 });
+      const { label } = await h.manager.create();
+
+      vi.advanceTimersByTime(900);
+      h.manager.input(label, b64('k'), fakeWs());
+
+      vi.advanceTimersByTime(900); // would have been reaped at t=1000 without the restart
+      expect(h.manager.size).toBe(1);
+      vi.advanceTimersByTime(100); // t=1900: a full TTL after the activity
+      expect(h.manager.size).toBe(0);
+    });
+
+    it('prompt and resize from an unattached client also restart the countdown', async () => {
+      const h = makeHarness({ idleTtlMs: 1000 });
+      const { label } = await h.manager.create();
+      const ws = fakeWs();
+
+      vi.advanceTimersByTime(900);
+      h.manager.sendPrompt(label, 'keep going', ws);
+      vi.advanceTimersByTime(900);
+      expect(h.manager.size).toBe(1);
+
+      h.manager.resize(label, 100, 40, ws);
+      vi.advanceTimersByTime(900);
+      expect(h.manager.size).toBe(1);
+
+      vi.advanceTimersByTime(100);
+      expect(h.manager.size).toBe(0);
+    });
+
+    it('does not arm a countdown while a subscriber is attached, whoever sends input', async () => {
+      const h = makeHarness({ idleTtlMs: 1000 });
+      const { label } = await h.manager.create();
+      const attached = fakeWs();
+      h.manager.attach(label, attached);
+
+      h.manager.input(label, b64('a'), attached);
+      h.manager.input(label, b64('b'), fakeWs()); // someone else, not attached
+      vi.advanceTimersByTime(10_000);
+
+      expect(h.manager.size).toBe(1);
+    });
+
+    it('activity does not re-arm the countdown for a session that is already stopping', async () => {
+      const { h, bridge } = makeNonExitingHarness({ idleTtlMs: 1000 });
+      const { label } = await h.manager.create();
+      h.manager.end(label);
+      expect(h.manager.listDtos()[0].status).toBe('stopping');
+
+      h.manager.input(label, b64('x'), fakeWs());
+      h.manager.resize(label, 100, 40, fakeWs());
+      vi.advanceTimersByTime(10_000);
+
+      expect(bridge.kill).toHaveBeenCalledTimes(1);
+      expect(h.manager.has(label)).toBe(true);
+      expect(h.manager.listDtos()[0].status).toBe('stopping');
     });
   });
 
@@ -972,8 +1074,7 @@ describe('PtySessionManager', () => {
       writeRequest(escDir, 'esc-pty-2');
       discover(h.lastBridge(), escDir);
 
-      const accepted = h.manager.resolveEscalation('esc-pty-2', 'approved');
-      expect(accepted).toBe(true);
+      expect(() => h.manager.resolveEscalation('esc-pty-2', 'approved')).not.toThrow();
 
       const responsePath = join(escDir, 'response-esc-pty-2.json');
       expect(existsSync(responsePath)).toBe(true);
@@ -985,6 +1086,19 @@ describe('PtySessionManager', () => {
 
       expect(h.manager.hasEscalation('esc-pty-2')).toBe(false);
       expect(h.manager.listPendingEscalationDtos()).toHaveLength(0);
+    });
+
+    it('does not approve an unavailable complete PTY review but still accepts denial', async () => {
+      const h = makeHarness();
+      await h.manager.create();
+      const dir = makeEscalationDir();
+      writeRequest(dir, 'example-unavailable', { arguments: { content: 'Example prose. '.repeat(1200) } });
+      discover(h.lastBridge(), dir);
+      expect(() => h.manager.resolveEscalation('example-unavailable', 'approved')).toThrow('can only be denied');
+      expect(existsSync(join(dir, 'response-example-unavailable.json'))).toBe(false);
+      expect(h.manager.hasEscalation('example-unavailable')).toBe(true);
+      h.manager.resolveEscalation('example-unavailable', 'denied');
+      expect(JSON.parse(readFileSync(join(dir, 'response-example-unavailable.json'), 'utf8')).decision).toBe('denied');
     });
 
     it('forwards the whitelist selection through to the response file', async () => {
@@ -1048,19 +1162,137 @@ describe('PtySessionManager', () => {
       expect(h.events.filter((e) => e.event === 'escalation.created')).toHaveLength(0);
     });
 
-    // The escalation-dispatch composition (Deliverable 3): resolve routes to the
-    // PTY manager when it owns the id; list unions PTY pendings.
-    function makeDispatchCtx(h: Harness): DispatchContext {
-      return {
-        handler: makeHandler(),
-        sessionManager: new SessionManager(),
-        mode: { kind: 'docker', agent: 'claude-code' },
-        eventBus: h.eventBus,
-        maxConcurrentWebSessions: 4,
-        sessionQueues: new Map(),
-        ptySessionManager: h.manager,
-      };
-    }
+    // WEB-10: an escalation can never be answered once its session is gone.
+    it('a child exit with a pending escalation emits escalation.expired before session.ended', async () => {
+      const h = makeHarness();
+      const { label } = await h.manager.create();
+      const escDir = makeEscalationDir();
+      writeRequest(escDir, 'esc-exit-1');
+      discover(h.lastBridge(), escDir);
+      expect(h.manager.hasEscalation('esc-exit-1')).toBe(true);
+      h.events.length = 0;
+
+      h.lastBridge().emitExit(1);
+
+      const expiredIdx = h.events.findIndex((e) => e.event === 'escalation.expired');
+      const endedIdx = h.events.findIndex((e) => e.event === 'session.ended');
+      expect(expiredIdx).toBeGreaterThanOrEqual(0);
+      expect(h.events[expiredIdx].payload).toEqual({ escalationId: 'esc-exit-1', sessionLabel: label });
+      expect(endedIdx).toBeGreaterThan(expiredIdx);
+      expect(h.manager.hasEscalation('esc-exit-1')).toBe(false);
+      expect(h.manager.listPendingEscalationDtos()).toHaveLength(0);
+    });
+
+    it('end() with a pending escalation emits escalation.expired once the child exits', async () => {
+      const h = makeHarness();
+      const { label } = await h.manager.create();
+      const escDir = makeEscalationDir();
+      writeRequest(escDir, 'esc-end-1');
+      discover(h.lastBridge(), escDir);
+      h.events.length = 0;
+
+      h.manager.end(label); // the stub bridge exits synchronously on kill
+
+      const expired = h.events.filter((e) => e.event === 'escalation.expired');
+      expect(expired).toHaveLength(1);
+      expect(expired[0].payload).toEqual({ escalationId: 'esc-end-1', sessionLabel: label });
+      expect(h.events.filter((e) => e.event === 'session.ended')).toHaveLength(1);
+    });
+
+    it('close() emits escalation.expired for every pending escalation', async () => {
+      const h = makeHarness();
+      const { label } = await h.manager.create();
+      const escDir = makeEscalationDir();
+      writeRequest(escDir, 'esc-close-1');
+      discover(h.lastBridge(), escDir);
+      h.events.length = 0;
+
+      await h.manager.close();
+
+      const expired = h.events.filter((e) => e.event === 'escalation.expired');
+      expect(expired).toHaveLength(1);
+      expect(expired[0].payload).toEqual({ escalationId: 'esc-close-1', sessionLabel: label });
+    });
+
+    // The expiry announcements are observational: like session.created in
+    // create(), a failing subscriber must not abort the teardown that follows
+    // them (on shutdown that is the child kill, i.e. the container).
+    it('a subscriber that throws on escalation.expired does not stop close() from killing the child', async () => {
+      const h = makeHarness();
+      await h.manager.create();
+      const escDir = makeEscalationDir();
+      writeRequest(escDir, 'esc-close-throw');
+      discover(h.lastBridge(), escDir);
+      h.eventBus.subscribe((event) => {
+        if (event === 'escalation.expired') throw new Error('subscriber failed');
+      });
+
+      await h.manager.close();
+
+      expect(h.lastBridge().kill).toHaveBeenCalledTimes(1);
+      expect(h.lastBridge().alive).toBe(false);
+    });
+
+    it('a subscriber that throws on escalation.expired does not stop a child exit from ending the session', async () => {
+      const h = makeHarness();
+      const { label } = await h.manager.create();
+      const escDir = makeEscalationDir();
+      writeRequest(escDir, 'esc-exit-throw');
+      discover(h.lastBridge(), escDir);
+      h.eventBus.subscribe((event) => {
+        if (event === 'escalation.expired') throw new Error('subscriber failed');
+      });
+
+      h.lastBridge().emitExit(1);
+
+      expect(h.manager.has(label)).toBe(false);
+      expect(h.events.filter((e) => e.event === 'session.ended')).toHaveLength(1);
+      expect(h.manager.hasEscalation('esc-exit-throw')).toBe(false);
+    });
+
+    it('a response after the proxy expired the request throws ESCALATION_EXPIRED and emits expired, not resolved', async () => {
+      const h = makeHarness();
+      const { label } = await h.manager.create();
+      const escDir = makeEscalationDir();
+      writeRequest(escDir, 'esc-late');
+      discover(h.lastBridge(), escDir);
+      // The proxy times out and removes the request before the watcher's next
+      // poll notices: the operator's answer arrives too late.
+      rmSync(join(escDir, 'request-esc-late.json'));
+      h.events.length = 0;
+
+      let caught: unknown;
+      try {
+        h.manager.resolveEscalation('esc-late', 'approved');
+      } catch (err) {
+        caught = err;
+      }
+
+      expect(caught).toBeInstanceOf(RpcError);
+      expect((caught as RpcError).code).toBe('ESCALATION_EXPIRED');
+      expect(h.events.filter((e) => e.event === 'escalation.resolved')).toHaveLength(0);
+      const expired = h.events.filter((e) => e.event === 'escalation.expired');
+      expect(expired).toHaveLength(1);
+      expect(expired[0].payload).toEqual({ escalationId: 'esc-late', sessionLabel: label });
+      expect(h.manager.hasEscalation('esc-late')).toBe(false);
+    });
+
+    it('escalations.resolve surfaces a too-late PTY response as ESCALATION_EXPIRED', async () => {
+      const h = makeHarness();
+      await h.manager.create();
+      const escDir = makeEscalationDir();
+      writeRequest(escDir, 'esc-late-dispatch');
+      discover(h.lastBridge(), escDir);
+      rmSync(join(escDir, 'request-esc-late-dispatch.json'));
+
+      await expect(
+        escalationDispatch(makeDispatchCtx(h), 'escalations.resolve', {
+          escalationId: 'esc-late-dispatch',
+          decision: 'approved',
+        }),
+      ).rejects.toMatchObject({ code: 'ESCALATION_EXPIRED' });
+      expect(h.events.filter((e) => e.event === 'escalation.resolved')).toHaveLength(0);
+    });
 
     it('escalations.resolve routes to the PTY manager and writes the response', async () => {
       const h = makeHarness();
@@ -1094,7 +1326,77 @@ describe('PtySessionManager', () => {
       expect(list[0].sessionSource.kind).toBe('web-pty');
     });
   });
+
+  // -------------------------------------------------------------------------
+  // WEB-12: sessions.ptyResize is bounded at the schema (src/pty/pty-size.ts);
+  // PtyBridge.resize clamps again (covered in test/pty-bridge.test.ts).
+  // -------------------------------------------------------------------------
+  describe('sessions.ptyResize bounds', () => {
+    it('rejects oversized and undersized frames before they reach the bridge', async () => {
+      const h = makeHarness();
+      const { label } = await h.manager.create();
+      const ctx = makeDispatchCtx(h);
+      const bad = [
+        { cols: 1_000_000, rows: 24 },
+        { cols: 80, rows: 100_000 },
+        { cols: 1001, rows: 24 },
+        { cols: 80, rows: 501 },
+        { cols: 1, rows: 24 },
+        { cols: 80, rows: 0 },
+        { cols: 80.5, rows: 24 },
+      ];
+      for (const size of bad) {
+        await expect(sessionDispatch(ctx, 'sessions.ptyResize', { label, ...size }, fakeWs())).rejects.toMatchObject({
+          code: 'INVALID_PARAMS',
+        });
+      }
+      expect(h.lastBridge().resize).not.toHaveBeenCalled();
+    });
+
+    it('forwards in-range frames, including the bounds themselves', async () => {
+      const h = makeHarness();
+      const { label } = await h.manager.create();
+      const ctx = makeDispatchCtx(h);
+
+      await sessionDispatch(ctx, 'sessions.ptyResize', { label, cols: 1000, rows: 500 }, fakeWs());
+      await sessionDispatch(ctx, 'sessions.ptyResize', { label, cols: 2, rows: 1 }, fakeWs());
+      await sessionDispatch(ctx, 'sessions.ptyResize', { label, cols: 120, rows: 40 }, fakeWs());
+
+      expect(h.lastBridge().resize.mock.calls).toEqual([
+        [1000, 500],
+        [2, 1],
+        [120, 40],
+      ]);
+    });
+
+    it('ptyInput through dispatch carries the client, so an unattached sender restarts the idle countdown', async () => {
+      const h = makeHarness({ idleTtlMs: 1000 });
+      const { label } = await h.manager.create();
+      const ctx = makeDispatchCtx(h);
+
+      vi.advanceTimersByTime(900);
+      await sessionDispatch(ctx, 'sessions.ptyInput', { label, data: b64('k') }, fakeWs());
+
+      vi.advanceTimersByTime(900);
+      expect(h.manager.size).toBe(1);
+      vi.advanceTimersByTime(100);
+      expect(h.manager.size).toBe(0);
+    });
+  });
 });
+
+/** Dispatch context over a harness: resolve/list/pty* route to its PTY manager. */
+function makeDispatchCtx(h: Harness): DispatchContext {
+  return {
+    handler: makeHandler(),
+    sessionManager: new SessionManager(),
+    mode: { kind: 'docker', agent: 'claude-code' as AgentId },
+    eventBus: h.eventBus,
+    maxConcurrentWebSessions: 4,
+    sessionQueues: new Map(),
+    ptySessionManager: h.manager,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Concurrency cap through the real docker sessions.create path (§11 D4)
@@ -1108,12 +1410,13 @@ function makeHandler(): ControlRequestHandler {
       signalConnected: false,
       nextFireTime: undefined,
     }),
-    addJob: vi.fn(),
     removeJob: vi.fn(),
     enableJob: vi.fn(),
     disableJob: vi.fn(),
     recompileJob: vi.fn(),
+    refreshLists: vi.fn(),
     reloadJob: vi.fn(),
+    startJobRun: vi.fn(),
     runJobNow: vi.fn(),
     listJobs: vi.fn().mockReturnValue([]),
   };
@@ -1126,7 +1429,7 @@ describe('sessions.create (docker) concurrency cap', () => {
       sender: { sendToSubscribers: () => {} },
       sessionManager: new SessionManager(),
       eventBus,
-      mode: { kind: 'docker', agent: 'claude-code' },
+      mode: { kind: 'docker', agent: 'claude-code' as AgentId },
       daemonId: 'test',
       daemonPid: 1,
       createBridge: async () => new StubBridge() as unknown as PtyBridge,
@@ -1136,7 +1439,7 @@ describe('sessions.create (docker) concurrency cap', () => {
     const ctx: DispatchContext = {
       handler: makeHandler(),
       sessionManager: new SessionManager(),
-      mode: { kind: 'docker', agent: 'claude-code' },
+      mode: { kind: 'docker', agent: 'claude-code' as AgentId },
       eventBus,
       maxConcurrentWebSessions: 2,
       sessionQueues: new Map(),
@@ -1160,7 +1463,7 @@ describe('sessions.create (docker) concurrency cap', () => {
       sender: { sendToSubscribers: () => {} },
       sessionManager,
       eventBus,
-      mode: { kind: 'docker', agent: 'claude-code' },
+      mode: { kind: 'docker', agent: 'claude-code' as AgentId },
       daemonId: 'test',
       daemonPid: 1,
       createBridge: () =>
@@ -1172,7 +1475,7 @@ describe('sessions.create (docker) concurrency cap', () => {
     const ctx: DispatchContext = {
       handler: makeHandler(),
       sessionManager,
-      mode: { kind: 'docker', agent: 'claude-code' },
+      mode: { kind: 'docker', agent: 'claude-code' as AgentId },
       eventBus,
       maxConcurrentWebSessions: 1,
       sessionQueues: new Map(),
@@ -1233,7 +1536,7 @@ describe('sessions resume RPC', () => {
       sender: { sendToSubscribers: () => {} },
       sessionManager,
       eventBus,
-      mode: { kind: 'docker', agent: 'claude-code' },
+      mode: { kind: 'docker', agent: 'claude-code' as AgentId },
       daemonId: 'test',
       daemonPid: 1,
       createBridge: async (options) => {
@@ -1245,7 +1548,7 @@ describe('sessions resume RPC', () => {
     return {
       handler: makeHandler(),
       sessionManager,
-      mode: { kind: 'docker', agent: 'claude-code' },
+      mode: { kind: 'docker', agent: 'claude-code' as AgentId },
       eventBus,
       maxConcurrentWebSessions: 2,
       sessionQueues: new Map(),

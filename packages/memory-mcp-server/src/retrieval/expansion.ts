@@ -24,7 +24,8 @@ import type { MemoryConfig } from '../config.js';
 import type { SegmentRow } from '../storage/database.js';
 import type { ExpandMode } from '../types.js';
 import type { ScoredMemory } from './scoring.js';
-import { getSegmentsByIds } from '../storage/queries.js';
+import { getLiveSegmentsByIds } from '../storage/queries.js';
+import { readScopeOf } from '../utils/review.js';
 import { splitToPassages } from '../storage/extraction.js';
 import { embed, cosineSimilarity } from '../embedding/embedder.js';
 import { estimateTokens, packToBudget } from './scoring.js';
@@ -48,7 +49,8 @@ export interface ExpansionResult {
  * segment that yields no passages.
  *
  * Shared by recall expansion (which takes `limit: 1` per segment) and
- * `memory_expand` / `engine.expand` (which ranks all passages of one segment).
+ * `memory_expand` / `engine.expand` (which ranks all passages of one segment, through
+ * {@link rankPassages}, and returns the best `max_passages`).
  * Lives in the retrieval layer; `engine-impl` already depends on retrieval
  * (pipeline, scoring), so importing this introduces no new cross-layer cycle.
  */
@@ -58,7 +60,19 @@ export async function rankSegmentPassages(
   queryEmbedding: Float32Array,
   limit?: number,
 ): Promise<string[]> {
-  const passages = splitToPassages(segmentText);
+  return rankPassages(config, splitToPassages(segmentText), queryEmbedding, limit);
+}
+
+/**
+ * {@link rankSegmentPassages} for a segment already split into `passages`: all of
+ * them embedded and ranked best-first, the top `limit` returned (all without one).
+ */
+export async function rankPassages(
+  config: MemoryConfig,
+  passages: string[],
+  queryEmbedding: Float32Array,
+  limit?: number,
+): Promise<string[]> {
   if (passages.length === 0) return [];
   // Single passage: no ranking needed; it is trivially the best (and only) one.
   if (passages.length === 1) return passages;
@@ -119,15 +133,21 @@ export async function expandKeptFacts(
     return { units: packToBudget(factUnits, budget), expandedSegmentIds: [] };
   }
 
-  // 3. Fetch the selected segments in one query.
-  const segments = getSegmentsByIds(db, config.namespace, segmentIdsToExpand);
+  // 3. Fetch the selected segments in one query (only those a live memory the reader may
+  //    see still references; the kept facts are such memories, utils/review.ts).
+  const segments = getLiveSegmentsByIds(db, config.namespace, segmentIdsToExpand, readScopeOf(config.writer));
   const segmentById = new Map(segments.map((s) => [s.id, s]));
 
-  // 4. Per expandable segment, split-and-rank to a chosen passage (segment-best-rank order).
-  const chosenPassageBySegment = await choosePassages(config, segmentIdsToExpand, segmentById, queryEmbedding);
-
-  // 5. Build the candidate passage units (overlap-deduped, capped), in segment-best-rank order.
-  const passageUnits = buildPassageUnits(segmentIdsToExpand, groups, chosenPassageBySegment, maxExpandPassages);
+  // 4+5. Choose the passage units (split-and-rank, overlap-deduped, capped), in
+  //      segment-best-rank order, stopping once the cap is reached.
+  const passageUnits = await choosePassageUnits(
+    config,
+    segmentIdsToExpand,
+    groups,
+    segmentById,
+    queryEmbedding,
+    maxExpandPassages,
+  );
 
   // 6. Pack facts + passages under a reservation that GUARANTEES the top passage's depth.
   return packHybrid(factUnits, passageUnits, budget);
@@ -154,62 +174,46 @@ function groupBySegment(kept: ScoredMemory[]): Map<string, ScoredMemory[]> {
 }
 
 /**
- * For each expandable segment, split its content into passages, embed them, and pick
- * the passage most similar to the query embedding. Returns the chosen passage text per
- * segment id, keyed in segment-best-rank order. A segment with no row (forgotten parent)
- * or no passages is skipped — its facts are simply not augmented with a passage.
+ * Build the passage display units, one per shared segment, in segment-best-rank order:
+ * for each expandable segment, split its content into passages, embed them, and take
+ * the passage most similar to the query embedding, after passage overlap-dedup, until
+ * `maxExpandPassages` passages are chosen. No budget logic here — `packHybrid` decides
+ * which of these survive packing (the first is guaranteed, the rest are supplementary).
  *
- * The `maxExpandPassages` cap is NOT applied here: it caps the passages that SURVIVE
- * overlap-dedup in `buildPassageUnits`, so a passage dropped as an overlap duplicate does
- * not waste a cap slot.
- */
-async function choosePassages(
-  config: MemoryConfig,
-  segmentIdsToExpand: string[],
-  segmentById: Map<string, SegmentRow>,
-  queryEmbedding: Float32Array,
-): Promise<Map<string, string>> {
-  const chosen = new Map<string, string>();
-
-  for (const segmentId of segmentIdsToExpand) {
-    const segment = segmentById.get(segmentId);
-    if (!segment) continue; // forgotten/missing parent → no passage to append
-
-    const ranked = await rankSegmentPassages(config, segment.content, queryEmbedding, 1);
-    if (ranked.length > 0) chosen.set(segmentId, ranked[0]);
-  }
-
-  return chosen;
-}
-
-/**
- * Build the passage display units, one per shared segment, in segment-best-rank order,
- * after passage overlap-dedup and the `maxExpandPassages` cap. No budget logic here —
- * `packHybrid` decides which of these survive packing (the first is guaranteed, the rest
- * are supplementary).
+ * Segments are ranked lazily, one at a time, and the walk stops at the cap, so a recall
+ * embeds the passages of the segments it shows (plus any whose passage overlapped an
+ * earlier one) instead of every candidate segment's (MEM-20). A passage dropped as an
+ * overlap duplicate does not use a cap slot. A segment with no row (forgotten parent) or
+ * no passages is skipped — its facts are simply not augmented with a passage.
  *
  * Each passage rides on its segment's best-ranked fact (carrying that fact's
  * date/importance so rendering is unchanged) but gets a DISTINCT synthetic id: the host
  * fact is also emitted, so a shared id would make id-keyed dedup/clustering treat the
  * passage as a duplicate of its host fact and silently drop it.
  */
-function buildPassageUnits(
+async function choosePassageUnits(
+  config: MemoryConfig,
   segmentIdsToExpand: string[],
   groups: Map<string, ScoredMemory[]>,
-  chosenPassageBySegment: Map<string, string>,
+  segmentById: Map<string, SegmentRow>,
+  queryEmbedding: Float32Array,
   maxExpandPassages: number,
-): DisplayUnit[] {
+): Promise<DisplayUnit[]> {
   const passageUnits: DisplayUnit[] = [];
   const emittedPassages: string[] = [];
 
   for (const segmentId of segmentIdsToExpand) {
     if (passageUnits.length >= maxExpandPassages) break;
 
-    const passage = chosenPassageBySegment.get(segmentId);
+    const segment = segmentById.get(segmentId);
     // group[0] is the segment's best-ranked fact (groups preserve score order); the
     // passage rides on it so date/importance/id rendering is unchanged.
     const bestFact = groups.get(segmentId)?.[0];
-    if (passage === undefined || bestFact === undefined) continue;
+    if (segment === undefined || bestFact === undefined) continue; // forgotten/missing parent
+
+    const ranked = await rankSegmentPassages(config, segment.content, queryEmbedding, 1);
+    if (ranked.length === 0) continue;
+    const passage = ranked[0];
 
     // Overlap dedup: skip a passage that is a near-substring of an already-chosen one.
     if (isOverlapping(passage, emittedPassages)) continue;

@@ -1,7 +1,8 @@
 # BuildKit host-network OCI envelope capture for CA injection
 
+**Status (2026-11-14):** Historical: redacted compatibility evidence, not lifecycle qualification.
+
 **Date:** 2026-08-22
-**Status:** redacted compatibility evidence; not lifecycle qualification
 **Scope:** Apple Container, Docker 29.2.1 embedded BuildKit, pinned runc 1.3.4
 
 ## Result
@@ -15,7 +16,9 @@ The sanitized machine-readable fixture is
 SHA-256 `128b830f4ab83823f0e3c6229e8af913b5d989c7480040d726ac8d750bfa6a58`.
 The checked comparison against the no-network capture is
 [`ca-injection-buildkit-oci-envelope-comparison.json`](../../../docker/build-trust-runtime/testdata/ca-injection-buildkit-oci-envelope-comparison.json),
-SHA-256 `36e5779065479b0aaecbbc7f859f8a9f5ae16a66665a4b8bcac318f4fbcbebf1`.
+SHA-256 `4b9688fafecc451cd70497aabcb4c59f1f5e6a6358c6bf7340b1abff82412e27` (since PR #467 removed its `fixtureSha256`
+fields; the hash recorded with the capture, `36e5779065479b0aaecbbc7f859f8a9f5ae16a66665a4b8bcac318f4fbcbebf1`, is that of
+the earlier blob).
 
 ## Exact structural delta
 

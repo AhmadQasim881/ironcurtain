@@ -17,8 +17,17 @@ import { wrapLanguageModel } from 'ai';
 import chalk from 'chalk';
 import type pLimit from 'p-limit';
 import ora, { type Ora } from 'ora';
-import { applyAllowedDirectoryToMcpArgs, computeProtectedPaths, resolveMcpServerPaths } from '../config/index.js';
+import { toDisplayText } from '../terminal/display-sanitize.js';
+import {
+  applyAllowedDirectoryToMcpArgs,
+  builtinServerConfigs,
+  computeProtectedPaths,
+  getConfiguredAuditLogPath,
+  resolveMcpServerPaths,
+} from '../config/index.js';
+import { MCP_SERVERS_FILENAME, loadMcpServers, warnOnMcpServerAdjustments } from '../config/mcp-servers-overlay.js';
 import { createLanguageModel } from '../config/model-provider.js';
+import { loadToolAnnotations } from '../config/tool-annotations-overlay.js';
 
 type LimitFunction = ReturnType<typeof pLimit>;
 import { getIronCurtainHome, getUserGeneratedDir, loadConstitutionText } from '../config/paths.js';
@@ -65,12 +74,19 @@ export function loadPipelineConfig(overrides: PipelineConfigOverrides = {}): Pip
     ? readFileSync(constitutionPath, 'utf-8')
     : loadConstitutionText(constitutionPath);
 
-  const mcpServersPath = resolve(configDir, 'mcp-servers.json');
-  const mcpServers = JSON.parse(readFileSync(mcpServersPath, 'utf-8')) as Record<string, MCPServerConfig>;
-  resolveMcpServerPaths(mcpServers);
+  // The same server set the runtime loads (loadConfig): the package's servers
+  // with the user's ~/.ironcurtain/mcp-servers.json layered over them, so
+  // annotate-tools and compile-policy see every server a session can run.
+  const loadedServers = loadMcpServers({ packagePath: resolve(configDir, MCP_SERVERS_FILENAME) });
+  warnOnMcpServerAdjustments(loadedServers);
+  const mcpServersPath = loadedServers.packagePath;
+  const mcpServers = loadedServers.servers;
+  resolveMcpServerPaths(builtinServerConfigs(loadedServers));
 
   const defaultAllowedDir = resolve(getIronCurtainHome(), 'sandbox');
-  const allowedDirectory = process.env.ALLOWED_DIRECTORY ?? defaultAllowedDir;
+  // Absolute: MCP servers run in their own trusted working directories
+  // (trusted-process/spawn-cwd.ts), not this process's cwd.
+  const allowedDirectory = resolve(process.env.ALLOWED_DIRECTORY ?? defaultAllowedDir);
 
   // Sync the filesystem server's allowed directory with the configured value
   applyAllowedDirectoryToMcpArgs(mcpServers, allowedDirectory);
@@ -78,7 +94,7 @@ export function loadPipelineConfig(overrides: PipelineConfigOverrides = {}): Pip
   // Output directory: use CLI override if provided, otherwise user generated dir.
   const generatedDir = overrides.outputDir ?? getUserGeneratedDir();
   const packageGeneratedDir = resolve(configDir, 'generated');
-  const auditLogPath = process.env.AUDIT_LOG_PATH ?? './audit.jsonl';
+  const auditLogPath = getConfiguredAuditLogPath();
 
   const protectedPaths = computeProtectedPaths({
     constitutionPath,
@@ -86,6 +102,10 @@ export function loadPipelineConfig(overrides: PipelineConfigOverrides = {}): Pip
     packageGeneratedDir,
     mcpServersPath,
     auditLogPath,
+    // The same credential-store additions and opt-outs as the runtime
+    // (loadConfig), so the compiler prompt and the verifier's PolicyEngine see
+    // exactly the protected paths the live engine enforces.
+    credentialProtection: loadUserConfig({ readOnly: true }).credentialProtection,
   });
 
   return {
@@ -135,9 +155,15 @@ export function loadExistingArtifact<T>(generatedDir: string, filename: string, 
  * annotator (which writes the file) and the policy engine (which resolves
  * conditionals at evaluation time against actual call args) need to know
  * about StoredToolAnnotationsFile.
+ *
+ * When `fallbackDir` (the package dir) differs from `dir`, the file in `dir`
+ * is a user overlay layered per server over the package annotations, exactly
+ * as the runtime loader does (see `config/tool-annotations-overlay.ts`).
+ * Returns undefined when no annotations file exists; throws when one exists
+ * but is unreadable or malformed.
  */
 export function loadToolAnnotationsFile(dir: string, fallbackDir?: string): ToolAnnotationsFile | undefined {
-  const stored = loadExistingArtifact<StoredToolAnnotationsFile>(dir, 'tool-annotations.json', fallbackDir);
+  const stored = loadStoredToolAnnotationsFile(dir, fallbackDir);
   if (!stored) return undefined;
   return resolveStoredAnnotationsFile(stored);
 }
@@ -146,21 +172,22 @@ export function loadToolAnnotationsFile(dir: string, fallbackDir?: string): Tool
  * Loads tool-annotations.json WITHOUT resolving conditional role specs.
  * Returns the raw on-disk format so callers can inspect conditional details
  * (e.g., for scenario generator prompts that need discriminator arg info).
+ * Overlay handling and errors as for {@link loadToolAnnotationsFile}.
  */
 export function loadStoredToolAnnotationsFile(
   dir: string,
   fallbackDir?: string,
 ): StoredToolAnnotationsFile | undefined {
-  return loadExistingArtifact<StoredToolAnnotationsFile>(dir, 'tool-annotations.json', fallbackDir);
+  return loadToolAnnotations(dir, fallbackDir)?.annotations;
 }
 
 // ---------------------------------------------------------------------------
 // Spinner Helpers
 // ---------------------------------------------------------------------------
 
-export function showCached(text: string): void {
+export function showCached(text: string, label = 'cached'): void {
   const spinner = ora({ text, stream: process.stderr, discardStdin: false }).start();
-  spinner.succeed(`${text} ${chalk.dim('(cached)')}`);
+  spinner.succeed(`${text} ${chalk.dim(`(${label})`)}`);
 }
 
 export async function withSpinner<T>(
@@ -307,7 +334,10 @@ export async function createPipelineLlm(
   const logPath = resolve(generatedDir, logFileName);
   const model = wrapLanguageModel({
     model: baseLlm,
-    middleware: createLlmLoggingMiddleware(logPath, logContext),
+    // Compilation logs keep the full prompts and responses: they are the
+    // record of how the policy was derived (constitution, annotations,
+    // rules), not of a session's conversation.
+    middleware: createLlmLoggingMiddleware(logPath, logContext, { detail: 'full' }),
   });
   const cacheStrategy = createCacheStrategy(userConfig.policyModelId);
   return { model, baseLlm, logContext, logPath, cacheStrategy };
@@ -317,16 +347,25 @@ export async function createPipelineLlm(
  * Creates a per-server wrapped LanguageModel with its own log context.
  * The base LLM (expensive: API key, provider) is shared; only the
  * lightweight logging middleware is per-server.
+ *
+ * Pass `sharedLogContext` to share another model's context: a server's
+ * second model (the verifier) then logs under the step names the runner
+ * sets on it.
  */
 export function createPerServerModel(
   baseLlm: LanguageModelV3,
   logPath: string,
   serverName: string,
+  sharedLogContext?: LlmLogContext,
 ): { model: LanguageModelV3; logContext: LlmLogContext } {
-  const logContext: LlmLogContext = { stepName: `init-${serverName}` };
+  const logContext: LlmLogContext = sharedLogContext ?? { stepName: `init-${serverName}` };
   const model = wrapLanguageModel({
     model: baseLlm,
-    middleware: createLlmLoggingMiddleware(logPath, logContext, { deltaLogging: false, appendOnly: true }),
+    middleware: createLlmLoggingMiddleware(logPath, logContext, {
+      detail: 'full',
+      deltaLogging: false,
+      appendOnly: true,
+    }),
   });
   return { model, logContext };
 }
@@ -428,10 +467,10 @@ export class SpinnerProgressReporter implements ServerProgressReporter {
   complete(phase: CompilationPhase, summary: string, elapsed: number): void {
     this.stopTimer();
     if (this.spinner) {
-      this.spinner.succeed(summary);
+      this.spinner.succeed(toDisplayText(summary));
       this.spinner = undefined;
     } else {
-      console.error(summary);
+      console.error(toDisplayText(summary));
     }
   }
 
@@ -439,10 +478,10 @@ export class SpinnerProgressReporter implements ServerProgressReporter {
     // Pause spinner to avoid interleaving, then resume
     if (this.spinner) {
       this.spinner.stop();
-      console.error(message);
+      console.error(toDisplayText(message, { multiline: true }));
       this.spinner.start();
     } else {
-      console.error(message);
+      console.error(toDisplayText(message, { multiline: true }));
     }
   }
 
@@ -457,12 +496,12 @@ export class SpinnerProgressReporter implements ServerProgressReporter {
 
   done(summary: string): void {
     this.stopSpinner();
-    console.error(`  ${chalk.green(this.serverName)}: ${summary}`);
+    console.error(`  ${chalk.green(toDisplayText(this.serverName))}: ${toDisplayText(summary)}`);
   }
 
   private formatText(phase: CompilationPhase, detail?: string): string {
-    const base = `  ${this.serverName}: ${phaseLabel(phase)}`;
-    return detail ? `${base} — ${detail}` : base;
+    const base = `  ${toDisplayText(this.serverName)}: ${phaseLabel(phase)}`;
+    return detail ? `${base} — ${toDisplayText(detail)}` : base;
   }
 
   private stopTimer(): void {

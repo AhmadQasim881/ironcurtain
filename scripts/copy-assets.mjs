@@ -28,10 +28,12 @@ for (const file of [
   }
 }
 
-// Copy generated artifacts (if they exist)
+// Copy generated artifacts (if they exist). dynamic-lists.json holds the
+// values of the @lists the shipped compiled policy uses; without it, the
+// rules that use them match nothing.
 const generatedDir = resolve(srcConfig, 'generated');
 if (existsSync(generatedDir)) {
-  for (const file of ['compiled-policy.json', 'test-scenarios.json', 'tool-annotations.json']) {
+  for (const file of ['compiled-policy.json', 'dynamic-lists.json', 'test-scenarios.json', 'tool-annotations.json']) {
     const src = resolve(generatedDir, file);
     if (existsSync(src)) {
       cpSync(src, resolve(distConfig, 'generated', file));

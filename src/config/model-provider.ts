@@ -16,8 +16,8 @@
 
 import type { LanguageModelV3 } from '@ai-sdk/provider';
 import type { ResolvedUserConfig, ResolvedProviderProfile, HostModelRole } from './user-config.js';
-import { resolveActiveProfile } from './user-config.js';
-import { getGatewayDefinition, resolveGatewayModel } from './provider-definitions.js';
+import { HOST_MODEL_ROLES, hostRoleModelId, resolveActiveProfile } from './user-config.js';
+import { describeGatewayModelIdProblem, getGatewayDefinition, resolveGatewayModel } from './provider-definitions.js';
 import { parseModelId } from './model-id.js';
 import type { ProviderId } from './model-id.js';
 
@@ -63,6 +63,40 @@ function modelIdForProfile(qualifiedId: string, profile?: ResolvedProviderProfil
 /** Effective identity for host accounting; pass the original request to SDK creation so maps apply once. */
 export function resolveHostModelId(qualifiedId: string, config: ResolvedUserConfig, role: HostModelRole): string {
   return modelIdForProfile(qualifiedId, hostProfile(config, role)?.profile);
+}
+
+/** A host role whose bound gateway profile would receive a model ID it cannot route. */
+export interface HostModelRoutingWarning {
+  readonly role: HostModelRole;
+  readonly profileName: string;
+  readonly modelId: string;
+  readonly message: string;
+}
+
+/**
+ * Checks, offline, every host role bound to a gateway profile: the role's own
+ * model ID must reach the gateway in a form it routes
+ * (`describeGatewayModelIdProblem`). The config editor and `doctor` report
+ * these as warnings; they are not load errors, since an ID the check cannot
+ * judge may still be valid at the gateway.
+ */
+export function findHostModelRoutingWarnings(config: ResolvedUserConfig): HostModelRoutingWarning[] {
+  const warnings: HostModelRoutingWarning[] = [];
+  for (const role of HOST_MODEL_ROLES) {
+    const binding = hostProfile(config, role);
+    if (binding === undefined || binding.profile.type === 'native') continue;
+    const modelId = hostRoleModelId(config, role);
+    const problem = describeGatewayModelIdProblem(binding.profile, modelId);
+    if (problem !== undefined) {
+      warnings.push({
+        role,
+        profileName: binding.name,
+        modelId,
+        message: `Host role "${role}" (profile "${binding.name}"): ${problem}`,
+      });
+    }
+  }
+  return warnings;
 }
 
 /**

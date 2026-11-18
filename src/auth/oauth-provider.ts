@@ -35,6 +35,17 @@ export interface OAuthProviderConfig {
   readonly additionalEnvVars?: Readonly<Record<string, (token: StoredOAuthToken) => string>>;
   readonly postAuthUrl?: string;
   readonly revocationUrl?: string;
+  /**
+   * Page where the user can revoke IronCurtain's access by hand, printed when
+   * `revocationUrl` cannot confirm a revocation (or there is none).
+   */
+  readonly manualRevocationUrl?: string;
+  /**
+   * Token-introspection endpoint that accepts `access_token` in a form POST
+   * body and reports the token's remaining lifetime without a refresh grant
+   * (`ironcurtain doctor --check-api`).
+   */
+  readonly tokenInfoUrl?: string;
   /** Extra query parameters for the authorization URL (e.g. access_type, prompt). */
   readonly extraAuthParams?: Readonly<Record<string, string>>;
   /** Interactive scope picker shown when no --scopes flag and stdin is a TTY. */
@@ -78,9 +89,17 @@ export function loadClientCredentials(provider: OAuthProviderConfig): OAuthClien
     return null;
   }
 
-  const raw = readFileSync(credentialsPath, 'utf-8');
-  const parsed = parseCredentialsJson(raw, credentialsPath);
-  return extractClientCredentials(parsed, credentialsPath);
+  return parseClientCredentials(readFileSync(credentialsPath, 'utf-8'), credentialsPath);
+}
+
+/**
+ * Parses and validates the text of a client credentials file (either format
+ * {@link loadClientCredentials} reads). `filePath` only labels errors.
+ *
+ * @throws Error naming the problem when the text is not valid credentials.
+ */
+export function parseClientCredentials(raw: string, filePath: string): OAuthClientCredentials {
+  return extractClientCredentials(parseCredentialsJson(raw, filePath), filePath);
 }
 
 /**

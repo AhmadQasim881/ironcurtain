@@ -16,11 +16,20 @@ export interface SessionSource {
   readonly persona?: string;
 }
 
+/**
+ * Where a cost figure comes from: every observed exchange carried a cost
+ * (`observed`), the agent's own report (`reported`), a lower bound
+ * (`partial`), or nothing reported one (`unknown`, shown as "unknown").
+ * Absent for sessions that price every step themselves.
+ */
+export type BudgetCostSource = 'observed' | 'reported' | 'partial' | 'unknown';
+
 export interface BudgetSummaryDto {
   readonly totalTokens: number;
   readonly stepCount: number;
   readonly elapsedSeconds: number;
   readonly estimatedCostUsd: number;
+  readonly costSource?: BudgetCostSource;
   readonly tokenTrackingAvailable: boolean;
   readonly tokenTrackingStatus?: 'complete' | 'partial' | 'unavailable';
   readonly observedExchanges?: number;
@@ -49,6 +58,14 @@ export interface SessionDto {
    * absent for all other kinds.
    */
   readonly lastAttachedAt?: string;
+  /**
+   * One-line warning for a `web-pty` session when MCP servers that ask for an
+   * OS sandbox will not get one on the daemon host (refused under
+   * sandboxPolicy "enforce", or running unconfined under "warn"). Rendered as
+   * an alert banner in the terminal view. Absent when every such server is
+   * sandboxed. Mirrors the backend `SessionDto.osSandboxWarning`.
+   */
+  readonly osSandboxWarning?: string;
 }
 
 /** Persisted Docker-agent session available to resume as a live terminal. */
@@ -90,9 +107,32 @@ export interface SessionDetailDto extends SessionDto {
 /** Whitelist candidate for display in the escalation UI. */
 export interface WhitelistCandidate {
   readonly description: string;
+  /** Unambiguous identity of the pattern (the daemon groups escalations by it). */
+  readonly patternKey?: string;
 }
 
-export interface EscalationDto {
+/** The human's most recent message to a session, as the trusted host recorded it. */
+export interface TrustedUserMessage {
+  readonly text: string;
+  /** ISO 8601 time it was sent, when known. */
+  readonly sentAt?: string;
+}
+
+/**
+ * What a reviewer sees besides the call itself (mirrors
+ * `EscalationDisplayFields` in `src/escalation/escalation-review.ts`).
+ * `lastTrustedUserMessage` and `taskSummary` are the human's own text;
+ * `agentJustification` is written by the agent, UNTRUSTED: shown set apart,
+ * labelled as the agent's, and it authorizes nothing.
+ */
+export interface EscalationReviewContext {
+  readonly lastTrustedUserMessage?: TrustedUserMessage;
+  readonly taskSummary?: string;
+  readonly agentJustification?: string;
+}
+
+export interface EscalationDto extends EscalationReviewContext {
+  readonly reviewUnavailable?: true;
   readonly escalationId: string;
   readonly sessionLabel: number;
   readonly sessionSource: SessionSource;
@@ -102,12 +142,25 @@ export interface EscalationDto {
   readonly reason: string;
   readonly context?: Record<string, string>;
   readonly whitelistCandidates?: readonly WhitelistCandidate[];
+  /**
+   * The whitelist-pattern group the escalation belongs to. Pending
+   * escalations with the same key share one pattern and can be approved
+   * together (`escalations.approveGroup`) after a confirmation listing them.
+   */
+  readonly groupKey?: string;
   readonly receivedAt: string;
+}
+
+/** Result of `escalations.approveGroup`. */
+export interface EscalationGroupApprovalDto {
+  readonly approved: readonly string[];
+  readonly failed: readonly { readonly escalationId: string; readonly code: string; readonly message: string }[];
 }
 
 export interface DaemonStatusDto {
   readonly uptimeSeconds: number;
-  readonly jobs: { total: number; enabled: number; running: number };
+  /** `failing`: jobs whose latest run ended in an error (absent from older daemons). */
+  readonly jobs: { total: number; enabled: number; running: number; failing?: number };
   readonly signalConnected: boolean;
   readonly webUiListening: boolean;
   readonly activeSessions: number;
@@ -139,21 +192,60 @@ export interface JobDefinition {
 export interface RunRecord {
   readonly startedAt: string;
   readonly completedAt: string;
-  readonly outcome: { kind: string; message?: string; dimension?: string };
+  /** `phase` (setup | sync | session) says where an `error` run failed; absent in older records. */
+  readonly outcome: { kind: string; message?: string; dimension?: string; phase?: string };
   readonly budget: {
     totalTokens: number;
     stepCount: number;
     elapsedSeconds: number;
     estimatedCostUsd: number;
+    costSource?: BudgetCostSource;
   };
   readonly summary: string | null;
+  /** What the run's session reported for the user (a stale policy, host-mount findings, ...); display text. */
+  readonly notices?: readonly string[];
 }
 
 export interface JobListDto {
   readonly job: JobDefinition;
   readonly nextRun: string | null;
   readonly lastRun: RunRecord | null;
+  /** True from the moment a run is reserved (before its git sync and session start) until its record is written. */
   readonly isRunning: boolean;
+  /** Runs in a row, newest first, that ended in an error (absent from older daemons). */
+  readonly consecutiveFailures?: number;
+}
+
+/**
+ * A diagnostic a session reports for the user to see (mirrors `SessionNotice`
+ * in `src/session/startup-notices.ts`): the start-up notices, emitted while
+ * the session initializes, and host-mount findings (`host_privileged_files`)
+ * after a turn or at session end. Every string can carry server- or
+ * agent-chosen text: render it with SafeText.
+ */
+export type SessionNoticeEvent =
+  | { readonly kind: 'annotation_drift'; readonly serverName: string; readonly message: string; readonly hint: string }
+  | { readonly kind: 'mcp_server_unavailable'; readonly serverName: string; readonly reason: string }
+  | { readonly kind: 'host_model_fallback'; readonly role: string; readonly action: string; readonly message: string }
+  | { readonly kind: 'policy_stale'; readonly message: string }
+  | {
+      readonly kind: 'host_privileged_files';
+      readonly when: string;
+      readonly stripped: number;
+      readonly unstripped: number;
+      readonly rootOwned: number;
+      readonly unlisted: number;
+      readonly paths: readonly string[];
+      readonly incomplete: boolean;
+      readonly hint: string;
+    };
+
+/** A session notice the session view shows until the user dismisses it. */
+export interface SessionNoticeEntry {
+  /** Identity of the notice: the same notice seeded and pushed is shown once. */
+  readonly key: string;
+  readonly notice: SessionNoticeEvent;
+  readonly dismissed: boolean;
 }
 
 export type DiagnosticEvent =
@@ -167,6 +259,7 @@ export type DiagnosticEvent =
       readonly message: string;
     }
   | { readonly kind: 'budget_exhausted'; readonly dimension: string; readonly message: string }
+  | SessionNoticeEvent
   | { readonly kind: string; [key: string]: unknown };
 
 /** JSON-RPC response frame. */
@@ -234,7 +327,6 @@ export type LlmStatisticsMeasure =
   | 'ttftMs'
   | 'upstreamLatencyMs'
   | 'clientLatencyMs'
-  | 'observableOutputTokensPerSecond'
   | 'effectiveOutputTokensPerSecond';
 
 export type LlmStatisticsDistributionMeasure = Exclude<
@@ -324,9 +416,16 @@ export interface StatisticsDimensionQuery extends StatisticsRangeQuery {
 
 export interface StatisticsMetricSummaryDto {
   readonly dimensions: Readonly<Record<string, string | boolean | null>>;
+  /**
+   * Display names for pseudonymized dimension values (persona, provider
+   * profile, agent), keyed by dimension. Present only when one resolves.
+   */
+  readonly labels?: Readonly<Record<string, string>>;
   readonly measure: LlmStatisticsMeasure;
   readonly value: number | null;
   readonly sampleCount: number;
+  /** Exchanges that added only their known parts to an input/output/total token sum. */
+  readonly lowerBoundCount?: number;
   readonly sampleSessionCount: number;
   readonly eligibleCount: number;
   readonly coverage: number;
@@ -344,6 +443,8 @@ export interface StatisticsTimeBucketDto {
 
 export interface StatisticsDimensionValueDto {
   readonly value: string | boolean | null;
+  /** Display name when `value` is the pseudonym of a configured persona, profile or agent. */
+  readonly label?: string;
   readonly count: number;
 }
 
@@ -365,7 +466,7 @@ export interface StatisticsMetricDistributionDto {
 }
 
 export interface StatisticsRepositoryHealthDto {
-  readonly state: 'starting' | 'ready' | 'degraded' | 'disabled' | 'closed';
+  readonly state: 'starting' | 'ready' | 'degraded' | 'restarting' | 'disabled' | 'closed';
   readonly schemaVersion: number | null;
   readonly observed: number;
   readonly finalized: number;
@@ -386,8 +487,15 @@ export interface StatisticsCapabilitiesDto {
   readonly formulaVersion: number;
   readonly schemaVersion: number | null;
   readonly maxPageSize: number;
+  /** Most matching observations one aggregation query may summarize (else STATISTICS_LIMIT). */
   readonly maxScannedRows: number;
   readonly maxGroups: number;
+  readonly maxOutputItems?: number;
+  readonly maxTimeSeriesBuckets?: number;
+  readonly maxRangeDays?: number;
+  readonly maxResponseBytes?: number;
+  /** Quartiles come from at most this many exact values per summary. */
+  readonly quantileSampleSize?: number;
   readonly allowedBucketSizesMs: readonly number[];
   readonly allowedCalendarBucketUnits: readonly 'day'[];
   readonly health: StatisticsRepositoryHealthDto;
@@ -510,11 +618,26 @@ export interface PtySink {
   reset(snapshotB64: string): void;
 }
 
-/** Available persona for session creation. */
+/**
+ * Why a persona's compiled policy is stale. Mirrors backend
+ * `PolicyStaleReason` (src/config/constitution-hash.ts): `'constitution'` =
+ * the constitution changed after the policy was compiled; `'engine'` =
+ * compiled for another policy-engine generation (reserved).
+ */
+export type PolicyStaleReason = 'constitution' | 'engine';
+
+/** Available persona for session creation (`personas.list` row). */
 export interface PersonaListItem {
   readonly name: string;
   readonly description: string;
+  /** Whether a compiled policy exists (it may still be stale). */
   readonly compiled: boolean;
+  /**
+   * Present when the compiled policy no longer matches the persona. The
+   * daemon refuses to start a session with a stale persona, so it is not a
+   * launchable choice until it is recompiled.
+   */
+  readonly stale?: PolicyStaleReason;
 }
 
 /**
@@ -549,8 +672,12 @@ export interface OutputLine {
 /** Phases reported by the orchestrator for a workflow currently tracked in memory. */
 export type LiveWorkflowPhase = 'running' | 'waiting_human' | 'completed' | 'failed' | 'aborted';
 
-/** Phases that appear on past-run records loaded from disk. */
-export type PastRunPhase = 'completed' | 'failed' | 'aborted' | 'waiting_human' | 'interrupted';
+/**
+ * Phases that appear on past-run records loaded from disk. `running_elsewhere`
+ * marks a run that is live in another IronCurtain process (its run lock is
+ * held there), so it is neither interrupted nor resumable from this daemon.
+ */
+export type PastRunPhase = 'completed' | 'failed' | 'aborted' | 'waiting_human' | 'interrupted' | 'running_elsewhere';
 
 /**
  * Wide phase union covering both live summaries and past-run records.
@@ -568,6 +695,7 @@ export const PHASE = {
   FAILED: 'failed',
   ABORTED: 'aborted',
   INTERRUPTED: 'interrupted',
+  RUNNING_ELSEWHERE: 'running_elsewhere',
 } as const satisfies Record<string, WorkflowPhase>;
 
 /**
@@ -686,6 +814,44 @@ export interface ResourceBudgetConfigDto {
   readonly warnThresholdPercent: number;
 }
 
+/** Run-wide ceiling (`settings.workflowBudget`); omitted or null fields set no ceiling. */
+export interface WorkflowBudgetLimitsDto {
+  readonly maxTotalTokens?: number | null;
+  readonly maxEstimatedCostUsd?: number | null;
+  readonly maxWallClockSeconds?: number | null;
+}
+
+/**
+ * Run-wide usage over every agent session, lane and resume of a workflow.
+ * Token figures are lower bounds unless `tokenTrackingStatus` is `complete`.
+ * Mirrors `WorkflowUsage` in `src/workflow/workflow-usage.ts`.
+ */
+export interface WorkflowUsageDto {
+  readonly inputTokens: number;
+  readonly cacheReadTokens: number;
+  readonly cacheWriteTokens: number;
+  readonly outputTokens: number;
+  /** Input plus output, plus what only the budget gates counted (`gateOnlyTokens`). */
+  readonly totalTokens: number;
+  /** Host-derived cost; a Docker agent's own cost report is never counted. */
+  readonly estimatedCostUsd: number;
+  /** Part of `totalTokens` only the bundles' budget gates counted (absent from older daemons). */
+  readonly gateOnlyTokens?: number;
+  /** Part of `estimatedCostUsd` only the bundles' budget gates counted (absent from older daemons). */
+  readonly gateOnlyCostUsd?: number;
+  readonly activeSeconds: number;
+  readonly observedExchanges: number;
+  readonly incompleteExchanges: number;
+  readonly unmeasuredExchanges: number;
+  readonly meteredSessions: number;
+  readonly reportedSessions: number;
+  readonly untrackedSessions: number;
+  /** Untracked sessions no budget gate counted either: the run's ceilings fail closed (absent from older daemons). */
+  readonly uncountedSessions?: number;
+  readonly lowerBound: boolean;
+  readonly tokenTrackingStatus: 'complete' | 'partial' | 'unavailable';
+}
+
 export interface WorkflowBudgetDto {
   readonly activeSessionCount?: number;
   readonly limits: ResourceBudgetConfigDto;
@@ -696,8 +862,18 @@ export interface WorkflowBudgetDto {
     readonly stepCount: number;
     readonly elapsedSeconds: number;
     readonly estimatedCostUsd: number;
+    /** `unknown`: nothing reported a cost, so `estimatedCostUsd` (0) is not zero spend. */
+    readonly costSource?: BudgetCostSource;
     readonly tokenTrackingAvailable: boolean;
+    /** `partial`: the token total is a lower bound. */
+    readonly tokenTrackingStatus?: 'complete' | 'partial' | 'unavailable';
+    readonly observedExchanges?: number;
+    readonly incompleteExchanges?: number;
   };
+  /** The run-wide ceiling, when the workflow sets one. */
+  readonly workflowLimits?: WorkflowBudgetLimitsDto;
+  /** Run-wide usage the ceiling is checked against. */
+  readonly workflowUsage?: WorkflowUsageDto;
 }
 
 /**
@@ -710,16 +886,44 @@ export interface WorkflowBudgetDto {
  */
 export type WorkflowDetailDto = WorkflowCardDto & {
   readonly budget?: WorkflowBudgetDto;
+  /** Run-wide usage (tokens by kind, cost, running time, tracking status); absent from older daemons. */
+  readonly usage?: WorkflowUsageDto;
   readonly startedAt: string;
   readonly description: string;
   readonly stateGraph: StateGraphDto;
   readonly transitionHistory: readonly TransitionRecordDto[];
   readonly context: WorkflowContextDto;
   readonly gate?: HumanGateRequestDto;
+  /** Tool calls blocked on a human decision (present only while some are pending). */
+  readonly escalations?: readonly WorkflowEscalationDto[];
   readonly workspacePath: string;
   /** True when the workflow's source package ships a `README.md` (fetch via `workflows.readme`). */
   readonly hasReadme: boolean;
 };
+
+/**
+ * A tool call that policy escalated inside a workflow agent state and that
+ * waits for a human (mirrors `WorkflowToolCallEscalation` in
+ * `src/workflow/types.ts`). The agent is blocked inside the call until it is
+ * approved, denied, or expires at the escalation timeout. Resolved with
+ * `workflows.resolveEscalation`.
+ */
+export interface WorkflowEscalationDto extends EscalationReviewContext {
+  readonly reviewUnavailable?: true;
+  readonly escalationId: string;
+  readonly workflowId: string;
+  readonly stateId: string;
+  readonly persona?: string;
+  readonly serverName: string;
+  readonly toolName: string;
+  readonly arguments: Record<string, unknown>;
+  readonly reason: string;
+  readonly context?: Record<string, string>;
+  readonly whitelistCandidates?: readonly WhitelistCandidate[];
+  /** Must be decided by a human, approved once and never whitelisted (e.g. opening a passthrough domain). */
+  readonly humanOnly?: boolean;
+  readonly receivedAt: string;
+}
 
 // ---------------------------------------------------------------------------
 // Workflow message log types
@@ -749,8 +953,18 @@ export interface AgentReceivedEntry extends MessageLogBaseEntry {
   readonly confidence: string | null;
 }
 
+/**
+ * Why the orchestrator sent an agent another turn. `missing_commit`: under
+ * the commit-tool protocol the turn ended without an accepted
+ * `workflow_commit` call, so the state had not committed.
+ */
 export type AgentRetryReason =
-  'missing_status_block' | 'malformed_status_block' | 'missing_artifacts' | 'invalid_verdict' | 'upstream_stall';
+  | 'missing_status_block'
+  | 'malformed_status_block'
+  | 'missing_commit'
+  | 'missing_artifacts'
+  | 'invalid_verdict'
+  | 'upstream_stall';
 
 export interface AgentRetryEntry extends MessageLogBaseEntry {
   readonly type: 'agent_retry';
@@ -762,13 +976,33 @@ export interface AgentRetryEntry extends MessageLogBaseEntry {
 
 export interface GateRaisedEntry extends MessageLogBaseEntry {
   readonly type: 'gate_raised';
+  /** Per-raise gate id; absent on logs written before per-raise ids existed. */
+  readonly gateId?: string;
   readonly acceptedEvents: readonly string[];
 }
 
 export interface GateResolvedEntry extends MessageLogBaseEntry {
   readonly type: 'gate_resolved';
+  /** Id of the raise the decision was validated against; absent on legacy logs. */
+  readonly gateId?: string;
   readonly event: string;
   readonly prompt: string | null;
+  /** Channel the decider declared (`web-ui`, `cli`, `signal`, `rpc`); absent on legacy logs. */
+  readonly resolvedBy?: string;
+}
+
+/**
+ * A tool call that policy escalated during an agent state, raised to the
+ * workflow's human route, and how it ended (one `raised` entry, then exactly
+ * one of `approved` / `denied` / `expired`).
+ */
+export interface ToolCallEscalationEntry extends MessageLogBaseEntry {
+  readonly type: 'tool_call_escalation';
+  readonly escalationId: string;
+  readonly serverName: string;
+  readonly toolName: string;
+  readonly reason: string;
+  readonly outcome: 'raised' | 'approved' | 'denied' | 'expired';
 }
 
 export interface ErrorEntry extends MessageLogBaseEntry {
@@ -797,22 +1031,40 @@ export type MessageLogEntry =
   | AgentRetryEntry
   | GateRaisedEntry
   | GateResolvedEntry
+  | ToolCallEscalationEntry
   | ErrorEntry
   | StateTransitionEntry
   | QuotaExhaustedEntry;
 
 /**
- * Response from `workflows.messageLog`: a page of {@link MessageLogEntry}
+ * A {@link MessageLogEntry} as delivered in a `workflows.messageLog` page.
+ * String fields longer than the daemon's inline limit (8,192 characters)
+ * arrive cut to that length with `truncated: true` and an opaque `ref` that
+ * `workflows.messageLogEntry` accepts to fetch the complete entry.
+ */
+export type MessageLogEntryDto = MessageLogEntry & {
+  readonly truncated?: boolean;
+  readonly ref?: string;
+};
+
+/**
+ * Response from `workflows.messageLog`: a page of {@link MessageLogEntryDto}
  * records for a workflow, sorted newest-first by `ts`.
  *
  * Cursor pagination per design decision D5: callers fetch the next page by
  * passing the last entry's `ts` as the next request's `before` parameter.
  * `hasMore` is true iff the returned page is full *and* at least one strictly
- * older entry exists on disk; otherwise false.
+ * older entry exists on disk; otherwise false. A page is full at `limit`
+ * entries or at the daemon's per-page byte budget, whichever comes first.
  */
 export interface MessageLogResponseDto {
-  readonly entries: readonly MessageLogEntry[];
+  readonly entries: readonly MessageLogEntryDto[];
   readonly hasMore: boolean;
+}
+
+/** Response from `workflows.messageLogEntry`: one complete entry addressed by a page entry's `ref`. */
+export interface MessageLogEntryResponseDto {
+  readonly entry: MessageLogEntry;
 }
 
 // ---------------------------------------------------------------------------
@@ -825,10 +1077,21 @@ export interface FileTreeEntryDto {
   readonly size?: number;
 }
 
+/**
+ * Response from `workflows.fileTree`. The daemon lists at most 2,000 entries
+ * per directory (directories and regular files only) and sets `truncated`
+ * when it stopped early.
+ */
 export interface FileTreeResponseDto {
   readonly entries: readonly FileTreeEntryDto[];
+  readonly truncated?: boolean;
 }
 
+/**
+ * Response from `workflows.fileContent` and `workflows.artifactFile`. Exactly
+ * one of `content`, `binary` or `error` is set; `error` is a short display
+ * message (e.g. "File too large to display (>1MB)", "Not a regular file").
+ */
 export interface FileContentResponseDto {
   readonly content?: string;
   readonly language?: string;
@@ -836,13 +1099,21 @@ export interface FileContentResponseDto {
   readonly error?: string;
 }
 
+/** One file of an artifact listing: `/`-separated path below the artifact directory and size in bytes. */
 export interface ArtifactFileDto {
   readonly path: string;
-  readonly content: string;
+  readonly size: number;
 }
 
+/**
+ * Response from `workflows.artifacts`: names and sizes only. Contents are
+ * fetched per file through `workflows.artifactFile`, so the gate review panel
+ * loads them lazily. `truncated` is set when the daemon stopped listing early
+ * (file count, depth or listing-byte budget).
+ */
 export interface ArtifactContentDto {
   readonly files: readonly ArtifactFileDto[];
+  readonly truncated: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -878,6 +1149,8 @@ export interface PersonaDetailDto {
   readonly servers?: readonly string[];
   readonly hasPolicy: boolean;
   readonly policyRuleCount?: number;
+  /** Present when the compiled policy is stale (see {@link PolicyStaleReason}). */
+  readonly stale?: PolicyStaleReason;
   /** Whether persistent memory is enabled (persona.memory?.enabled ?? true). */
   readonly memory?: boolean;
   /**
@@ -894,6 +1167,7 @@ export interface PersonaListDto {
   readonly name: string;
   readonly description: string;
   readonly compiled: boolean;
+  readonly stale?: PolicyStaleReason;
   readonly memory?: boolean;
 }
 
@@ -1040,7 +1314,10 @@ export type PersonaCompileErrorCode =
   | 'INVALID_PARAMS'
   // Phase 1c persona-CRUD error codes (mirror src/web-ui/web-ui-types.ts).
   | 'PERSONA_EXISTS'
-  | 'BROAD_POLICY_REJECTED';
+  | 'BROAD_POLICY_REJECTED'
+  // The merged policy failed the policy lint; nothing was written. The
+  // message names the first findings.
+  | 'POLICY_LINT_FAILED';
 
 /**
  * Compile-time rule diff vs the persona's previous compiled policy (Phase 1c).
@@ -1050,16 +1327,39 @@ export interface RuleDeltaDto {
   readonly added: number;
   readonly loosened: number;
   readonly removed: number;
+  /** Broad wildcard domains in allow rules (needs the broad-policy opt-in). */
   readonly broadenedDomains: readonly string[];
+  /** Allow rules' `paths.within` outside the persona workspace (needs the opt-in). */
   readonly outOfWorkspacePaths: readonly string[];
+  /** Allow rules leaving a resource argument unconstrained, `<rule>: <role> on <server>/<tool>` (needs the opt-in). */
+  readonly unconstrainedAllows: readonly string[];
+  /** Informational: wildcard/path breadth on escalate rules, which a human approves per call. */
+  readonly escalateBreadth: readonly string[];
 }
 
-/** Success-only compile result carried by a `done` record/event. */
+/**
+ * A server that failed to compile and has no rules in the written policy, so
+ * its tools are denied. Mirrors backend FailedServerDto.
+ */
+export interface FailedServerDto {
+  readonly serverName: string;
+  /** The phase the server was in when it failed. */
+  readonly phase: Exclude<CompilationPhase, 'cached' | 'done'>;
+  /** Single-line, length-bounded failure reason. */
+  readonly reason: string;
+}
+
+/**
+ * Compile result carried by a `done` record/event: the policy was written.
+ * It is partial when `failedServers` is present.
+ */
 export interface PersonaCompileResultDto {
   readonly success: true;
   readonly ruleCount: number;
   /** Compile-time diff vs the previous policy (absent on first compile). */
   readonly ruleDelta?: RuleDeltaDto;
+  /** Servers left out of the written policy because they failed (absent when none failed). */
+  readonly failedServers?: readonly FailedServerDto[];
 }
 
 /** Snapshot of a streamed compile operation (getCompile / listCompiles). */

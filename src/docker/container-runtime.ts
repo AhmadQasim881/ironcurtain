@@ -84,14 +84,30 @@ export async function resolveRuntimeKind(
   return autoResolution;
 }
 
+export interface CreateContainerRuntimeOptions {
+  /**
+   * Docker only: `exec --user` for calls that pass none (default
+   * `codespace`). Sudo-off agent bundles pass their numeric agent UID; the
+   * Apple runtime never runs a sudo-off agent (see `agent-privileges.ts`).
+   */
+  readonly defaultExecUser?: string;
+}
+
 export function createContainerRuntime(
   kind: ContainerRuntimeKind = 'docker',
   endpoint?: DockerEndpoint,
+  options: CreateContainerRuntimeOptions = {},
 ): ContainerRuntime {
   switch (kind) {
     case 'docker':
-      return createDockerManager(undefined, undefined, { endpoint });
+      return createDockerManager(undefined, undefined, {
+        endpoint,
+        ...(options.defaultExecUser === undefined ? {} : { defaultExecUser: options.defaultExecUser }),
+      });
     case 'apple-container':
+      if (options.defaultExecUser !== undefined) {
+        throw new Error('apple-container does not support a non-default agent exec user');
+      }
       return createAppleContainerManager();
   }
 }

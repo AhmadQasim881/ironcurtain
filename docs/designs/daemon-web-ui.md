@@ -1,6 +1,7 @@
 # Design: Daemon Web UI
 
-**Status:** Implemented (PRs #154, #157, #159)
+**Status (2026-11-14):** Implemented (PRs #154, #157, #159; extended since): `ironcurtain daemon --web-ui` (`src/web-ui/`, `packages/web-ui/`). Corrected 2026-11-14: the server always binds 127.0.0.1 (there is no `--web-host` flag), it caps concurrent connections but has no session-creation rate limit, and there are no `daemon.webUi` config keys; the flags are `--web-ui`, `--web-port` and `--web-ui-dev`. The streaming chat view of sessions this design describes was replaced by the live terminal of `webui-pty-terminal.md` for container sessions and removed for builtin ones (deferred, WP-125).
+
 **Date:** 2026-04-04 (drafted), 2026-04-08 (consolidated)
 **Author:** IronCurtain Engineering
 
@@ -90,15 +91,16 @@ All browser-daemon communication flows over a single WebSocket at `/ws`.
 export type MethodName =
   | 'status'
   | 'jobs.list' | 'jobs.remove' | 'jobs.enable'
-  | 'jobs.disable' | 'jobs.recompile' | 'jobs.reload' | 'jobs.run' | 'jobs.logs'
+  | 'jobs.disable' | 'jobs.recompile' | 'jobs.refreshLists' | 'jobs.reload' | 'jobs.run' | 'jobs.logs'
   | 'sessions.list' | 'sessions.get' | 'sessions.create' | 'sessions.end'
   | 'sessions.send' | 'sessions.budget' | 'sessions.history' | 'sessions.diagnostics'
-  | 'escalations.list' | 'escalations.resolve'
+  | 'escalations.list' | 'escalations.resolve' | 'escalations.approveGroup'
   | 'personas.list' | 'personas.get' | 'personas.compile'
   | 'workflows.list' | 'workflows.get' | 'workflows.start' | 'workflows.import'
   | 'workflows.resume' | 'workflows.abort' | 'workflows.resolveGate'
   | 'workflows.inspect' | 'workflows.fileTree' | 'workflows.fileContent'
-  | 'workflows.artifacts' | 'workflows.listDefinitions' | 'workflows.listResumable';
+  | 'workflows.artifacts' | 'workflows.artifactFile' | 'workflows.messageLog'
+  | 'workflows.messageLogEntry' | 'workflows.listDefinitions' | 'workflows.listResumable';
 
 /** Browser -> Daemon request frame. */
 export interface RequestFrame {
@@ -121,11 +123,11 @@ export interface EventFrame {
 
 /** Error codes for ResponseFrame errors. */
 export type ErrorCode =
-  | 'AUTH_REQUIRED' | 'SESSION_NOT_FOUND' | 'JOB_NOT_FOUND'
+  | 'AUTH_REQUIRED' | 'SESSION_NOT_FOUND' | 'JOB_NOT_FOUND' | 'JOB_ALREADY_RUNNING'
   | 'ESCALATION_NOT_FOUND' | 'ESCALATION_EXPIRED' | 'SESSION_BUSY'
-  | 'WORKFLOW_NOT_FOUND' | 'WORKFLOW_NOT_AT_GATE' | 'ARTIFACT_NOT_FOUND'
-  | 'PERSONA_NOT_FOUND' | 'FILE_TOO_LARGE'
-  | 'INVALID_PARAMS' | 'RATE_LIMITED' | 'METHOD_NOT_FOUND' | 'INTERNAL_ERROR';
+  | 'WORKFLOW_NOT_FOUND' | 'WORKFLOW_NOT_AT_GATE' | 'GATE_MISMATCH' | 'EVENT_NOT_ACCEPTED'
+  | 'ARTIFACT_NOT_FOUND' | 'PERSONA_NOT_FOUND' | 'FILE_TOO_LARGE'
+  | 'INVALID_PARAMS' | 'RATE_LIMITED' | 'RESPONSE_TOO_LARGE' | 'METHOD_NOT_FOUND' | 'INTERNAL_ERROR';
 ```
 
 ### 4.2 Methods
@@ -140,8 +142,9 @@ All request params are validated with Zod schemas before dispatch. Validation fa
 | `jobs.enable` | `{ jobId }` | -- | |
 | `jobs.disable` | `{ jobId }` | -- | |
 | `jobs.recompile` | `{ jobId }` | -- | |
+| `jobs.refreshLists` | `{ jobId, list?, withMcp? }` | `RefreshListsResultDto` | Re-resolves the job policy's dynamic lists (`refresh-lists --job`); refused for a job that runs under a persona, `JOB_NOT_FOUND` for an unknown job |
 | `jobs.reload` | `{ jobId }` | -- | Reload job definition from disk and reschedule |
-| `jobs.run` | `{ jobId }` | `{ accepted, jobId }` | Fire-and-forget; progress via events |
+| `jobs.run` | `{ jobId }` | `{ accepted, jobId }` | Fire-and-forget; progress via events. The job is reserved before the reply: `JOB_ALREADY_RUNNING` while a scheduled, CLI or web run of it has not finished, `JOB_NOT_FOUND` for an unknown job |
 | `jobs.logs` | `{ jobId, limit? }` | `RunRecord[]` | |
 | `sessions.list` | -- | `SessionDto[]` | |
 | `sessions.get` | `{ label }` | `SessionDetailDto` | |
@@ -153,6 +156,7 @@ All request params are validated with Zod schemas before dispatch. Validation fa
 | `sessions.diagnostics` | `{ label }` | `DiagnosticEvent[]` | |
 | `escalations.list` | -- | `EscalationDto[]` | |
 | `escalations.resolve` | `{ escalationId, decision, whitelistSelection? }` | -- | |
+| `escalations.approveGroup` | `{ groupKey, escalationIds }` | `{ approved, failed }` | Approves each member of one whitelist-pattern group once, after the UI listed them for confirmation. Refused (`ESCALATION_GROUP_CHANGED`, nothing approved) unless the ids are exactly the group's pending members; see 10.7 |
 | `personas.list` | -- | persona list | |
 | `personas.get` | `{ name }` | `PersonaDetailDto` | |
 | `personas.compile` | `{ name }` | `PersonaCompileResultDto` | |
@@ -162,11 +166,14 @@ All request params are validated with Zod schemas before dispatch. Validation fa
 | `workflows.import` | `{ yaml }` | `{ name }` | Parse and import YAML definition |
 | `workflows.resume` | `{ baseDir, state? }` | `{ workflowId }` | Resume a checkpointed workflow |
 | `workflows.abort` | `{ workflowId }` | -- | |
-| `workflows.resolveGate` | `{ workflowId, gateId, event }` | -- | |
+| `workflows.resolveGate` | `{ workflowId, gateId, event, prompt?, resolvedBy? }` | -- | `gateId` is the active raise's per-raise id (else `GATE_MISMATCH`); `event` must be one the gate routes (else `EVENT_NOT_ACCEPTED`); `resolvedBy` is a declared channel (`web-ui`/`cli`/`signal`) for the `gate_resolved` log entry |
 | `workflows.inspect` | `{ workflowId }` | messages log | |
-| `workflows.fileTree` | `{ workflowId, path? }` | `FileTreeResponseDto` | Browse workspace files |
-| `workflows.fileContent` | `{ workflowId, path }` | `FileContentResponseDto` | Read file content |
-| `workflows.artifacts` | `{ workflowId, name }` | `ArtifactContentDto` | |
+| `workflows.fileTree` | `{ workflowId, path? }` | `FileTreeResponseDto` | Browse workspace files; directories and regular files only, at most 2,000 entries (`truncated`) |
+| `workflows.fileContent` | `{ workflowId, path }` | `FileContentResponseDto` | Read file content (≤ 1 MiB, regular files only; `{ error }` otherwise) |
+| `workflows.artifacts` | `{ workflowId, artifactName }` | `ArtifactContentDto` | Paths and sizes only (bounded, `truncated`) |
+| `workflows.artifactFile` | `{ workflowId, artifactName, path }` | `FileContentResponseDto` | One artifact file, same rules as `fileContent` |
+| `workflows.messageLog` | `{ workflowId, before?, limit? }` | `MessageLogResponseDto` | Newest first; pages capped in bytes, long strings cut with a `ref` |
+| `workflows.messageLogEntry` | `{ workflowId, ref }` | `{ entry }` | Full text of a cut page entry |
 | `workflows.listDefinitions` | -- | `WorkflowDefinitionDto[]` | Bundled + user definitions |
 | `workflows.listResumable` | -- | `ResumableWorkflowDto[]` | Checkpointed workflows |
 
@@ -182,16 +189,17 @@ All request params are validated with Zod schemas before dispatch. Validation fa
 | `session.tool_result` | `{ label, toolName, stepIndex }` | Emitted when a step completes |
 | `session.text_delta` | `{ label, preview }` | Up to 200 chars of text per step (post-step snapshot, not streaming) |
 | `session.output` | `{ label, text, turnNumber }` | Final response when `forwardMessage()` resolves |
-| `session.diagnostic` | `{ label, event }` | Raw diagnostic events |
+| `session.diagnostic` | `{ label, event }` | Session notices only: the start-up notices and host-mount findings (see §5.4) |
 | `session.budget_update` | `{ label, budget }` | |
-| `escalation.created` | `EscalationDto` | |
-| `escalation.resolved` | `{ escalationId, decision }` | Single source: transport callback |
-| `escalation.expired` | `{ escalationId, sessionLabel }` | |
+| `escalation.created` | `EscalationDto` | Web sessions: their transport. Cron and Signal sessions: the SessionManager's escalation events, bridged by `WebUiServer` |
+| `escalation.resolved` | `{ escalationId, decision }` | Web sessions: transport callback. Cron and Signal sessions: `resolveSessionEscalation`, bridged |
+| `escalation.expired` | `{ escalationId, sessionLabel }` | Also bridged for cron and Signal sessions (proxy timeout, a response that came too late, the session ending) |
 | `job.started` | `{ jobId, sessionLabel }` | |
 | `job.completed` | `{ jobId, record }` | |
 | `job.failed` | `{ jobId, error }` | |
 | `job.list_changed` | `{}` | Emitted from daemon job mutation methods |
 | `daemon.status` | `DaemonStatusDto` | Periodic (every 10s) |
+| `daemon.resync` | `{ reason }` | To one client that missed events while backpressured; the UI refetches its state |
 | `workflow.started` | `{ workflowId, name, taskDescription }` | |
 | `workflow.state_entered` | `{ workflowId, state, previousState? }` | |
 | `workflow.completed` | `{ workflowId }` | |
@@ -228,7 +236,7 @@ src/web-ui/
 
 src/session/
   session-manager.ts       -- SessionSource with 'web' kind, resolveSessionEscalation(),
-                              pendingEscalation: EscalationDto | null
+                              pendingEscalations: Map<escalationId, PendingEscalationData>
 
 packages/web-ui/           -- Svelte 5 SPA (workspace package, private)
   src/
@@ -262,9 +270,10 @@ The core daemon-side component. Creates a raw `http.createServer()`, serves stat
 Key implementation details:
 
 - **Static file serving** uses a cache (`staticCache: Map`) with `readFileSync` + MIME type lookup. Files outside `staticRoot` are rejected via real-path containment check.
-- **WebSocket upgrade** validates the token via `timingSafeEqual`, validates Origin header (strict in production, skipped with `--web-ui-dev`), then upgrades.
+- **WebSocket upgrade** validates the Host header (see 8.3; anything else gets 421), then the token via `timingSafeEqual`, then the Origin header when present (same allowlist as Host; `--web-ui-dev` adds the Vite dev server origin instead of skipping the check; a missing Origin is a non-browser client such as the CLI daemon client and is accepted), then upgrades.
 - **Ping/pong heartbeat** at 30s intervals. Clients missing 2 consecutive pings are terminated.
-- **Orphaned session cleanup** via a grace period timer (60s default). When all connections close, the timer starts. If no client reconnects before it fires, all web sessions are ended.
+- **Orphaned session cleanup** via a grace period timer (60s default, `orphanGraceMs` for tests). When all connections close, the timer starts. If no client reconnects before it fires, all web sessions are ended.
+- **One teardown path for web sessions.** Every way a turn-based web session ends — `sessions.end`, budget exhaustion, the transport's `run()` completing, the orphan reaper, and `stop()` on daemon shutdown — goes through `endManagedSession` (`src/web-ui/web-session-teardown.ts`): `SessionManager.end()` (which memoizes an in-flight end per label, so concurrent callers share one teardown and the session stays registered until its `close()` has finished), token-stream bus cleanup, the per-label send queue, `escalation.expired` for a still-pending escalation, and finally exactly one `session.ended`. The helper is idempotent per session on its own (a concurrent caller joins the helper teardown in flight), so a teardown that some other caller started with a bare `SessionManager.end()` (the Signal bot's `/quit #N` takes any label) is joined rather than mistaken for one that will emit the event. The daemon relies on that event to release its `TokenStreamBridge` label maps.
 - **Event broadcasting** via `WebEventBus` subscription -- the server subscribes in its constructor and broadcasts all events to connected clients.
 
 ### 5.3 WebEventBus
@@ -277,21 +286,24 @@ Follows the `SignalSessionTransport` pattern:
 - `runSession()` blocks until `close()` resolves a promise.
 - `forwardMessage()` delegates to `sendAndLog()`.
 - Callback factories emit events to the `WebEventBus`:
-  - `createDiagnosticHandler()` emits both raw `session.diagnostic` and fine-grained `session.tool_call` / `session.text_delta` / `session.tool_result`.
+  - `createDiagnosticHandler()` emits the fine-grained `session.tool_call` / `session.text_delta` / `session.tool_result` events, and `session.diagnostic` only for the session notices (`isSessionNotice` in `src/session/startup-notices.ts`): the start-up diagnostics `annotation_drift`, `mcp_server_unavailable`, `host_model_fallback` and `policy_stale` (held until the session has a label), and `host_privileged_files` (setuid or root-owned files an agent left in its host mounts, after a turn or at session end). It does not forward every raw diagnostic (corrected 2026-11).
+  - The frontend shows these notices in the session view, each in a dismissible banner rendered through `SafeText` (`features/session-notices.svelte`, pure logic in `src/lib/session-notices.ts`): seeded from the session's `diagnosticLog` (`sessions.get`) when it is selected and after a reconnect, and added from `session.diagnostic` events. They are kept per label and dropped with the session: on `session.ended`, and when a fresh `sessions.list` no longer has the session or shows the label naming another session (one created at another time; a restarted daemon numbers its sessions from 1 again). Signal and cron sessions, whose transports do not use the web bus, show the notices of their diagnostic log the same way. A `web-pty` terminal prints its own notices in the terminal.
   - `createEscalationHandler()` stores the full `EscalationDto` in `ManagedSession` via `setPendingEscalation()` before emitting `escalation.created`.
-  - `createEscalationExpiredHandler()` reads `managed.pendingEscalation.escalationId` before clearing.
+  - `createEscalationExpiredHandler()` receives the expired escalation's id, clears that one (the session's other pending escalations stay) and emits `escalation.expired` for it.
   - `createEscalationResolvedHandler()` is the single source of truth for `escalation.resolved` events.
+
+**Cron and Signal sessions.** Their transports do not talk to the web bus. They record each escalation's full request on the SessionManager (`recordEscalation`: tool, arguments, whitelist candidates and the reviewer context, but no `groupKey`, so such an escalation never joins a group approval), and every outcome goes through `resolveSessionEscalation` or `expireEscalation`; the SessionManager tells its listeners, and `WebUiServer` re-emits those events for every session whose source is not `web` (web sessions announce their own, so nothing is sent twice; `escalations.resolve` and `escalations.approveGroup` announce the expiry of a late response themselves only for a web session's escalation). So a cron or Signal escalation appears live with its arguments, and disappears when it is decided anywhere. `escalations.resolve` refuses to approve (it can still deny) a pending escalation that does not name its server, tool and arguments, and the escalation card disables Approve for one. Without Signal, the daemon keeps a cron escalation pending for the web UI only while a browser is connected (`WebUiServer.hasBrowserClient()`: an authenticated client whose handshake carried an allowed Origin; the CLI clients send none); otherwise it is denied at once (see `cron-mode.md`, decision 3).
 
 ### 5.5 Integration with IronCurtainDaemon
 
-The daemon gains an optional `WebUiServer` field, started after the control socket. The `--web-ui` flag or `daemon.webUi.enabled` config setting controls activation. The server is dynamically imported so the `ws` dependency does not load when the web UI is disabled.
+The daemon gains an optional `WebUiServer` field, started after the control socket. The `--web-ui` flag controls activation (there is no config setting for it; see section 13). The server is dynamically imported so the `ws` dependency does not load when the web UI is disabled.
 
 ```bash
 # Via flag
 ironcurtain daemon --web-ui
 ironcurtain daemon --web-ui --web-port 8080
 
-# With development mode (skips Origin validation for Vite dev server)
+# With development mode (also accepts the Vite dev server origin, localhost:5173)
 ironcurtain daemon --web-ui --web-ui-dev
 
 # Via config.json
@@ -316,12 +328,20 @@ export interface ManagedSession {
   readonly transport: Transport;
   readonly source: SessionSource;
   messageInFlight: boolean;
-  /** Full escalation data for late-connecting clients and expiry handling. */
-  pendingEscalation: EscalationDto | null;
-  escalationResolving: boolean;
+  /**
+   * Full data of every escalation of this session waiting for a decision, by
+   * id: several can be pending at once (parallel tool calls), for
+   * late-connecting clients and expiry handling.
+   */
+  readonly pendingEscalations: Map<string, PendingEscalationData>;
+  /** Ids of the pending escalations whose resolution is in progress. */
+  readonly escalationsResolving: Set<string>;
   runPromise: Promise<void> | null;
 }
 ```
+
+`escalations.list` lists every pending escalation of every session, and
+`sessions.list` sets `hasPendingEscalation` when a session has at least one.
 
 ### 6.2 Escalation Resolution Extraction
 
@@ -333,12 +353,20 @@ async resolveSessionEscalation(
   decision: 'approved' | 'denied',
   options?: { whitelistSelection?: number },
 ): Promise<EscalationResolutionResult> {
-  // Find session by pendingEscalation.escalationId
-  // Guard against double-resolution (escalationResolving flag)
+  // Find the session that has escalationId among its pendingEscalations
+  // Guard against double-resolution of that escalation (escalationsResolving);
+  //   the session's other escalations can be decided meanwhile
   // Call session.resolveEscalation() with whitelistSelection passthrough
-  // Clear pendingEscalation in finally block
+  // A response written after the proxy's timeout throws ESCALATION_EXPIRED:
+  //   return { resolved: false, reason: 'expired' }
+  // Remove that escalation from pendingEscalations in a finally block
 }
 ```
+
+An `expired` result means the call was denied whatever the decision was:
+`escalations.resolve` emits `escalation.expired` for the session and answers
+with `ESCALATION_EXPIRED`, and the Signal bot replies that the escalation had
+already expired, so a late approval is never reported as approved.
 
 ### 6.3 Web Sessions and currentLabel
 
@@ -349,21 +377,27 @@ Web sessions do not update `currentLabel`. The browser UI always specifies the t
 The full DTO type definitions are in `src/web-ui/web-ui-types.ts`. Key types:
 
 - **SessionDto** / **SessionDetailDto** -- session snapshot with budget, escalation state, persona.
-- **BudgetSummaryDto** -- token/step/time/cost consumption with limits.
-- **EscalationDto** -- full escalation context (tool call, arguments, reason, whitelist candidates).
+- **BudgetSummaryDto** -- the session's token/step/active-time/cost totals (`toBudgetDto` reads the cumulative view, because a builtin session's per-turn counters are zero between turns), with the per-turn limits. `costSource` (Docker sessions only) says where the cost comes from; the dashboard and session list show `unknown` for an `unknown` source and `≥ $x` for a `partial` one, never a made-up `$0.00`.
+- **EscalationDto** -- full escalation context (tool call, arguments, reason, whitelist candidates), the reviewer context (`lastTrustedUserMessage` and `taskSummary`, the human's own text; `agentJustification`, written by the agent and untrusted) and `groupKey`, the whitelist-pattern group it belongs to (see 10.7).
 - **DaemonStatusDto** -- uptime, job counts, transport states.
-- **JobListDto** -- job definition with scheduling and last-run info.
+- **JobListDto** -- job definition with scheduling and last-run info, `isRunning` (true from the run's reservation, before its git sync and session start) and `consecutiveFailures`.
 - **WorkflowSummaryDto** / **WorkflowDetailDto** -- workflow state with graph, transitions, context.
 - **StateGraphDto** / **StateNodeDto** / **TransitionEdgeDto** -- state machine graph for visualization.
 - **HumanGateRequestDto** -- human gate with accepted events and artifact names.
 - **FileTreeResponseDto** / **FileContentResponseDto** -- workspace file browsing.
 - **PersonaDetailDto** / **PersonaCompileResultDto** -- persona management.
 
+### 7.1 Complete or deny-only escalation reviews
+
+Each escalation fits a conservative 16 KiB review budget, 2,048 traversal entries and depth 16, or becomes an explicitly deny-only summary. Lists, workflow details and push events share the projection. Original pending records stay intact; every direct, PTY, workflow and group approval route checks them before resolving anything. No truncated request can be approved or whitelisted.
+
+SPA refresh domains fail independently and retain held reviews on a failed RPC. The UI displays persistent recovery errors; a workflow whose current detail cannot be read has approval disabled while denial/abort remain available. The existing 8 MiB aggregate response cap remains, so very many bounded items can still fail a list/detail RPC visibly; pagination is not implemented.
+
 ## 8. Authentication and Security
 
 ### 8.1 Local-Only Binding
 
-The HTTP server binds to `127.0.0.1` by default. Binding to `0.0.0.0` requires explicit `--web-host 0.0.0.0` and prints a warning. No TLS.
+The HTTP server binds to `127.0.0.1`. The `--web-host` flag proposed here to bind other interfaces was not implemented, so `ironcurtain daemon` always binds the loopback address. No TLS.
 
 ### 8.2 Bearer Token Flow
 
@@ -376,16 +410,22 @@ The HTTP server binds to `127.0.0.1` by default. Binding to `0.0.0.0` requires e
 
 There is no unauthenticated endpoint serving the token.
 
-### 8.3 Origin Validation
+### 8.3 Host and Origin Validation
 
-Strict in production: only connections from `127.0.0.1` or `localhost` at the daemon's port are accepted. In dev mode (`--web-ui-dev`), Origin validation is skipped so the Vite dev server on port 5173 can connect directly. The token remains the primary auth gate.
+**Host** (every HTTP request and WebSocket upgrade, DNS-rebinding defence): the `Host` header must name `localhost`, a loopback address (`127.0.0.0/8`, `::1`), the configured bind host or, when the daemon binds a wildcard address, any IP literal (no DNS name can be rebound to an IP literal), in each case at the port the connection arrived on. A missing, malformed or foreign Host gets `421 Misdirected Request`. The Vite dev proxy rewrites Host to the daemon's address (`changeOrigin: true`), so dev mode passes this check unchanged.
+
+**Origin** (WebSocket upgrade, checked after the token): when the header is present it must be an `http:` origin whose authority passes the same Host rule. In dev mode (`--web-ui-dev`) the allowlist additionally contains the Vite dev server origins (`http://localhost:5173` and `http://127.0.0.1:5173`, the port following `IRONCURTAIN_WEB_UI_PORT` like `vite.config.ts`); the check is never skipped. A missing Origin is accepted because the CLI daemon client (`src/daemon-client/`) is not a browser and sends none; browsers always send one. The token remains the primary auth gate.
 
 ### 8.4 Additional Protections
 
 - **WebSocket message size**: `maxPayload: 1MB` on `ws.WebSocketServer`.
-- **XSS**: Agent output rendered via `marked` + `DOMPurify`. Tool arguments are JSON-rendered.
-- **CSP**: `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'`.
-- **Rate limiting**: Session creation max 5/min per connection. Max 10 concurrent WebSocket connections. Per-session message queuing.
+- **Reply and send-buffer bounds**: a reply larger than 8 MiB, or one that would push the connection's send buffer past 8 MiB, is replaced by a `RESPONSE_TOO_LARGE` error for that request id; the socket is never closed for it (closing would fail every in-flight request and drop PTY and token-stream subscriptions). Event frames to a client whose send buffer is above 4 MiB are skipped, and the client gets one `daemon.resync` event once it drains (PTY output resyncs with a replay; token-stream deltas are dropped).
+- **Agent-writable workspace reads**: the file browser and artifact methods never block on, or follow, what the agent planted: files are read through `readUntrustedRegularFileBelow` (`O_NOFOLLOW | O_NONBLOCK`, regular files only, at most 1 MiB + 1 bytes), each listed directory is opened through `openDirectoryBelow` (the directory actually opened must lie below the real workspace, or strictly below its real `.workflow` for artifacts; on Linux entries are read and sized through its descriptor, so a racing symlink swap cannot make a listing show a host directory), listings are asynchronous with entry, depth and serialized-byte budgets, and artifact contents are fetched one file per request.
+- **Agent markdown** (`lib/markdown.ts`): marked escapes raw HTML tokens, so markup in agent text is shown, not interpreted; a dedicated DOMPurify instance allows only formatting elements plus the attributes GFM needs (`align`, `start`, disabled task-list checkboxes), never `style`, `class` or `id`, forms or other inputs; links keep only `http(s)`/`mailto` hrefs and open with `target=_blank rel="noopener noreferrer"`; images become text. `.prose-markdown` adds `contain: paint` so nothing rendered can draw outside its block. Rationale: agent-written artifacts, transition messages and log entries render in the same document as the Approve/Deny controls, and the CSP must keep `style-src 'unsafe-inline'` for xterm and Svelte transitions.
+- **Escalation text** (`lib/unicode-display.ts`, `SafeText`): every agent-influenced string on the escalation card, on the workflow tool-call escalation panel (server/tool name, state, persona, reason, arguments, whitelist descriptions; see 10.3) and in the modal tab labels (server/tool name, reason, arguments, context, whitelist descriptions), and the modal's resolve-failure message (server text that can quote ids or exception messages), renders bidi controls, zero-width and other format characters, C0/C1 controls, and variation selectors, Hangul fillers and the other default-ignorable code points (which display as nothing) as highlighted `\uXXXX` escapes (at most 500 highlighted per text; any further ones are still spelled out, as plain text, so a value packed with invisible characters cannot make the page build an element per character). The one exception is the presentation selector of an ordinary emoji (a single U+FE0E/U+FE0F right after a pictograph, or the U+FE0F of a keycap): it changes how that emoji is drawn, so it is shown as itself and does not trigger the invisible-character note. Those blocks are `unicode-bidi: isolate; direction: ltr`, the argument and context blocks wrap instead of scrolling sideways, and notes warn when such characters are present or the arguments need scrolling. Path and URL arguments are shown as the policy engine evaluated them (relative paths resolved against the sandbox, `..` and symlinks resolved, URLs normalized), which is also what the transport sends.
+- **Headers**: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Resource-Policy: same-origin`.
+- **CSP**: `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'` (dev mode widens `connect-src` to local `ws://` origins). `form-action 'none'` closes the form-submission path that `default-src` does not govern; the SPA's own forms all call `preventDefault`.
+- **Rate limiting**: Max 10 concurrent WebSocket connections, and per-session message queuing. (The per-connection limit of 5 session creations per minute proposed here was not implemented; only concurrency caps exist.)
 - **Policy bypass prevention**: The web UI communicates exclusively through the daemon API. Tool calls flow through the agent and policy engine.
 
 ## 9. Frontend Architecture
@@ -464,11 +504,11 @@ packages/web-ui/src/lib/components/
 
 Reusable component providing backdrop, centering, close-on-Escape, close-on-backdrop-click, and a focus trap:
 
-- **On open:** saves `document.activeElement`, moves focus to first interactive element inside.
-- **While open:** Tab/Shift+Tab cycles among modal's focusable elements (never escapes).
+- **On open:** saves `document.activeElement`. With `focusOnOpen="dialog"` (default) focus moves into the dialog but never onto an action control (a button, link, checkbox or select focused automatically would act on an Enter or Space the user was already typing): the first text field if there is one, otherwise the dialog container (`tabindex="-1"`). With `focusOnOpen="none"` (the escalation modal, which opens without a user action) focus stays where it is, so keystrokes meant for the page -- typically the terminal -- keep going there.
+- **While open:** Tab/Shift+Tab cycles among modal's focusable elements (never escapes) once focus is inside. The `role="dialog"` element is exposed through `bind:dialog` for owners that observe presses inside it.
 - **On close:** restores focus to previously focused element.
 - ARIA: `role="dialog"`, `aria-modal="true"`, `aria-labelledby` pointing to title.
-- Escape `keydown` handler calls `event.stopPropagation()` before closing to prevent propagation.
+- Escape: with focus inside the dialog the wrapper's `keydown` handler closes it and calls `event.stopPropagation()`. With focus outside (focus was never moved in) a document-level capture listener closes the top-most open modal and consumes the key, so a dismissal never doubles as terminal input.
 
 ### 10.3 Escalation Card
 
@@ -478,12 +518,17 @@ Shared component used by both the Escalations page and the modal:
 {
   escalation: EscalationDto;
   loading: boolean;
+  armed?: boolean; // default true; false renders Approve, Deny and the whitelist choices inert
   onapprove: (whitelistSelection?: number) => void;
   ondeny: () => void;
 }
 ```
 
-The card owns its whitelist selection state via a local `$state` variable. Includes a "View Session #N" link that navigates to the session view and closes the modal.
+The card owns its whitelist selection state via a local `$state` variable. Includes a "View Session #N" link that navigates to the session view and closes the modal. Every agent-influenced string is rendered through `SafeText` (invisible and direction-changing characters become highlighted escapes, see 8.4), a note warns when such characters occur or the arguments need scrolling, and the card says that path and URL arguments appear as the policy engine evaluated them. On the Escalations page a card is armed only once it has been in its place in the list for `ESCALATION_ARM_DELAY_MS`: resolving a card moves the ones below it up under the pointer, so a card that just appeared or moved up ignores clicks (the second click of a double click on Approve) for that long, while cards that did not move stay armed.
+
+The card also shows the reviewer context (`escalation-review-context.svelte`): the session's task and "Your last message" (with the time it was sent) as the human's own text, and, set apart in a dashed warning box, "Agent's justification -- untrusted, written by the agent", with a note that it is the agent's unchecked claim and approves nothing. All of it goes through `SafeText`, and the justification counts toward the invisible-character note. The daemon fills these fields from the escalation request (`src/trusted-process/escalation-context.ts`): the last message is read like the auto-approver reads it (for a PTY session only what the trusted-message bar wrote), and the justification never reaches the auto-approver.
+
+Workflow tool-call escalations (a call blocked inside a workflow agent state) are decided on the WorkflowDetail page, in `workflow-escalation-panel.svelte`, by escalation id through `workflows.resolveEscalation`. The panel follows the same rules: `SafeText` for every agent-influenced string with the same invisible-character note, a wrapped, bidi-isolated argument block, and the Escalations-page arming (a card takes Approve, Deny and whitelist clicks only once it has been in its place for `ESCALATION_ARM_DELAY_MS`). A human-only escalation (`humanOnly`, e.g. opening a passthrough domain) shows a note that it is approved once and offers no whitelist choices.
 
 ### 10.4 Escalation Modal
 
@@ -492,17 +537,20 @@ Composes the generic Modal with a tab bar and escalation cards:
 - **Tab bar:** Each escalation gets a numbered tab with summary (e.g., "filesystem / write_file"). Left/Right arrows navigate. If the focused tab's escalation expires, focus snaps to nearest remaining tab.
 - **Tab overflow (10+):** `overflow-x: auto` with `scroll-snap-type: x mandatory`. CSS gradient fade indicators at edges.
 
-**Keyboard shortcuts** (matching the terminal mux):
+**Arming.** The modal opens on its own, usually while the user is typing into the terminal, so nothing already in flight may decide an escalation. It takes no focus (`focusOnOpen="none"`): keystrokes keep going where they were going and none reaches the dialog until the user clicks into it or tabs to it. Deciding is therefore always an explicit act inside the dialog -- a click on Approve or Deny, or a chord once focus is inside -- and it works only while the escalation on screen is _armed_: it has been visible for `ESCALATION_ARM_DELAY_MS` (750 ms) without a break. The delay restarts whenever a different escalation is shown (modal opened, previous one resolved, tab switched), so a double click or a repeated chord cannot decide the escalation that just replaced the one the user acted on. Visible means the user can be looking at it: while the page is hidden (background tab) or the window is unfocused the escalation is not armed, and the delay starts over when the page is shown or the window regains focus, so the first click into the window or tab (10.6 flashes the title to bring the user back) never decides. A click whose press (a pointer press, or Enter/Space on a focused button) began before arming, and key repeats, never act; the compatibility mousedown that follows a touch can only mark a press as unarmed. Until armed, Approve, Deny and the whitelist choices are shown but inert (`aria-disabled`). A `role="status"` line announces the state for screen readers.
+
+**Keyboard shortcuts** (chords only; a bare letter typed into the terminal must never approve):
 
 | Key | Action |
 |-----|--------|
-| `a` | Approve focused escalation |
-| `d` | Deny focused escalation |
-| `w` | Approve + whitelist (selects first candidate if none) |
+| Ctrl/⌘+Enter | Approve the escalation shown |
+| Ctrl/⌘+Backspace | Deny the escalation shown |
 | Left/Right | Navigate between tabs |
-| Escape | Dismiss modal (updates watermark) |
+| Escape | Dismiss modal (updates watermark), also while focus is outside the dialog |
 
-Shortcuts only fire when the modal has focus AND no text input is focused within the modal. A small legend is shown at the bottom: "a approve | d deny | w whitelist | Esc dismiss".
+Chords fire only when focus is inside the dialog, never from an input or textarea inside it, only while armed, ignore `e.repeat`, and require exactly Ctrl or ⌘ (no Shift/Alt). Approve + whitelist is a click on a whitelist choice, then Approve. The legend at the bottom shows the chords, whether Approve and Deny are enabled yet, and, while focus is outside the dialog, that the keys need a click inside first.
+
+**Resolve failures.** A decision the daemon rejects (`ESCALATION_EXPIRED`, `ESCALATION_NOT_FOUND`, a lost connection) is shown inside the modal as a `role="alert"` line ("Failed to approve: ...", rendered through `SafeText`), cleared when the next decision is attempted or the dialog closes. App keeps the dialog open on such a failure, so an expiry of the last pending escalation is reported instead of closing like a success.
 
 ### 10.5 Display Number Watermark
 
@@ -552,7 +600,7 @@ Each escalation in `pendingEscalations` gets a `displayNumber` assigned client-s
 </script>
 ```
 
-**Reconnect behavior:** After `refreshAll`, `escalationDismissedAt` is set to `escalationDisplayNumber` so stale escalations do not auto-open.
+**Reconnect behavior:** On the initial connect `refreshAll` sets `escalationDismissedAt` to `escalationDisplayNumber` so pre-existing escalations do not auto-open. On every (re)connect it keeps the display number of each escalation already in `pendingEscalations` and numbers only ids it has not seen, so a WebSocket reconnect never re-opens the modal for escalations the user already dismissed; only escalations that arrived while the socket was down count as new. The `escalations.list` answer is applied the moment it arrives and merged with the escalation events received while it was requested (`src/lib/escalation-snapshots.ts`): the answer reflects the daemon at one moment in that window, so an escalation an event raised, resolved or expired meanwhile (or one of a session that ended meanwhile) is decided by the client's live state, and every other one by the answer. An escalation raised during the refresh therefore stays pending, and one resolved during it does not come back. On the initial connect the watermark covers the escalations pending when that answer is applied; one raised after it opens the modal. A `daemon.resync` runs the same refresh.
 
 ### 10.6 Background Tab Notification
 
@@ -561,6 +609,8 @@ When an escalation fires and the tab is not visible, the document title flashes 
 ### 10.7 Escalations Page
 
 The full Escalations page remains as a persistent view. It serves as a fallback for deliberate browsing and a future home for escalation history. When the user is on the Escalations page, the modal suppresses auto-open.
+
+**Group approval.** Pending escalations that share one whitelist pattern (the same `groupKey`, stamped by the daemon from the pattern key of the escalation's first whitelist candidate, the exact one `/approve+` selects; never the directory-wide one, `src/escalation/escalation-groups.ts`) are offered as a group above the cards: "N pending escalations share one pattern", the pattern, the session labels and a "Review group" button. Human-only escalations, those without a keyed pattern, and those of cron and Signal sessions (recorded without a `groupKey`, see 5.4) never group. A banner that appears or goes (a group forms, or dissolves because a member expired or was decided elsewhere) moves every card without changing its index, so the number of banners is part of a card's place in the arming rule above: the cards wait `ESCALATION_ARM_DELAY_MS` again, and a click aimed at "Review group" cannot land on the Approve or Deny of the card that moved into the banner's place. "Review group" opens `escalation-group-confirm.svelte`, which lists every member (session, tool, arguments, reason, reviewer context) and says that each is approved once and nothing is whitelisted. Its Approve button is inert for `ESCALATION_ARM_DELAY_MS` after the list opens and for a press that began before that; when the group changes while the list is open (a member arrived, expired or was resolved) it says so and Approve stays inert. Approve sends `escalations.approveGroup` with exactly the ids listed; the daemon re-checks that they are still exactly the group's pending members before resolving any, and reports members that then fail on their own (expired meanwhile) in `failed`.
 
 ## 11. Escalation Flow
 
@@ -641,6 +691,10 @@ All frontend dependencies are `devDependencies` of the workspace package. Only c
 
 ## 13. Configuration
 
+> **As implemented (2026-11):** the web UI has no settings in `~/.ironcurtain/config.json`; the `daemon.webUi` block proposed below was never added to the config schema. It is configured by `ironcurtain daemon` flags only: `--web-ui` (enable), `--web-port <port>` (default 7400) and `--web-ui-dev` (also accept the Vite dev server origin). The bind address is always `127.0.0.1`.
+
+Proposed (not implemented):
+
 ```json
 // In ~/.ironcurtain/config.json
 {
@@ -657,7 +711,7 @@ All frontend dependencies are `devDependencies` of the workspace package. Only c
 |---------|---------|--------------|
 | `daemon.webUi.enabled` | `false` | `--web-ui` |
 | `daemon.webUi.port` | `7400` | `--web-port` |
-| `daemon.webUi.host` | `'127.0.0.1'` | `--web-host` |
+| `daemon.webUi.host` | `'127.0.0.1'` | `--web-host` (not implemented) |
 
 ## 14. Dependencies
 
@@ -723,7 +777,7 @@ This design went through a formal 21-item architectural critique. Key items that
 
 9. **`job.list_changed` trigger points wired** (critique #20). Event bus emissions added to daemon's `addJob()`, `removeJob()`, `enableJob()`, `disableJob()`, and `recompileJob()`.
 
-10. **Origin validation accepts any loopback origin** (critique #13) in dev mode. The bearer token is the real auth gate.
+10. **Origin validation in dev mode** (critique #13) originally accepted any origin. It now adds only the Vite dev server origins to the allowlist (see 8.3); the bearer token remains the real auth gate.
 
 Other critique items (turn number in `session.thinking`, auto-save memory for web sessions, `sessions.send` to non-web sessions, reconnection hydration order) were addressed during implementation as documented in the relevant sections above.
 

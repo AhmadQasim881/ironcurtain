@@ -1,17 +1,37 @@
 /**
  * Tests for SKILL.md discovery and layered resolution.
+ *
+ * A workflow's staged skills can come from an imported run directory (FU-07):
+ * discovery must refuse a FIFO or device where a SKILL.md belongs without
+ * blocking (those cases run in a child process with a hard timeout, since a
+ * blocking open would freeze this worker), and must not follow links in a
+ * workflow skills tree.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, mkdirSync, realpathSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { discoverSkills, discoverSkillsWithErrors, resolveSkillsForSession } from '../src/skills/discovery.js';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import {
+  discoverSkills,
+  discoverSkillsWithErrors,
+  resolveSkillsForSession,
+  SKILL_MANIFEST_READ_BYTES,
+} from '../src/skills/discovery.js';
+import type { SkillDiscoveryError, SkillSource } from '../src/skills/types.js';
+import { fifoSupported, makeFifo } from './helpers/fifo.js';
+
+const discoveryUrl = pathToFileURL(
+  resolve(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'skills', 'discovery.ts'),
+).href;
+const hasDevZero = process.platform !== 'win32' && existsSync('/dev/zero');
 
 let tempDir: string;
 
 function createTempDir(): string {
-  return mkdtempSync(resolve(tmpdir(), 'ironcurtain-skills-test-'));
+  return realpathSync(mkdtempSync(resolve(tmpdir(), 'ironcurtain-skills-test-')));
 }
 
 /**
@@ -56,6 +76,17 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('discoverSkills', () => {
+  it('refuses a linked workflow layer while preserving user-selected linked roots', () => {
+    const root = resolve(tempDir, 'ordinary-skills');
+    writeSkill(root, 'ordinary', { name: 'ordinary', description: 'fixture' });
+    const alias = resolve(tempDir, 'skills-alias');
+    symlinkSync(root, alias);
+    const result = discoverSkillsWithErrors(alias, 'workflow', { canonicalRoot: true });
+    expect(result.skills).toEqual([]);
+    expect(result.errors).toEqual([{ skillDir: alias, reason: 'unreadable', detail: expect.any(String) }]);
+    expect(discoverSkills(alias, 'user').map((skill) => skill.name)).toEqual(['ordinary']);
+  });
+
   it('returns [] for a missing root', () => {
     const missing = resolve(tempDir, 'does-not-exist');
     expect(discoverSkills(missing, 'user')).toEqual([]);
@@ -293,6 +324,156 @@ describe('discoverSkillsWithErrors', () => {
 
     const dups = errors.filter((e) => e.reason === 'duplicate-name');
     expect(dups.map((e) => e.skillDir).sort()).toEqual([resolve(skillsRoot, 'b'), resolve(skillsRoot, 'c')]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Special files and links (FU-07)
+// ---------------------------------------------------------------------------
+
+interface ChildDiscovery {
+  readonly skills: string[];
+  readonly errors: SkillDiscoveryError[];
+  readonly ms: number;
+}
+
+/**
+ * Runs `discoverSkillsWithErrors` on each root in a separate Node process
+ * killed after a hard timeout, so a blocking open fails the test instead of
+ * hanging the worker.
+ */
+function discoverInChild(plan: readonly { root: string; source: SkillSource }[]): ChildDiscovery[] {
+  const program = [
+    `import { discoverSkillsWithErrors } from ${JSON.stringify(discoveryUrl)};`,
+    'const results = [];',
+    'for (const { root, source } of JSON.parse(process.argv[1])) {',
+    '  const started = Date.now();',
+    '  const { skills, errors } = discoverSkillsWithErrors(root, source);',
+    '  results.push({ skills: skills.map((s) => s.name), errors, ms: Date.now() - started });',
+    '}',
+    'process.stdout.write(JSON.stringify(results));',
+  ].join('\n');
+  const child = spawnSync(
+    process.execPath,
+    ['--import', 'tsx', '--input-type=module', '--eval', program, JSON.stringify(plan)],
+    { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL' },
+  );
+  expect(child.error, 'discovery must return before the hard timeout').toBeUndefined();
+  expect(child.status, child.stderr).toBe(0);
+  return JSON.parse(child.stdout) as ChildDiscovery[];
+}
+
+describe('discoverSkillsWithErrors: special files and links', () => {
+  it.skipIf(!fifoSupported || !hasDevZero)(
+    'reports a FIFO or a /dev/zero link at SKILL.md as unreadable, promptly, and keeps the other skills',
+    () => {
+      const workflowRoot = resolve(tempDir, 'staged-skills');
+      writeSkill(workflowRoot, 'good', { name: 'good', description: 'd' });
+      mkdirSync(resolve(workflowRoot, 'pipe'));
+      makeFifo(resolve(workflowRoot, 'pipe', 'SKILL.md'));
+      mkdirSync(resolve(workflowRoot, 'zero'));
+      symlinkSync('/dev/zero', resolve(workflowRoot, 'zero', 'SKILL.md'));
+
+      const userRoot = resolve(tempDir, 'user-skills');
+      writeSkill(userRoot, 'good', { name: 'good', description: 'd' });
+      mkdirSync(resolve(userRoot, 'pipe'));
+      makeFifo(resolve(userRoot, 'pipe', 'SKILL.md'));
+      mkdirSync(resolve(userRoot, 'zero'));
+      symlinkSync('/dev/zero', resolve(userRoot, 'zero', 'SKILL.md'));
+
+      // The FIFOs come first: a regressed (blocking) read stalls on them and
+      // never reaches /dev/zero, which it would read without end.
+      const [workflow, user] = discoverInChild([
+        { root: workflowRoot, source: 'workflow' },
+        { root: userRoot, source: 'user' },
+      ]);
+
+      const refused = (skillDir: string) => ({
+        skillDir,
+        reason: 'unreadable',
+        detail: expect.stringContaining('not a regular file'),
+      });
+      expect(workflow.skills).toEqual(['good']);
+      expect(workflow.errors).toEqual([
+        refused(resolve(workflowRoot, 'pipe')),
+        // A workflow skill's SKILL.md is never followed, whatever the link leads to.
+        { skillDir: resolve(workflowRoot, 'zero'), reason: 'unreadable', detail: expect.stringContaining('symlink') },
+      ]);
+      expect(workflow.ms).toBeLessThan(2_000);
+      expect(user.skills).toEqual(['good']);
+      expect(user.errors).toEqual([refused(resolve(userRoot, 'pipe')), refused(resolve(userRoot, 'zero'))]);
+      expect(user.ms).toBeLessThan(2_000);
+    },
+    40_000,
+  );
+
+  it('never reads a workflow skill through a link: a linked skill directory or SKILL.md is reported', () => {
+    const outside = resolve(tempDir, 'outside');
+    const linkedDirTarget = writeSkill(outside, 'dir-target', { name: 'dir-target', description: 'outside' });
+    const linkedFileTarget = writeSkill(outside, 'file-target', { name: 'file-target', description: 'outside' });
+
+    const skillsRoot = resolve(tempDir, 'staged-skills');
+    writeSkill(skillsRoot, 'good', { name: 'good', description: 'd' });
+    symlinkSync(linkedDirTarget, resolve(skillsRoot, 'linked-dir'));
+    mkdirSync(resolve(skillsRoot, 'linked-manifest'));
+    symlinkSync(resolve(linkedFileTarget, 'SKILL.md'), resolve(skillsRoot, 'linked-manifest', 'SKILL.md'));
+
+    const { skills, errors } = discoverSkillsWithErrors(skillsRoot, 'workflow');
+    expect(skills.map((s) => s.name)).toEqual(['good']);
+    expect(errors).toEqual([
+      {
+        skillDir: resolve(skillsRoot, 'linked-dir'),
+        reason: 'unreadable',
+        detail: expect.stringContaining('symbolic link'),
+      },
+      {
+        skillDir: resolve(skillsRoot, 'linked-manifest'),
+        reason: 'unreadable',
+        detail: expect.stringContaining('symlink'),
+      },
+    ]);
+
+    // The user's own skills may be links, as before.
+    const user = discoverSkillsWithErrors(skillsRoot, 'user');
+    expect(user.skills.map((s) => s.name).sort()).toEqual(['dir-target', 'file-target', 'good']);
+    expect(user.errors).toEqual([]);
+  });
+
+  it('skips a link to a loose file at a skills root, like any loose file, and still reports a dangling one', () => {
+    // Only a link to a directory stands for a skill (and is refused for workflow
+    // skills); a linked README is no skill and must not become a WF010 error.
+    const skillsRoot = resolve(tempDir, 'staged-skills');
+    writeSkill(skillsRoot, 'good', { name: 'good', description: 'd' });
+    writeFileSync(resolve(tempDir, 'README.md'), '# shared readme\n');
+    symlinkSync(resolve(tempDir, 'README.md'), resolve(skillsRoot, 'README.md'));
+    symlinkSync(resolve(tempDir, 'missing'), resolve(skillsRoot, 'dangling'));
+    // A device behind a link is classified by stat alone, never opened.
+    if (hasDevZero) symlinkSync('/dev/zero', resolve(skillsRoot, 'zero'));
+
+    for (const source of ['workflow', 'user'] as const) {
+      expect(discoverSkillsWithErrors(skillsRoot, source)).toEqual({
+        skills: [{ name: 'good', source, sourceDir: resolve(skillsRoot, 'good'), description: 'd' }],
+        errors: [
+          {
+            skillDir: resolve(skillsRoot, 'dangling'),
+            reason: 'unreadable',
+            detail: expect.stringContaining('ENOENT'),
+          },
+        ],
+      });
+    }
+  });
+
+  it('parses the frontmatter of a SKILL.md longer than the read limit', () => {
+    const skillsRoot = resolve(tempDir, 'skills');
+    writeSkill(skillsRoot, 'long', { name: 'long', description: 'd' }, 'x'.repeat(SKILL_MANIFEST_READ_BYTES + 1024));
+
+    for (const source of ['workflow', 'user'] as const) {
+      expect(discoverSkillsWithErrors(skillsRoot, source)).toEqual({
+        skills: [{ name: 'long', source, sourceDir: resolve(skillsRoot, 'long'), description: 'd' }],
+        errors: [],
+      });
+    }
   });
 });
 

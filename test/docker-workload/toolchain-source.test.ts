@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import { resolveDockerToolchainSource } from '../../src/docker-workload/toolchain-source.js';
+import {
+  findLocalDockerToolchainSource,
+  resolveDockerToolchainSource,
+} from '../../src/docker-workload/toolchain-source.js';
 
 const image = {
   id: `sha256:${'a'.repeat(64)}`,
@@ -67,5 +70,33 @@ describe('shared Docker source selection', () => {
         'arm64',
       ),
     ).resolves.toMatchObject({ reference: `docker:29.2.1-dind-rootless@${image.id}` });
+  });
+
+  it('finds the source a resolution would select from the local image, without pulling', async () => {
+    // No pullImage: the lookup must never fetch anything.
+    const runtime = { inspectImage: vi.fn().mockResolvedValue({ ...image, architecture: 'arm64' }) };
+    await expect(findLocalDockerToolchainSource(runtime)).resolves.toEqual({
+      architecture: 'arm64',
+      imageId: image.id,
+      reference: image.repoDigests[0],
+    });
+    expect(runtime.inspectImage).toHaveBeenCalledWith('docker:29.2.1-dind-rootless');
+    const resolving = { inspectImage: vi.fn().mockResolvedValue(image), pullImage: vi.fn() };
+    await expect(findLocalDockerToolchainSource(resolving)).resolves.toEqual(
+      await resolveDockerToolchainSource(resolving, 'amd64'),
+    );
+  });
+
+  it('finds nothing when the local image is absent or unusable', async () => {
+    for (const local of [
+      undefined,
+      { ...image, architecture: undefined },
+      { ...image, repoDigests: undefined },
+      { ...image, id: 'not-an-id' },
+    ]) {
+      await expect(
+        findLocalDockerToolchainSource({ inspectImage: vi.fn().mockResolvedValue(local) }),
+      ).resolves.toBeUndefined();
+    }
   });
 });

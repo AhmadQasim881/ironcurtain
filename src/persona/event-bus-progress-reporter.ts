@@ -21,6 +21,10 @@
  */
 
 import type { ServerProgressReporter, CompilationPhase } from '../pipeline/pipeline-shared.js';
+import { toDisplayText } from '../terminal/display-sanitize.js';
+
+/** Longest failure message carried in a progress detail (rendered characters). */
+const FAILURE_DETAIL_MAX_LENGTH = 300;
 
 /** Live server-progress snapshot written into the operation record. */
 export interface ServerProgressSnapshot {
@@ -80,10 +84,12 @@ export class EventBusProgressReporter implements ServerProgressReporter {
     this.update('compiling', message);
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- interface conformance
   fail(phase: CompilationPhase, error: Error): void {
-    // The terminal `persona.compile.failed` event is emitted by the
-    // orchestrator's finally block; nothing to do here.
+    // One server failed. Show it in the live snapshot and progress stream; the
+    // compile may still finish for the other servers. The authoritative record
+    // is emitted by the orchestrator: the terminal result's `failedServers`
+    // (partial failure, `persona.compile.done`) or `persona.compile.failed`.
+    this.update(phase, `Failed: ${toDisplayText(error.message, { maxLength: FAILURE_DETAIL_MAX_LENGTH })}`);
   }
 
   done(summary: string): void {

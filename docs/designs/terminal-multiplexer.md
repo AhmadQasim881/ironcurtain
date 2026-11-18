@@ -1,6 +1,7 @@
 # Design: Terminal Multiplexer (`ironcurtain mux`)
 
-**Status:** Proposed
+**Status (2026-11-14):** Implemented (`src/mux/`, `ironcurtain mux`). Auto-approval and its trusted-input staleness check (`TRUSTED_INPUT_STALENESS_MS`) live in `src/trusted-process/tool-call-pipeline.ts`; the file list (section 13), the migration plan (section 14) and the closing list of critical files name `mcp-proxy-server.ts` for them as the original plan, each with a note on where the check moved. Section 10.4 (single-instance lock) is superseded by `multiple-mux-sessions.md`.
+
 **Date:** 2026-03-02
 **Author:** IronCurtain Engineering
 
@@ -111,6 +112,14 @@ Claude Code uses rich terminal output: colors, cursor movement, alternate screen
 The mux needs to compose multiple UI elements (tab bar, PTY viewport, escalation panel, input line) into a single screen. `terminal-kit`'s ScreenBuffer provides cell-level manipulation and delta-optimized rendering (only redraws changed cells). This is critical for performance -- re-rendering a full 80x24 terminal on every PTY output byte would cause visible flicker.
 
 We avoid `terminal-kit`'s `Layout` widget because it is undocumented (marked TODOC in the library). Instead, we use ScreenBuffer directly with manual row/column calculations for each UI region.
+
+**As implemented.** The renderer draws with terminal-kit's direct calls rather than a ScreenBuffer, and does its own damage tracking (`src/mux/mux-renderer.ts`, `src/mux/frame-writer.ts`):
+
+- **One write per frame.** Every redraw (output frame, full redraw, footer flash, arming tick) collects everything it draws and sends it as a single write wrapped in synchronized-output mode (`CSI ? 2026 h` ... `CSI ? 2026 l`), so a terminal that supports it presents the frame atomically and none sees a half-drawn state. Terminals that do not know the mode ignore it.
+- **Changed PTY rows only.** The bytes each viewport row was last drawn with are kept per tab (by screen row); a row is sent only when its bytes differ, so a spinner costs its own row, not the screen. The cache starts over on a full redraw (which clears the screen inside the frame), a resize, and a change of tab, mode or scroll position; rows an overlay takes over are dropped from it and repainted when they come back.
+- **Overlays composed into the frame.** The overlay is drawn first into its own buffer and records the cells it covers; PTY rows skip those cells (padding to the overlay's edge). Whenever a PTY span is emitted beside an overlay on the same row, that frame sends the overlay again after the PTY spans, even if its contents are unchanged.
+- **Host-width-safe PTY cells.** The renderer compares each cell's text with the host display-width model. A cell whose width differs from xterm's recorded width, or whose text contains default-ignorable or format characters, is replaced by spaces in its recorded columns and style. Matching wide, emoji and combining-mark cells keep their text; width disagreements and joining/format sequences cannot extend a PTY span into the overlay.
+- **Regions sent on change.** The tab bar and footer are sent only when their bytes differ from what was last sent for them: the footer, for one, only when the flash, the pending count, the scroll offset or the label changes. An unchanged overlay is cached only while its covered rows emit no adjacent PTY spans.
 
 ### 3.4 Two input modes with `Ctrl-A` as the command character
 
@@ -476,11 +485,25 @@ export interface MuxEscalationManager {
    */
   removeSession(sessionId: string): void;
 
-  /** Resolves a pending escalation by display number. */
-  resolve(displayNumber: number, decision: 'approved' | 'denied'): string;
+  /**
+   * Resolves a pending escalation by display number. With `escalationId`
+   * the decision is refused unless that request is the one pending under
+   * the number (the picker passes the id of the escalation it showed).
+   */
+  resolve(
+    displayNumber: number,
+    decision: 'approved' | 'denied',
+    options?: { whitelist?: boolean; escalationId?: string },
+  ): string;
 
-  /** Resolves all pending escalations. */
-  resolveAll(decision: 'approved' | 'denied'): string;
+  /** Denies all pending escalations. */
+  denyAll(): string;
+
+  /**
+   * Approves exactly the reviewed set from the approve-all confirmation;
+   * refused, resolving nothing, if the pending set changed since.
+   */
+  approveAll(reviewed: readonly PendingRef[], options?: { whitelist?: boolean }): string;
 
   /** Starts polling for externally-spawned sessions. */
   startRegistryPolling(): void;
@@ -726,7 +749,7 @@ function readTerminalBuffer(terminal: HeadlessTerminal, ...): TranslatedCell[][]
 }
 ```
 
-**2. Dirty-line tracking (future optimization).** If profiling shows the cell-by-cell scan is a bottleneck, add a dirty-line bitmap. xterm.js fires events when lines are modified; the renderer can track which lines changed since the last frame and only read those lines from the buffer. This optimization is deferred to Phase 1 validation -- the reusable cell approach may be sufficient.
+**2. Dirty-line tracking.** Output is tracked per row (see section 3.3, "As implemented"): each frame still reads the visible rows, but only rows whose rendered bytes changed are sent. Reading only the lines xterm.js reports as modified would also save the scan; it is not needed, since a frame's scan takes well under a millisecond.
 
 ### 5.4 Session Discovery
 
@@ -820,7 +843,7 @@ Escalation panel + hint bar + input line overlay the bottom N rows. Max overlay 
 │  │ [2] Session #2  git/git_push                                  │   │
 │  │     Reason: Not in allow list                                │   │
 │  ├───────────────────────────────────────────────────────────────┤   │
-│  │ [CMD] /approve N · /deny N · /approve all · Ctrl-A → PTY    │   │  ← hint bar (overlay)
+│  │ /approve N  /approve+ N  /deny N  /deny all  Ctrl-E review   │   │  ← hint bar (overlay)
 │  │ > _                                                          │   │  ← input line (overlay)
 └──┴───────────────────────────────────────────────────────────────┴───┘
 ```
@@ -903,14 +926,17 @@ User types "push my changes to origin" in command mode, presses Enter
 Later, Claude Code makes a git_push tool call
     │
     ▼
-MCP Proxy (mcp-proxy-server.ts) evaluates policy → escalate
+ToolCallCoordinator (tool-call-pipeline.ts, in the PTY session process)
+evaluates policy → escalate
     │
     ▼
-Auto-approver reads user-context.json:
+Coordinator reads user-context.json (isPtySession = true, from the config):
     - userMessage: "push my changes to origin"
     - source: "mux-trusted-input"  ← trusted source check passes
+    - timestamp: fresh             ← staleness check passes
     │
     ▼
+Anchor check: "origin" (or the host it connects to) is named → LLM consulted
 Auto-approver calls LLM: "push to origin" matches git_push → approve
     │
     ▼
@@ -927,63 +953,24 @@ The security guarantee depends on the following invariant:
 - The sandbox cannot overwrite `user-context.json` with a malicious message
 - Text captured in the mux's command mode is guaranteed to be from the human user
 
-The auto-approver in `mcp-proxy-server.ts` already reads `user-context.json` from the escalation directory. The only change needed is to optionally check the `source` field when auto-approving PTY sessions.
+The auto-approver runs in the `ToolCallCoordinator` (`handleCallTool` in `tool-call-pipeline.ts`) inside the session process and reads `user-context.json` from the escalation directory. For PTY sessions it additionally checks the `source` and `timestamp` fields (§7.3).
 
 ### 7.3 Auto-Approver Integration
 
-The auto-approver's `readUserContext()` function in `src/trusted-process/auto-approver.ts` currently reads `{ userMessage }` and returns the string. It needs to be extended to also parse the `source` field:
+`readUserContext()` in `src/trusted-process/auto-approver.ts` parses `{ userMessage, source?, timestamp? }` and returns `null` for a missing, malformed or empty context. The coordinator checks it with `isUserContextTrusted()` in `src/trusted-process/tool-call-pipeline.ts` before the auto-approver is called:
 
 ```typescript
-export interface UserContext {
-  readonly userMessage: string;
-  readonly source?: string;
-}
-
-export function readUserContext(escalationDir: string): UserContext | null {
-  try {
-    const contextPath = resolve(escalationDir, 'user-context.json');
-    const data = JSON.parse(readFileSync(contextPath, 'utf-8')) as Record<string, unknown>;
-    const { userMessage, source } = data;
-    if (typeof userMessage !== 'string' || !userMessage.trim()) return null;
-    return {
-      userMessage,
-      source: typeof source === 'string' ? source : undefined,
-    };
-  } catch {
-    return null;
-  }
-}
+// In handleCallTool (tool-call-pipeline.ts), inside the escalation wait:
+const ctx = readUserContext(deps.escalationDir);
+const trusted = ctx !== null && isUserContextTrusted(ctx, deps.isPtySession === true);
+// PTY sessions: source must be 'mux-trusted-input' and the timestamp present,
+// valid, not in the future and within TRUSTED_INPUT_STALENESS_MS (120 s).
+// Other sessions: any source; a valid timestamp must still be fresh.
 ```
 
-In the proxy, when auto-approving PTY sessions, the `source` field is checked:
+The coordinator learns that it serves a PTY session from the session config: `pty-session.ts` sets `isPtySession: true` on the `IronCurtainConfig` it hands to the Docker infrastructure, and `sandbox/index.ts` passes `config.isPtySession` to the `ToolCallCoordinator` constructor (`ToolCallCoordinatorOptions.isPtySession`), which threads it into the pipeline deps (`CallToolDeps.isPtySession`). No environment variable is involved. (An earlier version read `IRONCURTAIN_PTY_SESSION` from the environment; once the coordinator moved into the session process that variable only reached the relay subprocesses, which never run the auto-approver, so the PTY gate was silently inert. The variable has been removed.)
 
-```typescript
-// In mcp-proxy-server.ts, inside the escalation handling block:
-const context = readUserContext(deps.escalationDir);
-if (context) {
-  // For PTY sessions, require trusted source.
-  // For standard sessions, any source (or no source) is accepted
-  // since the session process writes user-context.json directly.
-  const isPtySession = Boolean(process.env.IRONCURTAIN_PTY_SESSION);
-  if (isPtySession && context.source !== 'mux-trusted-input') {
-    // Skip auto-approve -- fall through to human escalation
-  } else {
-    // Check staleness: reject trusted input older than 120 seconds
-    if (context.timestamp) {
-      const age = Date.now() - new Date(context.timestamp).getTime();
-      if (age > TRUSTED_INPUT_STALENESS_MS) {
-        // Stale context -- fall through to human escalation
-      }
-    }
-    const autoResult = await autoApprove(/* ... */);
-    // ...
-  }
-}
-
-const TRUSTED_INPUT_STALENESS_MS = 120_000; // 2 minutes
-```
-
-**Note:** The `IRONCURTAIN_PTY_SESSION` environment variable does not currently exist in the codebase. It must be added to the proxy's environment setup in `pty-session.ts` as part of this work. Specifically, `proxyEnv` in `pty-session.ts` (where `AUTO_APPROVE_*` env vars are set) must include `IRONCURTAIN_PTY_SESSION: '1'`. This ensures the proxy can distinguish PTY sessions from standard sessions when gating auto-approval on the `source` field.
+Escalations that a human must decide are never handed to the auto-approver at all, whatever the trusted input says: `add_proxy_domain` (opening a passthrough tunnel) is `humanOnly` (see `docs/designs/auto-approver.md` §8.9).
 
 ## 8. Command Handling
 
@@ -992,13 +979,16 @@ const TRUSTED_INPUT_STALENESS_MS = 120_000; // 2 minutes
 | Command | Description | Implementation |
 |---------|-------------|----------------|
 | `/approve N` | Approve escalation #N | Delegates to `MuxEscalationManager.resolve(N, 'approved')` |
-| `/approve all` | Approve all pending escalations | Delegates to `MuxEscalationManager.resolveAll('approved')` |
+| `/approve+ N` | Approve escalation #N and whitelist its exact pattern | Delegates to `MuxEscalationManager.resolve(N, 'approved', { whitelist: 'exact' })` |
+| `/approve+dir N` | Approve escalation #N and whitelist its directory-wide pattern; refused, resolving nothing, when it offers none (and for `all`) | Delegates to `MuxEscalationManager.resolve(N, 'approved', { whitelist: 'directory' })` |
+| `/approve all`, `/approve+ all` | Open the approve-all confirmation listing every pending escalation; `y` there approves exactly that set, except human-only ones (`EscalationRequest.humanOnly`, e.g. `add_proxy_domain`), which stay pending with a "requires individual approval" note. Any change to the set cancels it | `MuxInputHandler.enterBulkApproveConfirm()`, then `MuxEscalationManager.approveAll(reviewed)` (see `mux-escalation-picker-ui.md` section 5.4) |
+| `/approve group N`, `/approve+ group N` | Open the same confirmation for the escalations sharing #N's exact whitelist pattern, the one `/approve+` selects (never a human-only one; a shared directory-wide pattern forms no group, and `/approve+dir group` is refused); `y` there approves each member once (`+`: and whitelists that exact pattern in its session). Any change to the group cancels it | `MuxEscalationManager.groupOf(N)`, `MuxInputHandler.enterBulkApproveConfirm(members, whitelist, mode, group)`, then `MuxEscalationManager.approveGroup(reviewed, key)` (see `mux-escalation-picker-ui.md` section 6.2) |
 | `/deny N` | Deny escalation #N | Delegates to `MuxEscalationManager.resolve(N, 'denied')` |
-| `/deny all` | Deny all pending | Delegates to `MuxEscalationManager.resolveAll('denied')` |
+| `/deny all` | Deny all pending | Delegates to `MuxEscalationManager.denyAll()` |
 | `/new` | Spawn a new PTY session tab | Creates a new PtyBridge, adds to tab list |
 | `/tab N` | Switch to tab N | Changes active tab, triggers full redraw |
 | `/close N` | Close tab N (kills child process) | Calls `PtyBridge.kill()`, removes from tab list |
-| `/sessions` | Show session details | Displays session info in the escalation panel area |
+| `/sessions` | Show session details | Opens the message panel (`message-panel` mode, bottom half of the viewport, Esc closes) with one line per session |
 | `/quit` or `/q` | Exit multiplexer | Triggers `MuxApp.shutdown()` |
 | (any other text) | Trusted user input | Writes `user-context.json`, forwards to PTY |
 
@@ -1007,6 +997,7 @@ const TRUSTED_INPUT_STALENESS_MS = 120_000; // 2 minutes
 | Key | Action |
 |-----|--------|
 | `Ctrl-A` | Enter command mode |
+| `Ctrl-E` | Open the escalation picker (an arriving escalation never opens it; see `mux-escalation-picker-ui.md` section 5) |
 | `Ctrl-\` | Forwarded to active PTY (child handles as emergency exit -- see Section 3.9) |
 | All other keys | Forward to active PTY |
 
@@ -1088,16 +1079,21 @@ The `source: "mux-trusted-input"` field provides defense-in-depth: even if a fut
 
 ### 10.2 Auto-approver integration
 
-The auto-approver continues to operate in the proxy process (`mcp-proxy-server.ts`), reading `user-context.json` from the escalation directory. The changes are:
+The auto-approver operates in the `ToolCallCoordinator` in the session process (`handleCallTool` in `tool-call-pipeline.ts`), reading `user-context.json` from the escalation directory. The rules are:
 
-1. `readUserContext()` returns both `userMessage`, `source`, and `timestamp`
-2. For PTY sessions (detected via `IRONCURTAIN_PTY_SESSION` env var, which must be added to the proxy env in `pty-session.ts`), the proxy requires `source === 'mux-trusted-input'` before calling the auto-approver
-3. A staleness check rejects `user-context.json` older than 120 seconds (see Section 10.6)
-4. For standard sessions, the existing behavior is unchanged (no source or staleness check required)
+1. `readUserContext()` returns `userMessage`, `source` and `timestamp`
+2. For PTY sessions (the coordinator's `isPtySession` option, from `IronCurtainConfig.isPtySession`), the coordinator requires `source === 'mux-trusted-input'` before calling the auto-approver
+3. A staleness check rejects a `user-context.json` whose timestamp is older than 120 seconds (see Section 10.5); in PTY sessions a missing timestamp is rejected too
+4. For standard sessions the source is not checked; the session itself writes every context with `source: 'session-direct'` and a timestamp, and clears it (`source: 'system-generated'`, empty message) for turns it generates itself, such as the memory auto-save prompt
+5. Human-only escalations (`add_proxy_domain`) never reach the auto-approver, and `/approve all` leaves them pending
 
 The auto-approver can never deny, only approve or escalate. This invariant is unchanged.
 
 ### 10.3 Terminal safety
+
+Quoted untrusted terminal fields use the shared `toDisplayText` boundary; controls and invisible characters become visible escapes before trusted styling is added. In the non-mux CLI, `renderAgentMarkdown` strips terminal sequences before rendering prose and explicitly shows link/image destinations as inert text, including custom URI schemes. It never generates OSC 8 hyperlinks whose label could conceal a destination.
+
+Machine-readable CLI JSON uses `toTerminalSafeJsonText` at stdout sinks, including audit reports/proposals/verification, prune reports, statistics summaries, nested-workload status and workflow watch. Unicode escapes preserve decoded values while keeping terminal-active characters inert; watch also normalizes CR/tab JSON whitespace. Stored audit and workflow logs retain their existing bytes and redaction behavior. Relay stderr uses the same terminal-display boundary independently of persistent-log redaction (`src/trusted-process/relay-diagnostics.ts`).
 
 Raw mode restoration is critical. If the mux crashes without restoring the terminal, the user's shell becomes unusable (no echo, no line editing). The mux implements multiple safety layers:
 
@@ -1131,6 +1127,8 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
 
 ### 10.4 Single-instance enforcement
 
+> **Superseded (2026-11):** see `multiple-mux-sessions.md`. The mux no longer takes this lock: each mux owns the sessions it spawns (`muxId`), only `ironcurtain escalation-listener` takes the lock (`src/escalation/listener-lock.ts`), and a mux claims unowned or orphaned sessions only while no standalone listener holds it (`src/mux/mux-escalation-manager.ts`). The original text follows.
+
 The mux acquires `~/.ironcurtain/escalation-listener.lock` (the same lock used by `ironcurtain escalation-listener`) using the existing `acquireLock()` function from `listener-command.ts`. This prevents:
 
 - Two mux instances from conflicting on escalation resolution
@@ -1145,9 +1143,9 @@ There is a time-of-check-to-time-of-use gap between when the user types trusted 
 
 **Mitigation:** The auto-approver checks the `timestamp` field in `user-context.json`. If the context is older than `TRUSTED_INPUT_STALENESS_MS` (120 seconds / 2 minutes), the auto-approver skips auto-approval and falls through to human escalation. This bounds the TOCTOU window: the user's trusted input is only valid for a short period after they typed it.
 
-The 120-second window is a pragmatic choice: long enough that the agent can process the user's instruction and make tool calls, short enough that stale context from a previous conversation turn is unlikely to be used. This value is currently implemented as a fixed constant (`TRUSTED_INPUT_STALENESS_MS`) in `mcp-proxy-server.ts`; future work may make it configurable via user configuration.
+The 120-second window is a pragmatic choice: long enough that the agent can process the user's instruction and make tool calls, short enough that stale context from a previous conversation turn is unlikely to be used. This value is currently implemented as a fixed constant (`TRUSTED_INPUT_STALENESS_MS`) in `tool-call-pipeline.ts`; future work may make it configurable via user configuration. It bounds non-PTY sessions too, since their contexts are now timestamped: a user message authorizes auto-approval for 120 s after it was sent.
 
-**Residual risk:** Within the staleness window, a compromised sandbox could still exploit the mismatch between trusted context and actual PTY input. This is acceptable because (a) the auto-approver's LLM prompt is conservative and matches on specific intent, not broad categories, and (b) the policy engine's argument-level checks (via `extractArgsForAutoApprove`) catch mismatches between the stated intent and the actual tool arguments when annotations include resource-identifier roles.
+**Residual risk:** Within the staleness window, a compromised sandbox could still exploit the mismatch between trusted context and actual PTY input. This is acceptable because (a) the auto-approver's LLM prompt is conservative and matches on specific intent, not broad categories, (b) a deterministic anchor check escalates any call whose escalated resource (path or its directory, destination host, identifier) the trusted message does not name, before the model is consulted, and (c) the model sees the resource arguments (via `extractArgsForAutoApprove`) as structured, JSON-encoded data, so mismatches between the stated intent and the actual tool arguments are visible to it.
 
 ### 10.6 `source` field is not cryptographic -- Docker isolation is the trust root
 
@@ -1156,7 +1154,7 @@ The `source: "mux-trusted-input"` field is a plain string, not a cryptographic a
 This is acceptable because the trust root is **Docker container isolation**, not the source field. The source field provides defense-in-depth:
 
 - In **Docker Agent Mode** (the primary target): the container cannot access the escalation directory. The source field adds a second layer in case a future code change accidentally exposes the directory.
-- In **Code Mode** (bubblewrap sandbox): the sandbox has weaker isolation. The source field provides no meaningful security here. However, Code Mode uses `TrustedProcess` in-process (not the proxy), and the `setLastUserMessage()` method is called directly by the session -- so Code Mode does not need the `source` field mechanism at all.
+- In **Code Mode** (bubblewrap sandbox): the sandbox has weaker isolation. The source field provides no meaningful security here. Code Mode sessions are never PTY sessions: `AgentSession` writes `user-context.json` itself at the start of each turn (`source: 'session-direct'`, with a timestamp) and the coordinator in the same process reads it, so the `mux-trusted-input` check does not apply to them.
 
 This limitation should be documented in user-facing auto-approver docs: auto-approve in PTY mode is designed for Docker Agent Mode.
 
@@ -1218,7 +1216,7 @@ process.stdout.on('resize', () => {
 });
 ```
 
-Resizing all bridges costs one `docker exec resize-pty.sh` call per inactive session, but this is acceptable:
+Resizing all bridges costs one `docker exec resize-pty.sh` call per inactive session (each child coalesces a burst of resizes into at most one exec in flight with the latest size, see `src/docker/pty-resize-queue.ts`), but this is acceptable:
 - Terminal resizes are infrequent (human-initiated)
 - `docker exec` is fast (~50ms)
 - Incorrect terminal width causes garbled output that is much worse than the resize cost
@@ -1404,8 +1402,8 @@ This test will be skipped in CI if no TTY is available (`process.stdout.isTTY`).
 | `src/cli.ts` | Add `case 'mux':` to import and run `src/mux/mux-command.ts`. Add `mux` to help text. |
 | `src/escalation/listener-command.ts` | Extract lock management into `src/escalation/listener-lock.ts`. Import from new location. |
 | `src/trusted-process/auto-approver.ts` | Extend `readUserContext()` to return `{ userMessage, source? }` instead of just `string`. Add `UserContext` interface. |
-| `src/trusted-process/mcp-proxy-server.ts` | Add `source` check and staleness check on `readUserContext()` result for PTY sessions: require `source === 'mux-trusted-input'` and `timestamp` within staleness window when `IRONCURTAIN_PTY_SESSION` env var is set. |
-| `src/docker/pty-session.ts` | Add `IRONCURTAIN_PTY_SESSION: '1'` to `proxyEnv` so the proxy can detect PTY sessions for auto-approver source gating. |
+| `src/trusted-process/mcp-proxy-server.ts` | Add `source` check and staleness check on `readUserContext()` result for PTY sessions: require `source === 'mux-trusted-input'` and `timestamp` within staleness window when `IRONCURTAIN_PTY_SESSION` env var is set. *(Superseded: the check now lives in `tool-call-pipeline.ts` and the PTY mode arrives as the coordinator's `isPtySession` option; see §7.3.)* |
+| `src/docker/pty-session.ts` | Add `IRONCURTAIN_PTY_SESSION: '1'` to `proxyEnv` so the proxy can detect PTY sessions for auto-approver source gating. *(Superseded: `pty-session.ts` sets `isPtySession: true` on the session config; the environment variable has been removed.)* |
 | `package.json` | Add dependencies: `terminal-kit@3.1.2`, `@xterm/headless@6.0.0`. Add `node-pty@1.1.0` as `optionalDependency`. |
 | `docs/designs/terminal-multiplexer.md` | This design document. |
 
@@ -1449,8 +1447,8 @@ This test will be skipped in CI if no TTY is available (`process.stdout.isTTY`).
 
 1. Create `src/mux/trusted-input.ts` -- `writeTrustedUserContext()`
 2. Extend `readUserContext()` in `auto-approver.ts` to return `{ userMessage, source?, timestamp? }` instead of `string`
-3. Add `IRONCURTAIN_PTY_SESSION=1` to `proxyEnv` in `pty-session.ts`
-4. Add `source` check and staleness check in `mcp-proxy-server.ts` for PTY sessions
+3. Add `IRONCURTAIN_PTY_SESSION=1` to `proxyEnv` in `pty-session.ts` (superseded: `IronCurtainConfig.isPtySession` passed to the coordinator, §7.3)
+4. Add `source` check and staleness check in `mcp-proxy-server.ts` for PTY sessions (superseded: `isUserContextTrusted` in `tool-call-pipeline.ts`)
 5. Wire trusted input into MuxApp: non-command text writes context then forwards to PTY
 6. Write unit tests for trusted input and staleness logic
 7. Validate end-to-end: user types text in command mode, auto-approver receives it, approves matching escalation
@@ -1494,6 +1492,6 @@ Show a notification in the footer when the auto-approver auto-approves an escala
 
 - `/workspace/ironcurtain/src/escalation/listener-command.ts` - Contains lock management and command handling code to extract and reuse
 - `/workspace/ironcurtain/src/trusted-process/auto-approver.ts` - Must extend `readUserContext()` to support the `source` field for trusted input verification
-- `/workspace/ironcurtain/src/trusted-process/mcp-proxy-server.ts` - Must add source-field check for PTY session auto-approval gate
+- `/workspace/ironcurtain/src/trusted-process/mcp-proxy-server.ts` - Must add source-field check for PTY session auto-approval gate (the gate now lives in `tool-call-pipeline.ts`, §7.3)
 - `/workspace/ironcurtain/src/escalation/listener-state.ts` - Immutable state management to reuse directly in the escalation manager
 - `/workspace/ironcurtain/src/docker/pty-session.ts` - Reference implementation for PTY session spawning, registration, and cleanup patterns

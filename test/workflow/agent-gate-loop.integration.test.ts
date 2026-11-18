@@ -42,12 +42,13 @@ function makeMockHandler(): ControlRequestHandler {
       signalConnected: false,
       nextFireTime: undefined,
     }),
-    addJob: vi.fn().mockResolvedValue(undefined),
     removeJob: vi.fn().mockResolvedValue(undefined),
     enableJob: vi.fn().mockResolvedValue(undefined),
     disableJob: vi.fn().mockResolvedValue(undefined),
     recompileJob: vi.fn().mockResolvedValue(undefined),
+    refreshLists: vi.fn(),
     reloadJob: vi.fn().mockResolvedValue(undefined),
+    startJobRun: vi.fn(),
     runJobNow: vi.fn().mockResolvedValue({}),
     listJobs: vi.fn().mockReturnValue([]),
   };
@@ -209,31 +210,64 @@ describe('agent gate loop (integration)', () => {
     expect(atGate.gate?.presentedArtifacts).toContain('draft');
     expect(atGate.gate?.acceptedEvents).toEqual(expect.arrayContaining(['APPROVE', 'FORCE_REVISION', 'ABORT']));
 
-    // Inspect the presented artifact (names -> content).
-    const artifact = await client.call<{ files: { path: string; content: string }[] }>('workflows.artifacts', {
-      workflowId,
-      artifactName: 'draft',
-    });
+    // Inspect the presented artifact: the listing carries names and sizes,
+    // each file is fetched separately (WP-32).
+    const artifact = await client.call<{ files: { path: string; size: number }[]; truncated: boolean }>(
+      'workflows.artifacts',
+      { workflowId, artifactName: 'draft' },
+    );
     expect(artifact.ok).toBe(true);
     if (artifact.ok) {
+      expect(artifact.payload.truncated).toBe(false);
       expect(artifact.payload.files.length).toBeGreaterThan(0);
-      expect(artifact.payload.files[0].content).toContain('content for draft');
+      expect(artifact.payload.files[0].size).toBeGreaterThan(0);
+      const file = await client.call<{ content?: string }>('workflows.artifactFile', {
+        workflowId,
+        artifactName: 'draft',
+        path: artifact.payload.files[0].path,
+      });
+      expect(file.ok).toBe(true);
+      if (file.ok) expect(file.payload.content).toContain('content for draft');
     }
+
+    const visit1 = atGate.gate?.gateId;
+    expect(typeof visit1).toBe('string');
+
+    // A decision without the gate it was made against is malformed.
+    const unbound = await client.call('workflows.resolveGate', { workflowId, event: 'APPROVE' });
+    expect(unbound.ok).toBe(false);
+    if (!unbound.ok) expect(unbound.code).toBe('INVALID_PARAMS');
 
     // Empty-prompt FORCE_REVISION must be rejected by the daemon (feedback rule).
     const emptyRevision = await client.call('workflows.resolveGate', {
       workflowId,
+      gateId: visit1,
       event: 'FORCE_REVISION',
       prompt: '',
     });
     expect(emptyRevision.ok).toBe(false);
     if (!emptyRevision.ok) expect(emptyRevision.code).toBe('INVALID_PARAMS');
 
+    // An event the gate does not transition on is refused and nothing moves.
+    const replan = await client.call('workflows.resolveGate', {
+      workflowId,
+      gateId: visit1,
+      event: 'REPLAN',
+      prompt: 'start over',
+    });
+    expect(replan.ok).toBe(false);
+    if (!replan.ok) expect(replan.code).toBe('EVENT_NOT_ACCEPTED');
+    const stillAtGate = await getDetail(client, workflowId);
+    expect(stillAtGate.phase).toBe('waiting_human');
+    expect(stillAtGate.gate?.gateId).toBe(visit1);
+
     // Valid FORCE_REVISION loops back to `produce` and raises the gate again.
     const revision = await client.call('workflows.resolveGate', {
       workflowId,
+      gateId: visit1,
       event: 'FORCE_REVISION',
       prompt: 'tighten it',
+      resolvedBy: 'cli',
     });
     expect(revision.ok).toBe(true);
     await waitForGate(client, workflowId);
@@ -241,9 +275,19 @@ describe('agent gate loop (integration)', () => {
     const atSecondGate = await getDetail(client, workflowId);
     expect(atSecondGate.phase).toBe('waiting_human');
     expect(atSecondGate.gate?.stateName).toBe('review');
+    // The second visit is a new raise with its own id.
+    const visit2 = atSecondGate.gate?.gateId;
+    expect(typeof visit2).toBe('string');
+    expect(visit2).not.toBe(visit1);
 
-    // APPROVE drives to a `completed` terminal (requirement #3).
-    const approve = await client.call('workflows.resolveGate', { workflowId, event: 'APPROVE' });
+    // An approval minted for visit 1 must not land on visit 2.
+    const stale = await client.call('workflows.resolveGate', { workflowId, gateId: visit1, event: 'APPROVE' });
+    expect(stale.ok).toBe(false);
+    if (!stale.ok) expect(stale.code).toBe('GATE_MISMATCH');
+    expect((await getDetail(client, workflowId)).gate?.gateId).toBe(visit2);
+
+    // APPROVE bound to the current raise drives to a `completed` terminal (requirement #3).
+    const approve = await client.call('workflows.resolveGate', { workflowId, gateId: visit2, event: 'APPROVE' });
     expect(approve.ok).toBe(true);
 
     // Authoritative phase, read from `workflows.get` (not the event name).
@@ -263,7 +307,11 @@ describe('agent gate loop (integration)', () => {
     // A gate-ABORT routes to the `aborted` terminal and emits
     // `workflow.failed`; the follow-up `workflows.get` disambiguates the
     // authoritative `phase:'aborted'` result.
-    const abort = await client.call('workflows.resolveGate', { workflowId, event: 'ABORT' });
+    const abort = await client.call('workflows.resolveGate', {
+      workflowId,
+      gateId: atGate.gate?.gateId,
+      event: 'ABORT',
+    });
     expect(abort.ok).toBe(true);
 
     const phase = await waitForTerminal(client, workflowId);

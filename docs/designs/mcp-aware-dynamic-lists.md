@@ -1,5 +1,17 @@
 # MCP-Aware Dynamic Lists and All-Server Read-Only Policy
 
+**Status (2026-11-14):** Implemented, differently from the PolicyEngine sketch below; the Current Implementation section describes what shipped.
+
+## Current Implementation
+
+The mediation this document asks for in §4 is implemented differently from the PolicyEngine sketch below, and §6's "connect every server" behavior was removed:
+
+- **Mediation through the security kernel.** `connectViaProxy` (`src/pipeline/proxy-mcp-connections.ts`) builds a `ToolCallCoordinator` from the bundled read-only policy, the user's tool annotations and real protected paths, with no escalation handler (escalate = deny), auto-approval off, no `allowedDirectory`, no trusted servers, and a real audit log (`list-resolution-audit.jsonl` next to the artifacts). Every resolver tool call goes through `handleToolCall`, so it gets the same argument validation, normalization, protected-path checks, circuit breaker and audit as a session call. The relay subprocess (`mcp-proxy-server.ts`) is a pure pass-through and enforces nothing; an earlier version of the resolver relied on the relay for mediation after the relay stopped evaluating policy, which left list resolution unmediated.
+- **One relay per named server.** Each data-backed list must name its server in `mcpServerHint` (enforced by the compiler schema and again at resolution, via `getMcpListScopeError` in `dynamic-list-types.ts`). Only those servers are connected, each through its own relay with `SERVER_FILTER`, its own credentials, an empty throwaway `ALLOWED_DIRECTORY`, the resolved `IRONCURTAIN_HOME` (the relay runs from IronCurtain's package root, so every path it gets is absolute) and the user's resolved `sandboxPolicy` (a server that needs an unavailable OS sandbox is not started under `"enforce"`). Network-egress servers (`fetch`, including `web_search`) are never connected.
+- **Least-privilege exposure.** The resolver LLM is told only about tools that are annotated, that the read-only policy can allow for some arguments, and that it can never allow with a URL-category argument (`src/pipeline/list-resolution-tools.ts`). A multi-mode tool whose URL-carrying modes the policy refuses is offered for its other modes: `git_remote` is offered for listing, while add/set-url, whose `url` is a `git-remote-url`, are escalated and so refused. Calls to other tool names still go through the kernel and are audited; the bundled read-only policy refuses every tool that is not offered on a server that can be connected.
+- **Connections only on a cache miss, one per compile.** `compile-policy` opens the mediated connection for a server's data-backed lists only when one of them misses the per-list cache (`listsNeedingResolution` in `list-resolver.ts`): a list served from `dynamic-lists.json` starts no relay or Docker container. The connection is then reused by every later list resolution of that server's compile (the repair loop resolves the lists again after each repair) and shut down when the server's compile ends; a resolution that needs a server the open connection does not reach replaces it (`ListMcpConnection` in `pipeline-runner.ts`).
+- **Coverage check.** Instead of the runtime staleness warning in §5, `test/readonly-policy-coverage.test.ts` fails when a server named by the read-only constitution, configured in `mcp-servers.json`, or present in the bundled annotations has no rules in `generated-readonly/`.
+
 ## Problem Statement
 
 Two related gaps exist in the current pipeline:
@@ -44,17 +56,17 @@ Add read-only principles for all onboarded servers. Keep the language general --
 
 ## Concrete Guidance
 
- - The agent is allowed to read files and list directories anywhere on the filesystem
- - The agent is allowed to search file contents
- - The agent is allowed to read git log, status, diff, and branch information
- - The agent is allowed to set the git working directory for navigation
- - The agent must ask for approval before adding, removing, or renaming git remotes
- - The agent is allowed to list and read GitHub issues, pull requests, and repository metadata
- - The agent is allowed to read messages, contacts, calendar events, and document content from connected cloud services
- - The agent must ask for approval before sending messages, creating events, uploading files, or modifying any cloud service data
- - The agent is allowed to fetch URLs and perform web searches for data gathering
- - The agent must ask for approval before any write, create, delete, or push operation
- - The agent must ask for approval before modifying git state (commit, checkout, merge, rebase)
+- The agent is allowed to read files and list directories anywhere on the filesystem
+- The agent is allowed to search file contents
+- The agent is allowed to read git log, status, diff, and branch information
+- The agent is allowed to set the git working directory for navigation
+- The agent must ask for approval before adding, removing, or renaming git remotes
+- The agent is allowed to list and read GitHub issues, pull requests, and repository metadata
+- The agent is allowed to read messages, contacts, calendar events, and document content from connected cloud services
+- The agent must ask for approval before sending messages, creating events, uploading files, or modifying any cloud service data
+- The agent is allowed to fetch URLs and perform web searches for data gathering
+- The agent must ask for approval before any write, create, delete, or push operation
+- The agent must ask for approval before modifying git state (commit, checkout, merge, rebase)
 ```
 
 ### 2. Add a `--no-mcp` Flag to `compile-policy`
@@ -70,7 +82,7 @@ export interface CompilePolicyCliArgs {
   constitution?: string;
   outputDir?: string;
   server?: string;
-  noMcp?: boolean;  // new
+  noMcp?: boolean; // new
 }
 
 export function parseCompilePolicyArgs(argv: string[] = process.argv.slice(2)): CompilePolicyCliArgs {
@@ -92,7 +104,7 @@ export function parseCompilePolicyArgs(argv: string[] = process.argv.slice(2)): 
 }
 ```
 
-In `main()`, when `--no-mcp` is set, pass `mcpServers: undefined` to `PipelineRunConfig` so the pipeline skips MCP connections during list resolution. The existing list resolution code already handles this case: `if (needsMcp && config.mcpServers)` guards the connection.
+In `main()`, when `--no-mcp` is set, pass `mcpServers: undefined` to `PipelineRunConfig` so the pipeline skips MCP connections during list resolution. The existing list resolution code already handles this case: `if (needsMcp && config.mcpServers)` guards the connection. A data-backed list that then has no valid cached resolution is left UNRESOLVED (no values, an empty `inputHash` so no later run takes it for a cache hit) with a warning instead of failing its server; a later compile with MCP access resolves it and re-verifies that server's cached rules rather than serving them as they are.
 
 ### 3. Add `npm run compile-policy:readonly` Convenience Script
 
@@ -111,6 +123,8 @@ The existing `compile-policy` script routes through `src/cli.ts`. The readonly v
 This makes it easy to regenerate the read-only policy. The resulting artifacts are committed to the repo (they ship with the package as defaults).
 
 ### 4. Policy-Mediated List Resolution
+
+> Implemented with a `ToolCallCoordinator` rather than a bare `PolicyEngine`; see "Current Implementation" above. The sketch below is kept for the design rationale. Note that a bare `PolicyEngine.evaluate()` on raw arguments would skip the coordinator's argument validation, `prepareToolArgs` normalization and audit, and the single multi-server relay it assumed cannot tell the engine which server a tool belongs to.
 
 The list resolver's MCP calls must be routed through a PolicyEngine loaded with the read-only compiled policy. This ensures the LLM cannot accidentally invoke mutating tools (sending emails, deleting files, pushing code) during list resolution.
 
@@ -142,11 +156,7 @@ The `bridgeMcpTools` function receives the PolicyEngine from the config and gate
  * Bridges MCP server tools as AI SDK tools with execute functions
  * that route calls through the policy engine before forwarding.
  */
-function bridgeMcpTools(
-  serverName: string,
-  connection: McpServerConnection,
-  policyEngine: PolicyEngine,
-): ToolSet {
+function bridgeMcpTools(serverName: string, connection: McpServerConnection, policyEngine: PolicyEngine): ToolSet {
   const tools: ToolSet = {};
   for (const mcpTool of connection.tools) {
     const qualifiedName = `${serverName}__${mcpTool.name}`;
@@ -211,7 +221,7 @@ import { loadGeneratedPolicy, extractServerDomainAllowlists, getPackageGenerated
 // Read-only compiled policy lives in generated-readonly/.
 // Tool annotations are shared -- they live in the main generated dir.
 const readonlyPolicyDir = resolve(__dirname, '..', 'config', 'generated-readonly');
-const mainAnnotationsDir = config.generatedDir;  // or getPackageGeneratedDir() as fallback
+const mainAnnotationsDir = config.generatedDir; // or getPackageGeneratedDir() as fallback
 
 const readonlyArtifacts = loadGeneratedPolicy({
   policyDir: readonlyPolicyDir,
@@ -223,22 +233,22 @@ const readonlyArtifacts = loadGeneratedPolicy({
 // irrelevant -- list resolution queries cloud services, not the local filesystem.
 // Domain allowlists ARE relevant: they enforce the structural domain gate for
 // URL-category roles (e.g., fetch-url, git-remote-url).
-const serverDomainAllowlists = config.mcpServers
-  ? extractServerDomainAllowlists(config.mcpServers)
-  : undefined;
+const serverDomainAllowlists = config.mcpServers ? extractServerDomainAllowlists(config.mcpServers) : undefined;
 
 const policyEngine = new PolicyEngine(
   readonlyArtifacts.compiledPolicy,
   readonlyArtifacts.toolAnnotations as StoredToolAnnotationsFile,
-  [],                      // protectedPaths: not relevant for cloud service calls
-  undefined,               // allowedDirectory: not relevant for cloud service calls
-  serverDomainAllowlists,  // structural domain gate for URL-category roles
+  [], // protectedPaths: not relevant for cloud service calls
+  undefined, // allowedDirectory: not relevant for cloud service calls
+  serverDomainAllowlists, // structural domain gate for URL-category roles
 );
 ```
 
 Note on the type cast: `loadGeneratedPolicy` returns `ToolAnnotationsFile`, but `PolicyEngine` expects `StoredToolAnnotationsFile`. The on-disk JSON is always the stored format (it may contain conditional role specs). The `StoredToolAnnotationsFile` type extends `ToolAnnotationsFile` with optional conditional fields, so the runtime data is structurally compatible. The cast makes this explicit.
 
 ### 5. Staleness Detection
+
+> Implemented as a test (`test/readonly-policy-coverage.test.ts`) rather than a runtime warning; see "Current Implementation" above.
 
 When loading the read-only policy for list resolution, validate that the read-only `compiled-policy.json` covers all servers present in `tool-annotations.json`. This catches the case where a new server has been onboarded but the read-only policy was not recompiled.
 
@@ -250,10 +260,7 @@ This is a warning, not a blocking error -- missing server coverage means the Pol
  * that appear in tool-annotations.json. This indicates the read-only
  * policy needs recompilation after a new server was onboarded.
  */
-function checkReadonlyPolicyStaleness(
-  compiledPolicy: CompiledPolicyFile,
-  toolAnnotations: ToolAnnotationsFile,
-): void {
+function checkReadonlyPolicyStaleness(compiledPolicy: CompiledPolicyFile, toolAnnotations: ToolAnnotationsFile): void {
   const annotatedServers = new Set(Object.keys(toolAnnotations.servers));
 
   // Collect servers mentioned in compiled rules (via server conditions)
@@ -279,6 +286,8 @@ Called once when constructing the list resolver's PolicyEngine, before any list 
 
 ### 6. Make All MCP Servers Available for List Resolution by Default
 
+> Superseded in part: MCP access is still on by default for `compile-policy` and `refresh-lists` (`--no-mcp` turns it off), but a data-backed list must name its server in `mcpServerHint` and only the named servers are connected. The "connect all servers when a list has no hint" fallback was removed, and network-egress servers are never connected.
+
 Currently, `connectMcpServersForLists()` only connects to servers that are hinted by list definitions or, when any list lacks a hint, connects to all configured servers. The function already handles the "connect all" case correctly. The issue is that `refresh-lists` requires `--with-mcp` to connect to any MCP server at all.
 
 **Change:** Make `--with-mcp` the default for both `compile-policy` and `refresh-lists` when MCP-requiring lists exist. The current `--with-mcp` flag becomes a no-op (kept for backward compatibility), and a new `--no-mcp` flag is added to explicitly skip MCP connections.
@@ -288,7 +297,7 @@ Currently, `connectMcpServersForLists()` only connects to servers that are hinte
 ```typescript
 interface RefreshListsOptions {
   readonly listName?: string;
-  readonly withMcp: boolean;  // now defaults to true
+  readonly withMcp: boolean; // now defaults to true
 }
 
 function parseRefreshArgs(args: string[]): RefreshListsOptions | null {
@@ -317,7 +326,7 @@ No changes needed -- it already connects to MCP servers when `config.mcpServers`
 
 ### 7. Graceful Server Connection Failures
 
-`connectMcpServersForLists()` already returns `null` entries for servers that fail to connect. However, the current behavior throws if *no* MCP server connects and a list requires one. For the "all servers available by default" model, some servers may legitimately be unavailable (Docker not running, credentials not configured).
+`connectMcpServersForLists()` already returns `null` entries for servers that fail to connect. However, the current behavior throws if _no_ MCP server connects and a list requires one. For the "all servers available by default" model, some servers may legitimately be unavailable (Docker not running, credentials not configured).
 
 **File:** `src/pipeline/mcp-connections.ts`
 
@@ -335,7 +344,9 @@ const entries = await Promise.all(
       // ... existing connection logic ...
       return [serverName, { client, tools: toolsResult.tools }];
     } catch (err) {
-      console.error(`  ${chalk.yellow('Warning:')} Failed to connect to "${serverName}" -- skipping: ${(err as Error).message}`);
+      console.error(
+        `  ${chalk.yellow('Warning:')} Failed to connect to "${serverName}" -- skipping: ${(err as Error).message}`,
+      );
       return null;
     }
   }),
@@ -360,6 +371,7 @@ compile.ts (CLI) -- with --constitution, --output-dir, and --no-mcp flags
 ```
 
 The only differences are:
+
 - **Input:** `constitution-readonly.md` instead of `constitution.md`
 - **Output:** `src/config/generated-readonly/` instead of `~/.ironcurtain/generated/`
 - **MCP:** No MCP connections (read-only constitution has no dynamic lists)
@@ -387,6 +399,7 @@ compile-policy (main, without --no-mcp)
 ```
 
 After changes:
+
 - `refresh-lists` connects to MCP servers by default (was opt-in via `--with-mcp`).
 - `compile-policy` already passes `mcpServers` through; no change needed.
 - `connectMcpServersForLists()` gracefully handles unavailable servers.
@@ -421,26 +434,26 @@ PR 1 must land first. PR 2 depends on PR 1 (needs the read-only compiled artifac
 
 ## Key Files to Modify
 
-| File | Change |
-|------|--------|
-| `src/config/constitution-readonly.md` | Add general read-only principles for all servers |
-| `src/pipeline/compile.ts` | Add `--no-mcp` flag, suppress mcpServers when set |
-| `src/pipeline/list-resolver.ts` | Add `policyEngine` to config, route MCP calls through policy |
-| `src/pipeline/pipeline-runner.ts` | Load read-only artifacts, create PolicyEngine for list resolution |
-| `src/pipeline/refresh-lists.ts` | Default `withMcp` to `true`, add `--no-mcp`, load read-only policy |
-| `src/pipeline/mcp-connections.ts` | Try-catch around individual server connections |
-| `src/config/generated-readonly/compiled-policy.json` | Regenerated (committed artifact) |
-| `src/config/generated-readonly/test-scenarios.json` | Regenerated (committed artifact) |
-| `package.json` | Add `compile-policy:readonly` script |
+| File                                                 | Change                                                             |
+| ---------------------------------------------------- | ------------------------------------------------------------------ |
+| `src/config/constitution-readonly.md`                | Add general read-only principles for all servers                   |
+| `src/pipeline/compile.ts`                            | Add `--no-mcp` flag, suppress mcpServers when set                  |
+| `src/pipeline/list-resolver.ts`                      | Add `policyEngine` to config, route MCP calls through policy       |
+| `src/pipeline/pipeline-runner.ts`                    | Load read-only artifacts, create PolicyEngine for list resolution  |
+| `src/pipeline/refresh-lists.ts`                      | Default `withMcp` to `true`, add `--no-mcp`, load read-only policy |
+| `src/pipeline/mcp-connections.ts`                    | Try-catch around individual server connections                     |
+| `src/config/generated-readonly/compiled-policy.json` | Regenerated (committed artifact)                                   |
+| `src/config/generated-readonly/test-scenarios.json`  | Regenerated (committed artifact)                                   |
+| `package.json`                                       | Add `compile-policy:readonly` script                               |
 
 ## Non-Goals
 
 - **Per-server output directories for read-only policy.** The read-only `generated-readonly/` dir does not need `servers/` subdirectories since the per-server artifacts are intermediate build products. Only the merged `compiled-policy.json` and `test-scenarios.json` are needed at runtime.
 
-  *However*, the per-server pipeline will write to `outputDir/servers/<name>/` as part of its normal operation. These intermediate files will be created in `generated-readonly/servers/` during compilation and should be `.gitignore`d or cleaned up post-compilation. The simplest approach is to let them exist (they are useful for debugging) and add `src/config/generated-readonly/servers/` to `.gitignore`.
+  _However_, the per-server pipeline will write to `outputDir/servers/<name>/` as part of its normal operation. These intermediate files will be created in `generated-readonly/servers/` during compilation and should be `.gitignore`d or cleaned up post-compilation. The simplest approach is to let them exist (they are useful for debugging) and add `src/config/generated-readonly/servers/` to `.gitignore`.
 
 - **Automatic recompilation of read-only policy.** The read-only policy is compiled manually by developers when new servers are onboarded. It does not need to be part of the regular `compile-policy` flow.
 
-- **Dynamic lists in the read-only policy.** The read-only constitution does not reference dynamic lists. The `--no-mcp` flag ensures no MCP connections are attempted. If a future read-only constitution somehow produces list definitions, the pipeline handles them normally (knowledge-based lists work without MCP; MCP-backed lists would fail due to `--no-mcp`).
+- **Dynamic lists in the read-only policy.** The read-only constitution does not reference dynamic lists. The `--no-mcp` flag ensures no MCP connections are attempted. If a future read-only constitution somehow produces list definitions, the pipeline handles them normally (knowledge-based lists work without MCP; under `--no-mcp` an MCP-backed list is left unresolved: empty, never cached as resolved, with a warning).
 
 - **Escalation handling in list resolution.** When the read-only policy returns `escalate` for a list resolver MCP call, it is treated the same as `deny` -- the call is blocked and an error message is returned to the LLM. There is no human in the loop during offline pipeline execution.

@@ -1,5 +1,7 @@
 # Scenario Generation Batching
 
+**Status (2026-11-14):** Implemented: scenarios are generated in batches of `SCENARIO_BATCH_SIZE` (25) that run concurrently (`src/pipeline/scenario-generator.ts`). The same change (PR #118) removed the `ScenarioGeneratorSession` that the problem statement describes.
+
 ## Problem
 
 The scenario generator fails for large MCP servers (100+ tools) in two ways:
@@ -39,11 +41,21 @@ The current repair loop uses `mergeReplacements` to **remove** corrected scenari
 
 The new design keeps corrected scenarios in-place with patched expectations (via `applyScenarioCorrections`). This is an intentional improvement:
 
-1. **Correctness**: A scenario corrected by the judge has the right expectation by definition. Keeping it preserves verified test coverage.
+1. **Correctness**: A scenario the judge corrected keeps its coverage. Corrections are not trusted blindly, though (see "Correction safeguards" below): they only change which expectation the scenario is checked against, and the scenario still has to pass against the rules.
 2. **Stability**: No LLM call means no risk of the replacement introducing new errors or failing to cover the same ground.
 3. **Simplicity**: Eliminates `mergeReplacements`, `ScenarioFeedback` construction, and the `ScenarioGeneratorSession` multi-turn state.
 
 The only case that still requires an LLM call is generating replacements for structurally discarded scenarios (see "Targeted scenario repair" below).
+
+### Correction safeguards
+
+The judge is an LLM, so its scenario corrections can move the test oracle toward the policy instead of fixing the policy. `triageVerificationFailures` and the repair loop therefore apply them fail-closed:
+
+- **Keyed by result.** The judge names each failure by its `[N]` index as well as its description; `resolveFailureAttributions` maps it to that very result, and corrections are applied by scenario identity. Two scenarios that share a description cannot inherit each other's correction or blame.
+- **Never handwritten, never newly `allow`.** Handwritten scenarios are ground truth. A correction that would newly expect `allow` (loosening `deny`, `escalate` or `not-allow`) is not applied: the failure stays a rule failure and the repair compiler gets the judge's argument as a note. `deny` to `escalate` is accepted; it is the most common legitimate correction.
+- **Replayed, not assumed.** A correction only changes the expectation. After applying corrections the runner re-runs every scenario and accumulated probe against the current rules, with the engine `verifyPolicy` builds. The replay selects scenarios exactly as verification does (structural conflicts, default-role fallbacks, and the input-schema check against the live schemas `compile-policy` collected, `liveToolSchemas`, else the stored ones), so it never runs a scenario verification set aside, nor skips one verification ran. A correction that does not match the engine's actual decision leaves a failure, which is repaired like any rule failure (for blame `both`, with the corrected expectation).
+- **Still judged.** A clean replay passes only if the judge's structured verdict was a pass; otherwise the corrected scenarios go back to a fresh judge (no repair compile), and a rejection with nothing failing is repaired from the judge's analysis.
+- **Checked at commit.** Before a server's rules are committed as verified, every scenario that will be persisted with them is replayed once more against the final rules.
 
 ## Key Design Decisions
 
@@ -69,7 +81,7 @@ The multi-turn session class is deleted. Rationale:
 
 Each batch MUST have its own system prompt containing only that batch's annotations. The caller in `pipeline-runner.ts` should NOT pass a pre-built system prompt. Instead, `generateScenarios` builds per-batch prompts internally using `buildGeneratorSystemPrompt` with the batch's annotations slice.
 
-The `system` parameter is removed from `generateScenarios`. The function receives the raw ingredients (constitution text, sandbox directory, permitted directories, dynamic lists) and constructs prompts per-batch.
+The `system` parameter is removed from `generateScenarios`. The function receives the raw ingredients (constitution text, sandbox directory, the directories the rules under test name, dynamic lists) and constructs prompts per-batch. The prompt labels those directories and list values as coming from the policy under test, never as permitted (see `docs/designs/policy-compilation-pipeline.md`, section 4).
 
 **Cache strategy threading**: Since `generateScenarios` builds system prompts internally, it needs a way to apply provider-specific prompt caching. The function accepts an optional `wrapSystemPrompt` callback parameter typed as `(prompt: string) => string | SystemModelMessage`. This matches the signature of `PromptCacheStrategy.wrapSystemPrompt()` and allows the caller to pass `cacheStrategy.wrapSystemPrompt` directly. When omitted, the raw string prompt is passed through unchanged.
 
@@ -81,13 +93,15 @@ const scenarios = await generateScenarios(
   unit.annotations,
   unit.handwrittenScenarios,
   unit.allowedDirectory,
-  this.model,
-  permittedDirectories,
+  verifier.model,
+  ruleDirectories,
   onProgress,
   dynamicLists,
-  (prompt) => this.cacheStrategy.wrapSystemPrompt(prompt),
+  (prompt) => verifier.cacheStrategy.wrapSystemPrompt(prompt),
 );
 ```
+
+`verifier` is the server's verification model and its provider's cache strategy: the model named by `policyVerifierModelId` when one is configured, otherwise the policy model. The scenario repair call below and the judge use it too.
 
 ### 4. Increase maxOutputTokens to 16384 for scenario generation
 
@@ -99,7 +113,7 @@ With 25 tools per batch, the annotation summary is ~1,500-2,500 tokens -- well w
 
 ### 6. Scenario repair is a targeted single-shot call
 
-When the judge identifies scenarios with wrong expectations, the existing `extractScenarioCorrections` + `applyScenarioCorrections` flow handles corrections without any LLM call. The only case requiring an LLM call is when structurally discarded scenarios need replacement. This is a small, bounded output -- "here are N discarded scenarios, generate N replacements" -- so a single `generateObjectWithRepair` call suffices, no batching needed.
+When the judge identifies scenarios with wrong expectations, `triageVerificationFailures` + `applyScenarioCorrections` handle the corrections without any LLM call (subject to the safeguards above). The only case requiring an LLM call is when structurally discarded scenarios need replacement. This is a small, bounded output -- "here are N discarded scenarios, generate N replacements" -- so a single `generateObjectWithRepair` call suffices, no batching needed.
 
 **Clarification on `discardedScenarios` source**: Structurally discarded scenarios come from `filterStructuralConflicts` -- a pre-loop one-time operation that removes scenarios conflicting with structural invariants (e.g., a scenario expects "allow" for a path outside the sandbox, but the engine would structurally deny it). These are NOT from the judge. The `repairScenarios` function handles these pre-loop discards. Inside the repair loop, the judge identifies scenario-blamed failures which are handled by `applyScenarioCorrections` (patching expectations), not by `repairScenarios`.
 
@@ -169,7 +183,7 @@ export async function generateScenarios(
   handwrittenScenarios: TestScenario[],
   sandboxDirectory: string,
   llm: LanguageModel,
-  permittedDirectories?: string[],
+  ruleDirectories?: readonly string[],
   onProgress?: (message: string) => void,
   dynamicLists?: DynamicListsFile,
   wrapSystemPrompt?: (prompt: string) => string | SystemModelMessage,
@@ -192,7 +206,7 @@ export async function generateScenarios(
     // Per-batch system prompt with only this batch's annotations
     const batchPromptText = buildGeneratorSystemPrompt(
       constitutionText, batch, sandboxDirectory,
-      permittedDirectories, dynamicLists,
+      ruleDirectories, dynamicLists,
     );
 
     // Apply cache strategy wrapping if provided
@@ -279,7 +293,7 @@ export async function repairScenarios(
   annotations: ToolAnnotation[],
   sandboxDirectory: string,
   llm: LanguageModel,
-  permittedDirectories?: string[],
+  ruleDirectories?: readonly string[],
   dynamicLists?: DynamicListsFile,
   onProgress?: (message: string) => void,
 ): Promise<TestScenario[]> {
@@ -301,7 +315,7 @@ Generate one replacement scenario per discarded scenario.`;
 
   const system = buildGeneratorSystemPrompt(
     constitutionText, annotations, sandboxDirectory,
-    permittedDirectories, dynamicLists,
+    ruleDirectories, dynamicLists,
   );
 
   const { output } = await generateObjectWithRepair({
@@ -349,13 +363,18 @@ if discardedScenarios.length > 0:
 loop:
   verify(scenarios + probes)
   if failed:
-    extract attributions from judge
-    applyScenarioCorrections(scenarios)        // fix expectations in-place (no LLM call)
+    triage attributions (keyed by result index)
+    applyScenarioCorrections(scenarios)        // accepted corrections only (no LLM call)
     insert probes into accumulated probes
-    if ruleBlamedFailures.length > 0:
+    replay all scenarios + probes against the current rules
+    if failures remain, or the judge rejected with nothing failing:
       repairRules(...)                         // recompile rules via compiler session
+    else if the judge approved:
+      pass
     re-verify
 ```
+
+The safeguards around corrections are described in "Correction safeguards" above.
 
 The key simplification: no `ScenarioGeneratorSession` to manage, no `mergeReplacements`, no `ScenarioFeedback` construction. Scenario correction is handled by the existing `applyScenarioCorrections`. Replacement generation (for structurally discarded scenarios only) is a pre-loop single-shot call, not part of the repair loop.
 
@@ -431,7 +450,7 @@ This deprecation is a follow-up, not blocking the main batching work:
 
 ## Future Considerations
 
-- **Parallel batching**: Batches are currently sequential. They could run in parallel with `Promise.all` since they are independent. Deferred to avoid complexity in error handling and progress reporting, but the design is ready for it (no shared mutable state between batches).
-- **Adaptive batch size**: If a batch still hits token limits, the batch size could be halved and retried. Not needed now since 25 tools at 16384 tokens provides ample headroom.
-- **Rule compilation batching**: If per-server rule compilation hits output limits for very large servers, the same batch-by-tools pattern can be applied to the constitution compiler. This would require merging rule sets from multiple batches and resolving cross-batch rule ordering -- nontrivial but feasible.
+- **Parallel batching**: implemented (WP-88). `generateScenarios` runs the batches with `Promise.all`; the pipeline runner's model is already throttled by its shared LLM semaphore (`createThrottledModel`), so no extra concurrency control is needed. Results are concatenated in batch order whatever order the calls finish in, so deduplication (first occurrence wins) is unchanged. A failing batch fails the call, as before. Progress reports the batch count and each completion ("3/6 batches done") rather than a running batch index.
+- **Adaptive batch size**: If a batch still hits token limits, the batch size could be halved and retried. Not needed now since 25 tools at 16384 tokens provides ample headroom. A batch whose response stops at its cap (finish reason "length") is requested once more at 32768 tokens and otherwise fails with "output truncated at N tokens" (`generateWithinOutputCap` in `generate-with-repair.ts`), instead of a JSON error after a schema-repair turn under the same cap.
+- **Rule compilation batching**: If per-server rule compilation hits output limits for very large servers (it is now reported as "output truncated at 32768 tokens" after one retry with that larger cap, rather than as a JSON error), the same batch-by-tools pattern can be applied to the constitution compiler. This would require merging rule sets from multiple batches and resolving cross-batch rule ordering -- nontrivial but feasible.
 - **Batch-aware verification**: Currently verification runs on the full concatenated scenario set. If verification becomes slow for very large sets, it could be batched too. Not a concern now since verification is fast (no LLM calls for execution, only for the judge rounds).

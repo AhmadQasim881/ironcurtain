@@ -25,10 +25,12 @@ import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { WorkflowDefinition } from '../../src/workflow/types.js';
+import type { SessionOptions } from '../../src/session/types.js';
 import { WorkflowOrchestrator } from '../../src/workflow/orchestrator.js';
 import type { MessageLogEntry, QuotaExhaustedEntry } from '../../src/workflow/message-log.js';
 import {
   MockSession,
+  approvedResponse,
   noStatusResponse,
   simulateArtifacts,
   findWorkflowDir,
@@ -36,6 +38,7 @@ import {
   createDeps,
   createCheckpointStore,
   waitForCompletion,
+  waitForGateOrCompletion,
   stubPersonasForTest,
 } from './test-helpers.js';
 
@@ -85,9 +88,6 @@ describe('WorkflowOrchestrator quota-exhaustion short-circuit', () => {
     }
     cleanupPersonas?.();
     rmSync(tmpDir, { recursive: true, force: true });
-    const baseName = resolve(tmpDir).split('/').pop()!;
-    const ckptDir = resolve(tmpDir, '..', `${baseName}-ckpt`);
-    rmSync(ckptDir, { recursive: true, force: true });
   });
 
   it('halts immediately when the primary turn reports quotaExhausted, preserves checkpoint, and does not double-log', async () => {
@@ -287,5 +287,98 @@ describe('WorkflowOrchestrator quota-exhaustion short-circuit', () => {
     expect(quotaEntries).toHaveLength(1);
     expect(quotaEntries[0].resetAt).toBeUndefined();
     expect(quotaEntries[0].rawMessage).toBe('Rate limit exceeded. Try again later.');
+  });
+
+  it("ends aborted-resumable without raising a gate when the failing state's error target is a human gate", async () => {
+    // Regression guard for the stale-flag misreport. `findErrorTarget` picks a
+    // human gate whenever any transition targets one; routing a quota error
+    // there would park the run at the gate with `instance.quotaExhausted`
+    // still set, so a FORCE_REVISION retry that then succeeded would be
+    // reported as `aborted` (checkpoint kept resumable, snapshot retained).
+    // Quota must halt on a terminal immediately: no gate, checkpoint pinned
+    // at the failing state.
+    const gateDef: WorkflowDefinition = {
+      name: 'quota-gate-target',
+      description: 'Plan, then a review whose error target resolves to a gate',
+      initial: 'plan',
+      settings: { mode: 'builtin' },
+      states: {
+        plan: {
+          type: 'agent',
+          description: 'Plans',
+          persona: 'coder',
+          prompt: 'You are a planner.',
+          inputs: [],
+          outputs: ['plan'],
+          transitions: [{ to: 'review' }],
+        },
+        review: {
+          type: 'agent',
+          description: 'Reviews',
+          persona: 'coder',
+          prompt: 'You are a reviewer.',
+          inputs: ['plan'],
+          outputs: [],
+          transitions: [
+            { to: 'done', when: { verdict: 'approved' } },
+            { to: 'escalate_gate', when: { verdict: 'rejected' } },
+          ],
+        },
+        escalate_gate: {
+          type: 'human_gate',
+          description: 'Human review',
+          acceptedEvents: ['APPROVE', 'FORCE_REVISION', 'ABORT'],
+          transitions: [
+            { to: 'done', event: 'APPROVE' },
+            { to: 'review', event: 'FORCE_REVISION' },
+            { to: 'aborted', event: 'ABORT' },
+          ],
+        },
+        done: { type: 'terminal', description: 'Done' },
+        aborted: { type: 'terminal', description: 'Aborted' },
+      },
+    };
+    const defPath = writeDefinitionFile(tmpDir, gateDef);
+
+    const sessionFactory = vi.fn(async (opts: SessionOptions) => {
+      if (opts.workflow?.stateId === 'plan') {
+        simulateArtifacts(findWorkflowDir(tmpDir), ['plan']);
+        return new MockSession({ responses: [approvedResponse('planned')] });
+      }
+      return new MockSession({
+        responses: [
+          {
+            text: 'Agent stopped mid-stream.',
+            hardFailure: false,
+            quotaExhausted: { resetAt: RESET_AT, rawMessage: RAW_MESSAGE },
+          },
+        ],
+      });
+    });
+    const raiseGate = vi.fn();
+    const checkpointStore = createCheckpointStore(tmpDir);
+    const deps = createDeps(tmpDir, { createSession: sessionFactory, checkpointStore, raiseGate });
+    const orchestrator = new WorkflowOrchestrator(deps);
+    activeOrchestrator = orchestrator;
+
+    const workflowId = await orchestrator.start(defPath, 'write code');
+    expect(await waitForGateOrCompletion(orchestrator, workflowId)).toBe('done');
+
+    const status = orchestrator.getStatus(workflowId);
+    expect(status?.phase).toBe('aborted');
+    if (status?.phase === 'aborted') {
+      expect(status.reason).toContain('quota');
+    }
+    expect(raiseGate).not.toHaveBeenCalled();
+
+    // Checkpoint pinned at the failing state and marked resumable.
+    const checkpoint = checkpointStore.load(workflowId);
+    expect(checkpoint?.machineState).toBe('review');
+    expect(checkpoint?.finalStatus?.phase).toBe('aborted');
+
+    const log = readMessageLog(tmpDir);
+    expect(log.filter((e) => e.type === 'gate_raised')).toHaveLength(0);
+    expect(log.filter((e) => e.type === 'quota_exhausted')).toHaveLength(1);
+    expect(log.filter((e) => e.type === 'error')).toHaveLength(0);
   });
 });

@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { BundleId, SessionOptions } from '../../src/session/types.js';
@@ -18,6 +18,7 @@ import {
   WorkflowOrchestrator,
   type CreateWorkflowInfrastructureInput,
   type LoadPolicyRpcInput,
+  type WorkflowOrchestratorDeps,
 } from '../../src/workflow/orchestrator.js';
 import {
   approvedResponse,
@@ -27,6 +28,11 @@ import {
   waitForCompletion,
   stubPersonasForTest,
 } from './test-helpers.js';
+import { writePersonaPolicy } from '../fixtures/scoped-policy.js';
+
+type StartControlServer = NonNullable<WorkflowOrchestratorDeps['startWorkflowControlServer']>;
+type LoadPolicyRpc = NonNullable<WorkflowOrchestratorDeps['loadPolicyRpc']>;
+type DestroyInfrastructure = NonNullable<WorkflowOrchestratorDeps['destroyWorkflowInfrastructure']>;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -53,10 +59,12 @@ function makeStubInfrastructure(workflowId: string, bundleId: BundleId): DockerI
 }
 
 /**
- * Seeds a minimal `compiled-policy.json` into every non-global persona
- * directory under `IRONCURTAIN_HOME`. `cyclePolicy` calls
- * `resolvePersona(name)` which asserts the file exists; without this
- * helper the resolver throws before the test can exercise cycling.
+ * Seeds a minimal `compiled-policy.json` (and the constitution.md it was
+ * compiled from) into every non-global persona directory under
+ * `IRONCURTAIN_HOME`. `cyclePolicy` calls `resolvePersona(name)`, which
+ * refuses a persona whose policy is missing or does not match its
+ * constitution; without this helper the resolver throws before the test
+ * can exercise cycling.
  *
  * `stubPersonasForTest` (from test-helpers) already created the
  * persona directories and the `persona.json` stub; here we just drop a
@@ -66,9 +74,7 @@ function seedPersonaPolicies(personas: readonly string[]): void {
   const home = process.env.IRONCURTAIN_HOME;
   if (!home) throw new Error('IRONCURTAIN_HOME not set; call stubPersonasForTest first');
   for (const name of personas) {
-    const generated = resolve(home, 'personas', name, 'generated');
-    mkdirSync(generated, { recursive: true });
-    writeFileSync(resolve(generated, 'compiled-policy.json'), JSON.stringify({ rules: [] }));
+    writePersonaPolicy(resolve(home, 'personas', name));
   }
 }
 
@@ -76,13 +82,14 @@ function seedPersonaPolicies(personas: readonly string[]): void {
  * Two-state workflow exercising persona transitions within one bundle.
  * Both states default to the "primary" scope, so they share the same
  * bundle and control socket. `cyclePolicy` hot-swaps the active policy
- * on each state entry.
+ * on each state entry. Mixing personas in one scope makes it a single
+ * trust domain, which the definition must opt in to.
  */
 const twoPersonaDef: WorkflowDefinition = {
   name: 'two-persona',
   description: 'Global then reviewer, both on the default (primary) scope',
   initial: 'plan',
-  settings: { mode: 'docker', dockerAgent: 'claude-code', sharedContainer: true },
+  settings: { mode: 'docker', dockerAgent: 'claude-code', sharedContainer: true, allowMixedPersonas: true },
   states: {
     plan: {
       type: 'agent',
@@ -116,7 +123,7 @@ const reentryDef: WorkflowDefinition = {
   name: 'reentry',
   description: 'Global visits twice to exercise re-entry',
   initial: 'plan',
-  settings: { mode: 'docker', dockerAgent: 'claude-code', sharedContainer: true },
+  settings: { mode: 'docker', dockerAgent: 'claude-code', sharedContainer: true, allowMixedPersonas: true },
   states: {
     plan: {
       type: 'agent',
@@ -204,9 +211,9 @@ describe('WorkflowOrchestrator shared-container mode — policy cycling', () => 
     const createInfra = vi.fn(async (input: CreateWorkflowInfrastructureInput) =>
       makeStubInfrastructure(input.workflowId, input.bundleId),
     );
-    const destroyInfra = vi.fn(async () => {});
-    const startCtrl = vi.fn(async () => {});
-    const loadPolicy = vi.fn(async () => {});
+    const destroyInfra = vi.fn<DestroyInfrastructure>(async () => {});
+    const startCtrl = vi.fn<StartControlServer>(async () => {});
+    const loadPolicy = vi.fn<LoadPolicyRpc>(async () => {});
 
     // Each state gets its own fresh MockSession with one scripted response,
     // matching the existing test patterns in orchestrator.test.ts.
@@ -284,9 +291,9 @@ describe('WorkflowOrchestrator shared-container mode — policy cycling', () => 
     const createInfra = vi.fn(async (input: CreateWorkflowInfrastructureInput) =>
       makeStubInfrastructure(input.workflowId, input.bundleId),
     );
-    const destroyInfra = vi.fn(async () => {});
-    const startCtrl = vi.fn(async () => {});
-    const loadPolicy = vi.fn(async () => {});
+    const destroyInfra = vi.fn<DestroyInfrastructure>(async () => {});
+    const startCtrl = vi.fn<StartControlServer>(async () => {});
+    const loadPolicy = vi.fn<LoadPolicyRpc>(async () => {});
 
     let callIdx = 0;
     const responsesByCall = [
@@ -370,9 +377,9 @@ describe('WorkflowOrchestrator shared-container mode — policy cycling', () => 
       createdBundles.push(bundle);
       return bundle;
     });
-    const destroyInfra = vi.fn(async () => {});
-    const startCtrl = vi.fn(async () => {});
-    const loadPolicy = vi.fn(async () => {});
+    const destroyInfra = vi.fn<DestroyInfrastructure>(async () => {});
+    const startCtrl = vi.fn<StartControlServer>(async () => {});
+    const loadPolicy = vi.fn<LoadPolicyRpc>(async () => {});
 
     const seenInfra: Array<DockerInfrastructure | undefined> = [];
     let callIdx = 0;
@@ -419,8 +426,8 @@ describe('WorkflowOrchestrator shared-container mode — policy cycling', () => 
     const createInfra = vi.fn(async (input: CreateWorkflowInfrastructureInput) =>
       makeStubInfrastructure(input.workflowId, input.bundleId),
     );
-    const destroyInfra = vi.fn(async () => {});
-    const startCtrl = vi.fn(async () => {});
+    const destroyInfra = vi.fn<DestroyInfrastructure>(async () => {});
+    const startCtrl = vi.fn<StartControlServer>(async () => {});
     const loadPolicy = vi.fn(async () => {
       throw new Error('coordinator rejected load');
     });
@@ -453,6 +460,49 @@ describe('WorkflowOrchestrator shared-container mode — policy cycling', () => 
   });
 
   // -------------------------------------------------------------------------
+  // A persona whose policy went stale is never loaded or run
+  // -------------------------------------------------------------------------
+
+  it('refuses a persona whose constitution changed after compile: no policy load, no session', async () => {
+    // The reviewer's constitution is edited after its policy was compiled.
+    const home = process.env.IRONCURTAIN_HOME;
+    if (!home) throw new Error('IRONCURTAIN_HOME not set');
+    writeFileSync(resolve(home, 'personas', 'reviewer', 'constitution.md'), 'The reviewer may now push to main.\n');
+    const defPath = writeDefinitionFile(tmpDir, twoPersonaDef);
+
+    const createInfra = vi.fn(async (input: CreateWorkflowInfrastructureInput) =>
+      makeStubInfrastructure(input.workflowId, input.bundleId),
+    );
+    const loadPolicy = vi.fn(async () => {});
+    const sessionFactory = vi.fn(async () =>
+      createArtifactAwareSession([{ text: approvedResponse('planned'), artifacts: ['plan'] }], tmpDir),
+    );
+
+    const orchestrator = new WorkflowOrchestrator(
+      createDeps(tmpDir, {
+        createSession: sessionFactory,
+        createWorkflowInfrastructure: createInfra,
+        destroyWorkflowInfrastructure: vi.fn(async () => {}),
+        startWorkflowControlServer: vi.fn(async () => {}),
+        loadPolicyRpc: loadPolicy,
+      }),
+    );
+    activeOrchestrator = orchestrator;
+
+    const workflowId = await orchestrator.start(defPath, 'task');
+    await waitForCompletion(orchestrator, workflowId);
+
+    // Unattended runs have no stale-policy override: the reviewer's old policy
+    // is never hot-swapped in and no reviewer session runs.
+    expect(loadPolicy.mock.calls.map((call) => (call as unknown[])[0])).not.toContainEqual(
+      expect.objectContaining({ persona: 'reviewer' }),
+    );
+    expect(sessionFactory.mock.calls.map((call) => (call as unknown[])[0])).not.toContainEqual(
+      expect.objectContaining({ persona: 'reviewer' }),
+    );
+  });
+
+  // -------------------------------------------------------------------------
   // Test 5: infra creation throws -> state invoke fails, session never runs
   // -------------------------------------------------------------------------
 
@@ -466,9 +516,9 @@ describe('WorkflowOrchestrator shared-container mode — policy cycling', () => 
     const createInfra = vi.fn(async () => {
       throw new Error('docker unavailable');
     });
-    const destroyInfra = vi.fn(async () => {});
-    const startCtrl = vi.fn(async () => {});
-    const loadPolicy = vi.fn(async () => {});
+    const destroyInfra = vi.fn<DestroyInfrastructure>(async () => {});
+    const startCtrl = vi.fn<StartControlServer>(async () => {});
+    const loadPolicy = vi.fn<LoadPolicyRpc>(async () => {});
     const sessionFactory = vi.fn();
 
     const orchestrator = new WorkflowOrchestrator(
@@ -508,11 +558,11 @@ describe('WorkflowOrchestrator shared-container mode — policy cycling', () => 
       createdBundle = makeStubInfrastructure(input.workflowId, input.bundleId);
       return createdBundle;
     });
-    const destroyInfra = vi.fn(async () => {});
+    const destroyInfra = vi.fn<DestroyInfrastructure>(async () => {});
     const startCtrl = vi.fn(async () => {
       throw new Error('port in use');
     });
-    const loadPolicy = vi.fn(async () => {});
+    const loadPolicy = vi.fn<LoadPolicyRpc>(async () => {});
     const sessionFactory = vi.fn();
 
     const orchestrator = new WorkflowOrchestrator(
@@ -581,7 +631,7 @@ describe('WorkflowOrchestrator shared-container mode — policy cycling', () => 
     const createInfra = vi.fn(async (input: CreateWorkflowInfrastructureInput) =>
       makeStubInfrastructure(input.workflowId, input.bundleId),
     );
-    const loadPolicy = vi.fn(async () => {});
+    const loadPolicy = vi.fn<LoadPolicyRpc>(async () => {});
 
     let callIdx = 0;
     const responsesByCall = [

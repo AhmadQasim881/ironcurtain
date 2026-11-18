@@ -7,6 +7,7 @@
   import { mergePastRuns, terminalSummariesAsPastRuns, formatRelativeTime, phaseLabel } from './workflows-helpers.js';
   import { computeWorkflowKpis, buildPhaseDistribution, sumWorkflowTokens, formatTokens } from './dashboard-helpers.js';
   import type { PastRunDto, WorkflowPhase } from '$lib/types.js';
+  import { formatCostUsd } from '$lib/format.js';
 
   import ChatCircle from 'phosphor-svelte/lib/ChatCircle';
   import Warning from 'phosphor-svelte/lib/Warning';
@@ -21,10 +22,6 @@
 
   function formatTime(iso: string): string {
     return new Date(iso).toLocaleTimeString();
-  }
-
-  function formatCost(usd: number): string {
-    return `$${usd.toFixed(2)}`;
   }
 
   // ── Workflow statistics ──────────────────────────────────────────────
@@ -61,7 +58,7 @@
   const totalTokens = $derived(sumWorkflowTokens(liveWorkflows, pastRuns));
   const hasWorkflowData = $derived(liveWorkflows.length > 0 || pastRuns.length > 0 || appState.pendingGates.size > 0);
 
-  // Phase → bar/legend swatch. Distinct, theme-driven colors so the six phases
+  // Phase → bar/legend swatch. Distinct, theme-driven colors so the seven phases
   // stay legible in every theme. `waiting_human` is a lighter shade of the
   // warning hue so it separates from `running` in the Iron theme, where
   // --primary and --warning resolve to the same amber.
@@ -72,6 +69,7 @@
     failed: 'bg-destructive',
     aborted: 'bg-muted-foreground/60',
     interrupted: 'bg-foreground/40',
+    running_elsewhere: 'bg-primary/40',
   };
 
   function goToWorkflows(): void {
@@ -324,7 +322,9 @@
                 </Badge>
               </TableCell>
               <TableCell class="font-mono text-muted-foreground">{session.turnCount}</TableCell>
-              <TableCell class="font-mono">{formatCost(session.budget.estimatedCostUsd)}</TableCell>
+              <TableCell class="font-mono"
+                >{formatCostUsd(session.budget.estimatedCostUsd, session.budget.costSource)}</TableCell
+              >
               <TableCell class="text-muted-foreground">{formatTime(session.createdAt)}</TableCell>
             </TableRow>
           {/each}

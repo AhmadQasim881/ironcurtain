@@ -23,6 +23,7 @@ import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { WorkflowDefinition } from '../../src/workflow/types.js';
+import type { SessionOptions } from '../../src/session/types.js';
 import { WorkflowOrchestrator } from '../../src/workflow/orchestrator.js';
 import type { MessageLogEntry, TransientFailureEntry, QuotaExhaustedEntry } from '../../src/workflow/message-log.js';
 import {
@@ -35,6 +36,7 @@ import {
   createDeps,
   createCheckpointStore,
   waitForCompletion,
+  waitForGateOrCompletion,
   stubPersonasForTest,
 } from './test-helpers.js';
 
@@ -89,9 +91,6 @@ describe('WorkflowOrchestrator transient-failure short-circuit', () => {
     }
     cleanupPersonas?.();
     rmSync(tmpDir, { recursive: true, force: true });
-    const baseName = resolve(tmpDir).split('/').pop()!;
-    const ckptDir = resolve(tmpDir, '..', `${baseName}-ckpt`);
-    rmSync(ckptDir, { recursive: true, force: true });
   });
 
   function trackOrchestrator(o: WorkflowOrchestrator): WorkflowOrchestrator {
@@ -247,7 +246,7 @@ describe('WorkflowOrchestrator transient-failure short-circuit', () => {
 
       const checkpointStore = createCheckpointStore(tmpDir);
       const deps1 = createDeps(tmpDir, {
-        createSession: failingFactory as unknown as ReturnType<typeof vi.fn>,
+        createSession: failingFactory,
         checkpointStore,
       });
       const orchestrator1 = trackOrchestrator(new WorkflowOrchestrator(deps1));
@@ -273,7 +272,7 @@ describe('WorkflowOrchestrator transient-failure short-circuit', () => {
       });
 
       const deps2 = createDeps(tmpDir, {
-        createSession: healthyFactory as unknown as ReturnType<typeof vi.fn>,
+        createSession: healthyFactory,
         checkpointStore,
       });
       const orchestrator2 = trackOrchestrator(new WorkflowOrchestrator(deps2));
@@ -376,5 +375,93 @@ describe('WorkflowOrchestrator transient-failure short-circuit', () => {
     const log = readMessageLog(tmpDir);
     const transientEntries = log.filter((e): e is TransientFailureEntry => e.type === 'transient_failure');
     expect(transientEntries).toHaveLength(1);
+  });
+
+  it("ends aborted-resumable without raising a gate when the failing state's error target is a human gate", async () => {
+    // Sibling of the quota test: `findErrorTarget` would send the failure to
+    // `escalate_gate`, leaving `instance.transientFailure` set while a human
+    // could FORCE_REVISION past the stalled turn. The transient failure must
+    // halt on a terminal immediately with the checkpoint pinned at `review`.
+    const gateDef: WorkflowDefinition = {
+      name: 'transient-gate-target',
+      description: 'Plan, then a review whose error target resolves to a gate',
+      initial: 'plan',
+      settings: { mode: 'builtin' },
+      states: {
+        plan: {
+          type: 'agent',
+          description: 'Plans',
+          persona: 'coder',
+          prompt: 'You are a planner.',
+          inputs: [],
+          outputs: ['plan'],
+          transitions: [{ to: 'review' }],
+        },
+        review: {
+          type: 'agent',
+          description: 'Reviews',
+          persona: 'coder',
+          prompt: 'You are a reviewer.',
+          inputs: ['plan'],
+          outputs: [],
+          transitions: [
+            { to: 'done', when: { verdict: 'approved' } },
+            { to: 'escalate_gate', when: { verdict: 'rejected' } },
+          ],
+        },
+        escalate_gate: {
+          type: 'human_gate',
+          description: 'Human review',
+          acceptedEvents: ['APPROVE', 'FORCE_REVISION', 'ABORT'],
+          transitions: [
+            { to: 'done', event: 'APPROVE' },
+            { to: 'review', event: 'FORCE_REVISION' },
+            { to: 'aborted', event: 'ABORT' },
+          ],
+        },
+        done: { type: 'terminal', description: 'Done' },
+        aborted: { type: 'terminal', description: 'Aborted' },
+      },
+    };
+    const defPath = writeDefinitionFile(tmpDir, gateDef);
+
+    const sessionFactory = vi.fn(async (opts: SessionOptions) => {
+      if (opts.workflow?.stateId === 'plan') {
+        simulateArtifacts(findWorkflowDir(tmpDir), ['plan']);
+        return new MockSession({ responses: [approvedResponse('planned')] });
+      }
+      return new MockSession({
+        responses: [
+          {
+            text: 'preamble',
+            hardFailure: false,
+            transientFailure: { kind: 'degenerate_response', rawMessage: RAW_MESSAGE },
+          },
+        ],
+      });
+    });
+    const raiseGate = vi.fn();
+    const checkpointStore = createCheckpointStore(tmpDir);
+    const deps = createDeps(tmpDir, { createSession: sessionFactory, checkpointStore, raiseGate });
+    const orchestrator = trackOrchestrator(new WorkflowOrchestrator(deps));
+
+    const workflowId = await orchestrator.start(defPath, 'write code');
+    expect(await waitForGateOrCompletion(orchestrator, workflowId)).toBe('done');
+
+    const status = orchestrator.getStatus(workflowId);
+    expect(status?.phase).toBe('aborted');
+    if (status?.phase === 'aborted') {
+      expect(status.reason).toContain('Transient upstream failure');
+    }
+    expect(raiseGate).not.toHaveBeenCalled();
+
+    const checkpoint = checkpointStore.load(workflowId);
+    expect(checkpoint?.machineState).toBe('review');
+    expect(checkpoint?.finalStatus?.phase).toBe('aborted');
+
+    const log = readMessageLog(tmpDir);
+    expect(log.filter((e) => e.type === 'gate_raised')).toHaveLength(0);
+    expect(log.filter((e) => e.type === 'transient_failure')).toHaveLength(1);
+    expect(log.filter((e) => e.type === 'error')).toHaveLength(0);
   });
 });

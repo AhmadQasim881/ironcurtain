@@ -1,15 +1,21 @@
 import { execFile } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { getLlmMetricsEventBus } from '../src/llm-metrics/event-bus.js';
-import { createPersistenceIdentityProtector } from '../src/llm-metrics/identity-protector.js';
+import {
+  createPersistenceIdentityProtector,
+  loadStatisticsLabelProtector,
+  PUBLIC_AGENT_IDS,
+  rotateLlmStatisticsIdentityKey,
+} from '../src/llm-metrics/identity-protector.js';
+import { listAgents, registerBuiltinAdapters } from '../src/docker/agent-registry.js';
 import { acquireLlmMetricsRuntime, type LlmMetricsRuntimeLease } from '../src/llm-metrics/runtime.js';
 import type { LlmExchangeCompleted } from '../src/llm-metrics/types.js';
 
@@ -146,6 +152,7 @@ describe('statistics persistence identity protection', () => {
   }
 
   afterEach(async () => {
+    vi.useRealTimers();
     await Promise.all(leases.splice(0).map((lease) => lease.release()));
     for (const directory of directories.splice(0)) {
       if (existsSync(directory)) rmSync(directory, { recursive: true, force: true });
@@ -240,6 +247,93 @@ describe('statistics persistence identity protection', () => {
     } finally {
       unsubscribe();
     }
+  });
+
+  it('stores built-in agent adapter ids raw and still pseudonymizes any other agent id', async () => {
+    const protector = createPersistenceIdentityProtector(join(await temporaryDirectory(), 'statistics'));
+    const original = exchange();
+    for (const agentId of PUBLIC_AGENT_IDS) {
+      const stored = protector.protectExchange({ ...original, attribution: { ...original.attribution, agentId } });
+      expect(stored.attribution.agentId).toBe(agentId);
+    }
+    expect(protector.protectExchange(original).attribution.agentId).toBe(protector.protectLabel('agent', RAW.agent));
+  });
+
+  it('lists exactly the registry built-ins as public agent ids', async () => {
+    await registerBuiltinAdapters();
+    expect([...listAgents().map((adapter) => String(adapter.id))].sort()).toEqual([...PUBLIC_AGENT_IDS].sort());
+  });
+
+  it('rotates the key atomically and running protectors switch to the new key', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const statisticsDirectory = join(await temporaryDirectory(), 'statistics');
+    const running = createPersistenceIdentityProtector(statisticsDirectory);
+    const before = running.protectLabel('persona', 'security-reviewer');
+    const keyPath = join(statisticsDirectory, 'identity.key');
+    const oldKey = readFileSync(keyPath);
+
+    rotateLlmStatisticsIdentityKey(statisticsDirectory);
+
+    expect(readFileSync(keyPath)).not.toEqual(oldKey);
+    expect(statSync(keyPath).size).toBe(32);
+    expect(statSync(keyPath).mode & 0o777).toBe(0o600);
+    expect(readdirSync(statisticsDirectory).filter((name) => name.endsWith('.tmp'))).toEqual([]);
+    const fresh = createPersistenceIdentityProtector(statisticsDirectory).protectLabel('persona', 'security-reviewer');
+    expect(fresh).not.toBe(before);
+
+    vi.setSystemTime(Date.now() + 5_000);
+    expect(running.protectLabel('persona', 'security-reviewer')).toBe(fresh);
+    expect(running.protectExchange(exchange()).attribution.personaId).toBe(
+      createPersistenceIdentityProtector(statisticsDirectory).protectLabel('persona', RAW.persona),
+    );
+  });
+
+  it('re-checks a rotated key after the clock moves backwards instead of keeping the old key', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const statisticsDirectory = join(await temporaryDirectory(), 'statistics');
+    const running = createPersistenceIdentityProtector(statisticsDirectory);
+    const before = running.protectLabel('persona', 'security-reviewer');
+
+    rotateLlmStatisticsIdentityKey(statisticsDirectory);
+    vi.setSystemTime(Date.now() - 60 * 60 * 1_000);
+
+    const fresh = createPersistenceIdentityProtector(statisticsDirectory).protectLabel('persona', 'security-reviewer');
+    expect(fresh).not.toBe(before);
+    expect(running.protectLabel('persona', 'security-reviewer')).toBe(fresh);
+  });
+
+  it('stops using the previous key when a replaced key file cannot be read', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const statisticsDirectory = join(await temporaryDirectory(), 'statistics');
+    const running = createPersistenceIdentityProtector(statisticsDirectory);
+    running.protectLabel('persona', 'security-reviewer');
+    const keyPath = join(statisticsDirectory, 'identity.key');
+    // A new inode with an invalid length replaces the key.
+    writeFileSync(`${keyPath}.next`, Buffer.alloc(16), { mode: 0o600 });
+    renameSync(`${keyPath}.next`, keyPath);
+
+    vi.setSystemTime(Date.now() + 5_000);
+    expect(() => running.protectLabel('persona', 'security-reviewer')).toThrow(/invalid length/);
+    // Within the re-check interval no label is derived from the dropped key either.
+    vi.setSystemTime(Date.now() + 500);
+    expect(() => running.protectLabel('persona', 'security-reviewer')).toThrow(/unavailable/);
+    expect(() => running.protectExchange(exchange())).toThrow(/unavailable/);
+
+    rotateLlmStatisticsIdentityKey(statisticsDirectory);
+    vi.setSystemTime(Date.now() + 5_000);
+    expect(running.protectLabel('persona', 'security-reviewer')).toBe(
+      createPersistenceIdentityProtector(statisticsDirectory).protectLabel('persona', 'security-reviewer'),
+    );
+  });
+
+  it('reads labels from an existing key without ever creating one', async () => {
+    const statisticsDirectory = join(await temporaryDirectory(), 'statistics');
+    expect(loadStatisticsLabelProtector(statisticsDirectory)).toBeUndefined();
+    expect(existsSync(statisticsDirectory)).toBe(false);
+
+    const writer = createPersistenceIdentityProtector(statisticsDirectory);
+    const reader = loadStatisticsLabelProtector(statisticsDirectory);
+    expect(reader?.protectLabel('profile', 'work-openrouter')).toBe(writer.protectLabel('profile', 'work-openrouter'));
   });
 
   it('HMACs private routes and canonicalizes recognized HTTPS public origins without mutating input', async () => {

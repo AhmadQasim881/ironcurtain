@@ -1,6 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { handleEvent, type AppStateLike, type EventSideEffects } from '../event-handler.js';
-import type { OutputLine, PendingEscalation, WorkflowSummaryDto, HumanGateRequestDto } from '../types.js';
+import type {
+  OutputLine,
+  PendingEscalation,
+  WorkflowSummaryDto,
+  HumanGateRequestDto,
+  WorkflowEscalationDto,
+} from '../types.js';
 
 // ---------------------------------------------------------------------------
 // Factories
@@ -16,7 +22,9 @@ function createMockState(): AppStateLike & { outputs: Map<number, OutputLine[]> 
     jobs: [],
     workflows: new Map(),
     pendingGates: new Map(),
+    pendingWorkflowEscalations: new Map(),
     personaCompiles: new Map(),
+    sessionNotices: new Map(),
     outputs,
     addOutput(label: number, line: OutputLine) {
       let existing = outputs.get(label) ?? [];
@@ -42,6 +50,7 @@ function createMockEffects(): EventSideEffects {
     refreshWorkflowHistory: vi.fn(),
     refreshPersonas: vi.fn(),
     refreshConfig: vi.fn(),
+    resync: vi.fn(),
     assignDisplayNumber: vi.fn(() => 1),
     getPtySink: vi.fn(() => undefined),
   };
@@ -168,6 +177,54 @@ describe('workflow event handling', () => {
       });
 
       expect(state.pendingGates.size).toBe(0);
+    });
+  });
+
+  describe('workflow tool-call escalations', () => {
+    function makeEscalation(id: string, workflowId = 'wf-1'): WorkflowEscalationDto {
+      return {
+        escalationId: id,
+        workflowId,
+        stateId: 'implement',
+        serverName: 'filesystem',
+        toolName: 'write_file',
+        arguments: { path: '/outside/f.txt' },
+        reason: 'Writes outside the workspace require approval.',
+        receivedAt: '2026-01-01T00:00:00Z',
+      };
+    }
+
+    it('tracks a raised escalation until it is resolved', () => {
+      const escalation = makeEscalation('esc-1');
+      expect(handleEvent(state, effects, 'workflow.escalation_raised', { workflowId: 'wf-1', escalation })).toBe(true);
+      expect(state.pendingWorkflowEscalations.get('esc-1')).toEqual(escalation);
+
+      expect(
+        handleEvent(state, effects, 'workflow.escalation_resolved', {
+          workflowId: 'wf-1',
+          escalationId: 'esc-1',
+          outcome: 'expired',
+        }),
+      ).toBe(true);
+      expect(state.pendingWorkflowEscalations.size).toBe(0);
+    });
+
+    it("drops a workflow's escalations when it reaches a terminal, keeping other workflows'", () => {
+      state.workflows = new Map([['wf-1', mockWorkflow('wf-1')]]);
+      handleEvent(state, effects, 'workflow.escalation_raised', {
+        workflowId: 'wf-1',
+        escalation: makeEscalation('a'),
+      });
+      handleEvent(state, effects, 'workflow.escalation_raised', {
+        workflowId: 'wf-2',
+        escalation: makeEscalation('b', 'wf-2'),
+      });
+
+      handleEvent(state, effects, 'workflow.completed', { workflowId: 'wf-1' });
+      expect([...state.pendingWorkflowEscalations.keys()]).toEqual(['b']);
+
+      handleEvent(state, effects, 'workflow.failed', { workflowId: 'wf-2', error: 'aborted', phase: 'aborted' });
+      expect(state.pendingWorkflowEscalations.size).toBe(0);
     });
   });
 

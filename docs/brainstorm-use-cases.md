@@ -1,5 +1,7 @@
 # Use Case Strategy & Tracer Bullet Roadmap
 
+> **Status (2026-11-14):** Brainstorm and roadmap record, kept for its reasoning. Most of the tracer bullets and the whole Parking Lot have shipped since it was written; the status notes below say which. [`docs/MISSING_FEATURES.md`](MISSING_FEATURES.md) is the source of truth for what is implemented and what is missing.
+
 This document captures our analysis of which use cases IronCurtain should target and the feature sequence to get there.
 
 ## Target Use Cases
@@ -93,16 +95,18 @@ Each tracer bullet is an independently shippable thin slice. Each builds infrast
 DevOps Use Case (immediate)          Second Brain (future)
          |                                    |
     TB0: Execution Containment ✓ ------------ |
-    TB1: Multi-Server ----------------------- |
+    TB1: Multi-Server ✓ (no exec server) ---- |
     TB2: Resource Budgets ✓ ----------------- |
     TB3: Messaging Transport (Signal) ✓ ----- |
-    TB4: Per-Task Policy -------------------- |
-    TB5: LLM Assessment -------------------- |
+    TB4: Per-Task Policy ✓ ------------------ |
+    TB5: LLM Assessment (partial) ----------- |
                                               |
-                                    + OAuth/API integration
-                                    + Scheduling/cron
-                                    + Multi-agent coordination
+                                    + OAuth/API integration ✓
+                                    + Scheduling/cron ✓
+                                    + Multi-agent coordination ✓
 ```
+
+Status 2026-11-14 (✓ = shipped). The shell/exec server of TB1 was never built: Docker Agent Mode runs agents with a shell inside a network-isolated container instead (`src/docker/`).
 
 ### TB0: Execution Containment (sandbox-runtime Integration)
 
@@ -133,7 +137,7 @@ Not all MCP servers benefit from OS sandboxing. Servers fall into two categories
 
 **Exec-like servers** — they run opaque code the agent may have written (test runners, build tools, script interpreters). The policy engine can inspect the tool call arguments (`run_tests(project: "/repo")`) but cannot see what happens during execution. These need OS-level containment.
 
-Configuration in `mcp-servers.json`:
+Configuration in `mcp-servers.json` (as proposed at the time; status 2026-11-14: the shipped filesystem server runs `node` on the exactly pinned package in `node_modules`, never `npx`, and is sandboxed and confined to its roots, see `src/config/mcp-servers.json`):
 
 ```json
 {
@@ -165,6 +169,8 @@ Configuration in `mcp-servers.json`:
 Default when `"sandbox"` is omitted: **sandboxed** with restrictive defaults (write only to session sandbox, no network). Servers must explicitly opt out with `"sandbox": false`.
 
 **Demo:** Agent writes a test file containing a `curl` exfiltration attempt, then calls `exec` to run `npm test`. Policy allows the exec call (the agent is permitted to run commands for this task). The test executes but `curl` fails — the network namespace is isolated. `rm -rf /` would only destroy ephemeral sandbox contents. Meanwhile, the filesystem server runs without sandbox overhead and MCP Roots expansions work dynamically.
+
+> **Status (2026-11-14):** TB0 shipped (`src/trusted-process/sandbox-integration.ts`, `docs/designs/execution-containment.md`). Two things changed since this plan: the filesystem server is now sandboxed too, confined to its MCP roots and restarted when they change, because it was open to a symlink-swap race (`docs/designs/filesystem-server-confinement.md`); and `sandboxPolicy: "enforce"` (the default on Linux and macOS) keeps a server that needs a sandbox from starting when the sandbox tools are missing.
 
 **Dependencies:** None. This is the new starting point.
 
@@ -201,6 +207,8 @@ The only path to persist work outside the sandbox is through Tier 1 tools (git p
 
 **Dependencies:** TB0 (exec containment must be in place before adding the shell/exec server).
 
+> **Status (2026-11-14):** Implemented apart from the shell/exec server. The shipped servers are filesystem, git (`@cyanheads/git-mcp-server`), fetch (with web search), github and google-workspace (`src/config/mcp-servers.json`), and `ironcurtain mcp add|remove|list` adds a server, annotates it and recompiles the policy in one flow (`docs/designs/user-mcp-servers.md`). Command execution happens in Docker Agent Mode instead.
+
 ### TB2: Resource Budget Enforcement
 
 **From:** MISSING_FEATURES.md — "Resource Budget Enforcement"
@@ -218,6 +226,8 @@ The only path to persist work outside the sandbox is through Tier 1 tools (git p
 
 **Dependencies:** None (can be done in parallel with TB1).
 
+> **Status (2026-11-14):** Implemented: tokens, steps, wall clock and estimated cost (`resourceBudget`), per turn for builtin sessions (`src/session/resource-budget-tracker.ts`) and enforced at the MITM proxy per agent container for Docker agents (`src/docker/budget-gate.ts`).
+
 ### TB3: Messaging Transport (Signal) — **IMPLEMENTED**
 
 **From:** MISSING_FEATURES.md — "Remote Access / Messaging Integration"
@@ -230,9 +240,9 @@ The only path to persist work outside the sandbox is through Tier 1 tools (git p
 - **Pluggable Transport abstraction** (`src/session/transport.ts`) — `Transport` interface with `run(session)` / `close()`, used by both `CliTransport` and `SignalSessionTransport`
 - **Signal bot daemon** (`src/signal/signal-bot-daemon.ts`) — persistent WebSocket listener, session lifecycle management, escalation state machine, control commands (`/quit`, `/new`, `/budget`, `/help`)
 - **Signal session transport** (`src/signal/signal-transport.ts`) — ephemeral adapter implementing `Transport`, 1:1 with a Session
-- **Docker-managed signal-cli** (`src/signal/signal-container.ts`) — `signal-cli-rest-api` container with health checks, auto-restart, persistent registration data
+- **Docker-managed signal-cli** (`src/signal/signal-container.ts`) — `signal-cli-rest-api` container with health checks and persistent registration data (status 2026-11-14: no Docker restart policy; the daemon manages the container's lifecycle)
 - **Markdown-to-Signal conversion** (`src/signal/markdown-to-signal.ts`) — converts agent markdown to Signal's styled text (bold, italic, monospace, strikethrough)
-- **Escalation over Signal** — formatted banners with text-based approve/deny, race condition prevention, expiration handling
+- **Escalation over Signal** — formatted banners with text-based approve/deny, race condition prevention, expiration handling (status 2026-11-14: a reply must name the code shown in the escalation's banner, `approve <code>`)
 - **Identity verification** — fail-closed approach checking Signal identity keys to prevent SIM swap attacks, TTL-based proactive checks
 - **Message splitting** — long responses split at paragraph boundaries (Signal's 2,000-char limit)
 - **Interactive setup wizard** (`ironcurtain setup-signal`) — registration or device linking, captcha handling, identity key capture
@@ -244,7 +254,7 @@ The only path to persist work outside the sandbox is through Tier 1 tools (git p
 - Remote interaction is viable and secure with E2E encryption
 - Session lifecycle can be managed remotely (create/destroy via commands)
 
-**Demo:** Developer sends a task via Signal, receives formatted results, approves a `git push` by replying "approve" — all E2E encrypted.
+**Demo:** Developer sends a task via Signal, receives formatted results, approves a `git push` by replying "approve" (now "approve <code>") — all E2E encrypted.
 
 **Dependencies:** TB1 (needs exec/git servers to be useful for DevOps scenario).
 
@@ -270,6 +280,8 @@ The only path to persist work outside the sandbox is through Tier 1 tools (git p
 
 **Dependencies:** TB1 (needs multiple servers to make scoping meaningful).
 
+> **Status (2026-11-14):** Implemented in two forms. Cron jobs compile a task policy that replaces the global policy (`src/cron/compile-task-policy.ts`). `ironcurtain start`, mux `/new` and `ironcurtain workflow start` accept an opt-in `--task-scoped`; unlike the "second chain checked before the constitution" above, the task scope is intersected with the session policy after it, and an out-of-scope call that the session policy allows escalates rather than being denied (`docs/designs/task-scoped-sessions.md`).
+
 ### TB5: LLM Assessment Rules (Semantic Checks)
 
 **From:** MISSING_FEATURES.md — "LLM Assessment Rules"
@@ -286,6 +298,8 @@ The only path to persist work outside the sandbox is through Tier 1 tools (git p
 **Demo:** Agent processes a file containing a hidden prompt injection attempt. Assessment rule catches it before execution.
 
 **Dependencies:** TB4 (task context needed for scope drift detection).
+
+> **Status (2026-11-14):** Partial. The `assess` rule outcome exists, opt-in: deterministic detectors plus an optional LLM intelligibility check examine outbound content, and content that fails escalates to a human rather than being denied (`docs/designs/outbound-content-assessment.md`). There is no scope drift check, and nothing assesses inbound content for prompt injection.
 
 ## How sandbox-runtime and IronCurtain Complement Each Other
 
@@ -348,6 +362,8 @@ Not every MCP server needs OS sandboxing. The key distinction:
 
 For sandboxed servers, each gets a tailored profile:
 
+Status 2026-11-14: the shipped configuration differs from this table. The filesystem server is sandboxed (confined to its MCP roots), git and google-workspace are sandboxed with domain allowlists, fetch runs without `srt` (it guards its own connections, `src/servers/guarded-fetch.ts`), the github server runs in Docker, and there is no exec server.
+
 | Server | Tier | Filesystem | Network | Sandboxed? |
 |---|---|---|---|---|
 | filesystem | 1 (semantic) | Policy-engine mediated | None | **No** — fully mediated, MCP Roots needs dynamic paths |
@@ -359,21 +375,21 @@ Since sandbox-runtime is a singleton per process, each sandboxed MCP server is a
 
 ## Open Questions
 
-- **Git MCP server?** Build a custom git server with structured arguments, or use an existing community server? Custom gives better policy engine integration; community saves development time.
-- **Exec MCP server?** Minimal custom server wrapping `child_process.spawn`, or an existing community shell server? The server itself is simple — the sandbox does the heavy lifting.
+- ~~**Git MCP server?**~~ **Resolved: community server.** `@cyanheads/git-mcp-server`, pinned exactly in `package.json`, with IronCurtain's own annotations and a hardened git environment.
+- ~~**Exec MCP server?**~~ **Resolved: not built.** Docker Agent Mode runs agents with a shell in a network-isolated container instead.
 - ~~**Telegram vs Discord vs Matrix?**~~ **Resolved: Signal.** E2E encryption aligns with security ethos. Implemented via `signal-cli-rest-api` Docker container with identity verification. See `src/signal/`.
-- **Per-task policy granularity?** Full LLM-generated rule chain vs. simpler "tool whitelist + path scope" per task.
-- **Budget defaults?** What are sensible default token/cost/time limits for a session?
+- ~~**Per-task policy granularity?**~~ **Resolved: a full compiled rule chain** from the task text, with the strict task-policy prompt (cron task policies and `--task-scoped`).
+- ~~**Budget defaults?**~~ **Resolved:** 1M tokens, 200 steps, 30 minutes and $5 (`resourceBudget`; `null` disables a limit).
 - **sandbox-runtime stability?** It's a "research preview" — do we vendor it, pin a version, or build our own thin wrapper over the same OS primitives?
 - **Windows story?** Require WSL2 (where bubblewrap works), use Node.js `--permission` as a weaker fallback, or defer Windows support?
 - **Error UX when sandbox blocks a policy-allowed call?** The agent sees an opaque OS error. Should IronCurtain detect this pattern and surface a clearer message?
 
 ## Parking Lot (Future Tracer Bullets)
 
-These are needed for the Second Brain but not for DevOps:
+These are needed for the Second Brain but not for DevOps. Status 2026-11-14: all five have shipped.
 
-- **OAuth token lifecycle management** — Google, Gmail, GitHub tokens with refresh
-- **Scheduling/cron** — trigger agent runs on schedule
-- **Multi-agent coordination** — multiple concurrent sessions with independent policies
-- **Audit log analysis** — CLI reports on decisions, tools, denials, patterns
-- **Runtime integrity checks** — constitution hash verification at startup
+- **OAuth token lifecycle management** — Google, Gmail, GitHub tokens with refresh. Shipped: `ironcurtain auth` and `src/auth/` for third-party OAuth, with the proxy refreshing Google Workspace tokens (`src/trusted-process/token-file-refresher.ts`), and Claude OAuth for Docker agents (`src/docker/oauth-token-manager.ts`). GitHub uses a personal access token.
+- **Scheduling/cron** — trigger agent runs on schedule. Shipped: `ironcurtain daemon` with cron jobs (`src/cron/`).
+- **Multi-agent coordination** — multiple concurrent sessions with independent policies. Shipped: concurrent daemon and mux sessions, personas, and multi-agent workflows (`src/workflow/`).
+- **Audit log analysis** — CLI reports on decisions, tools, denials, patterns. Shipped: `ironcurtain audit report` (`src/audit/`).
+- **Runtime integrity checks** — constitution hash verification at startup. Shipped: `checkConstitutionFreshness()` plus load-time policy provenance and schema checks (`src/config/policy-provenance-check.ts`).

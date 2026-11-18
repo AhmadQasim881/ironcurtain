@@ -1,0 +1,13 @@
+# Git admission for repositories with protected paths
+
+**Status (2026-11-16):** Implemented (`src/trusted-process/policy-engine.ts`).
+
+Git selectors such as `paths`, `filePath`, object names and pathspecs are not ordinary filesystem arguments. They can select working-tree files, many paths at once or historical objects. IronCurtain therefore applies a conservative repository check before running a Git tool, without rewriting those selectors.
+
+The engine discovers the repository containing each selected path, using its existing ancestor discovery and the admitted argument budget. It refuses the call when that repository contains a specific current protected entry. Original protected names, their current targets and controlling links all count, including protected files that do not exist yet. The check does not traverse repository contents or open protected file bodies. A broad protected ancestor still permits its exempt sandbox: a repository inside an exempt sandbox does not contain the ancestor itself.
+
+This refusal applies to Git metadata operations too. A protected audit or configuration file inside a repository makes that repository unavailable to Git tools, even when the requested selector names a different file or the file appears in `.gitignore`. Move such files outside the repository and keep their protection configured at the new location. In particular, the default relative `AUDIT_LOG_PATH=./audit.jsonl` can put a protected log in the checkout where IronCurtain was launched. Set an absolute audit-log path outside that repository before starting the session to use its Git tools. Removing the protected-path declaration is not required.
+
+`git_wrapup_instructions` uses the working directory recorded after a successful `git_set_working_dir`. This trusted coordinator state is supplied separately to evaluation and is never added to backend tool arguments. Without a tracked directory the operation is denied with an instruction to establish explicit context first. A clean repository still requires human approval for every wrap-up call. Clearing the stored directory remains possible without repository admission.
+
+A refusal is audited before backend dispatch and cannot be discharged by a compiled allow, approval whitelist or auto-approver. These are per-call checks, not an atomic transaction with a later Git subprocess: concurrent repository changes remain a limitation of static inspection. The rule also does not label every historical copy of sensitive content wherever it may have been copied; it conservatively controls Git access to repositories containing currently protected names or targets.

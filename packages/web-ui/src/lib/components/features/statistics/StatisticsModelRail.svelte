@@ -1,7 +1,39 @@
 <script lang="ts">
   import { Card } from '$lib/components/ui/card/index.js';
   import type { StatisticsIdentityMode, StatisticsModelRailItem } from './statistics-helpers.js';
-  import { formatCompactNumber, formatCoverage } from './statistics-helpers.js';
+  import { formatCompactNumber, formatCoverage, statisticsGroupNoun } from './statistics-helpers.js';
+
+  const RAIL_COPY: Readonly<
+    Record<
+      StatisticsIdentityMode,
+      { readonly title: string; readonly description: string; readonly comparison: string; readonly column: string }
+    >
+  > = {
+    routed: {
+      title: 'Provider and model rail',
+      description: 'Provider route and model sent upstream.',
+      comparison: 'Provider and model comparison',
+      column: 'Provider · model',
+    },
+    served: {
+      title: 'Provider and model rail',
+      description: 'Identity reported by the serving provider or trusted router.',
+      comparison: 'Provider and model comparison',
+      column: 'Provider · model',
+    },
+    persona: {
+      title: 'Persona rail',
+      description: 'Persona the session or workflow state ran as. Names show for personas configured on this host.',
+      comparison: 'Persona comparison',
+      column: 'Persona',
+    },
+    workflow: {
+      title: 'Workflow rail',
+      description: 'Workflow run that issued the requests.',
+      comparison: 'Workflow run comparison',
+      column: 'Workflow run',
+    },
+  };
 
   let {
     items,
@@ -14,24 +46,20 @@
 
 <Card class="overflow-hidden" role="region" aria-labelledby="model-rail-title">
   <header>
-    <h2 id="model-rail-title">Provider and model rail</h2>
-    <p>
-      {mode === 'served'
-        ? 'Identity reported by the serving provider or trusted router.'
-        : 'Provider route and model sent upstream.'}
-    </p>
+    <h2 id="model-rail-title">{RAIL_COPY[mode].title}</h2>
+    <p>{RAIL_COPY[mode].description}</p>
   </header>
   {#if items.length === 0}
-    <p class="empty">No provider/model groups were observed.</p>
+    <p class="empty">No {statisticsGroupNoun(mode)} groups were observed.</p>
   {:else}
     <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-    <div class="table-scroll" tabindex="0" role="region" aria-label="Provider and model comparison">
+    <div class="table-scroll" tabindex="0" role="region" aria-label={RAIL_COPY[mode].comparison}>
       <table>
         <thead
           ><tr
-            ><th>Provider · model</th><th>Median speed</th><th>Middle 50%</th><th>Requests</th><th>Output tokens</th><th
-              >Coverage</th
-            ></tr
+            ><th>{RAIL_COPY[mode].column}</th><th>Median speed</th><th>Middle 50%</th><th>Requests</th><th
+              >Output tokens</th
+            ><th>Coverage</th></tr
           ></thead
         >
         <tbody>

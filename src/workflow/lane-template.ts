@@ -38,6 +38,28 @@ export function resolveFanOutWorkers(fanOut: FanOutDefinition, settings?: Workfl
   return fanOut.count === 'workers' ? (settings?.workers ?? 1) : fanOut.count;
 }
 
+/**
+ * Hard upper bound on the lanes one fan-out state may run (`settings.workers`
+ * and a numeric `fanOut.count`). Validation rejects anything above it and the
+ * orchestrator refuses it at runtime. In shared-container mode every lane is
+ * an agent process in the ONE scope container, which defaults to 4 CPUs and
+ * 8 GB (`dockerResources`) and whose MCP proxy serves 64 connections. Their
+ * `execute_code` scripts share that bundle's Code Mode sandbox, which runs a
+ * few at once and queues the rest (`CODE_MODE_PROXY_MAX_CONCURRENT_CHAINS`,
+ * `sandbox/chain-limits.ts`); past 16 concurrent agents the lanes mostly
+ * contend instead of overlapping.
+ * Workflow lint (WF019) already warns past {@link FAN_OUT_LANES_WARNING_THRESHOLD}.
+ */
+export const MAX_FAN_OUT_LANES = 16;
+
+/**
+ * Lane count above which workflow lint warns (WF019): the default container
+ * has 4 CPUs, its Code Mode sandbox runs 4 scripts at once, and non-shared
+ * lanes beyond the default `maxConcurrentAgentSessions` (4) wait for a slot
+ * instead of running.
+ */
+export const FAN_OUT_LANES_WARNING_THRESHOLD = 4;
+
 // Lane-dir format seam: `current/lane_<k>`. The matching step-name half of this
 // convention lives on the Python side as STEP_NAME_RE in
 // scripts/evolve_result.py (`step_<NNNN>_lane_<k>`) — keep both in sync if the

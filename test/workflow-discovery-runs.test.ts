@@ -4,11 +4,25 @@
  * workflow-run directories exist on disk?". See `src/workflow/workflow-discovery.ts`.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from 'node:fs';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import {
+  appendFileSync,
+  linkSync,
+  mkdtempSync,
+  mkdirSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { resolve, isAbsolute } from 'node:path';
 import { tmpdir } from 'node:os';
-import { discoverWorkflowRuns, discoverWorkspacePathFromContainers } from '../src/workflow/workflow-discovery.js';
+import {
+  discoverWorkflowRuns,
+  discoverWorkspacePathFromContainers,
+  summaryForId,
+} from '../src/workflow/workflow-discovery.js';
 import type { WorkflowId } from '../src/workflow/types.js';
 
 // ---------------------------------------------------------------------------
@@ -160,6 +174,128 @@ describe('discoverWorkflowRuns', () => {
       expect(isAbsolute(run.directoryPath)).toBe(true);
       expect(run.directoryPath).toBe(resolve(tempDir, run.workflowId));
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Robustness and cost (WP-83: WFC-28, GAP4-6)
+// ---------------------------------------------------------------------------
+
+describe('discoverWorkflowRuns robustness', () => {
+  it('reads no run file: no checkpoint is parsed to build the summaries', () => {
+    for (const id of ['run-a', 'run-b', 'run-c']) {
+      const dir = createRunDir(tempDir, id, { definition: true, messageLog: true });
+      writeFileSync(
+        resolve(dir, 'checkpoint.json'),
+        JSON.stringify({ machineState: 'plan', containerSnapshots: { primary: { image: `img-${id}` } } }),
+      );
+    }
+    const parse = vi.spyOn(JSON, 'parse');
+    try {
+      const runs = discoverWorkflowRuns(tempDir);
+      expect(runs).toHaveLength(3);
+      expect(runs.every((run) => run.hasCheckpoint)).toBe(true);
+      expect(parse).not.toHaveBeenCalled();
+    } finally {
+      parse.mockRestore();
+    }
+  });
+
+  it('skips a run that cannot be examined with a warning, and still returns the others', () => {
+    createRunDir(tempDir, 'good-run', { checkpoint: true });
+    // A probed name that is a symlink loop: stat fails with ELOOP, which the
+    // scan used to rethrow, failing the whole listing.
+    const looped = createRunDir(tempDir, 'looped-run', { definition: true });
+    symlinkSync('checkpoint.json', resolve(looped, 'checkpoint.json'));
+    const warnings: string[] = [];
+
+    const runs = discoverWorkflowRuns(tempDir, { warn: (message) => warnings.push(message) });
+
+    expect(runs.map((run) => run.workflowId as string)).toEqual(['good-run']);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('looped-run');
+    expect(warnings[0]).toContain('ELOOP');
+  });
+
+  it('warns on stderr by default, with control characters shown as visible escapes', () => {
+    // A run is named like a workflow id, so the control characters come from
+    // the scanned directory's own path, which the warning quotes.
+    const baseDir = resolve(tempDir, 'runs\u001b[2J');
+    const looped = createRunDir(baseDir, 'looped-run', {});
+    symlinkSync('checkpoint.json', resolve(looped, 'checkpoint.json'));
+    const write = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      expect(discoverWorkflowRuns(baseDir)).toEqual([]);
+      const output = write.mock.calls.map(([chunk]) => String(chunk)).join('');
+      expect(output).toContain('looped-run');
+      expect(output).toContain('runs\\u001b[2J');
+      expect(output).not.toContain('\u001b');
+    } finally {
+      write.mockRestore();
+    }
+  });
+
+  it('skips entries not named like a workflow id without a warning: a prune tombstone, control characters', () => {
+    createRunDir(tempDir, 'good-run', { checkpoint: true });
+    createRunDir(tempDir, '.ironcurtain-pruned-old-run-0123456789ab', { checkpoint: true });
+    const odd = createRunDir(tempDir, 'run\u001b[2J', {});
+    symlinkSync('checkpoint.json', resolve(odd, 'checkpoint.json'));
+    const warnings: string[] = [];
+
+    const runs = discoverWorkflowRuns(tempDir, { warn: (message) => warnings.push(message) });
+
+    expect(runs.map((run) => run.workflowId as string)).toEqual(['good-run']);
+    expect(warnings).toEqual([]);
+  });
+
+  it('never treats a symlink as a run, dangling or not', () => {
+    const real = createRunDir(tempDir, 'real-run', { checkpoint: true });
+    symlinkSync(real, resolve(tempDir, 'linked-run'));
+    symlinkSync(resolve(tempDir, 'does-not-exist'), resolve(tempDir, 'dangling-run'));
+
+    const runs = discoverWorkflowRuns(tempDir);
+
+    expect(runs.map((run) => run.workflowId as string)).toEqual(['real-run']);
+  });
+});
+
+describe('WorkflowRunSummary.filesKey', () => {
+  function keyOf(id: string): string {
+    const run = discoverWorkflowRuns(tempDir).find((r) => r.workflowId === id);
+    if (!run) throw new Error(`run ${id} not found`);
+    return run.filesKey;
+  }
+
+  /** Replaces a file the way the checkpoint store does: a new file renamed over the old. */
+  function replaceByRename(path: string, content: string): void {
+    writeFileSync(`${path}.tmp`, content);
+    renameSync(`${path}.tmp`, path);
+  }
+
+  it('is stable while nothing changes', () => {
+    createRunDir(tempDir, 'steady', { checkpoint: true, definition: true, messageLog: true });
+    expect(keyOf('steady')).toBe(keyOf('steady'));
+  });
+
+  it('changes when the checkpoint is replaced, the previous checkpoint appears, the definition copy is replaced or the message log grows', () => {
+    const dir = createRunDir(tempDir, 'changing', { checkpoint: true, definition: true, messageLog: true });
+    const keys = [keyOf('changing')];
+
+    replaceByRename(resolve(dir, 'checkpoint.json'), '{"machineState":"next"}');
+    keys.push(keyOf('changing'));
+    linkSync(resolve(dir, 'checkpoint.json'), resolve(dir, 'checkpoint.prev.json'));
+    keys.push(keyOf('changing'));
+    replaceByRename(resolve(dir, 'definition.json'), '{"name":"other"}');
+    keys.push(keyOf('changing'));
+    appendFileSync(resolve(dir, 'messages.jsonl'), '{"type":"error"}\n');
+    keys.push(keyOf('changing'));
+
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
+  it('is the same from summaryForId as from the scan', () => {
+    createRunDir(tempDir, 'single', { checkpoint: true, definition: true });
+    expect(summaryForId(tempDir, 'single' as WorkflowId)?.filesKey).toBe(keyOf('single'));
   });
 });
 

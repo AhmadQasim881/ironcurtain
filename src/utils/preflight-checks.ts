@@ -1,9 +1,12 @@
 import { spawn } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import chalk from 'chalk';
 import { getIronCurtainHome } from '../config/paths.js';
+import { inheritedEnv } from '../trusted-process/child-env.js';
+import { writePrivateFileAtomicSync } from '../util/atomic-write.js';
 
 export interface PreflightCheckResult {
   ok: boolean;
@@ -14,57 +17,131 @@ export interface PreflightCheckResult {
 /** Hard timeout for the child-process viability check. */
 const SANDBOX_CHECK_TIMEOUT_MS = 10_000;
 
-/** Cache marker — skips the subprocess on repeat runs when the env hasn't changed. */
-interface CacheMarker {
-  nodeVersion: string;
-  utcpVersion: string;
+/**
+ * What a cached "the V8 sandbox loads" verdict was established for. The
+ * marker in the IronCurtain home is reused only while every field still
+ * matches the running process and the installed packages:
+ *
+ * - `nodeVersion`, `platform`, `arch`: the runtime the native addon must
+ *   match. A Rosetta x64 and an arm64 Node.js of the same version load
+ *   different binaries, and a home can be shared between machines.
+ * - `utcpVersion`, `isolatedVmVersion`: the installed versions of
+ *   @utcp/code-mode and of the isolated-vm it loads. isolated-vm is pinned
+ *   on its own, so it can change while the code-mode fork does not.
+ * - `utcpEntryPath`: which installation. A global install and a source
+ *   checkout can share one home, and so one marker.
+ */
+export interface SandboxFingerprint {
+  readonly nodeVersion: string;
+  readonly platform: string;
+  readonly arch: string;
+  readonly utcpVersion: string;
+  readonly utcpEntryPath: string;
+  readonly isolatedVmVersion: string;
 }
 
-function getCacheMarkerPath(): string {
+const FINGERPRINT_FIELDS = [
+  'nodeVersion',
+  'platform',
+  'arch',
+  'utcpVersion',
+  'utcpEntryPath',
+  'isolatedVmVersion',
+] as const satisfies readonly (keyof SandboxFingerprint)[];
+
+/** The cache marker's path: `<IronCurtain home>/.preflight-ok`. */
+export function getSandboxCacheMarkerPath(): string {
   return resolve(getIronCurtainHome(), '.preflight-ok');
 }
 
 /**
- * Resolves the installed `@utcp/code-mode` version by reading its
- * `node_modules/@utcp/code-mode/package.json`. We pick the resolved version
- * (not the semver range from the root package.json) because the cache is
- * about ABI compatibility — the installed build is what actually runs.
- * Returns null if the package can't be located (treated as a cache miss).
- *
- * Uses Node's module resolution (via createRequire) rather than cwd-based
- * guessing so this works from any invocation directory, including global
- * installs.
+ * The version of the package `filePath` belongs to: the nearest package.json
+ * above it that names a package (a nested one such as `dist/package.json`
+ * holding only `"type"` does not), never looking past the `node_modules`
+ * directory the package sits in. Null when there is none.
  */
-function resolveUtcpVersion(): string | null {
-  try {
-    const pkgPath = createRequire(import.meta.url).resolve('@utcp/code-mode/package.json');
-    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8')) as { version?: string };
-    if (typeof pkg.version === 'string') return pkg.version;
-  } catch {
-    // Fall through — caller treats null as "no cache, run real check".
+function owningPackageVersion(filePath: string): string | null {
+  for (let dir = dirname(filePath); basename(dir) !== 'node_modules'; dir = dirname(dir)) {
+    try {
+      const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf-8')) as { name?: unknown; version?: unknown };
+      if (typeof pkg.name === 'string' && typeof pkg.version === 'string') return pkg.version;
+    } catch {
+      // No (readable) package.json here: keep walking up.
+    }
+    if (dirname(dir) === dir) break;
   }
   return null;
 }
 
-function readCacheMarker(): CacheMarker | null {
+/**
+ * The fingerprint of the V8 sandbox this process would load, resolved the
+ * way the viability check and Code Mode load it: `@utcp/code-mode` through
+ * Node's module resolution from `from` (this module by default), and
+ * isolated-vm from the code-mode package. Versions come from the resolved
+ * packages' own package.json files, found from their entry points: the
+ * code-mode fork's `exports` map does not expose `./package.json`, so
+ * resolving that subpath directly always fails. Null when anything cannot be
+ * resolved, which disables the cache: the real check then runs and reports
+ * the problem.
+ */
+export function resolveSandboxFingerprint(from: string | URL = import.meta.url): SandboxFingerprint | null {
   try {
-    const parsed = JSON.parse(readFileSync(getCacheMarkerPath(), 'utf-8')) as Partial<CacheMarker>;
-    if (typeof parsed.nodeVersion !== 'string' || typeof parsed.utcpVersion !== 'string') {
-      return null;
-    }
-    return { nodeVersion: parsed.nodeVersion, utcpVersion: parsed.utcpVersion };
+    const utcpEntryPath = createRequire(from).resolve('@utcp/code-mode');
+    const utcpVersion = owningPackageVersion(utcpEntryPath);
+    const isolatedVmVersion = owningPackageVersion(createRequire(utcpEntryPath).resolve('isolated-vm'));
+    if (utcpVersion === null || isolatedVmVersion === null) return null;
+    return {
+      nodeVersion: process.versions.node,
+      platform: process.platform,
+      arch: process.arch,
+      utcpVersion,
+      utcpEntryPath,
+      isolatedVmVersion,
+    };
   } catch {
     return null;
   }
 }
 
-function writeCacheMarker(marker: CacheMarker): void {
+/** The marker's fingerprint, or null when there is none or it is not a complete one (a pre-fingerprint marker). */
+function readCacheMarker(): SandboxFingerprint | null {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(getSandboxCacheMarkerPath(), 'utf-8'));
+    if (typeof parsed !== 'object' || parsed === null) return null;
+    const record = parsed as Record<string, unknown>;
+    return FINGERPRINT_FIELDS.every((field) => typeof record[field] === 'string')
+      ? (record as unknown as SandboxFingerprint)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function sameFingerprint(a: SandboxFingerprint, b: SandboxFingerprint): boolean {
+  return FINGERPRINT_FIELDS.every((field) => a[field] === b[field]);
+}
+
+function writeCacheMarker(fingerprint: SandboxFingerprint): void {
   try {
     mkdirSync(getIronCurtainHome(), { recursive: true, mode: 0o700 });
-    writeFileSync(getCacheMarkerPath(), JSON.stringify(marker), { mode: 0o600 });
+    const marker = Object.fromEntries(FINGERPRINT_FIELDS.map((field) => [field, fingerprint[field]]));
+    writePrivateFileAtomicSync(getSandboxCacheMarkerPath(), JSON.stringify(marker));
   } catch {
     // Cache writes are best-effort — failure just means we re-run next time.
   }
+}
+
+/** Options for {@link checkSandboxViability}. */
+export interface SandboxViabilityOptions {
+  /**
+   * Consult and refresh the cache marker in the IronCurtain home (default
+   * true). `ironcurtain doctor` passes false: it always runs the real check
+   * and writes nothing, so a diagnostic run neither trusts a stale marker
+   * nor creates the home.
+   */
+  readonly useCache?: boolean;
+  /** The check run on a cache miss (tests). Default: load the sandbox in a child process. */
+  readonly probe?: () => Promise<PreflightCheckResult>;
 }
 
 /**
@@ -73,24 +150,52 @@ function writeCacheMarker(marker: CacheMarker): void {
  * segfaults on Node 25 or ABI mismatches from stale builds) from killing
  * the main CLI process.
  *
- * On success, writes a cache marker keyed on `{nodeVersion, utcpVersion}`
- * so subsequent invocations skip the spawn (which otherwise costs hundreds
- * of ms for the UTCP module load).
+ * On success, writes a cache marker holding the {@link SandboxFingerprint}
+ * (runtime, installation and resolved package versions), so later
+ * invocations with the same fingerprint skip the spawn (which otherwise
+ * costs hundreds of ms for the UTCP module load). Any difference, such as an
+ * isolated-vm upgrade, a different architecture or another installation
+ * sharing the home, runs the real check again. With `useCache: false` the
+ * marker is neither read nor written.
  */
-export async function checkSandboxViability(): Promise<PreflightCheckResult> {
-  const utcpVersion = resolveUtcpVersion();
-  if (utcpVersion) {
+export async function checkSandboxViability(options: SandboxViabilityOptions = {}): Promise<PreflightCheckResult> {
+  const fingerprint = options.useCache === false ? null : resolveSandboxFingerprint();
+  if (fingerprint !== null) {
     const cached = readCacheMarker();
-    if (cached && cached.nodeVersion === process.versions.node && cached.utcpVersion === utcpVersion) {
+    if (cached !== null && sameFingerprint(cached, fingerprint)) {
       return { ok: true, message: 'cached' };
     }
   }
 
-  const result = await runSandboxViabilityCheck();
-  if (result.ok && utcpVersion) {
-    writeCacheMarker({ nodeVersion: process.versions.node, utcpVersion });
+  const result = await (options.probe ?? runSandboxViabilityCheck)();
+  if (result.ok && fingerprint !== null) {
+    writeCacheMarker(fingerprint);
   }
   return result;
+}
+
+/**
+ * The sandbox preflight of a command about to run agent sessions in this
+ * process: runs {@link checkSandboxViability} and, when the V8 sandbox cannot
+ * load, prints the fatal error and exits with status 1. Commands answer
+ * `--help` and argument errors before calling it (see
+ * `sandboxPreflightRequired` in src/cli-routing.ts and the daemon command),
+ * so those never depend on isolated-vm, and neither do the commands that run
+ * no session (listing jobs or workflows, for example).
+ *
+ * Writes with process.stderr.write rather than console.error: the logger
+ * (src/logger.ts) can redirect console.* into a log file, and this message
+ * must reach the terminal.
+ */
+export async function ensureSandboxViable(): Promise<void> {
+  const result = await checkSandboxViability();
+  if (result.ok) return;
+  process.stderr.write(`\n${chalk.bold(chalk.red('Fatal Error:'))} ${result.message}\n`);
+  if (result.details) {
+    process.stderr.write(chalk.dim(result.details) + '\n');
+  }
+  process.stderr.write(chalk.dim('Run `ironcurtain doctor` for a full diagnostic.\n\n'));
+  process.exit(1);
 }
 
 function runSandboxViabilityCheck(): Promise<PreflightCheckResult> {
@@ -126,7 +231,10 @@ function runSandboxViabilityCheck(): Promise<PreflightCheckResult> {
 
     const child = spawn(process.execPath, ['--no-warnings', '-e', script], {
       stdio: ['ignore', 'ignore', 'pipe'],
-      env: process.env,
+      // The check loads one native module and exits; it needs nothing from
+      // the host beyond the allowlist (PATH, HOME, TMPDIR, ...), and must not
+      // inherit NODE_OPTIONS or the host's secrets.
+      env: inheritedEnv(process.env),
     });
 
     let stderrOutput = '';

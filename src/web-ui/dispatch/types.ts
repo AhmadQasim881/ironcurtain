@@ -14,6 +14,7 @@ import type { TokenStreamBridge } from '../token-stream-bridge.js';
 import type { PtySessionManager, PtyWebSession } from '../pty-session-manager.js';
 import type { WebEventBus } from '../web-event-bus.js';
 import type { LlmStatisticsReader } from '../../llm-metrics/query-service.js';
+import type { WorkflowManager } from '../../workflow/workflow-manager.js';
 import { type SessionDto, type BudgetSummaryDto, type DaemonStatusDto, InvalidParamsError } from '../web-ui-types.js';
 
 // ---------------------------------------------------------------------------
@@ -39,6 +40,12 @@ export interface DispatchContext {
   /** Manager for Docker-agent PTY terminal sessions (docker mode only). */
   ptySessionManager?: PtySessionManager;
   /**
+   * Workflow manager, when the daemon runs the workflow system. Workflow
+   * dispatch requires it; escalation dispatch consults it so a workflow
+   * tool-call escalation can be resolved by id through `escalations.resolve`.
+   */
+  workflowManager?: WorkflowManager;
+  /**
    * Daemon-process capture-traces default. Used by `sessions.create`
    * when the JSON-RPC payload does not include `captureTraces`. See
    * docs/designs/mitm-token-trajectory-capture.md §10.
@@ -48,8 +55,9 @@ export interface DispatchContext {
    * Policy-mutation authz gate. When false (the DEFAULT), the policy-mutation
    * surface does not exist: every persona-mutation method
    * (`compileStream` / `create` / `editConstitution` / `setMemory` / `delete` /
-   * `setBroadPolicyOptIn`) returns `POLICY_MUTATION_FORBIDDEN`. Read methods
-   * (`list` / `get` / `getCompile` / `listCompiles`) stay ungated.
+   * `setBroadPolicyOptIn` / `clone` / `rename` / `restoreTrash` /
+   * `purgeTrash`) returns `POLICY_MUTATION_FORBIDDEN`. Read methods
+   * (`list` / `get` / `getCompile` / `listCompiles` / `listTrash`) stay ungated.
    *
    * Wired (Phase 1c) via the 4-hop `--allow-policy-mutation` daemon flag,
    * mirroring `captureTracesDefault`:
@@ -90,7 +98,7 @@ export function toSessionDto(managed: ManagedSession): SessionDto {
     status: info.status,
     turnCount: info.turnCount,
     createdAt: info.createdAt,
-    hasPendingEscalation: managed.pendingEscalation !== null,
+    hasPendingEscalation: managed.pendingEscalations.size > 0,
     messageInFlight: managed.messageInFlight,
     budget: toBudgetDto(managed),
     ...(persona ? { persona } : {}),
@@ -117,6 +125,7 @@ export function toPtySessionDto(session: PtyWebSession): SessionDto {
     budget: zeroedBudgetDto(),
     ...(persona ? { persona } : {}),
     ...(session.lastAttachedAt ? { lastAttachedAt: session.lastAttachedAt } : {}),
+    ...(session.osSandboxWarning ? { osSandboxWarning: session.osSandboxWarning } : {}),
   };
 }
 
@@ -132,13 +141,20 @@ export function zeroedBudgetDto(): BudgetSummaryDto {
   };
 }
 
+/**
+ * Session totals for the web UI. The DTO is built after turns end (and for
+ * idle sessions), when a builtin session's per-turn fields are already
+ * reset, so it reports the cumulative view; `limits` stay per-turn limits.
+ */
 export function toBudgetDto(managed: ManagedSession): BudgetSummaryDto {
   const status = managed.session.getBudgetStatus();
+  const { cumulative } = status;
   return {
-    totalTokens: status.totalTokens,
-    stepCount: status.stepCount,
-    elapsedSeconds: status.elapsedSeconds,
-    estimatedCostUsd: status.estimatedCostUsd,
+    totalTokens: cumulative.totalTokens,
+    stepCount: cumulative.stepCount,
+    elapsedSeconds: cumulative.activeSeconds,
+    estimatedCostUsd: cumulative.estimatedCostUsd,
+    ...(status.costSource !== undefined ? { costSource: status.costSource } : {}),
     tokenTrackingAvailable: status.tokenTrackingAvailable,
     tokenTrackingStatus: status.tokenTrackingStatus,
     observedExchanges: status.observedExchanges,

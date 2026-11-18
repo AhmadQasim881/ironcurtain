@@ -20,6 +20,8 @@ export const googleOAuthProvider: OAuthProviderConfig = {
   clientSecretEnvVar: 'GOOGLE_CLIENT_SECRET',
   credentialsFilename: 'google-credentials.json',
   revocationUrl: 'https://oauth2.googleapis.com/revoke',
+  manualRevocationUrl: 'https://myaccount.google.com/permissions',
+  tokenInfoUrl: 'https://oauth2.googleapis.com/tokeninfo',
   extraAuthParams: { access_type: 'offline', prompt: 'consent', include_granted_scopes: 'true' },
   scopePicker: promptGoogleScopes,
   resolveShortScopes: resolveGoogleShortScopes,

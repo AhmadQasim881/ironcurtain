@@ -15,13 +15,29 @@
 # (runners sit at 10240, not starved) and plain handle leaks (closing/unref-ing
 # them didn't help). See issue #363.
 #
-# Until it's found, re-run the root suite (up to MAX_ATTEMPTS) but ONLY when the
-# failure is that benign teardown signature with ZERO failed tests. This is
-# re-verification, not masking: a genuine test failure ("N failed" in the vitest
-# summary) is never retried — it propagates immediately. Success requires a
-# clean `vitest` exit within the attempt budget; if every attempt hit the
-# teardown flake (tests passing each time) we log loudly and pass, since failing
-# a run in which no test ever failed is worse than the flake it papers over.
+# A worker that dies mid-file looks almost the same: vitest prints no
+# "N failed", because the tests after the crash point never ran (BLD-3). So a
+# worker death counts as the flake only when it is proven harmless. Each
+# attempt runs with scripts/vitest-run-ledger.ts, a reporter that records every
+# planned test file, the final state of every file and test, and every
+# unhandled error, and scripts/classify-vitest-run.ts labels the attempt:
+#
+#   pass        vitest exited 0.
+#   fail        a failed test or file, an unhandled error other than a worker
+#               exit, or a non-zero exit with no worker death. Never retried:
+#               it propagates immediately.
+#   flake       workers exited unexpectedly, but every planned file and test
+#               finished and none failed. Retried; if the final attempt is
+#               still a flake, the run passes with a loud warning, since
+#               failing a run in which every test ran and passed is worse than
+#               the flake it papers over.
+#   incomplete  a worker died and some planned file or test has no final
+#               result (a crash mid-file or while importing), or no ledger was
+#               written. Retried, but the run fails if the final attempt is
+#               still incomplete: tests that never ran cannot pass.
+#
+# So the root suite passes only when its last attempt ran every planned test
+# to completion with zero failures.
 set -uo pipefail
 
 # Targeted runs (any arg): original behavior, no retry, no web-ui sub-suite.
@@ -29,40 +45,55 @@ if [ $# -ne 0 ]; then
   exec npx vitest run "$@"
 fi
 
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
+
 MAX_ATTEMPTS=3
-# vitest summary lines look like "Test Files  1 failed | 251 passed …" /
-# "Tests  3 failed | …"; a real failure always prints "<n> failed" there.
-FAILURE_RE='(Test Files|Tests)[[:space:]]+[0-9]+ failed'
-TEARDOWN_RE='Worker exited unexpectedly|prevents Vite server from exiting|close timed out after [0-9]+ms'
 
-strip_ansi() { perl -pe 's/\x1b\[[0-9;]*m//g' 2>/dev/null || cat; }
+# Naming a reporter replaces vitest's own choice (`agent` under an AI coding
+# agent, otherwise `default`, plus `github-actions` on GitHub), so keep that
+# choice and add the ledger reporter to it.
+base_reporter=default
+if node --input-type=module -e 'const { isAgent } = await import("std-env"); process.exit(isAgent ? 0 : 1);' 2>/dev/null; then
+  base_reporter=agent
+fi
+REPORTERS=(--reporter="$base_reporter")
+if [ "${GITHUB_ACTIONS:-}" = true ]; then
+  REPORTERS+=(--reporter=github-actions)
+fi
+REPORTERS+=(--reporter=./scripts/vitest-run-ledger.ts)
 
-# Runs the root suite once; sets CLASSIFY to pass | fail | flake.
-CLASSIFY=""
+# Explicit template: BSD mktemp (macOS) can require one; harmless on GNU.
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ic-vitest-run.XXXXXX")" || exit 1
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+# Runs the root suite once; sets VERDICT to pass | fail | flake | incomplete.
+VERDICT=""
 run_root_once() {
-  local log
-  # Explicit template: BSD mktemp (macOS) can require one; harmless on GNU.
-  log="$(mktemp "${TMPDIR:-/tmp}/ic-vitest-run.XXXXXX")"
-  npx vitest run 2>&1 | tee "$log"
+  local log="$WORK_DIR/attempt-$1.log"
+  local ledger="$WORK_DIR/attempt-$1.ledger.json"
+  IC_VITEST_LEDGER="$ledger" npx vitest run "${REPORTERS[@]}" 2>&1 | tee "$log"
   local ec="${PIPESTATUS[0]}"
-  local clean
-  clean="$(strip_ansi <"$log")"
-  rm -f "$log"
   if [ "$ec" -eq 0 ]; then
-    CLASSIFY=pass
-  elif printf '%s\n' "$clean" | grep -qE "$FAILURE_RE"; then
-    CLASSIFY=fail
-  elif printf '%s\n' "$clean" | grep -qE "$TEARDOWN_RE"; then
-    CLASSIFY=flake
-  else
-    CLASSIFY=fail
+    VERDICT=pass
+    return
   fi
+  # The classifier prints the verdict on stdout and its reasons on stderr. It
+  # runs from node_modules, not through npx: a wrapper on PATH (the release
+  # workflow's safe-chain shims, say) may write to stdout and corrupt the
+  # verdict. Anything unexpected is a failure.
+  if ! VERDICT="$(./node_modules/.bin/tsx scripts/classify-vitest-run.ts --exit-code "$ec" --ledger "$ledger" --log "$log")"; then
+    VERDICT=fail
+  fi
+  case "$VERDICT" in
+    fail | flake | incomplete) ;;
+    *) VERDICT=fail ;;
+  esac
 }
 
 attempt=1
 while :; do
-  run_root_once
-  case "$CLASSIFY" in
+  run_root_once "$attempt"
+  case "$VERDICT" in
     pass)
       break
       ;;
@@ -71,13 +102,20 @@ while :; do
       ;;
     flake)
       if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
-        echo "::warning::vitest teardown flake persisted across ${MAX_ATTEMPTS} attempts; every attempt had zero failed tests, so treating as success (see scripts/test.sh / issue #363)"
+        echo "::warning::vitest teardown flake persisted across ${MAX_ATTEMPTS} attempts; the last attempt ran every planned test to completion with zero failures, so treating as success (see scripts/test.sh / issue #363)"
         break
       fi
-      echo "::warning::vitest teardown flake on attempt ${attempt}/${MAX_ATTEMPTS} (all tests passed but a worker died at teardown); retrying the root suite"
-      attempt=$((attempt + 1))
+      echo "::warning::vitest teardown flake on attempt ${attempt}/${MAX_ATTEMPTS} (every test finished and passed, but a worker died); retrying the root suite"
+      ;;
+    incomplete)
+      if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+        echo "::error::vitest worker died and test results are missing on the final attempt (${attempt}/${MAX_ATTEMPTS}); tests that never ran cannot pass, so failing (see scripts/test.sh / issue #363)"
+        exit 1
+      fi
+      echo "::warning::vitest worker died on attempt ${attempt}/${MAX_ATTEMPTS} and some tests have no result; retrying the root suite"
       ;;
   esac
+  attempt=$((attempt + 1))
 done
 
 npm test -w packages/web-ui

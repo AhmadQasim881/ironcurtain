@@ -1,5 +1,7 @@
 # ArgumentRole Registry Design
 
+**Status (2026-11-14):** Implemented: the role registry in `src/types/argument-roles.ts`, which has grown well beyond the path roles described here (URL, identifier, history, egress-host and outbound-content roles).
+
 ## Problem
 
 Argument role definitions (`'read-path' | 'write-path' | 'delete-path' | 'none'`) are scattered as hardcoded string literals across six files. Path normalization in `path-utils.ts` uses fragile heuristics (checking if strings start with `/`, `.`, or `~`) instead of leveraging the tool annotations that already classify every argument. This creates two problems:
@@ -32,7 +34,7 @@ Each role definition provides:
 
 - **`description`** -- Human-readable explanation of the role's security semantics.
 - **`isResourceIdentifier`** -- True if the role tags an argument that names an external resource (filesystem path, URL, etc.). False for `'none'`. Replaces all `role !== 'none'` checks in the codebase.
-- **`canonicalize`** -- Canonicalizes a string argument value for transport to the MCP server. For path roles: tilde expansion + symlink-aware `resolveRealPath()` (follows symlinks via `realpathSync`, with fallbacks for non-existent paths). For `'none'`: identity function. Must be pure and must not throw.
+- **`canonicalize`** -- Canonicalizes a string argument value for transport to the MCP server. For path roles: tilde expansion + symlink-aware `resolveRealPath()` (follows symlinks via `realpathSync`, the native variant on macOS, with a deepest-existing-ancestor fallback for non-existent paths). For `'none'`: identity function. Must be pure. Only path roles may throw, and only `PathResolutionError` (code `PATH_UNRESOLVABLE`) when no ancestor of the path can be canonicalized; the tool-call pipeline turns that into an audited `structural-unresolvable-path` deny.
 
 Domain extraction and other policy-oriented value transformations are handled externally by helper functions in `domain-utils.ts`, rather than through additional methods on `RoleDefinition`.
 
@@ -58,14 +60,16 @@ A type-level assertion ensures every member of the `ArgumentRole` union has a re
 
 ## Role Definitions
 
-| Role | isResourceIdentifier | canonicalize | Description |
-|------|---------------------|-----------|-------------|
-| `read-path` | true | tilde expand + `resolveRealPath()` | Filesystem path that will be read |
-| `write-path` | true | tilde expand + `resolveRealPath()` | Filesystem path that will be written to |
-| `delete-path` | true | tilde expand + `resolveRealPath()` | Filesystem path that will be deleted |
-| `none` | false | identity (no-op) | Argument carries no resource-identifier semantics |
+| Role          | isResourceIdentifier | canonicalize                       | Description                                       |
+| ------------- | -------------------- | ---------------------------------- | ------------------------------------------------- |
+| `read-path`   | true                 | tilde expand + `resolveRealPath()` | Filesystem path that will be read                 |
+| `write-path`  | true                 | tilde expand + `resolveRealPath()` | Filesystem path that will be written to           |
+| `delete-path` | true                 | tilde expand + `resolveRealPath()` | Filesystem path that will be deleted              |
+| `none`        | false                | identity (no-op)                   | Argument carries no resource-identifier semantics |
 
-For path roles, `canonicalize` uses `resolveRealPath()` which follows symlinks to produce the canonical real path. This neutralizes both path traversal attacks (via `resolve`) and symlink-escape attacks (via `realpathSync`). The function has a three-tier fallback: (1) `realpathSync(path)` for existing paths, (2) `realpathSync(dirname) + basename` for new files in existing directories, (3) `path.resolve()` for entirely new paths.
+The registry has grown since (URL, identifier and opaque roles; see `src/types/argument-roles.ts`). A role may also set `outboundContent` (`'text'` or `'url'`): its values leave the machine as content other people or systems read, and the opt-in outbound content assessment checks them for encoded or hidden data. `outbound-text` (github, google-workspace: comment, issue and PR text, message subjects; never an argument that holds an object, see below), `email-body`, `commit-message` (git, github) and `fetch-url` set it; see [outbound-content-assessment.md](outbound-content-assessment.md). `isResourceIdentifier` is independent of the category: `github-resource-id` (github only) is an opaque role that is still a resource identifier. It tags arguments that name a GitHub resource by a global ID rather than by owner/repo, such as `pull_request_review_write.threadId` for `resolve_thread`/`unresolve_thread` and `sub_issue_write.sub_issue_id`. The engine evaluates it like any other resource role, so owner/repo-scoped rules (whose role conditions do not name it) never discharge it and the shipped github write rule escalates it, while the approval whitelist, which can generalize only paths, URLs and identifiers, offers no pattern for it.
+
+For path roles, `canonicalize` uses `resolveRealPath()` which follows symlinks to produce the canonical real path. This neutralizes both path traversal attacks (via `resolve`) and symlink-escape attacks (via `realpathSync`). It works in three steps: (1) the whole path is canonicalized when it resolves; on macOS this uses `realpathSync.native`, which also returns the on-disk letter case and Unicode form of every component, so the policy engine and the MCP server see the same spelling; (2) otherwise the deepest ancestor that resolves is canonicalized and the remaining components are re-attached verbatim, however many there are (a binary search over the ancestors keeps this at O(log depth) realpath calls); (3) if not even the filesystem root resolves, it throws `PathResolutionError` rather than returning the unresolved spelling.
 
 Policy-oriented transformations (e.g., domain extraction from URLs) are handled by helper functions in `domain-utils.ts` rather than through `RoleDefinition` methods.
 
@@ -80,8 +84,10 @@ For each argument in `args`:
 1. Look up `annotation.args[argName]` to get the role array
 2. Find the first role where `getRoleDefinition(role).isResourceIdentifier === true`
 3. If found: apply `canonicalize` to produce the canonical value for both transport and policy
-4. If not found (roles are all `'none'`, or argument not in annotation): pass through unchanged to both outputs
+4. If not found (roles are all `'none'`): pass through unchanged to both outputs
 5. If `annotation` is `undefined` (unknown tool): fall back to the heuristic `normalizeToolArgPaths()` for both outputs
+
+An argument that is not in the annotation at all never reaches `prepareToolArgs`: `handleCallTool` denies the call first (rule `unannotated-arguments`), because policy, the approval whitelist and the auto-approver only see annotated arguments. The check uses the stored annotation's keys, not the server's live schema, which is where server releases add or rename arguments.
 
 The input object is never mutated; new objects are returned.
 
@@ -89,17 +95,16 @@ The input object is never mutated; new objects are returned.
 interface PreparedToolArgs {
   /** Canonical args sent to the real MCP server. */
   argsForTransport: Record<string, unknown>;
-  /** Args presented to the policy engine (may differ for relative paths when allowedDirectory is set). */
+  /** Args presented to the policy engine (resource-role values identical to argsForTransport). */
   argsForPolicy: Record<string, unknown>;
 }
 
-function prepareToolArgs(
-  args: Record<string, unknown>,
-  annotation: ToolAnnotation | undefined,
-): PreparedToolArgs;
+function prepareToolArgs(args: Record<string, unknown>, annotation: ToolAnnotation | undefined): PreparedToolArgs;
 ```
 
-For path roles, both outputs are typically identical -- the resolved absolute path. The dual-output structure exists because `argsForPolicy` may differ when relative paths are resolved against `allowedDirectory`.
+For path roles both outputs carry the same absolute canonical path. With `allowedDirectory` set, a relative path (anything but `/...`, `~` or `~/...`) is resolved against `allowedDirectory` before canonicalization, for transport as well as policy: left relative, the MCP server would resolve it against its own working directory (for git a per-server temp directory under srt, otherwise the IronCurtain launch directory), not against the sandbox that policy checked. For the git server, a `path` of `'.'` (its sentinel for the session working directory) is replaced by the tracked working directory before this step, like an omitted path.
+
+A role describes a top-level argument as a whole, and `canonicalize` applies to a string or to each string of an array. Any other value of a role-bearing argument (an object, an array holding an object or another array, a boolean) passes through unchanged, so policy cannot claim it evaluated what the server receives. The policy engine reads such a value through `argumentValues()` (`src/trusted-process/argument-values.ts`): every string and number inside it is a value of the argument's roles for the protected-path, forbidden-destination and compiled checks, and the call escalates to a human (`structural-nested-argument-escalate`, human-only) unless one of them denies it. A number is read in decimal form (a numeric ID such as `sub_issue_write.sub_issue_id`), and an absent value (`undefined`, `null`) yields nothing. `annotate-tools` warns about every role it assigns to a schema property that can hold an object or a nested array (`findStructuredRoleArguments()` in `src/pipeline/tool-annotator.ts`); in the shipped annotations those are the `editors` argument of the two gsheets protected-range tools. Sub-path (JSON-pointer-style) roles that could address the values inside such an argument individually do not exist yet.
 
 ### Normalization flow
 
@@ -116,7 +121,7 @@ mcp-proxy-server.ts / TrustedProcess.handleToolCall()
      |       +-- for each arg: looks up roles from annotation
      |       +-- for first resource-identifier role:
      |       |     canonicalize(value)         → argsForTransport[key]
-     |       |     (argsForPolicy typically identical; may differ for relative paths)
+     |       |     (argsForPolicy identical; relative paths resolved against allowedDirectory for both)
      |       |
      |       +-- returns { argsForTransport, argsForPolicy }
      |
@@ -153,34 +158,34 @@ Resolves conditional role specs against the tool call arguments and returns a pl
 
 All hardcoded role references across the codebase are replaced with registry-derived values:
 
-| Current pattern | Replacement |
-|----------------|-------------|
-| `['read-path', 'write-path', 'delete-path']` | `getResourceRoles()` |
-| `role !== 'none'` | `getRoleDefinition(role).isResourceIdentifier` |
-| `z.enum(['read-path', 'write-path', 'delete-path', 'none'])` | `z.enum(getArgumentRoleValues())` |
-| `VALID_ROLES.includes(role)` | `isArgumentRole(role)` |
+| Current pattern                                              | Replacement                                    |
+| ------------------------------------------------------------ | ---------------------------------------------- |
+| `['read-path', 'write-path', 'delete-path']`                 | `getResourceRoles()`                           |
+| `role !== 'none'`                                            | `getRoleDefinition(role).isResourceIdentifier` |
+| `z.enum(['read-path', 'write-path', 'delete-path', 'none'])` | `z.enum(getArgumentRoleValues())`              |
+| `VALID_ROLES.includes(role)`                                 | `isArgumentRole(role)`                         |
 
 ## Files Affected
 
 ### New files
 
-| File | Purpose |
-|------|---------|
-| `src/types/argument-roles.ts` | Registry, type, normalizers, accessors |
+| File                          | Purpose                                 |
+| ----------------------------- | --------------------------------------- |
+| `src/types/argument-roles.ts` | Registry, type, normalizers, accessors  |
 | `test/argument-roles.test.ts` | Unit tests for registry and normalizers |
 
 ### Modified files
 
-| File | Change |
-|------|--------|
-| `src/pipeline/types.ts` | Re-export `ArgumentRole` from canonical location |
-| `src/trusted-process/path-utils.ts` | Add `prepareToolArgs()`, deprecate heuristic |
-| `src/trusted-process/policy-engine.ts` | Use `getResourceRoles()`, `getRoleDefinition()`, add `getAnnotation()` |
-| `src/trusted-process/mcp-proxy-server.ts` | Use annotation-driven normalization |
-| `src/trusted-process/index.ts` | Use annotation-driven normalization |
-| `src/pipeline/tool-annotator.ts` | Use `getArgumentRoleValues()` for Zod schema |
-| `src/pipeline/constitution-compiler.ts` | Use `getArgumentRoleValues()`, `isArgumentRole()` |
-| `test/path-utils.test.ts` | Add tests for annotation-driven normalization |
+| File                                      | Change                                                                 |
+| ----------------------------------------- | ---------------------------------------------------------------------- |
+| `src/pipeline/types.ts`                   | Re-export `ArgumentRole` from canonical location                       |
+| `src/trusted-process/path-utils.ts`       | Add `prepareToolArgs()`, deprecate heuristic                           |
+| `src/trusted-process/policy-engine.ts`    | Use `getResourceRoles()`, `getRoleDefinition()`, add `getAnnotation()` |
+| `src/trusted-process/mcp-proxy-server.ts` | Use annotation-driven normalization                                    |
+| `src/trusted-process/index.ts`            | Use annotation-driven normalization                                    |
+| `src/pipeline/tool-annotator.ts`          | Use `getArgumentRoleValues()` for Zod schema                           |
+| `src/pipeline/constitution-compiler.ts`   | Use `getArgumentRoleValues()`, `isArgumentRole()`                      |
+| `test/path-utils.test.ts`                 | Add tests for annotation-driven normalization                          |
 
 ### Unchanged files
 
@@ -201,7 +206,7 @@ All Zod schemas, validation logic, and normalization flows pick up the new role 
 
 ### Policy-oriented transformations
 
-When the policy engine needs a different view of a value than the MCP server (e.g., domain extraction from URLs), this is handled by standalone helper functions in `domain-utils.ts` rather than through `RoleDefinition` methods. The policy engine calls these functions directly, dispatching by role identity (see `extractDomainForRole`, `resolveGitRemote`).
+When the policy engine needs a different view of a value than the MCP server (e.g., domain extraction from URLs), this is handled by standalone helper functions in `domain-utils.ts` rather than through `RoleDefinition` methods. The policy engine calls these functions directly, dispatching by role identity (see `extractDomainForRole` and `resolveUrlForDomainCheck`, the single resolver from a URL-role value to the domains it reaches).
 
 ### Future: `sanitizeForLLM` on RoleDefinition
 

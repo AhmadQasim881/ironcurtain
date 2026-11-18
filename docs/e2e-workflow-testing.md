@@ -10,7 +10,7 @@ The fastest path. Uses the mock WebSocket server to simulate the full workflow l
 
 ### Prerequisites
 
-- Node.js 20+
+- Node.js 24 or 26
 - `npm install` at repo root (installs workspace deps)
 
 ### Steps
@@ -51,8 +51,8 @@ Runs the actual daemon, creates real Docker agent sessions, runs real LLM agents
 ### Prerequisites
 
 1. **Docker** installed and running (the bundled `design-and-code` workflow uses `mode: "docker"` with `dockerAgent: "claude-code"`)
-2. **`ANTHROPIC_API_KEY`** set in `.env` at repo root (or exported in shell)
-3. **Compiled policy**: `npm run annotate-tools` and `npm run compile-policy` must have been run at least once (generates `src/config/generated/compiled-policy.json` and `tool-annotations.json`)
+2. **`ANTHROPIC_API_KEY`** exported in the shell or set in `~/.ironcurtain/.env` (a `.env` at the repository root is not read), or a Claude login for Claude Code
+3. **Compiled policy**: the package ships one (`src/config/generated/compiled-policy.json` and `tool-annotations.json`). `npm run compile-policy` writes your own to `~/.ironcurtain/generated/`, which then takes precedence; `npm run annotate-tools` writes only your annotation overlay (`~/.ironcurtain/generated/tool-annotations.json`)
 4. **Built project**: `npm run build` (compiles TypeScript + builds web UI static assets to `dist/web-ui-static/`)
 
 ### Verify prerequisites
@@ -61,11 +61,13 @@ Runs the actual daemon, creates real Docker agent sessions, runs real LLM agents
 # Check Docker
 docker info >/dev/null 2>&1 && echo "Docker: OK" || echo "Docker: NOT AVAILABLE"
 
-# Check API key
-[ -n "$ANTHROPIC_API_KEY" ] && echo "API key: set" || echo "API key: NOT SET (check .env)"
+# Check API key (exported, or in ~/.ironcurtain/.env)
+[ -n "$ANTHROPIC_API_KEY" ] || grep -q '^ANTHROPIC_API_KEY=' ~/.ironcurtain/.env 2>/dev/null \
+  && echo "API key: set" || echo "API key: NOT SET"
 
-# Check compiled policy
-[ -f src/config/generated/compiled-policy.json ] && echo "Policy: compiled" || echo "Policy: NOT COMPILED"
+# Check compiled policy (your own, or the shipped one)
+[ -f ~/.ironcurtain/generated/compiled-policy.json ] || [ -f src/config/generated/compiled-policy.json ] \
+  && echo "Policy: compiled" || echo "Policy: NOT COMPILED"
 
 # Check web UI build
 [ -f dist/web-ui-static/index.html ] && echo "Web UI: built" || echo "Web UI: NOT BUILT"
@@ -133,7 +135,7 @@ Open the dev URL (`localhost:5173`) for HMR support.
    - `workflow.gate_raised` event is emitted with the gate details (presented artifacts, accepted events, summary)
    - The web UI shows the gate panel with Approve/Force Revision/Replan/Abort buttons
    - The user reviews artifacts (real files from the workspace) and clicks a button
-   - `workflows.resolveGate` RPC sends the decision back
+   - `workflows.resolveGate` RPC sends the decision back (`{ workflowId, gateId, event, prompt?, resolvedBy? }`; `gateId` is the id of this raise of the gate, and a stale one is refused with `GATE_MISMATCH`)
    - The orchestrator continues to the next state
 7. On completion, `workflow.completed` event fires
 
@@ -148,8 +150,8 @@ Open the dev URL (`localhost:5173`) for HMR support.
 | `implement` | Agent writes code in workspace root | 60-180s |
 | `review` | Critic agent reviews implementation | 30-90s |
 | `implement` (loop) | If rejected, coder fixes issues | 60-180s |
-| `final_review` | **Gate**: Review final code, click Approve | Manual |
-| `completed` | Done | -- |
+| `escalate_gate` | **Gate** (only when the round limit is reached): Approve, Force Revision or Abort | Manual |
+| `done` | Done | -- |
 
 Total: 5-15 minutes depending on task complexity and LLM response times.
 
@@ -176,7 +178,7 @@ WebUiServer (src/web-ui/web-ui-server.ts)
    |       |       |       |-- loadConfig()
    |       |       |       |-- returns (opts) => createSession(opts)
    |       |       |
-   |       |       |-- FileCheckpointStore (temp dir)
+   |       |       |-- FileCheckpointStore (~/.ironcurtain/workflow-runs/)
    |       |       |
    |       |       v
    |       |   WorkflowOrchestrator (src/workflow/orchestrator.ts)
@@ -190,18 +192,19 @@ WebUiServer (src/web-ui/web-ui-server.ts)
 WebEventBus -> broadcast() -> all connected WS clients
 ```
 
-### Key wiring in the daemon (`ironcurtain-daemon.ts`, lines 666-693):
+### Key wiring in the daemon (`startWebUiServer()` in `src/daemon/ironcurtain-daemon.ts`):
 
 ```typescript
-// startWebUiServer():
 const server = new WebUiServer({ ... });
-server.setWorkflowManager(new WorkflowManager({ eventBus: server.getEventBus() }));
+const workflowManager = new WorkflowManager({ eventBus: server.getEventBus(), enableSnapshotGc: true });
+server.setWorkflowManager(workflowManager);
+workflowManager.startBackgroundTasks();
 ```
 
 The `WorkflowManager` is created with the server's `WebEventBus`. When the orchestrator emits events, they flow through the manager's `forwardLifecycleEvent()` into the bus, which broadcasts to all connected WebSocket clients.
 
 The `WorkflowManager.createOrchestrator()` method:
-- Creates a temp dir for checkpoints
+- Uses `~/.ironcurtain/workflow-runs/` for checkpoints and run directories
 - Calls `createWorkflowSessionFactory()` which loads config and returns a session factory
 - Wires up gate raise/dismiss callbacks to emit `WebEventBus` events
 - Creates no-op tab handles (mux tabs are meaningless in web UI mode)
@@ -214,16 +217,16 @@ The `WorkflowManager.createOrchestrator()` method:
 
 The wiring is complete:
 
-- `ironcurtain-daemon.ts` creates `WorkflowManager` with the event bus (line 684)
+- `ironcurtain-daemon.ts` creates `WorkflowManager` with the event bus
 - `WorkflowManager.createOrchestrator()` uses `createWorkflowSessionFactory()` which calls `loadConfig()` and `createSession()` (the same path as CLI workflows)
 - The orchestrator creates real Docker sessions based on the definition's `mode: "docker"` setting
 - Lifecycle events are forwarded through `WebEventBus` to WebSocket clients
 - `workflow-dispatch.ts` handles all `workflows.*` RPC methods
-- Gate resolution via `workflows.resolveGate` calls `controller.resolveGate()`
+- Gate resolution via `workflows.resolveGate` calls `controller.resolveGate()`, which throws a typed `GateResolutionError` (for example for a stale `gateId` or an event the gate does not accept) instead of silently returning
 
 ### Things to be aware of
 
-1. **Docker is required for the bundled workflow**. The `design-and-code.json` workflow has `"mode": "docker"`. If Docker is not available, the session factory will fail. To test without Docker, you would need a custom workflow definition with `"mode": "builtin"` -- but builtin mode uses the code sandbox, not a full agent, so the experience would be different.
+1. **Docker is required for the bundled workflow**. The bundled `design-and-code` workflow (`src/workflow/workflows/design-and-code/workflow.yaml`) has `mode: docker`. If Docker is not available, the session factory will fail. To test without Docker, you would need a custom workflow definition with `"mode": "builtin"` -- but builtin mode uses the code sandbox, not a full agent, so the experience would be different.
 
 2. **Cost**: Each agent state invocation runs a real LLM session. The `design-and-code` workflow has 4+ agent states, and the implement/review loop can repeat up to 3 times. Budget: expect $2-10 per full run depending on task complexity.
 
@@ -242,19 +245,21 @@ The wiring is complete:
 | "Web UI not built" in browser | `dist/web-ui-static/` missing | `npm run build` or `npm run build:web-ui` |
 | WebSocket 401 | Wrong or missing token | Copy the full URL with `?token=...` from daemon output |
 | "Workflow system not available" RPC error | `--web-ui` flag not passed | Start daemon with `ironcurtain daemon --web-ui` |
-| Session creation fails | Docker not running or no API key | Check `docker info` and `.env` |
-| Workflow stuck at agent state | LLM taking long or rate limited | Check daemon logs at `~/.ironcurtain/logs/daemon-*.log` |
+| Session creation fails | Docker not running or no API key | Check `docker info` and your key (`~/.ironcurtain/.env` or the shell) |
+| Workflow stuck at agent state | LLM taking long or rate limited | Check the daemon log at `~/.ironcurtain/logs/daemon.log` |
 | "No output generated" from agent | Budget exhausted or model error | Check session logs, increase budget in `~/.ironcurtain/config.json` |
 | Gate not appearing in UI | WebSocket disconnected | Check browser console for WS errors; refresh page |
-| CORS/Origin error on WebSocket | Using Vite dev server without `--web-ui-dev` | Add `--web-ui-dev` flag when using Vite dev proxy |
+| CORS/Origin error on WebSocket | Using Vite dev server without `--web-ui-dev` | Add `--web-ui-dev` flag when using Vite dev proxy (it accepts `localhost` and `127.0.0.1` on `IRONCURTAIN_WEB_UI_PORT`, default 5173) |
+| HTTP 421 | The UI was opened by another host name | Open it as `127.0.0.1` or `localhost` |
 | Port 7400 in use | Previous daemon still running | `ironcurtain daemon status` to check; kill the old process |
 
 ### Viewing logs
 
 ```bash
-# Daemon log (stderr redirected to file after startup)
-tail -f ~/.ironcurtain/logs/daemon-*.log
+# Daemon log (rotated to daemon.log.1 ... .3)
+tail -f ~/.ironcurtain/logs/daemon.log
 
-# Session logs (one per agent invocation)
+# Session logs (one per agent invocation; shared-container runs keep theirs under the run)
 ls ~/.ironcurtain/sessions/*/session.log
+ls ~/.ironcurtain/workflow-runs/*/containers/*/states/*/session.log
 ```

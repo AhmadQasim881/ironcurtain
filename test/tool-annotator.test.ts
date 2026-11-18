@@ -1,12 +1,22 @@
 import { describe, it, expect } from 'vitest';
 import { MockLanguageModelV3 } from 'ai/test';
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
+  annotateServerTools,
   annotateTools,
+  annotationPromptVersion,
   buildRoleDescriptions,
   chunk,
+  computeToolAnnotationKey,
+  describeStructuredRoleArguments,
+  findStructuredRoleArguments,
+  schemaAdmitsStructuredValue,
   ANNOTATION_BATCH_SIZE,
   type MCPToolSchema,
 } from '../src/pipeline/tool-annotator.js';
+import type { StoredToolAnnotation, StoredToolAnnotationsFile } from '../src/pipeline/types.js';
 import { getRolesForServer } from '../src/types/argument-roles.js';
 
 const sampleTools: MCPToolSchema[] = [
@@ -142,6 +152,79 @@ describe('Tool Annotator', () => {
       const mockLLM = createMockModel({ annotations: [] });
       const result = await annotateTools('filesystem', [], mockLLM);
       expect(result).toEqual([]);
+    });
+
+    // WP-61: the runtime loaders refuse a server entry that annotates a tool
+    // twice, so the annotator must not write one.
+    it('asks for a repair when the LLM annotates a tool twice', async () => {
+      const repeated = {
+        annotations: [
+          ...cannedAnnotations.annotations,
+          { toolName: 'read_file', comment: 'Reads a file again', args: { path: ['write-path'] } },
+        ],
+      };
+      const prompts: string[] = [];
+      const replies = [repeated, cannedAnnotations];
+      const model = new MockLanguageModelV3({
+        doGenerate: async (options) => {
+          prompts.push(JSON.stringify(options.prompt));
+          const reply = replies[Math.min(prompts.length - 1, replies.length - 1)];
+          return createMockModel(reply).doGenerate(options);
+        },
+      });
+
+      const result = await annotateTools('filesystem', sampleTools, model);
+
+      expect(prompts).toHaveLength(2);
+      expect(prompts[1]).toContain('is annotated more than once');
+      expect(result.map((a) => a.toolName).sort()).toEqual(
+        ['list_allowed_directories', 'move_file', 'read_file', 'write_file'].sort(),
+      );
+      expect(result.find((a) => a.toolName === 'read_file')?.args.path).toEqual(['read-path']);
+    });
+
+    it('refuses a conditional role on an inherited name such as "constructor"', async () => {
+      const inherited = {
+        annotations: cannedAnnotations.annotations.map((a) =>
+          a.toolName === 'write_file'
+            ? {
+                ...a,
+                args: {
+                  path: {
+                    default: ['write-path'],
+                    when: [{ condition: { arg: 'constructor', is: 'present' }, roles: ['write-path'] }],
+                  },
+                  content: ['none'],
+                },
+              }
+            : a,
+        ),
+      };
+      // The zod error message is the issue list as JSON, so the quotes are escaped.
+      await expect(annotateTools('filesystem', sampleTools, createMockModel(inherited))).rejects.toThrow(
+        /references unknown argument \\"constructor\\"/,
+      );
+    });
+
+    // WP-59: the policy lint uses the server's hints to recognize tools that
+    // change state (tighten-only), so the annotation keeps them.
+    it("stores the server's read-only and destructive hints, and nothing else from them", async () => {
+      const hinted: MCPToolSchema[] = sampleTools.map((t) => {
+        if (t.name === 'read_file') return { ...t, annotations: { readOnlyHint: true, title: 'Read' } };
+        if (t.name === 'write_file') {
+          return { ...t, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true } };
+        }
+        if (t.name === 'move_file') return { ...t, annotations: { readOnlyHint: 'no', destructiveHint: 1 } };
+        return t;
+      });
+      const result = await annotateTools('filesystem', hinted, createMockModel(cannedAnnotations));
+      const hintsOf = (name: string) => result.find((a) => a.toolName === name)?.mcpHints;
+
+      expect(hintsOf('read_file')).toEqual({ readOnlyHint: true });
+      expect(hintsOf('write_file')).toEqual({ readOnlyHint: false, destructiveHint: true });
+      // Non-boolean values are ignored, and a tool without hints gets no field.
+      expect(result.find((a) => a.toolName === 'move_file')).not.toHaveProperty('mcpHints');
+      expect(result.find((a) => a.toolName === 'list_allowed_directories')).not.toHaveProperty('mcpHints');
     });
   });
 
@@ -459,6 +542,25 @@ describe('Tool Annotator', () => {
 
       await expect(annotateTools('filesystem', tools, model)).rejects.toThrow('Annotation incomplete: missing tools');
     });
+
+    it('fails when the server lists a tool in two batches instead of writing it twice', async () => {
+      // tool_0 is listed first and again as the 26th tool, so each batch annotates it once.
+      const tools = [...makeTools(ANNOTATION_BATCH_SIZE), { ...makeTools(1)[0] }];
+      const names = [...new Set(tools.map((t) => t.name))];
+      const model = new MockLanguageModelV3({
+        doGenerate: async (options) => {
+          const prompt = JSON.stringify(options.prompt);
+          const annotations = names
+            .filter((name) => new RegExp(`Tool: ${name}\\b`).test(prompt))
+            .map((name) => ({ toolName: name, comment: `Annotation for ${name}`, args: { path: ['read-path'] } }));
+          return createMockModel({ annotations }).doGenerate(options);
+        },
+      });
+
+      await expect(annotateTools('filesystem', tools, model)).rejects.toThrow(
+        'the server lists these tools more than once: "tool_0"',
+      );
+    });
   });
 
   describe('buildRoleDescriptions', () => {
@@ -483,6 +585,443 @@ describe('Tool Annotator', () => {
       expect(descriptions).toContain('git-remote-url');
       expect(descriptions).toContain('branch-name');
       expect(descriptions).toContain('commit-message');
+    });
+  });
+
+  describe('roles on arguments that can hold structured values', () => {
+    function annotation(
+      args: StoredToolAnnotation['args'],
+      properties: Record<string, unknown>,
+      toolName = 'tool',
+    ): StoredToolAnnotation {
+      return { toolName, serverName: 'srv', comment: 'test', args, inputSchema: { type: 'object', properties } };
+    }
+
+    it('recognizes schemas that admit an object or an array of structured elements', () => {
+      expect(schemaAdmitsStructuredValue({ type: 'object', properties: { users: { type: 'array' } } })).toBe(true);
+      expect(schemaAdmitsStructuredValue({ properties: { p: { type: 'string' } } })).toBe(true);
+      expect(schemaAdmitsStructuredValue({ type: ['object', 'null'] })).toBe(true);
+      expect(schemaAdmitsStructuredValue({ type: 'array', items: { type: 'object' } })).toBe(true);
+      expect(schemaAdmitsStructuredValue({ type: 'array', items: { type: 'array', items: { type: 'string' } } })).toBe(
+        true,
+      );
+      expect(
+        schemaAdmitsStructuredValue({ type: 'array', prefixItems: [{ type: 'string' }, { type: 'object' }] }),
+      ).toBe(true);
+      expect(schemaAdmitsStructuredValue({ anyOf: [{ type: 'string' }, { type: 'object' }] })).toBe(true);
+      expect(
+        schemaAdmitsStructuredValue({
+          oneOf: [{ type: 'string' }, { type: 'array', items: { anyOf: [{ type: 'object' }] } }],
+        }),
+      ).toBe(true);
+    });
+
+    it('does not flag strings, numbers, flat arrays or schemas that do not say', () => {
+      expect(schemaAdmitsStructuredValue({ type: 'string' })).toBe(false);
+      expect(schemaAdmitsStructuredValue({ type: 'number' })).toBe(false);
+      expect(schemaAdmitsStructuredValue({ type: ['string', 'null'] })).toBe(false);
+      expect(schemaAdmitsStructuredValue({ type: 'array', items: { type: 'string' } })).toBe(false);
+      expect(
+        schemaAdmitsStructuredValue({ type: 'array', items: { anyOf: [{ type: 'string' }, { type: 'integer' }] } }),
+      ).toBe(false);
+      // git_checkout.target: two string branches.
+      expect(schemaAdmitsStructuredValue({ anyOf: [{ type: 'string' }, { type: 'string', minLength: 1 }] })).toBe(
+        false,
+      );
+      expect(schemaAdmitsStructuredValue({ $ref: '#/$defs/thing' })).toBe(false);
+      expect(schemaAdmitsStructuredValue({})).toBe(false);
+      expect(schemaAdmitsStructuredValue(undefined)).toBe(false);
+    });
+
+    it('flags a role other than none on such an argument, and nothing else', () => {
+      const found = findStructuredRoleArguments([
+        annotation(
+          {
+            editors: ['email-address'],
+            files: ['none'],
+            paths: ['read-path'],
+            ops: {
+              default: ['write-path', 'none'],
+              when: [{ condition: { arg: 'mode', equals: 'dry' }, roles: ['none'] }],
+            },
+            mode: ['none'],
+          },
+          {
+            editors: { type: 'object', properties: { users: { type: 'array', items: { type: 'string' } } } },
+            files: { type: 'array', items: { type: 'object' } },
+            paths: { type: 'array', items: { type: 'string' } },
+            ops: { type: 'array', items: { type: 'object' } },
+            mode: { type: 'string' },
+          },
+        ),
+      ]);
+      expect(found).toEqual([
+        { toolName: 'tool', argName: 'editors', roles: ['email-address'] },
+        { toolName: 'tool', argName: 'ops', roles: ['write-path'] },
+      ]);
+    });
+
+    it('flags exactly the gsheets protected-range editors in the shipped annotations', () => {
+      // A new entry here needs review: policy can only escalate calls that
+      // pass a structured value to such an argument, never judge its values.
+      const generated = resolve(
+        dirname(fileURLToPath(import.meta.url)),
+        '../src/config/generated/tool-annotations.json',
+      );
+      const shipped = JSON.parse(readFileSync(generated, 'utf-8')) as StoredToolAnnotationsFile;
+      const flagged = Object.entries(shipped.servers).flatMap(([server, entry]) =>
+        findStructuredRoleArguments(entry.tools).map((found) => ({ server, ...found })),
+      );
+      expect(flagged).toEqual([
+        {
+          server: 'google-workspace',
+          toolName: 'gsheets_add_protected_range',
+          argName: 'editors',
+          roles: ['email-address'],
+        },
+        {
+          server: 'google-workspace',
+          toolName: 'gsheets_update_protected_range',
+          argName: 'editors',
+          roles: ['email-address'],
+        },
+      ]);
+    });
+
+    it('describes each one terminal-safely', () => {
+      const lines = describeStructuredRoleArguments('srv\u001b[31m', [
+        { toolName: 'tool', argName: 'arg\u0007', roles: ['email-address'] },
+      ]);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatch(/^Warning: /);
+      expect(lines[0]).toContain('email-address');
+      expect(lines[0]).toContain('escalated to a human');
+      expect(lines[0]).not.toMatch(/\p{Cc}/u);
+    });
+
+    it('can be checked on what annotateTools returns', async () => {
+      const tools: MCPToolSchema[] = [
+        {
+          name: 'protect_range',
+          inputSchema: {
+            type: 'object',
+            properties: { editors: { type: 'object', properties: { users: { type: 'array' } } } },
+          },
+        },
+      ];
+      const model = createMockModel({
+        annotations: [{ toolName: 'protect_range', comment: 'Protects a range', args: { editors: ['email-address'] } }],
+      });
+      const result = await annotateTools('google-workspace', tools, model);
+      expect(findStructuredRoleArguments(result)).toEqual([
+        { toolName: 'protect_range', argName: 'editors', roles: ['email-address'] },
+      ]);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // WP-88 / GAP1-9: per-tool annotation cache
+  // -------------------------------------------------------------------------
+
+  describe('per-tool annotation cache', () => {
+    function pathTool(name: string, description = `Tool ${name}`): MCPToolSchema {
+      return {
+        name,
+        description,
+        inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+      };
+    }
+
+    /**
+     * Annotates whichever tools the prompt lists (`roles` per tool, default
+     * read-path) and records, per call, the tools it was asked about and the
+     * temperature.
+     */
+    function recordingModel(roles: Record<string, string[]> = {}) {
+      const calls: Array<{ tools: string[]; temperature: number | undefined }> = [];
+      const model = new MockLanguageModelV3({
+        doGenerate: async (options) => {
+          const prompt = JSON.stringify(options.prompt);
+          const asked = [...prompt.matchAll(/Tool: ([A-Za-z0-9_]+)/g)].map((m) => m[1]);
+          calls.push({ tools: asked, temperature: options.temperature });
+          const annotations = asked.map((name) => ({
+            toolName: name,
+            comment: `Annotation for ${name}`,
+            args: { path: roles[name] ?? ['read-path'] },
+          }));
+          return createMockModel({ annotations }).doGenerate(options);
+        },
+      });
+      return { model, calls };
+    }
+
+    const TOOLS = Array.from({ length: 30 }, (_, i) => pathTool(`tool_${i}`));
+
+    it('adding one tool re-annotates only that tool', async () => {
+      const first = recordingModel();
+      const before = await annotateServerTools({ serverName: 'filesystem', tools: TOOLS, llm: first.model });
+      expect(first.calls.map((c) => c.tools.length)).toEqual([25, 5]);
+      expect(before.annotations.every((a) => typeof a.annotationKey === 'string')).toBe(true);
+
+      const withNewTool = [...TOOLS.slice(0, 12), pathTool('tool_new'), ...TOOLS.slice(12)];
+      const second = recordingModel();
+      const after = await annotateServerTools({
+        serverName: 'filesystem',
+        tools: withNewTool,
+        llm: second.model,
+        previous: [before.annotations],
+      });
+
+      expect(second.calls.map((c) => c.tools)).toEqual([['tool_new']]);
+      expect(after.annotated).toEqual(['tool_new']);
+      expect(after.reused).toEqual(TOOLS.map((t) => t.name));
+      // The unchanged tools keep their annotations verbatim, in the server's order.
+      expect(after.annotations.map((a) => a.toolName)).toEqual(withNewTool.map((t) => t.name));
+      expect(after.annotations.filter((a) => a.toolName !== 'tool_new')).toEqual(before.annotations);
+      expect(after.annotations.find((a) => a.toolName === 'tool_new')?.annotationKey).toBe(
+        computeToolAnnotationKey(pathTool('tool_new'), annotationPromptVersion('filesystem')),
+      );
+    });
+
+    it('makes no LLM call when every tool is unchanged', async () => {
+      const before = await annotateServerTools({ serverName: 'filesystem', tools: TOOLS, llm: recordingModel().model });
+      const again = recordingModel();
+      const after = await annotateServerTools({
+        serverName: 'filesystem',
+        tools: TOOLS,
+        llm: again.model,
+        previous: [before.annotations],
+      });
+      expect(again.calls).toHaveLength(0);
+      expect(after.annotations).toEqual(before.annotations);
+    });
+
+    it('re-annotates a tool whose description changed, even with the same input schema', async () => {
+      const tools = [pathTool('git_clone', 'Clones a remote repository.'), pathTool('git_log')];
+      const before = await annotateServerTools({ serverName: 'git', tools, llm: recordingModel().model });
+      const changed = [pathTool('git_clone', 'Clones a repository; now also accepts local paths.'), tools[1]];
+      const second = recordingModel({ git_clone: ['read-path', 'write-path'] });
+
+      const after = await annotateServerTools({
+        serverName: 'git',
+        tools: changed,
+        llm: second.model,
+        previous: [before.annotations],
+      });
+
+      expect(second.calls.map((c) => c.tools)).toEqual([['git_clone']]);
+      expect(after.annotations.find((a) => a.toolName === 'git_clone')?.args.path).toEqual(['read-path', 'write-path']);
+    });
+
+    it('re-annotates a tool whose input schema changed', async () => {
+      const before = await annotateServerTools({ serverName: 'filesystem', tools: TOOLS, llm: recordingModel().model });
+      const renamed: MCPToolSchema = {
+        ...TOOLS[3],
+        inputSchema: { type: 'object', properties: { path: { type: 'string' }, recursive: { type: 'boolean' } } },
+      };
+      const second = new MockLanguageModelV3({
+        doGenerate: async (options) =>
+          createMockModel({
+            annotations: [{ toolName: 'tool_3', comment: 'c', args: { path: ['read-path'], recursive: ['none'] } }],
+          }).doGenerate(options),
+      });
+      const after = await annotateServerTools({
+        serverName: 'filesystem',
+        tools: TOOLS.map((t) => (t.name === 'tool_3' ? renamed : t)),
+        llm: second,
+        previous: [before.annotations],
+      });
+      expect(after.annotated).toEqual(['tool_3']);
+      expect(after.reused).toHaveLength(29);
+    });
+
+    it('re-annotates when the prompt or role-registry version behind a key differs', async () => {
+      const before = await annotateServerTools({ serverName: 'filesystem', tools: TOOLS, llm: recordingModel().model });
+      // A key made under another prompt/registry version never matches.
+      const staleKeys: StoredToolAnnotation[] = before.annotations.map((a) => ({
+        ...a,
+        annotationKey: computeToolAnnotationKey(
+          TOOLS.find((t) => t.name === a.toolName) ?? TOOLS[0],
+          'an-older-version',
+        ),
+      }));
+      const second = recordingModel();
+      const after = await annotateServerTools({
+        serverName: 'filesystem',
+        tools: TOOLS,
+        llm: second.model,
+        previous: [staleKeys],
+      });
+      expect(after.reused).toEqual([]);
+      expect(second.calls.flatMap((c) => c.tools)).toHaveLength(30);
+      // The registry version is per server: another server's tools get other keys.
+      expect(annotationPromptVersion('git')).not.toBe(annotationPromptVersion('filesystem'));
+    });
+
+    it('does not reuse an annotation without a key, or one that no longer validates', async () => {
+      const promptVersion = annotationPromptVersion('filesystem');
+      const keyOf = (t: MCPToolSchema) => computeToolAnnotationKey(t, promptVersion);
+      const previous: StoredToolAnnotation[] = [
+        // Written before keys existed.
+        {
+          toolName: 'tool_0',
+          serverName: 'filesystem',
+          comment: 'old',
+          args: { path: ['read-path'] },
+          inputSchema: {},
+        },
+        // A matching key, but its argument is not annotated (hand-edited).
+        {
+          toolName: 'tool_1',
+          serverName: 'filesystem',
+          comment: 'x',
+          args: {},
+          inputSchema: {},
+          annotationKey: keyOf(TOOLS[1]),
+        },
+        // A matching key and a role the filesystem server may not use.
+        {
+          toolName: 'tool_2',
+          serverName: 'filesystem',
+          comment: 'x',
+          args: { path: ['git-remote-url'] },
+          inputSchema: {},
+          annotationKey: keyOf(TOOLS[2]),
+        },
+        // Valid and current.
+        {
+          toolName: 'tool_3',
+          serverName: 'filesystem',
+          comment: 'kept',
+          args: { path: ['write-path'] },
+          inputSchema: {},
+          annotationKey: keyOf(TOOLS[3]),
+        },
+      ];
+      const second = recordingModel();
+      const after = await annotateServerTools({
+        serverName: 'filesystem',
+        tools: TOOLS.slice(0, 4),
+        llm: second.model,
+        previous: [previous],
+      });
+      expect(after.reused).toEqual(['tool_3']);
+      expect(second.calls.flatMap((c) => c.tools)).toEqual(['tool_0', 'tool_1', 'tool_2']);
+      expect(after.annotations.find((a) => a.toolName === 'tool_3')?.args.path).toEqual(['write-path']);
+    });
+
+    it('takes a tool from the first previous annotation set that has it current', async () => {
+      const key = computeToolAnnotationKey(TOOLS[0], annotationPromptVersion('filesystem'));
+      const reviewed: StoredToolAnnotation = {
+        toolName: 'tool_0',
+        serverName: 'filesystem',
+        comment: 'reviewed',
+        args: { path: ['read-path'] },
+        inputSchema: {},
+        annotationKey: key,
+      };
+      const own: StoredToolAnnotation = { ...reviewed, comment: 'mine', args: { path: ['write-path'] } };
+      const after = await annotateServerTools({
+        serverName: 'filesystem',
+        tools: [TOOLS[0]],
+        llm: recordingModel().model,
+        previous: [[reviewed], [own]],
+      });
+      // Roles and comment as reviewed; the input schema recorded is the live one.
+      expect(after.annotations).toEqual([{ ...reviewed, inputSchema: TOOLS[0].inputSchema }]);
+      expect(after.reused).toEqual(['tool_0']);
+    });
+
+    // WP-59 + WP-88: the policy lint reads the server's hints (tighten-only).
+    // They are not part of the key, so a reused annotation must not keep the
+    // hints of the run that annotated it.
+    it("gives a reused annotation the live tool's MCP hints", async () => {
+      const plain = TOOLS.slice(0, 3);
+      const before = await annotateServerTools({ serverName: 'filesystem', tools: plain, llm: recordingModel().model });
+      expect(before.annotations.some((a) => 'mcpHints' in a)).toBe(false);
+
+      // The server now marks tool_0 destructive and tool_1 read-only; nothing
+      // the key covers changed, so no tool goes back to the LLM.
+      const hinted: MCPToolSchema[] = [
+        { ...plain[0], annotations: { readOnlyHint: false, destructiveHint: true } },
+        { ...plain[1], annotations: { readOnlyHint: true } },
+        plain[2],
+      ];
+      const again = recordingModel();
+      const after = await annotateServerTools({
+        serverName: 'filesystem',
+        tools: hinted,
+        llm: again.model,
+        previous: [before.annotations],
+      });
+      expect(again.calls).toHaveLength(0);
+      expect(after.reused).toEqual(plain.map((t) => t.name));
+      expect(after.annotations.map((a) => a.mcpHints)).toEqual([
+        { readOnlyHint: false, destructiveHint: true },
+        { readOnlyHint: true },
+        undefined,
+      ]);
+      // Roles and comments are the reused ones.
+      expect(after.annotations.map((a) => [a.comment, a.args])).toEqual(
+        before.annotations.map((a) => [a.comment, a.args]),
+      );
+
+      // Hints the server no longer declares are dropped, as on a fresh annotation.
+      const dropped = await annotateServerTools({
+        serverName: 'filesystem',
+        tools: plain,
+        llm: again.model,
+        previous: [after.annotations],
+      });
+      expect(again.calls).toHaveLength(0);
+      expect(dropped.annotations.some((a) => 'mcpHints' in a)).toBe(false);
+    });
+
+    it('asks for the model only when some tool needs the LLM, and once per call', async () => {
+      const before = await annotateServerTools({ serverName: 'filesystem', tools: TOOLS, llm: recordingModel().model });
+      let requested = 0;
+      const unavailable = () => {
+        requested++;
+        return Promise.reject(new Error('no credentials'));
+      };
+
+      // A tool removed: every remaining tool is unchanged, so no model is needed.
+      const after = await annotateServerTools({
+        serverName: 'filesystem',
+        tools: TOOLS.slice(1),
+        llm: unavailable,
+        previous: [before.annotations],
+      });
+      expect(requested).toBe(0);
+      expect(after.reused).toEqual(TOOLS.slice(1).map((t) => t.name));
+
+      // Two batches to annotate: the model is requested once.
+      const fresh = recordingModel();
+      const annotated = await annotateServerTools({
+        serverName: 'filesystem',
+        tools: TOOLS,
+        llm: () => {
+          requested++;
+          return Promise.resolve(fresh.model);
+        },
+      });
+      expect(requested).toBe(1);
+      expect(fresh.calls).toHaveLength(2);
+      expect(annotated.annotated).toHaveLength(30);
+    });
+
+    it('annotates at temperature 0', async () => {
+      const { model, calls } = recordingModel();
+      await annotateTools('filesystem', TOOLS.slice(0, 2), model);
+      expect(calls.map((c) => c.temperature)).toEqual([0]);
+    });
+
+    it('fails before any LLM call when the server lists a tool twice', async () => {
+      const { model, calls } = recordingModel();
+      await expect(
+        annotateServerTools({ serverName: 'filesystem', tools: [TOOLS[0], TOOLS[1], TOOLS[0]], llm: model }),
+      ).rejects.toThrow('the server lists these tools more than once: "tool_0"');
+      expect(calls).toHaveLength(0);
     });
   });
 });

@@ -3,6 +3,7 @@
  */
 
 import { parseCronExpression, type CronFields } from './cron-scheduler.js';
+import { MAX_COUNTED_FAILURES } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Shared constants
@@ -45,6 +46,16 @@ export function formatRelativeTime(date: Date, now = new Date()): string {
   const dur = formatDuration(absDiffSec);
   const relative = diffMs >= 0 ? `in ${dur}` : `${dur} ago`;
   return `${relative} (${absolute})`;
+}
+
+/**
+ * Describes a job's failure streak (see countConsecutiveFailures), for
+ * example "3 consecutive failures"; a streak at the counting cap is shown as
+ * "100+ consecutive failures".
+ */
+export function formatFailureStreak(consecutiveFailures: number): string {
+  const count = consecutiveFailures >= MAX_COUNTED_FAILURES ? `${MAX_COUNTED_FAILURES}+` : String(consecutiveFailures);
+  return `${count} consecutive failure${consecutiveFailures === 1 ? '' : 's'}`;
 }
 
 function formatAbsoluteTime(date: Date): string {

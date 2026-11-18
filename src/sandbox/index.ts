@@ -5,66 +5,127 @@
  * LLM-generated code runs with no direct access to the network, filesystem,
  * or credentials. Instead of connecting to real MCP servers, it connects
  * to our MCP proxy server which evaluates policy on every tool call.
+ *
+ * Each `execute_code` script runs in a fresh V8 isolate (`code-mode-chain.ts`)
+ * under host-enforced limits (`chain-limits.ts`): an explicit isolate memory
+ * limit, bounded console output, a timeout capped by the caller, a few
+ * scripts at once per sandbox with a bounded queue, and one isolate memory
+ * budget for the whole process. A caller's signal cancels a script, and every
+ * tool call the script makes is withdrawn when the script ends.
  */
 
 import { dirname, resolve } from 'node:path';
+import { computeSandboxCredentialPaths } from '../config/credential-stores.js';
+import { sandboxCredentialPathsEnv } from '../trusted-process/sandbox-credential-paths.js';
 import { fileURLToPath } from 'node:url';
 import '@utcp/mcp'; // Register MCP call template type with UTCP SDK
 import { CodeModeUtcpClient } from '@utcp/code-mode';
-import { Protocol } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import type { IronCurtainConfig, MCPServerConfig } from '../config/types.js';
 import { CONTAINER_WORKSPACE_DIR } from '../docker/agent-adapter.js';
 import { createLanguageModel } from '../config/model-provider.js';
 import {
   resolveNodeModulesBin,
-  checkSandboxAvailability,
-  resolveSandboxConfigsForAudit,
+  getOsSandboxAvailability,
+  osSandboxAvailabilityEnv,
+  planServerSandboxing,
+  resolveOsSandboxAvailability,
+  formatOsSandboxNotice,
+  writeOsSandboxNotice,
+  type OsSandboxAvailability,
+  type OsSandboxAvailabilityProbe,
+  type OsSandboxPlan,
 } from '../trusted-process/sandbox-integration.js';
-import { ToolCallCoordinator, type CoordinatorTool } from '../trusted-process/tool-call-coordinator.js';
+import { effectiveSandboxPolicy, sandboxPolicyEnv, type SandboxAvailabilityPolicy } from '../config/sandbox-policy.js';
+import {
+  ToolCallCoordinator,
+  type CoordinatorTool,
+  type EscalationPromptFn,
+} from '../trusted-process/tool-call-coordinator.js';
+import { collectAuditRedactionSecrets } from '../trusted-process/audit-secrets.js';
+import type { EgressPolicyOptions } from '../trusted-process/egress-policy.js';
+import { contentAssessorOptionsFromConfig } from '../trusted-process/assessment-config.js';
+import {
+  BACKEND_CALL_TIMEOUT_ENV,
+  backendCallTimeoutMsFromConfig,
+  codeModeChainTimeoutMs,
+  escalationTimeoutMsFromConfig,
+} from '../trusted-process/call-timeouts.js';
 import { loadGeneratedPolicy, extractServerDomainAllowlists, getPackageGeneratedDir } from '../config/index.js';
+import { getIronCurtainHome } from '../config/paths.js';
 import { buildTrustedServerSet } from '../memory/memory-annotations.js';
 import { proxyAnnotations, proxyPolicyRules, createControlApiClient } from '../docker/proxy-tools.js';
+import {
+  WORKFLOW_COMMIT_SERVER,
+  WORKFLOW_COMMIT_SERVER_DESCRIPTION,
+  type WorkflowCommitHandler,
+} from '../trusted-process/workflow-commit-tool.js';
 import { extractPolicyRoots, toMcpRoots } from '../trusted-process/policy-roots.js';
-import type { McpRoot } from '../trusted-process/mcp-client-manager.js';
+import { loadTaskScopePolicy } from '../trusted-process/task-scope.js';
+import { pickPassthroughEnv, relayHostSettings, type HostEnv } from '../trusted-process/child-env.js';
+import type { ClientState, McpRoot, MCPClientManager } from '../trusted-process/mcp-client-manager.js';
+import pLimit from 'p-limit';
 import {
   registerIronCurtainProtocol,
   bindCoordinatorToManual,
   unbindCoordinatorFromManual,
+  withToolCallOptions,
   IRONCURTAIN_CALL_TEMPLATE_TYPE,
 } from './ironcurtain-protocol.js';
+import { structuredResultNotes } from './structured-results.js';
+import { runToolChain } from './code-mode-chain.js';
+import {
+  ChainAdmissionError,
+  DEFAULT_CHAIN_MEMORY_LIMIT_MB,
+  DEFAULT_MAX_CONCURRENT_CHAINS,
+  DEFAULT_MAX_CONSOLE_BYTES,
+  DEFAULT_MAX_CONSOLE_ENTRIES,
+  DEFAULT_MAX_QUEUED_CHAINS,
+  WeightedSemaphore,
+  chainMemoryWeightMb,
+  processChainBudget,
+  type ReleaseSlot,
+} from './chain-limits.js';
+import { ChainJustifications } from './chain-justifications.js';
 import * as logger from '../logger.js';
 import { wrapLanguageModel } from 'ai';
-import { createLlmLoggingMiddleware } from '../observability/llm-logger.js';
+import { createSessionLlmLogMiddleware } from '../observability/session-llm-log.js';
 import type { LanguageModelV3 } from '@ai-sdk/provider';
 
-// Workaround: UTCP creates MCP SDK Client instances without setting a per-request
-// timeout, so they inherit the SDK's DEFAULT_REQUEST_TIMEOUT_MSEC (60s). This is
-// too short when human escalation approval is pending (up to 300s). The SDK doesn't
-// expose a way to set a client-level default timeout, so we patch Protocol.request()
-// to use our escalation timeout as the default instead of 60s.
-//
-// This must run before any Client instances are created (i.e. before Sandbox.initialize()).
-// The timeout is mutable so Sandbox.initialize() can update it from the config.
-let escalationTimeoutMs = 300 * 1000; // default fallback
+// Tool-call timeouts are explicit per request: the security pipeline passes
+// `relayCallTimeoutMs()` to every relay `callTool`, and the relay bounds
+// the backend call with `BACKEND_CALL_TIMEOUT_MS` (see
+// `trusted-process/call-timeouts.ts`). Human escalation does not happen
+// inside an MCP request (the coordinator waits for it in this process,
+// bounded by the configured escalation timeout, before dispatch), so no
+// global MCP SDK timeout override is needed. The `initialize` handshake
+// with each relay carries its own bound (`MCP_CONNECT_TIMEOUT_MS`, set in
+// `MCPClientManager.connect`) because a relay answers only once its
+// backend is up, and the start-up tool listing has its own as well
+// (`RELAY_LIST_TOOLS_TIMEOUT_MS`); the remaining parent-to-relay requests
+// keep the SDK default.
 
-/** Updates the Protocol.request timeout used by UTCP's MCP SDK clients. */
-function setEscalationTimeout(seconds: number): void {
-  escalationTimeoutMs = seconds * 1000;
+/**
+ * Relays a sandbox starts at once. Each is a node/tsx process that in turn
+ * starts its backend (possibly an `npx -y` resolution or a container), so
+ * starting them together makes session start cost the slowest server rather
+ * than the sum of all of them, while the bound keeps a long server list from
+ * spawning everything in one burst.
+ */
+export const RELAY_CONNECT_CONCURRENCY = 4;
+
+/**
+ * Bound for a relay's start-up tool listing. The relay answers from the list
+ * it fetched from its backend before it started serving, so this only cuts
+ * off a relay that died or hung right after its handshake.
+ */
+export const RELAY_LIST_TOOLS_TIMEOUT_MS = 60_000;
+
+/** An MCP server whose relay the sandbox could not start; the session runs without it. */
+export interface UnavailableMcpServer {
+  readonly serverName: string;
+  /** Why: the connection or tool-listing error (one line of error text). */
+  readonly reason: string;
 }
-
-// eslint-disable-next-line @typescript-eslint/no-unsafe-function-type, @typescript-eslint/unbound-method -- monkey-patch requires untyped apply() and unbound method reference
-const originalRequest: Function = Protocol.prototype.request;
-Protocol.prototype.request = function (
-  this: unknown,
-  ...args: [request: unknown, schema: unknown, options?: { timeout?: number }]
-) {
-  const options = args[2] ?? {};
-  if (!options.timeout) {
-    args[2] = { ...options, timeout: escalationTimeoutMs };
-  }
-  // eslint-disable-next-line @typescript-eslint/no-unsafe-return -- monkey-patch returns the original method's untyped result
-  return originalRequest.apply(this, args);
-} as typeof Protocol.prototype.request;
 
 // Detect compiled (.js in dist/) vs source (.ts in src/) mode.
 // In compiled mode, spawn with `node`; in source mode, spawn with `tsx` directly.
@@ -81,6 +142,11 @@ const PROXY_ARGS = [proxyServerPath];
 
 /** Sanitize a string to a valid JS identifier segment. */
 const sanitize = (s: string) => s.replace(/[^a-zA-Z0-9_]/g, '_').replace(/^[0-9]/, '_$&');
+
+/** `value` when it is a positive finite number, else `fallback`. */
+function positiveOr(value: number | undefined, fallback: number): number {
+  return value !== undefined && Number.isFinite(value) && value > 0 ? value : fallback;
+}
 
 /** Shared: first segment + remaining joined with underscores. */
 function flattenDotted(segments: string[]): string {
@@ -142,9 +208,77 @@ export function extractRequiredParams(inputs?: { properties?: Record<string, unk
   return `{ ${inputs.required.join(', ')} }`;
 }
 
+/**
+ * What one `execute_code` script returned and logged. A script that failed --
+ * an exception, a timeout, a cancellation, a limit, or no free execution slot
+ * -- has `result: null` and an `[ERROR] Code execution failed: ...` entry in
+ * `logs`. `logs` is bounded by the console limits; callers bound what they
+ * show the agent with `truncateExecutionOutput` (session layer).
+ */
 export interface CodeExecutionResult {
   result: unknown;
   logs: string[];
+}
+
+/** Per-call options for {@link Sandbox.executeCode}. */
+export interface ExecuteCodeOptions {
+  /**
+   * Cancels the call: a queued call leaves the queue, a running script's
+   * isolate is disposed, and its tool calls in flight are cancelled (a
+   * pending escalation is withdrawn, nothing more is dispatched). The AI
+   * SDK's per-turn signal (session close, wall-clock budget) and an MCP
+   * request's signal (client cancellation, disconnect) are passed here.
+   */
+  readonly signal?: AbortSignal;
+  /**
+   * Upper bound for the whole call -- waiting for a free execution slot
+   * included -- in milliseconds, e.g. the remaining wall-clock budget of the
+   * turn. The sandbox's own chain timeout ({@link Sandbox.getChainTimeoutMs})
+   * always applies as well.
+   */
+  readonly timeoutMs?: number;
+  /**
+   * Host-assigned lane of the agent stream that sent the code. Every tool
+   * call the script makes reaches the coordinator with it, keying the
+   * circuit breaker's per-lane window (`ToolCallOptions.lane`).
+   */
+  readonly lane?: string;
+  /**
+   * The agent's `execute_code` justification. UNTRUSTED: shown to a human
+   * reviewer when one of the chain's calls escalates, labelled as the
+   * agent's, and read by nothing else (see chain-justifications.ts).
+   */
+  readonly justification?: unknown;
+}
+
+/**
+ * Isolate limits of one sandbox. Defaults come from `chain-limits.ts`; the
+ * process-wide budget is shared by every sandbox in the process.
+ */
+export interface SandboxOptions {
+  /** isolated-vm `memoryLimit` of each `execute_code` isolate, in MB. */
+  readonly memoryLimitMb?: number;
+  /** Scripts this sandbox runs at once; further calls queue. */
+  readonly maxConcurrentChains?: number;
+  /** Calls that may wait for a slot; further calls are refused at once. */
+  readonly maxQueuedChains?: number;
+  /** Console output (UTF-8 bytes) after which a script is stopped. */
+  readonly maxConsoleBytes?: number;
+  /** Console calls after which a script is stopped. */
+  readonly maxConsoleEntries?: number;
+  /**
+   * Process-wide memory budget the sandbox's scripts draw on. Defaults to the
+   * one every sandbox in the process shares; tests inject their own.
+   */
+  readonly processBudget?: WeightedSemaphore;
+}
+
+/** A sandbox's `execute_code` load (diagnostics, tests). */
+export interface ChainLoad {
+  /** Scripts holding one of the sandbox's slots (running, or waiting only for the process-wide budget). */
+  readonly running: number;
+  /** Calls waiting for a slot. */
+  readonly queued: number;
 }
 
 /** A single tool entry for help discovery. */
@@ -157,6 +291,11 @@ export interface HelpToolEntry {
 export interface HelpData {
   serverDescriptions: Record<string, string>;
   toolsByServer: Record<string, HelpToolEntry[]>;
+  /**
+   * What a server's results carry beyond `content` (its `structuredContent`),
+   * printed after its tools by `help.help(server)`. See structured-results.ts.
+   */
+  resultNotes?: Record<string, string>;
 }
 
 /** Fixed reserved namespaces that aliases must never shadow. */
@@ -301,17 +440,20 @@ export function buildInterfacePatchSnippet(
  * created, so the policy engine and audit log never see help calls.
  *
  * - `help.help()` with no args lists all servers with descriptions.
- * - `help.help('filesystem')` lists that server's tools as `callableName(params)`.
+ * - `help.help('filesystem')` lists that server's tools as `callableName(params)`,
+ *   then the server's result note, if it has one (`HelpData.resultNotes`).
  * - Unknown server returns an error message suggesting `help.help()`.
  */
 export function buildHelpSnippet(helpData: HelpData): string {
   const descriptionsJson = JSON.stringify(helpData.serverDescriptions);
   const toolsJson = JSON.stringify(helpData.toolsByServer);
+  const resultNotesJson = JSON.stringify(helpData.resultNotes ?? {});
 
   return `
     (function() {
       var _serverDescs = ${descriptionsJson};
       var _toolsByServer = ${toolsJson};
+      var _resultNotes = ${resultNotesJson};
       global.help = {
         help: function(serverName) {
           if (!serverName) {
@@ -333,6 +475,10 @@ export function buildHelpSnippet(helpData: HelpData): string {
           for (var i = 0; i < tools.length; i++) {
             var t = tools[i];
             lines.push('  ' + t.callableName + '(' + t.params + ')');
+          }
+          if (Object.prototype.hasOwnProperty.call(_resultNotes, serverName)) {
+            lines.push('');
+            lines.push(_resultNotes[serverName]);
           }
           return lines.join('\\n');
         }
@@ -365,6 +511,33 @@ const VIRTUAL_MANUAL_PREFIX = 'tools_';
 /** Monotonic per-process counter making each sandbox's manual name unique. */
 let manualNameCounter = 0;
 
+/** Caller-supplied hooks for `Sandbox.initialize()`. */
+export interface SandboxInitOptions {
+  /**
+   * In-process escalation handler for the coordinator. When set it
+   * supersedes the file-IPC escalation path (`config.escalationDir`); the
+   * workflow orchestrator uses it so a shared-container bundle's
+   * escalations reach the workflow's human route instead of a per-session
+   * watcher. Standalone sessions leave it unset.
+   */
+  readonly onEscalation?: EscalationPromptFn;
+  /**
+   * Most agent lanes expected to call through this sandbox's coordinator
+   * at once (`ToolCallCoordinatorOptions.maxLanes`). The workflow
+   * orchestrator sets it for a shared-container bundle whose scope runs a
+   * fan-out; everything else leaves it unset (1).
+   */
+  readonly maxLanes?: number;
+  /**
+   * Target of the coordinator-owned `workflow_commit` tool. The workflow
+   * orchestrator sets it for agent states (a bundle's channel in
+   * shared-container mode, a per-state channel otherwise) so the agent can
+   * commit its state's result through the tool; every other session leaves
+   * it unset and its agent has no such tool.
+   */
+  readonly workflowCommit?: WorkflowCommitHandler;
+}
+
 export class Sandbox {
   private client: CodeModeUtcpClient | null = null;
   private toolCatalog: string = '';
@@ -378,6 +551,43 @@ export class Sandbox {
    * UTCP creates in the isolate; snippets reference it directly.
    */
   private readonly manualName = `${VIRTUAL_MANUAL_PREFIX}${++manualNameCounter}`;
+  /**
+   * Default `execute_code` chain timeout. Set by `initialize()` from the
+   * session's escalation and backend-call bounds so a chain outlives the
+   * longest single wait inside it (see `codeModeChainTimeoutMs`); the
+   * pre-initialize value is the historical 300 s.
+   */
+  private chainTimeoutMs = 300_000;
+
+  private readonly memoryLimitMb: number;
+  private readonly maxConsoleBytes: number;
+  private readonly maxConsoleEntries: number;
+  /** Scripts of this sandbox that run at once (count semaphore). */
+  private readonly chainSlots: WeightedSemaphore;
+  /** Isolate memory budget shared with every other sandbox in the process. */
+  private readonly processBudget: WeightedSemaphore;
+  /**
+   * Aborted by `shutdown()`: every running script is cancelled and every
+   * queued one leaves the queue, so nothing outlives the sandbox.
+   */
+  private lifetime = new AbortController();
+  /** Servers whose relay could not be started by the last `initialize()`. */
+  private unavailableServers: readonly UnavailableMcpServer[] = [];
+
+  /** The agent's justification for each running chain (see chain-justifications.ts). */
+  private readonly chainJustifications = new ChainJustifications();
+
+  constructor(options: SandboxOptions = {}) {
+    this.memoryLimitMb = positiveOr(options.memoryLimitMb, DEFAULT_CHAIN_MEMORY_LIMIT_MB);
+    this.maxConsoleBytes = positiveOr(options.maxConsoleBytes, DEFAULT_MAX_CONSOLE_BYTES);
+    this.maxConsoleEntries = positiveOr(options.maxConsoleEntries, DEFAULT_MAX_CONSOLE_ENTRIES);
+    this.chainSlots = new WeightedSemaphore(
+      positiveOr(options.maxConcurrentChains, DEFAULT_MAX_CONCURRENT_CHAINS),
+      positiveOr(options.maxQueuedChains, DEFAULT_MAX_QUEUED_CHAINS),
+      'execute_code slot in this session',
+    );
+    this.processBudget = options.processBudget ?? processChainBudget;
+  }
 
   /**
    * Exposes the policy coordinator once the sandbox is initialized.
@@ -387,21 +597,72 @@ export class Sandbox {
     return this.coordinator;
   }
 
-  async initialize(config: IronCurtainConfig): Promise<void> {
-    // Update the Protocol.request timeout before any Client instances are created.
-    setEscalationTimeout(config.escalationTimeoutSeconds);
+  /**
+   * MCP servers the last `initialize()` skipped because their relay failed
+   * to connect or to list its tools (each also logged). The session runs
+   * without them; sessions report them as `mcp_server_unavailable`
+   * diagnostics. Servers refused by the OS-sandbox plan are not included:
+   * `reportOsSandboxPlan` reports those.
+   */
+  getUnavailableServers(): readonly UnavailableMcpServer[] {
+    return this.unavailableServers;
+  }
 
+  /**
+   * Starts the sandbox: the coordinator, one relay per configured server
+   * (a server whose relay fails is skipped, see `getUnavailableServers`)
+   * and the UTCP manual. When it throws, everything it had started (relays
+   * and their backends, the coordinator and its audit log, the manual
+   * binding) has been shut down again, so a failed session start leaks
+   * nothing, whichever factory created the sandbox.
+   */
+  async initialize(config: IronCurtainConfig, options: SandboxInitOptions = {}): Promise<void> {
+    if (this.lifetime.signal.aborted) this.lifetime = new AbortController();
+    // A chain that timed out before one of its calls finished waiting for
+    // an approval would abandon that call while the approval could still
+    // run it, so the default chain timeout tracks the configured waits.
+    this.chainTimeoutMs = codeModeChainTimeoutMs({
+      escalationTimeoutMs: escalationTimeoutMsFromConfig(config),
+      backendCallTimeoutMs: backendCallTimeoutMsFromConfig(config),
+    });
+    this.unavailableServers = [];
+
+    try {
+      await this.start(config, options);
+    } catch (error) {
+      await this.shutdown().catch((shutdownError: unknown) => {
+        logger.warn(
+          `[sandbox] Cleanup after a failed start did not complete: ${
+            shutdownError instanceof Error ? shutdownError.message : String(shutdownError)
+          }`,
+        );
+      });
+      throw error;
+    }
+  }
+
+  private async start(config: IronCurtainConfig, options: SandboxInitOptions): Promise<void> {
     this.client = await CodeModeUtcpClient.create();
 
     // Install the custom in-process UTCP protocol that routes tool calls
     // to the coordinator. Idempotent: safe to call multiple times.
     registerIronCurtainProtocol();
 
+    // Decide, once, which servers get an OS sandbox, which run without one
+    // ("warn") and which must not start ("enforce"). The same plan drives
+    // audit stamping, relay spawning and the user notice so they agree, and
+    // its availability (srt smoke run included) is handed to every relay.
+    const osSandboxPlan = await resolveSessionOsSandboxPlan(config);
+    reportOsSandboxPlan(osSandboxPlan);
+
     // Build the coordinator. It owns policy evaluation, audit logging,
     // the circuit breaker, the approval whitelist, and the server-context
     // map. All of these used to be duplicated per subprocess.
-    const { coordinator, initialRoots } = await buildCoordinator(config);
+    const { coordinator, initialRoots } = await buildCoordinator(config, osSandboxPlan, options);
     this.coordinator = coordinator;
+    // An escalated call shows the reviewer the justification the agent gave
+    // the chain that issued it, while exactly one chain runs.
+    coordinator.setAgentJustificationProvider(() => this.currentAgentJustification());
     bindCoordinatorToManual(this.manualName, coordinator);
 
     // Spawn one router-mode mcp-proxy-server subprocess per backend
@@ -409,7 +670,7 @@ export class Sandbox {
     // sandbox-runtime wrapping, and the stdio MCP connection to the
     // real backend, but forwards CallTool requests verbatim -- the
     // coordinator owns the policy gate.
-    await connectBackendSubprocesses(coordinator, config, initialRoots);
+    this.unavailableServers = await connectBackendSubprocesses(coordinator, config, initialRoots, osSandboxPlan);
 
     // Register a single virtual UTCP manual. The UTCP variable
     // substitutor deep-clones `config` into a plain object, so class
@@ -496,8 +757,10 @@ export class Sandbox {
       const serverName = segments.length >= 2 ? segments[1] : segments[0];
       if (!(serverName in toolsByServer)) {
         toolsByServer[serverName] = [];
-        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- defensive: Record index may be undefined at runtime
-        serverDescriptions[serverName] = config.mcpServers[serverName]?.description ?? serverName;
+        serverDescriptions[serverName] =
+          // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- defensive: Record index may be undefined at runtime
+          config.mcpServers[serverName]?.description ??
+          (serverName === WORKFLOW_COMMIT_SERVER ? WORKFLOW_COMMIT_SERVER_DESCRIPTION : serverName);
       }
       toolsByServer[serverName].push({ callableName, params });
     }
@@ -511,7 +774,12 @@ export class Sandbox {
         : '';
     const aliasSnippet =
       namespaceAliases.length > 0 ? buildNamespaceAliasSnippet(namespaceAliases, utcpGlobalName) : '';
-    const helpData: HelpData = { serverDescriptions, toolsByServer };
+    const resultNotes = structuredResultNotes(Object.keys(toolsByServer));
+    const helpData: HelpData = {
+      serverDescriptions,
+      toolsByServer,
+      ...(Object.keys(resultNotes).length > 0 ? { resultNotes } : {}),
+    };
 
     return { catalog: catalogLines.join('\n'), patchSnippet, aliasSnippet, helpData };
   }
@@ -524,27 +792,129 @@ export class Sandbox {
     return this.helpData;
   }
 
-  async executeCode(code: string, timeoutMs = 300000): Promise<CodeExecutionResult> {
-    if (!this.client) throw new Error('Sandbox not initialized');
-
-    // Prepend the pre-built preamble (interface patch + namespace aliases +
-    // help snippet). Each callToolChain creates a fresh V8 isolate.
-    const patchedCode = this.preamble ? `${this.preamble}${code}` : code;
-
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- callToolChain returns { result: any }
-    const { result, logs } = await this.client.callToolChain(patchedCode, timeoutMs);
-    return { result, logs };
+  /** Default chain timeout `executeCode` applies (see {@link codeModeChainTimeoutMs}). */
+  getChainTimeoutMs(): number {
+    return this.chainTimeoutMs;
   }
 
-  async shutdown(): Promise<void> {
-    if (this.client) {
-      await this.client.close();
-      this.client = null;
+  /** Scripts this sandbox is running, and calls waiting for a slot. */
+  getChainLoad(): ChainLoad {
+    return { running: this.chainSlots.used, queued: this.chainSlots.queued };
+  }
+
+  /**
+   * Runs one `execute_code` script in a fresh V8 isolate.
+   *
+   * The call first takes one of the sandbox's execution slots and its share
+   * of the process-wide isolate budget, waiting in FIFO order when none is
+   * free (a full queue refuses the call at once). Waiting counts against the
+   * call's time: the script runs for whatever remains of
+   * `min(options.timeoutMs, chain timeout)`. Console output is bounded on the
+   * host side; a script past the limit is stopped. `options.signal` cancels
+   * the call at any point, `options.lane` goes with every tool call the
+   * script makes, and `options.justification` is shown to the reviewer of
+   * an escalated call while this is the only script running (see
+   * {@link ExecuteCodeOptions}). Failures are reported in the result, never
+   * thrown (see {@link CodeExecutionResult}).
+   */
+  async executeCode(code: string, options: ExecuteCodeOptions = {}): Promise<CodeExecutionResult> {
+    const client = this.client;
+    if (!client) throw new Error('Sandbox not initialized');
+
+    const requested = options.timeoutMs;
+    const timeoutMs =
+      requested !== undefined && Number.isFinite(requested)
+        ? Math.max(1, Math.min(requested, this.chainTimeoutMs))
+        : this.chainTimeoutMs;
+    const deadlineMs = Date.now() + timeoutMs;
+    const signal = options.signal ? AbortSignal.any([options.signal, this.lifetime.signal]) : this.lifetime.signal;
+
+    let release: ReleaseSlot;
+    try {
+      release = await this.admitChain(signal, deadlineMs);
+    } catch (err) {
+      const message = err instanceof ChainAdmissionError ? err.message : String(err);
+      return { result: null, logs: [`[ERROR] Code execution failed: ${message}`] };
     }
-    if (this.coordinator) {
-      unbindCoordinatorFromManual(this.manualName);
-      await this.coordinator.close();
-      this.coordinator = null;
+
+    // Counted as running only once admitted: a queued call cannot issue
+    // tool calls yet, so it does not hide the justification of the one
+    // chain that can (see chain-justifications.ts).
+    const endChain = this.chainJustifications.begin(options.justification);
+    try {
+      // Prepend the pre-built preamble (interface patch + namespace aliases +
+      // help snippet). Each chain creates a fresh V8 isolate.
+      const patchedCode = this.preamble ? `${this.preamble}${code}` : code;
+      return await runToolChain(client, patchedCode, {
+        timeoutMs: Math.max(1, deadlineMs - Date.now()),
+        memoryLimitMb: this.memoryLimitMb,
+        maxConsoleBytes: this.maxConsoleBytes,
+        maxConsoleEntries: this.maxConsoleEntries,
+        signal,
+        // The call's signal aborts when the script ends; the lane is the
+        // host-assigned lane of the agent stream that sent the script. The
+        // IronCurtain protocol hands both to the coordinator (see
+        // `withToolCallOptions`).
+        callTool: (toolName, args, callSignal) =>
+          withToolCallOptions({ signal: callSignal, lane: options.lane }, () => client.callTool(toolName, args)),
+      });
+    } finally {
+      endChain();
+      release();
+    }
+  }
+
+  /**
+   * The agent's justification for the chain issuing tool calls now: the
+   * justification of the only running chain, or undefined when none or
+   * several run (a call cannot be attributed to one of several chains).
+   * UNTRUSTED display text for the human reviewer.
+   */
+  currentAgentJustification(): string | undefined {
+    return this.chainJustifications.current();
+  }
+
+  /**
+   * Takes a sandbox slot, then the chain's weight in the process-wide
+   * budget (always in that order, so no two waiters can deadlock).
+   */
+  private async admitChain(signal: AbortSignal, deadlineMs: number): Promise<ReleaseSlot> {
+    const releaseSlot = await this.chainSlots.acquire(1, { signal, deadlineMs });
+    try {
+      const releaseBudget = await this.processBudget.acquire(chainMemoryWeightMb(this.memoryLimitMb), {
+        signal,
+        deadlineMs,
+      });
+      return () => {
+        releaseBudget();
+        releaseSlot();
+      };
+    } catch (err) {
+      releaseSlot();
+      throw err;
+    }
+  }
+
+  /**
+   * Stops everything the sandbox started. The coordinator (which closes the
+   * relays and the audit log) is closed and unbound even when closing the
+   * UTCP client fails; that failure is rethrown afterwards. Idempotent.
+   */
+  async shutdown(): Promise<void> {
+    // Cancel running and queued scripts first: their tool calls are then
+    // withdrawn, so the coordinator's drain below does not wait for them.
+    this.lifetime.abort(new Error('the Code Mode sandbox is shutting down'));
+    const client = this.client;
+    const coordinator = this.coordinator;
+    this.client = null;
+    this.coordinator = null;
+    try {
+      if (client) await client.close();
+    } finally {
+      if (coordinator) {
+        unbindCoordinatorFromManual(this.manualName);
+        await coordinator.close();
+      }
     }
   }
 }
@@ -554,15 +924,19 @@ export class Sandbox {
 // ---------------------------------------------------------------------------
 
 /**
- * Wraps a language model with LLM logging middleware when a log path is
- * set. Mirrors the logging the proxy previously did in-subprocess.
+ * Wraps the auto-approve model with the session's LLM interaction logging
+ * when `config.autoApproveLlmLogPath` is set. What is logged follows
+ * `observability.llmInteractionLog` ('off' returns the model unwrapped), and
+ * the log is appended to, so a resumed session extends it. Exported for tests.
  */
-function wrapAutoApproveModel(model: LanguageModelV3, llmLogPath?: string): LanguageModelV3 {
-  if (!llmLogPath) return model;
-  return wrapLanguageModel({
-    model,
-    middleware: createLlmLoggingMiddleware(llmLogPath, { stepName: 'auto-approve' }),
-  });
+export function wrapAutoApproveModel(model: LanguageModelV3, config: IronCurtainConfig): LanguageModelV3 {
+  if (!config.autoApproveLlmLogPath) return model;
+  const middleware = createSessionLlmLogMiddleware(
+    config.autoApproveLlmLogPath,
+    { stepName: 'auto-approve' },
+    config.userConfig,
+  );
+  return middleware ? wrapLanguageModel({ model, middleware }) : model;
 }
 
 /**
@@ -578,11 +952,92 @@ interface CoordinatorBundle {
 }
 
 /**
+ * Applies the session's OS-sandbox availability policy to its MCP servers,
+ * given the availability (see {@link resolveSessionOsSandboxPlan}, which
+ * session start uses). Exported for tests, which inject the availability to
+ * simulate a host with or without a working sandbox.
+ */
+export function planSessionOsSandbox(config: IronCurtainConfig, availability: OsSandboxAvailability): OsSandboxPlan {
+  return planServerSandboxing(
+    config.mcpServers,
+    config.allowedDirectory,
+    availability,
+    effectiveSandboxPolicy(config),
+    computeSandboxCredentialPaths(config.userConfig.credentialProtection),
+  );
+}
+
+/**
+ * The session's OS-sandbox plan. Availability means "platform supported, no
+ * missing dependency (bubblewrap, socat, ripgrep on Linux), and srt can
+ * start a sandbox": when a server asks for an OS sandbox, the dependency
+ * check is confirmed by one srt smoke run per process
+ * (`resolveOsSandboxAvailability`), so on a host where srt cannot start
+ * (AppArmor-restricted user namespaces, a seccomp helper the host will not
+ * run) "enforce" refuses those servers with the notice and "warn" runs them
+ * unconfined, instead of wrapping them in an srt that fails. Exported for
+ * tests; `probe` injects the host checks.
+ */
+export async function resolveSessionOsSandboxPlan(
+  config: IronCurtainConfig,
+  probe: OsSandboxAvailabilityProbe = {},
+): Promise<OsSandboxPlan> {
+  const availability = await resolveOsSandboxAvailability(config.mcpServers, {
+    dependencies: probe.dependencies ?? getOsSandboxAvailability(),
+    smokeTest: probe.smokeTest,
+  });
+  return planSessionOsSandbox(config, availability);
+}
+
+/**
+ * Surfaces servers that will not get the OS sandbox they ask for: one line
+ * on stderr (the session logger swallows console output, so it is written
+ * to the stream directly) plus the session log. Silent when every server
+ * that asks for a sandbox gets one. Called at session start by
+ * `Sandbox.initialize()`; exported for tests.
+ */
+export function reportOsSandboxPlan(plan: OsSandboxPlan): void {
+  const notice = formatOsSandboxNotice(plan);
+  if (notice === undefined) return;
+  logger.warn(`[sandbox] ${notice}`);
+  writeOsSandboxNotice(notice);
+}
+
+/**
+ * The coordinator's policy-evaluated egress options (see
+ * docs/designs/mitm-egress-policy.md): present only when the user opted in
+ * (`egressPolicy.enabled`) and the session has a MITM proxy whose control
+ * API is up, which is what asks the coordinator (Docker Agent Mode).
+ * Exported for tests.
+ */
+export function egressPolicyOptionsFor(config: IronCurtainConfig): EgressPolicyOptions | undefined {
+  const egressPolicy = config.userConfig.egressPolicy;
+  if (egressPolicy?.enabled !== true || !config.mitmControlAddr) return undefined;
+  return { allowedHosts: egressPolicy.allowedHosts };
+}
+
+/**
+ * The servers the session spawns relays for: every configured server except
+ * those the OS-sandbox plan refuses. Exported for tests.
+ */
+export function relayServerNames(config: IronCurtainConfig, plan: OsSandboxPlan): string[] {
+  const refused = new Set(plan.refused);
+  return Object.keys(config.mcpServers).filter((name) => !refused.has(name));
+}
+
+/**
  * Builds the `ToolCallCoordinator` from the loaded policy artifacts.
  * Merges proxy-tool annotations/rules so the coordinator can evaluate
  * virtual proxy tools the same way the subprocess used to.
  */
-async function buildCoordinator(config: IronCurtainConfig): Promise<CoordinatorBundle> {
+async function buildCoordinator(
+  config: IronCurtainConfig,
+  osSandboxPlan: OsSandboxPlan,
+  initOptions: SandboxInitOptions = {},
+): Promise<CoordinatorBundle> {
+  // Schema-validated by the loader (src/types/policy-schema.ts): a
+  // malformed compiled policy, lists file or annotations file throws here
+  // and the session does not start.
   const { compiledPolicy, toolAnnotations, dynamicLists } = loadGeneratedPolicy({
     policyDir: config.generatedDir,
     toolAnnotationsDir: config.toolAnnotationsDir ?? config.generatedDir,
@@ -591,12 +1046,24 @@ async function buildCoordinator(config: IronCurtainConfig): Promise<CoordinatorB
 
   // Inject the virtual proxy tools/rules so the coordinator treats
   // add_proxy_domain / remove_proxy_domain / list_proxy_domains as
-  // policy-evaluated tools like any other.
+  // policy-evaluated tools like any other. They are merged after
+  // validation: the hardcoded rules carry `humanOnly`, which the file
+  // format does not allow.
   toolAnnotations.servers.proxy = {
     inputHash: 'hardcoded',
     tools: proxyAnnotations,
   };
   compiledPolicy.rules = [...proxyPolicyRules, ...compiledPolicy.rules];
+
+  // `--task-scoped`: the task scope narrows the session policy for the
+  // coordinator's whole life (the coordinator adds the proxy rules to it,
+  // and the egress rules when policy-evaluated egress is on). A scope that
+  // cannot be loaded throws here, so the session fails to start instead of
+  // running unscoped.
+  const taskScope = config.taskPolicyDir === undefined ? undefined : loadTaskScopePolicy(config.taskPolicyDir);
+  if (taskScope) {
+    logger.info(`[policy] Task scope: ${taskScope.policyDir} (calls outside it escalate)`);
+  }
 
   const serverDomainAllowlists = extractServerDomainAllowlists(config.mcpServers);
   const trustedServers = buildTrustedServerSet(config.mcpServers);
@@ -608,7 +1075,7 @@ async function buildCoordinator(config: IronCurtainConfig): Promise<CoordinatorB
   if (autoApprove.enabled) {
     try {
       const base = await createLanguageModel(autoApprove.modelId, config.userConfig, 'autoApprove');
-      autoApproveModel = wrapAutoApproveModel(base, config.autoApproveLlmLogPath);
+      autoApproveModel = wrapAutoApproveModel(base, config);
     } catch (err) {
       // Model construction failure is non-fatal: auto-approve becomes
       // unavailable but the session still runs with manual escalation.
@@ -617,48 +1084,94 @@ async function buildCoordinator(config: IronCurtainConfig): Promise<CoordinatorB
     }
   }
 
+  // Outbound content assessment (opt-in, off unless the user enabled it):
+  // the coordinator checks what assess-allowed and escalated calls send out.
+  const contentAssessment = await contentAssessorOptionsFromConfig(config.userConfig);
+
   // Virtual proxy control client (Docker Agent Mode only). Matches the
   // subprocess's previous behavior where SERVER_FILTER=proxy entered
   // virtual-only mode with MITM_CONTROL_ADDR set.
-  const controlApiClient = config.mitmControlAddr ? createControlApiClient(config.mitmControlAddr) : null;
+  const controlApiClient = config.mitmControlAddr
+    ? createControlApiClient(config.mitmControlAddr, { token: config.mitmControlToken })
+    : null;
 
-  // Compute per-server sandbox disposition for audit-log annotation.
-  // The subprocesses own the actual sandbox wrapping (srt settings files,
-  // command wrapping); the parent only needs the boolean to stamp audit
-  // entries and annotate EPERM/EACCES errors as sandbox violations.
-  const { platformSupported } = checkSandboxAvailability();
-  const resolvedSandboxConfigs = resolveSandboxConfigsForAudit(
-    config.mcpServers,
-    config.allowedDirectory,
-    platformSupported,
-    config.sandboxPolicy ?? 'warn',
-  );
+  // Per-server sandbox disposition for audit-log annotation. The
+  // subprocesses own the actual sandbox wrapping (srt settings files,
+  // command wrapping); the parent only needs the disposition to stamp audit
+  // entries and annotate EPERM/EACCES errors as sandbox violations. The
+  // plan marks a server sandboxed only when sandboxing is really available
+  // (platform supported, no missing dependency, and srt's smoke run passed),
+  // and leaves refused servers out entirely.
+  const resolvedSandboxConfigs = new Map(osSandboxPlan.resolved);
 
   const coordinator = new ToolCallCoordinator({
     compiledPolicy,
     toolAnnotations,
+    ...(taskScope ? { taskScope: taskScope.policy } : {}),
     protectedPaths: config.protectedPaths,
     allowedDirectory: config.allowedDirectory,
+    // A read-only workspace (a read-only workflow state or scope) denies
+    // every change outside its writable directories, whatever the policy.
+    readOnlyWorkspace: config.readOnlyWorkspace,
     serverDomainAllowlists,
     dynamicLists,
     trustedServers,
     auditLogPath: config.auditLogPath,
     auditRedact: config.userConfig.auditRedaction.enabled,
+    auditRedactSecrets: collectAuditRedactionSecrets(config.userConfig),
     autoApproveModel,
+    contentAssessment,
     escalationDir: config.escalationDir,
+    // The coordinator runs in this process, so the PTY mode that gates the
+    // auto-approver's trust in user-context.json is passed explicitly from
+    // the session config rather than read from any environment variable.
+    isPtySession: config.isPtySession === true,
+    // The user's escalationTimeoutSeconds bounds the in-process human
+    // wait; the backend bound is what every relay also gets through
+    // BACKEND_CALL_TIMEOUT_MS (see buildProxySubprocessEnv).
+    escalationTimeoutMs: escalationTimeoutMsFromConfig(config),
+    backendCallTimeoutMs: backendCallTimeoutMsFromConfig(config),
+    onEscalation: initOptions.onEscalation,
     controlApiClient,
+    ...(initOptions.workflowCommit ? { workflowCommit: initOptions.workflowCommit } : {}),
     resolvedSandboxConfigs,
+    // Workflow policy hot-swaps check each persona's policy provenance.
+    policyOnStale: config.userConfig.policy?.onStale,
+    maxLanes: initOptions.maxLanes,
+    // Opt-in sequence-aware policy (absent = disabled). The coordinator
+    // replays this session's audit log first, so a resumed session that was
+    // tainted stays tainted, then the earlier legs' bundle logs of a resumed
+    // workflow run (set by the workflow orchestrator).
+    taintEscalation: config.userConfig.taintEscalation,
+    taintReplayAuditLogPaths: config.taintReplayAuditLogPaths,
+    // Opt-in policy-evaluated MITM egress (absent = disabled; Docker Agent
+    // Mode only, where the MITM proxy asks this coordinator).
+    egressPolicy: egressPolicyOptionsFor(config),
+    approvalHistoryScope: config.approvalHistoryScope,
   });
 
   // Derive initial MCP roots from the compiled policy using the same
   // rule the relay subprocess applied in the legacy single-process
   // path. Passing these to `manager.connect()` makes the coordinator's
   // client advertise `roots.listChanged` and seeds the mutable roots
-  // array that `addRootToClient` extends on escalation approval.
+  // array that `addRootsToClient` extends on escalation approval.
   const policyRoots = extractPolicyRoots(compiledPolicy, config.allowedDirectory);
   const initialRoots: McpRoot[] = toMcpRoots(policyRoots);
 
   return { coordinator, initialRoots };
+}
+
+/** One relay subprocess the sandbox starts. */
+interface RelaySpec {
+  /** The server the relay serves (`proxy` for the virtual proxy-tools relay). */
+  readonly serverName: string;
+  readonly config: MCPServerConfig;
+}
+
+/** A relay that connected and listed its tools, ready to register with the coordinator. */
+interface StartedRelay {
+  readonly tools: CoordinatorTool[];
+  readonly clientState: ClientState;
 }
 
 /**
@@ -667,8 +1180,19 @@ async function buildCoordinator(config: IronCurtainConfig): Promise<CoordinatorB
  * virtual-only proxy subprocess when `mitmControlAddr` is configured.
  *
  * The subprocesses are driven through the coordinator's
- * `MCPClientManager`. After each connects, its tool list is registered
- * with the coordinator so UTCP sees every tool.
+ * `MCPClientManager`. They start concurrently, at most
+ * `RELAY_CONNECT_CONCURRENCY` at a time, each within its own deadlines
+ * (the `MCP_CONNECT_TIMEOUT_MS` handshake, then
+ * `RELAY_LIST_TOOLS_TIMEOUT_MS` for its tool list), so a slow server delays
+ * no other. Once all have settled, each started relay's tools are
+ * registered with the coordinator in configuration order, so the tool
+ * catalog (and the system prompt built from it) never depends on which
+ * relay answered first.
+ *
+ * A relay that fails to connect or to list its tools is closed (its process
+ * stops with its connection), logged, and returned in the result; the
+ * session runs without that server. Anything else that fails here throws,
+ * and `Sandbox.initialize` shuts everything down.
  *
  * `initialRoots` seeds the mutable roots array each relay connection
  * advertises. Passing the same set to every subprocess ensures the
@@ -688,78 +1212,103 @@ async function connectBackendSubprocesses(
   coordinator: ToolCallCoordinator,
   config: IronCurtainConfig,
   initialRoots: McpRoot[],
-): Promise<void> {
+  osSandboxPlan: OsSandboxPlan,
+): Promise<UnavailableMcpServer[]> {
   const manager = coordinator.getMcpManager();
-  const proxyEnv = buildProxySubprocessEnv(config);
+  const proxyEnv = buildProxySubprocessEnv(config, osSandboxPlan);
 
-  for (const serverName of Object.keys(config.mcpServers)) {
-    const serverCreds = config.userConfig.serverCredentials[serverName] as Record<string, string> | undefined;
-    const subprocessConfig: MCPServerConfig = {
+  for (const serverName of osSandboxPlan.refused) {
+    logger.warn(`[sandbox] Not starting MCP server "${serverName}": required OS sandbox is unavailable`);
+  }
+
+  const relays: RelaySpec[] = relayServerNames(config, osSandboxPlan).map((serverName) => ({
+    serverName,
+    config: {
       command: PROXY_COMMAND,
       args: [...PROXY_ARGS],
-      env: {
-        ...proxyEnv,
-        SERVER_FILTER: serverName,
-        ...(serverCreds ? { SERVER_CREDENTIALS: JSON.stringify(serverCreds) } : {}),
-      },
+      env: buildServerRelayEnv(
+        proxyEnv,
+        serverName,
+        config.mcpServers[serverName],
+        config.userConfig.serverCredentials[serverName] as Record<string, string> | undefined,
+      ),
       sandbox: false,
-    };
-    try {
-      await manager.connect(serverName, subprocessConfig, initialRoots);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      logger.warn(`Failed to connect MCP server "${serverName}": ${message} -- skipping`);
-      continue;
-    }
-    await registerServerToolsWithCoordinator(coordinator, serverName);
-  }
+    },
+  }));
 
   // Virtual-only proxy subprocess (domain management tools). Only
   // exists when MITM is active (Docker Agent Mode). MITM_CONTROL_ADDR
-  // is set exclusively here; no backend credentials, no SERVER_FILTER
-  // mapping to a real server.
+  // and the control API's bearer token are set exclusively here; no
+  // backend config or credentials, no SERVER_FILTER mapping to a real
+  // server.
   if (config.mitmControlAddr) {
-    const virtualProxyConfig: MCPServerConfig = {
-      command: PROXY_COMMAND,
-      args: [...PROXY_ARGS],
-      env: {
-        ...proxyEnv,
-        SERVER_FILTER: 'proxy',
-        MITM_CONTROL_ADDR: config.mitmControlAddr,
+    relays.push({
+      serverName: 'proxy',
+      config: {
+        command: PROXY_COMMAND,
+        args: [...PROXY_ARGS],
+        env: {
+          ...proxyEnv,
+          MCP_SERVERS_CONFIG: '{}',
+          SERVER_FILTER: 'proxy',
+          MITM_CONTROL_ADDR: config.mitmControlAddr,
+          ...(config.mitmControlToken === undefined ? {} : { MITM_CONTROL_TOKEN: config.mitmControlToken }),
+        },
+        sandbox: false,
       },
-      sandbox: false,
-    };
-    try {
-      await manager.connect('proxy', virtualProxyConfig, initialRoots);
-      await registerServerToolsWithCoordinator(coordinator, 'proxy');
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      logger.warn(`Failed to connect virtual proxy subprocess: ${message}`);
-    }
+    });
   }
+
+  const limit = pLimit(RELAY_CONNECT_CONCURRENCY);
+  const outcomes = await Promise.allSettled(
+    relays.map((relay) => limit(() => startRelay(manager, relay, initialRoots))),
+  );
+
+  const unavailable: UnavailableMcpServer[] = [];
+  for (const [index, relay] of relays.entries()) {
+    const outcome = outcomes[index];
+    if (outcome.status === 'fulfilled') {
+      coordinator.registerTools(relay.serverName, outcome.value.tools, outcome.value.clientState);
+      continue;
+    }
+    const reason = errorLine(outcome.reason);
+    logger.warn(`Failed to start MCP server "${relay.serverName}": ${reason} -- skipping`);
+    // A relay that connected and then failed its tool listing would
+    // otherwise live on, unused, until the session ends.
+    await manager.close(relay.serverName);
+    unavailable.push({ serverName: relay.serverName, reason });
+  }
+  return unavailable;
 }
 
 /**
- * Asks the subprocess for its tool list and registers each tool with
- * the coordinator. The coordinator shares the manager's live
- * `ClientState` so `addRootToClient` mutates the same array the
- * manager returns from its `roots/list` handler.
+ * Connects one relay and lists its tools, within the relay's deadlines.
+ * The tools are not registered yet (see `connectBackendSubprocesses`).
+ * The coordinator later shares the manager's live `ClientState`, so
+ * `addRootsToClient` mutates the same array the manager returns from its
+ * `roots/list` handler.
  */
-async function registerServerToolsWithCoordinator(coordinator: ToolCallCoordinator, serverName: string): Promise<void> {
-  const manager = coordinator.getMcpManager();
-  const clientState = manager.getClientState(serverName);
-  if (!clientState) {
-    logger.warn(`[sandbox] No live client for server "${serverName}" after connect -- skipping`);
-    return;
-  }
-  const tools = await manager.listTools(serverName);
-  const coordinatorTools: CoordinatorTool[] = tools.map((t) => ({
-    serverName,
-    name: t.name,
-    description: t.description,
-    inputSchema: (t.inputSchema ?? {}) as Record<string, unknown>,
-  }));
-  coordinator.registerTools(serverName, coordinatorTools, clientState);
+async function startRelay(manager: MCPClientManager, relay: RelaySpec, initialRoots: McpRoot[]): Promise<StartedRelay> {
+  await manager.connect(relay.serverName, relay.config, initialRoots);
+  const clientState = manager.getClientState(relay.serverName);
+  if (!clientState) throw new Error('no live client after connecting');
+  const tools = await manager.listTools(relay.serverName, { timeoutMs: RELAY_LIST_TOOLS_TIMEOUT_MS });
+  return {
+    clientState,
+    tools: tools.map((t) => ({
+      serverName: relay.serverName,
+      name: t.name,
+      description: t.description,
+      inputSchema: (t.inputSchema ?? {}) as Record<string, unknown>,
+    })),
+  };
+}
+
+/** First line of an error's message, for logs and diagnostics. */
+function errorLine(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const newline = message.indexOf('\n');
+  return newline === -1 ? message : message.slice(0, newline);
 }
 
 /**
@@ -776,25 +1325,121 @@ async function registerServerToolsWithCoordinator(coordinator: ToolCallCoordinat
  *   - AUDIT_LOG_PATH, AUDIT_REDACTION   -- coordinator owns audit
  *   - CONSTITUTION_PATH                 -- never read by the proxy
  *   - PROTECTED_PATHS                   -- only used by PolicyEngine
- *   - ESCALATION_DIR                    -- only used by escalation path
+ *   - ESCALATION_DIR, ESCALATION_TIMEOUT_SECONDS -- escalation runs in the
+ *     coordinator; the relay only gets the backend call bound
  *   - AUTO_APPROVE_*                    -- coordinator owns auto-approve
+ *   - IRONCURTAIN_PTY_SESSION           -- the PTY mode gates auto-approve
+ *                                          trust in the coordinator, which
+ *                                          receives it as a constructor
+ *                                          option (`isPtySession`)
+ *
+ * The sandbox policy is the session's resolved policy (which already gives
+ * an explicit IRONCURTAIN_SANDBOX_POLICY / SANDBOX_POLICY precedence), set
+ * under both names so the relay cannot resolve a different one from its
+ * inherited environment. The availability the plan was made with, srt smoke
+ * run included, goes along as OS_SANDBOX_AVAILABILITY: the relay narrows it
+ * with its own dependency check instead of deciding from that check alone,
+ * so on a host where srt cannot start it runs a "warn" server unconfined, as
+ * the plan (and the audit stamp) says, rather than wrapping it in srt.
+ *
+ * Every path in the block is absolute, resolved here against this
+ * process's cwd (the base the coordinator's policy engine uses for the
+ * same values): relays run from IronCurtain's package root (see
+ * trusted-process/spawn-cwd.ts), not this process's cwd, and refuse a
+ * relative ALLOWED_DIRECTORY. `allowedDirectory` is resolved too, as
+ * defense in depth for callers that set it without going through
+ * loadConfig(): a relative value would otherwise make every relay exit.
+ *
+ * This is the part shared by every relay of the session. What is specific
+ * to one relay -- its server's config (MCP_SERVERS_CONFIG), SERVER_FILTER,
+ * SERVER_CREDENTIALS and the host values its server's `-e NAME` arguments
+ * forward -- is added per relay by {@link buildServerRelayEnv}, so no relay
+ * sees another server's configuration or credentials. The relay inherits
+ * nothing else from this process: `MCPClientManager.connect` spawns it with
+ * the allowlist of trusted-process/child-env.ts plus this block.
+ * Exported for tests.
  */
-function buildProxySubprocessEnv(config: IronCurtainConfig): Record<string, string> {
+export function buildProxySubprocessEnv(
+  config: IronCurtainConfig,
+  osSandboxPlan: OsSandboxPlan,
+): Record<string, string> {
   const env: Record<string, string> = {
-    MCP_SERVERS_CONFIG: JSON.stringify(config.mcpServers),
+    ...sandboxCredentialPathsEnv(computeSandboxCredentialPaths(config.userConfig.credentialProtection)),
     // Needed for policy-root derivation (advertised to backend MCP
     // servers as MCP Roots at connection time).
-    GENERATED_DIR: config.generatedDir,
-    TOOL_ANNOTATIONS_DIR: config.toolAnnotationsDir ?? config.generatedDir,
-    ALLOWED_DIRECTORY: config.allowedDirectory,
+    GENERATED_DIR: resolve(config.generatedDir),
+    TOOL_ANNOTATIONS_DIR: resolve(config.toolAnnotationsDir ?? config.generatedDir),
+    ALLOWED_DIRECTORY: resolve(config.allowedDirectory),
+    // The relay runs from the package root, not this process's cwd, so it
+    // gets the home this process resolved (always absolute: a relative
+    // IRONCURTAIN_HOME is refused) and both agree on where OAuth tokens
+    // and client credentials are read from.
+    IRONCURTAIN_HOME: getIronCurtainHome(),
     CONTAINER_WORKSPACE_DIR,
-    ESCALATION_TIMEOUT_SECONDS: String(config.escalationTimeoutSeconds),
-    SANDBOX_POLICY: config.sandboxPolicy ?? 'warn',
+    // The relay bounds each backend call with this; the coordinator waits
+    // `relayCallTimeoutMs()` for the relay so both agree on who times out.
+    [BACKEND_CALL_TIMEOUT_ENV]: String(backendCallTimeoutMsFromConfig(config)),
+    ...sandboxPolicyEnv(relaySandboxPolicy(osSandboxPlan)),
+    ...osSandboxAvailabilityEnv(osSandboxPlan.availability),
     ...(process.env.SSH_AUTH_SOCK ? { SSH_AUTH_SOCK: process.env.SSH_AUTH_SOCK } : {}),
+    // Where the user moved the credential stores the relay must hide from
+    // sandboxed servers (ANTHROPIC_CONFIG_DIR, CODEX_HOME): the relay builds
+    // the srt denyRead baseline from them and does not pass them on.
+    ...relayHostSettings(process.env),
   };
 
-  if (config.sessionLogPath) env.SESSION_LOG_PATH = config.sessionLogPath;
-  if (config.isPtySession) env.IRONCURTAIN_PTY_SESSION = '1';
+  if (config.sessionLogPath) env.SESSION_LOG_PATH = resolve(config.sessionLogPath);
 
   return env;
+}
+
+/**
+ * The environment block of the relay for one server: the shared block from
+ * {@link buildProxySubprocessEnv} plus what belongs to that server alone.
+ *
+ * - `MCP_SERVERS_CONFIG` holds only this server's config. A relay used to
+ *   receive every server's config, `env` blocks included, and spread its
+ *   environment into its backend, so each third-party server could read the
+ *   others' configuration (and the memory server's LLM key).
+ * - `SERVER_CREDENTIALS` carries this server's stored credentials
+ *   (config.json `serverCredentials`); the relay scrubs the variable before
+ *   spawning the backend and injects the values into the backend's
+ *   environment.
+ * - The host values the server's docker-style `-e NAME` arguments forward
+ *   (GITHUB_PERSONAL_ACCESS_TOKEN for the shipped github server) are copied
+ *   from `hostEnv` by name. The relay's environment is allowlisted and holds
+ *   nothing else from the host, so this process, which still has the host
+ *   environment, is the one that must hand them over; the relay forwards
+ *   them to the backend because the backend's arguments name them. They are
+ *   layered first, so a `-e` name can never replace a value the relay is
+ *   configured with (the relay-internal names are refused outright).
+ *
+ * Exported for tests.
+ */
+export function buildServerRelayEnv(
+  proxyEnv: Readonly<Record<string, string>>,
+  serverName: string,
+  serverConfig: MCPServerConfig,
+  serverCredentials: Readonly<Record<string, string>> | undefined,
+  hostEnv: HostEnv = process.env,
+): Record<string, string> {
+  return {
+    ...pickPassthroughEnv(hostEnv, serverConfig.args),
+    ...proxyEnv,
+    MCP_SERVERS_CONFIG: JSON.stringify({ [serverName]: serverConfig }),
+    SERVER_FILTER: serverName,
+    ...(serverCredentials ? { SERVER_CREDENTIALS: JSON.stringify(serverCredentials) } : {}),
+  };
+}
+
+/**
+ * The policy handed to relays. When the parent found OS sandboxing
+ * available it stamps sandbox-requesting servers `sandboxed: true` in the
+ * audit log, so the relay gets "enforce": a relay that nonetheless finds
+ * sandboxing unavailable then refuses the server instead of running it
+ * unconfined under a sandboxed audit stamp. Otherwise the session policy
+ * applies unchanged.
+ */
+function relaySandboxPolicy(plan: OsSandboxPlan): SandboxAvailabilityPolicy {
+  return plan.availability.available ? 'enforce' : plan.policy;
 }

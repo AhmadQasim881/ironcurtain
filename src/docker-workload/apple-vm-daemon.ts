@@ -93,6 +93,11 @@ export const APPLE_VM_EGRESS_RELAY_PATH = '/usr/local/lib/ironcurtain-docker/app
  * would derive exactly this path from the `HOME` the start script exports, so
  * naming it changes nothing at runtime and makes the daemon's state an exact
  * path that teardown can ledger and remove deterministically.
+ *
+ * It lives inside the VM's rootfs, so on the host its growth shows up only as
+ * allocated blocks of that VM's runtime-owned rootfs image. That image is what
+ * the observed-disk watchdog measures (`observed-storage.ts`); nothing the
+ * daemon writes reaches the lease's host state root.
  */
 export const APPLE_VM_DAEMON_DATA_ROOT = `${APPLE_VM_DAEMON_HOME}/.local/share/docker`;
 

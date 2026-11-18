@@ -9,8 +9,20 @@
  *
  * The protocol is idempotent: `registerIronCurtainProtocol()` can be
  * called multiple times safely (subsequent calls are no-ops).
+ *
+ * Per-call options. UTCP's `callTool(name, args)` has no input for them, so
+ * the Code Mode chain runner hands each tool call's host-assigned options --
+ * its cancellation signal and the caller's circuit-breaker lane (see
+ * `ToolCallOptions`) -- through `withToolCallOptions`, an AsyncLocalStorage
+ * scope around the UTCP call; the protocol reads them here and passes them
+ * to `coordinator.handleToolCall`. The scope is entered on the host side for
+ * every call the isolate bridges out (`code-mode-chain.ts`): a scope around
+ * the whole chain would not reach the calls, because they re-enter the host
+ * from the isolated-vm isolate through native callbacks that do not carry
+ * the chain's async context.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import {
   CallTemplateSerializer,
   CommunicationProtocol,
@@ -20,8 +32,9 @@ import {
   type IUtcpClient,
   type RegisterManualResult,
 } from '@utcp/sdk';
-import type { ToolCallCoordinator } from '../trusted-process/tool-call-coordinator.js';
+import type { ToolCallCoordinator, ToolCallOptions } from '../trusted-process/tool-call-coordinator.js';
 import { extractTextFromContent } from '../trusted-process/tool-call-pipeline.js';
+import { exposesStructuredContent } from './structured-results.js';
 
 /**
  * The `call_template_type` identifier used for coordinator-backed manuals.
@@ -54,6 +67,22 @@ export interface IronCurtainCallTemplate extends CallTemplate {
  * store only the name in the serialized dict.
  */
 const coordinatorByManual = new Map<string, ToolCallCoordinator>();
+
+/** The options of the tool call being made in the current async scope. */
+const toolCallOptionsScope = new AsyncLocalStorage<ToolCallOptions>();
+
+/**
+ * Runs `call` (a UTCP `callTool`) with `options` as the per-call options the
+ * protocol passes to the coordinator. Aborting `options.signal` withdraws a
+ * pending escalation and stops the call from being dispatched;
+ * `options.lane` keys the circuit breaker's per-lane window (see
+ * `ToolCallCoordinator.handleToolCall`). A call made outside any scope gets
+ * neither: no cancellation, and the breaker's shared default lane (the
+ * stricter outcome).
+ */
+export function withToolCallOptions<T>(options: ToolCallOptions, call: () => Promise<T>): Promise<T> {
+  return toolCallOptionsScope.run(options, call);
+}
 
 class IronCurtainCallTemplateSerializer extends Serializer<IronCurtainCallTemplate> {
   toDict(obj: IronCurtainCallTemplate): Record<string, unknown> {
@@ -88,7 +117,9 @@ class IronCurtainCallTemplateSerializer extends Serializer<IronCurtainCallTempla
  *     returns it as a UTCP manual.
  *   - On `callTool`: strips the UTCP manual/server prefixes to recover the
  *     backend tool name, then delegates to
- *     `coordinator.handleToolCall(toolName, args)`.
+ *     `coordinator.handleToolCall(serverName, toolName, args, options)`
+ *     with the call's options -- cancellation signal and lane -- from the
+ *     enclosing `withToolCallOptions` scope.
  */
 class IronCurtainCommunicationProtocol extends CommunicationProtocol {
   // eslint-disable-next-line @typescript-eslint/require-await -- UTCP interface mandates Promise return
@@ -144,7 +175,11 @@ class IronCurtainCommunicationProtocol extends CommunicationProtocol {
     const serverName = stripped.slice(0, dotIdx);
     const backendToolName = stripped.slice(dotIdx + 1);
 
-    const response = await coordinator.handleToolCall(serverName, backendToolName, toolArgs);
+    // Set by the chain runner (`withToolCallOptions`): the signal aborts
+    // when the script that made the call has ended, and the lane is the
+    // host-assigned lane of the agent stream that sent the script.
+    const options = toolCallOptionsScope.getStore() ?? {};
+    const response = await coordinator.handleToolCall(serverName, backendToolName, toolArgs, options);
     // Throw on backend / policy errors so the UTCP Code Mode isolate
     // surfaces them as exceptions the LLM-generated snippet can catch.
     // Only use the user-facing text from `response.content`; internal
@@ -154,6 +189,12 @@ class IronCurtainCommunicationProtocol extends CommunicationProtocol {
     if (response.isError) {
       const text = extractTextFromContent(response.content);
       throw new Error(text || 'Tool call returned an error');
+    }
+    // The server's structured output rides along for the servers whose
+    // structured result is worth its tokens (structured-results.ts; documented
+    // in help.help(server)). It is the backend's own data, like `content`.
+    if (response.structuredContent !== undefined && exposesStructuredContent(serverName)) {
+      return { content: response.content, structuredContent: response.structuredContent };
     }
     return { content: response.content };
   }

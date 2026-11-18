@@ -10,6 +10,7 @@ import forge from 'node-forge';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { loadOrCreateCA, randomSerialNumber, type CertificateAuthority } from '../../src/docker/ca.js';
 import { createPackageValidator } from '../../src/docker/package-validator.js';
+import { DEFAULT_PACKAGE_EGRESS_LIMITS } from '../../src/docker/package-egress-ledger.js';
 import {
   canonicalizePackageEgressRedirect,
   classifyPackageEgressRoute,
@@ -72,6 +73,22 @@ describe('strict package route grammar', () => {
       'debian',
       'artifact',
     ],
+    // apt quotes + and ~ across the whole request URI: package names and pool directories too.
+    ['deb.debian.org', '/debian/pool/main/g/gcc-12/g%2b%2b-12_12.2.0-14_amd64.deb', 'debian', 'artifact'],
+    [
+      'deb.debian.org',
+      '/debian/pool/main/libs/libsigc%2b%2b-2.0/libsigc%2b%2b-2.0-0v5_2.12.0-1_amd64.deb',
+      'debian',
+      'artifact',
+    ],
+    [
+      'security.debian.org',
+      '/debian-security/pool/updates/main/g/gcc-12/libstdc%2b%2b6_12.2.0-14%2bdeb12u1_amd64.deb',
+      'debian',
+      'artifact',
+    ],
+    ['deb.debian.org', '/debian-security/pool/updates/main/c%2b/curl_7.88.1-10_arm64.deb', 'debian', 'artifact'],
+    ['deb.debian.org', '/debian-security/pool/updates/main/c/cu%2brl_7.88.1-10_arm64.deb', 'debian', 'artifact'],
     ['index.crates.io', '/config.json', 'cargo', 'bootstrap'],
     ['index.crates.io', '/se/rd/serde', 'cargo', 'metadata'],
     ['static.crates.io', '/crates/serde/serde-1.0.219.crate', 'cargo', 'artifact'],
@@ -104,8 +121,17 @@ describe('strict package route grammar', () => {
     ['deb.debian.org', '/debian-security/pool/updates/main/c/curl/curl_7.88.1-10%252bdeb12u15_arm64.deb'],
     ['deb.debian.org', '/debian-security/pool/updates/main/c/curl/curl_7.88.1-10%2fdeb12u15_arm64.deb'],
     ['deb.debian.org', '/debian-security/pool/updates/main/c/curl/curl_7%2e88.1-10_arm64.deb'],
-    ['deb.debian.org', '/debian-security/pool/updates/main/c%2b/curl_7.88.1-10_arm64.deb'],
-    ['deb.debian.org', '/debian-security/pool/updates/main/c/cu%2brl_7.88.1-10_arm64.deb'],
+    // Outside the version only apt's lowercase %2b and %7e are admitted, never the literal characters.
+    ['deb.debian.org', '/debian/pool/main/g/gcc-12/g++-12_12.2.0-14_amd64.deb'],
+    ['deb.debian.org', '/debian/pool/main/libs/libsigc++-2.0/libsigc%2b%2b-2.0-0v5_2.12.0-1_amd64.deb'],
+    ['deb.debian.org', '/debian/pool/main/g/gcc-12/g%2B%2B-12_12.2.0-14_amd64.deb'],
+    ['deb.debian.org', '/debian/pool/main/libs/libsigc%2B%2B-2.0/libsigc%2b%2b-2.0-0v5_2.12.0-1_amd64.deb'],
+    ['deb.debian.org', '/debian/pool/main/g/gcc-12/g%252b%252b-12_12.2.0-14_amd64.deb'],
+    ['deb.debian.org', '/debian/pool/main/libs/libsigc%252b%252b-2.0/libsigc%2b%2b-2.0-0v5_2.12.0-1_amd64.deb'],
+    ['deb.debian.org', '/debian/pool/main/g/gcc-12/g%2b%2b-12%3a_12.2.0-14_amd64.deb'],
+    ['deb.debian.org', '/debian/pool/main/c/curl~x/curl_7.88.1-10_arm64.deb'],
+    // A name that decodes to text outside the Debian name grammar.
+    ['deb.debian.org', '/debian/pool/main/c/curl/cu%7erl_7.88.1-10_arm64.deb'],
     ['deb.debian.org', '/debian-security/pool/updates/main/c/curl_7.88.1-10_arm%2b64.deb'],
     ['deb.debian.org', '/debian-security/pool/updates/main/c/curl%5f7.88.1-10_arm64.deb'],
     ['deb.debian.org', '/debian-security/pool/updates/main/c/curl_7.88.1-10%20u15_arm64.deb'],
@@ -121,6 +147,26 @@ describe('strict package route grammar', () => {
   it('honors a caller-resolved target-byte ceiling instead of the default classifier ceiling', () => {
     expect(classifyPackageEgressRoute('registry.npmjs.org', '/express', 4)).toBeUndefined();
     expect(classifyPackageEgressRoute('registry.npmjs.org', '/express', 8)).toMatchObject({ kind: 'metadata' });
+  });
+
+  it('preserves exact apt-quoted Debian artifact paths while decoding %2b in names and pool directories', () => {
+    for (const [path, name, version] of [
+      ['/debian/pool/main/g/gcc-12/g%2b%2b-12_12.2.0-14_amd64.deb', 'g++-12', '12.2.0-14'],
+      ['/debian/pool/main/g/gcc-12/libstdc%2b%2b6_12.2.0-14_amd64.deb', 'libstdc++6', '12.2.0-14'],
+      [
+        '/debian/pool/main/libs/libsigc%2b%2b-2.0/libsigc%2b%2b-2.0-0v5_2.12.0-1%2bb1_amd64.deb',
+        'libsigc++-2.0-0v5',
+        '2.12.0-1+b1',
+      ],
+    ] as const) {
+      expect(classifyPackageEgressRoute('deb.debian.org', path), path).toEqual({
+        ecosystem: 'debian',
+        host: 'deb.debian.org',
+        path,
+        kind: 'artifact',
+        package: { registry: 'debian', name, version },
+      });
+    }
   });
 
   it('preserves exact canonical Debian artifact paths while decoding version %2b, %7e, and %3a', () => {
@@ -246,6 +292,24 @@ describe('strict package egress proxy', () => {
     await waitFor(() => proxy.snapshot.activeClients === 0);
     expect(allowRemoteAddress).toHaveBeenCalledWith(expect.stringContaining('127.0.0.1'));
     expect(proxy.snapshot.clientAttempts).toBe(1);
+  });
+
+  it('binds its TCP listener to loopback only', async () => {
+    // Docker Desktop delivers host-gateway traffic as loopback, so a wider
+    // bind would only expose the listener to the LAN.
+    const fixture = await startFixture((_request, response) => response.end('not reached'));
+    const listen = vi.spyOn(http.Server.prototype, 'listen');
+    try {
+      const proxy = createTestProxy(fixture.transport, { allowRemoteAddress: () => true });
+      resources.push(() => proxy.stop());
+      const address = await proxy.start({ listenPort: 0 });
+      if (address.port === undefined) throw new Error('expected package egress to bind TCP');
+      const tcpBinds = listen.mock.calls.filter(([port]) => typeof port === 'number');
+      expect(tcpBinds).toHaveLength(1);
+      expect(tcpBinds[0][1]).toBe('127.0.0.1');
+    } finally {
+      listen.mockRestore();
+    }
   });
 
   it('requires the exact per-bundle credential from an admitted TCP source', async () => {
@@ -522,6 +586,50 @@ describe('strict package egress proxy', () => {
     ]);
   });
 
+  it("forwards apt's %2b-quoted package names over plain HTTP by their exact path and gates the decoded name", async () => {
+    const fixture = await startFixture((_request, response) => response.end('deb-bytes'));
+    const auditLogPath = join(caDir, `package-egress-audit-${auditCounter++}.jsonl`);
+    const started = await startPolicyProxy(fixture.transport, {
+      auditLogPath,
+      policy: { validator: createPackageValidator({ deniedPackages: ['libsigc++-2.0-0v5'], quarantineDays: 2 }) },
+    });
+    const get = (path: string): Promise<string> =>
+      rawUdsRequest(
+        started.socketPath,
+        `GET http://deb.debian.org${path} HTTP/1.1\r\nHost: deb.debian.org\r\nConnection: close\r\n\r\n`,
+      );
+    const gpp = '/debian/pool/main/g/gcc-12/g%2b%2b-12_12.2.0-14_amd64.deb';
+    const sigc = '/debian/pool/main/libs/libsigc%2b%2b-2.0/libsigc%2b%2b-2.0-0v5_2.12.0-1_amd64.deb';
+
+    expect(await get(gpp)).toContain('deb-bytes');
+    // The denylist sees the decoded name.
+    expect(await get(sigc)).toContain('403');
+    // A literal + is an alias apt never sends.
+    expect(await get('/debian/pool/main/g/gcc-12/g++-12_12.2.0-14_amd64.deb')).toContain('403');
+
+    expect(fixture.transport.seen).toEqual([
+      expect.objectContaining({
+        destination: { protocol: 'https:', hostname: 'deb.debian.org', port: 443 },
+        path: gpp,
+      }),
+    ]);
+    await started.proxy.stop();
+    expect(readPackageAudit(auditLogPath)).toEqual([
+      expect.objectContaining({
+        decision: 'allow',
+        reasonCode: 'debian-curated-epoch',
+        path: gpp,
+        package: { name: 'g++-12', version: '12.2.0-14' },
+      }),
+      expect.objectContaining({
+        decision: 'deny',
+        reasonCode: 'policy-deny',
+        path: sigc,
+        package: { name: 'libsigc++-2.0-0v5', version: '2.12.0-1' },
+      }),
+    ]);
+  });
+
   it('derives npm metadata for the exact artifact version and enforces fresh deny versus old allow', async () => {
     const requestedVersion = '1.0.0';
     const metadataTime = new Date(Date.now() - 60 * 60_000).toISOString();
@@ -627,7 +735,8 @@ describe('strict package egress proxy', () => {
     const auditLogPath = join(caDir, `package-egress-audit-${auditCounter++}.jsonl`);
     const started = await startPolicyProxy(fixture.transport, {
       auditLogPath,
-      policy: { validator: createPackageValidator({ quarantineDays: 0 }) },
+      // A quarantine, so the age gate needs the derived metadata (without one it is skipped).
+      policy: { validator: createPackageValidator({ quarantineDays: 2 }) },
       limits: { idleTimeoutMs: 300, absoluteTimeoutMs: 2_000 },
     });
     const tunnel = await sendConnect(started.socketPath, 'registry.npmjs.org');
@@ -649,7 +758,14 @@ describe('strict package egress proxy', () => {
       metadataHost: 'pypi.org',
       metadataPath: '/pypi/demo/json',
       metadataBody: JSON.stringify({
-        releases: { '1.0.0': [{ upload_time_iso_8601: new Date(Date.now() - 3 * 24 * 60 * 60_000).toISOString() }] },
+        releases: {
+          '1.0.0': [
+            {
+              url: `https://files.pythonhosted.org/packages/aa/bb/${'c'.repeat(64)}/demo-1.0.0.tar.gz`,
+              upload_time_iso_8601: new Date(Date.now() - 3 * 24 * 60 * 60_000).toISOString(),
+            },
+          ],
+        },
       }),
     },
     {
@@ -1068,6 +1184,8 @@ describe('strict package egress proxy', () => {
     const started = await startProxy(fixture.transport, () => ({ status: 'allow', reason: 'fixture allow' }));
     unlinkSync(started.socketPath);
     writeFileSync(started.socketPath, 'replacement');
+    // The proxy must leave the replacement in place, so the test removes it.
+    resources.push(() => rmSync(started.socketPath, { force: true }));
 
     const firstStop = started.proxy.stop();
     const secondStop = started.proxy.stop();
@@ -1385,7 +1503,7 @@ function listenUds(server: net.Server, path: string): Promise<void> {
   });
 }
 
-function closeServer(server: http.Server | https.Server): Promise<void> {
+function closeServer(server: net.Server): Promise<void> {
   if (!server.listening) return Promise.resolve();
   return new Promise((resolve) => server.close(() => resolve()));
 }
@@ -1708,3 +1826,379 @@ function createUpstreamCredentials(authority: CertificateAuthority): { readonly 
     cert: forge.pki.certificateToPem(certificate),
   };
 }
+
+// ── Derived metadata: streamed, per-file for PyPI, skipped when unneeded (EGR-5, EGR-6) ──
+
+describe('strict package egress derived metadata', () => {
+  const OLD = '2020-01-01T00:00:00.000Z';
+  const recent = (): string => new Date(Date.now() - 60 * 60_000).toISOString();
+
+  async function requestArtifact(
+    socketPath: string,
+    host: string,
+    path: string,
+  ): Promise<{ readonly statusCode: number; readonly body: string }> {
+    const tunnel = await sendConnect(socketPath, host);
+    if (tunnel.socket === null) throw new Error('expected CONNECT socket');
+    return makeHttpsRequest(tunnel.socket, host, { path });
+  }
+
+  /** A compact packument of about `targetBytes`; `fresh` versions were published an hour ago. */
+  function largeNpmPackument(name: string, targetBytes: number, fresh: readonly string[]): Buffer {
+    const filler = 'x'.repeat(64 * 1024);
+    const versions: Record<string, unknown> = {};
+    const time: Record<string, string> = { created: OLD, modified: recent() };
+    let count = 0;
+    for (let size = 0; size < targetBytes; size += filler.length + 128) {
+      const version = `5.${Math.floor(count / 100)}.${count % 100}`;
+      count += 1;
+      versions[version] = { name, version, readme: filler };
+      time[version] = OLD;
+    }
+    for (const version of fresh) {
+      versions[version] = { name, version };
+      time[version] = recent();
+    }
+    return Buffer.from(JSON.stringify({ _id: name, name, 'dist-tags': { latest: '5.0.0' }, versions, time }));
+  }
+
+  it('streams an @prisma/client-sized packument (about 68 MB) to age-gate one tarball', async () => {
+    const packument = largeNpmPackument('@prisma/client', 68 * 1000 * 1000, ['6.0.0-dev.1']);
+    expect(packument.length).toBeGreaterThan(64 * 1024 * 1024);
+    const fixture = await startFixture((request, response) => {
+      if (request.url === '/@prisma%2fclient') {
+        response.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': packument.length });
+        response.end(packument);
+        return;
+      }
+      response.end('artifact-bytes');
+    });
+    const auditLogPath = join(caDir, `package-egress-audit-${auditCounter++}.jsonl`);
+    const started = await startPolicyProxy(fixture.transport, {
+      auditLogPath,
+      policy: { validator: createPackageValidator({ quarantineDays: 2 }) },
+    });
+
+    expect(
+      await requestArtifact(started.socketPath, 'registry.npmjs.org', '/@prisma/client/-/client-5.0.0.tgz'),
+    ).toMatchObject({ statusCode: 200, body: 'artifact-bytes' });
+    const fresh = await requestArtifact(
+      started.socketPath,
+      'registry.npmjs.org',
+      '/@prisma/client/-/client-6.0.0-dev.1.tgz',
+    );
+    expect(fresh.statusCode).toBe(403);
+    expect(fresh.body).toContain('day(s) old');
+
+    await started.proxy.stop();
+    expect(readPackageAudit(auditLogPath)).toEqual([
+      expect.objectContaining({ reasonCode: 'derived-metadata-fetched', source: 'derived', path: '/@prisma%2fclient' }),
+      expect.objectContaining({
+        reasonCode: 'policy-allow',
+        source: 'client',
+        package: expect.objectContaining({ version: '5.0.0' }),
+      }),
+      expect.objectContaining({ reasonCode: 'derived-metadata-fetched', source: 'derived' }),
+      expect.objectContaining({ reasonCode: 'policy-deny', source: 'client' }),
+    ]);
+  }, 120_000);
+
+  it('age-gates each PyPI file by its own upload time, matched by its exact path', async () => {
+    const filePath = (byte: string, file: string): string => `/packages/${byte}/${byte}/${byte.repeat(30)}/${file}`;
+    const sdist = filePath('a1', 'PyYAML-6.0.1.tar.gz');
+    const lateWheel = filePath('b2', 'PyYAML-6.0.1-cp313-cp313-manylinux_2_17_aarch64.whl');
+    const unlisted = filePath('c3', 'PyYAML-6.0.1-cp313-cp313-win_amd64.whl');
+    const metadata = JSON.stringify({
+      releases: {
+        '6.0.1': [
+          { url: `https://files.pythonhosted.org${sdist}`, upload_time_iso_8601: OLD },
+          { url: `https://files.pythonhosted.org${lateWheel}`, upload_time_iso_8601: recent() },
+        ],
+      },
+    });
+    const fixture = await startFixture((request, response) => {
+      response.end(request.url === '/pypi/pyyaml/json' ? metadata : 'artifact-bytes');
+    });
+    const auditLogPath = join(caDir, `package-egress-audit-${auditCounter++}.jsonl`);
+    const started = await startPolicyProxy(fixture.transport, {
+      auditLogPath,
+      policy: { validator: createPackageValidator({ quarantineDays: 2 }) },
+    });
+    const host = 'files.pythonhosted.org';
+
+    expect(await requestArtifact(started.socketPath, host, sdist)).toMatchObject({ statusCode: 200 });
+    // The release is years old, but this wheel was uploaded an hour ago.
+    expect((await requestArtifact(started.socketPath, host, lateWheel)).statusCode).toBe(403);
+    // A sidecar is gated with its file.
+    expect((await requestArtifact(started.socketPath, host, `${lateWheel}.metadata`)).statusCode).toBe(403);
+    // A file no release lists fails closed.
+    expect((await requestArtifact(started.socketPath, host, unlisted)).statusCode).toBe(403);
+
+    expect(fixture.transport.seen.filter(({ path }) => path !== '/pypi/pyyaml/json').map(({ path }) => path)).toEqual([
+      sdist,
+    ]);
+    await started.proxy.stop();
+    expect(readPackageAudit(auditLogPath)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ reasonCode: 'policy-deny', path: lateWheel }),
+        expect.objectContaining({
+          reasonCode: 'derived-metadata-failed',
+          reason: 'requested file is absent from PyPI metadata',
+          source: 'derived',
+        }),
+      ]),
+    );
+  });
+
+  describe("PyPI's JSON API redirect to a project's display name", () => {
+    const sdist = `/packages/d1/d1/${'d1'.repeat(30)}/Django-4.2.7.tar.gz`;
+    const freshWheel = `/packages/e2/e2/${'e2'.repeat(30)}/Django-4.2.7-py3-none-any.whl`;
+    const metadata = (): string =>
+      JSON.stringify({
+        releases: {
+          '4.2.7': [
+            { url: `https://files.pythonhosted.org${sdist}`, upload_time_iso_8601: OLD },
+            { url: `https://files.pythonhosted.org${freshWheel}`, upload_time_iso_8601: recent() },
+          ],
+        },
+      });
+
+    /** pypi.org answers /pypi/django/json with `redirects[path]` and /pypi/Django/json with the metadata. */
+    async function startRedirectingPypi(redirects: Readonly<Partial<Record<string, string>>>) {
+      const fixture = await startFixture((request, response) => {
+        const location = redirects[request.url ?? ''];
+        if (location !== undefined) {
+          response.writeHead(301, { Location: location });
+          response.end('Moved Permanently');
+          return;
+        }
+        response.end(request.url === '/pypi/Django/json' ? metadata() : 'artifact-bytes');
+      });
+      const auditLogPath = join(caDir, `package-egress-audit-${auditCounter++}.jsonl`);
+      const started = await startPolicyProxy(fixture.transport, {
+        auditLogPath,
+        policy: { validator: createPackageValidator({ quarantineDays: 2 }) },
+      });
+      return { fixture, started, auditLogPath };
+    }
+
+    it('follows the one redirect as a second derived request and gates each file by it', async () => {
+      const { fixture, started, auditLogPath } = await startRedirectingPypi({
+        '/pypi/django/json': 'https://pypi.org/pypi/Django/json',
+      });
+      const host = 'files.pythonhosted.org';
+
+      expect(await requestArtifact(started.socketPath, host, sdist)).toMatchObject({
+        statusCode: 200,
+        body: 'artifact-bytes',
+      });
+      expect((await requestArtifact(started.socketPath, host, freshWheel)).statusCode).toBe(403);
+
+      expect(
+        fixture.transport.seen.map(({ destination, method, path }) => [destination.hostname, method, path]),
+      ).toEqual([
+        ['pypi.org', 'GET', '/pypi/django/json'],
+        ['pypi.org', 'GET', '/pypi/Django/json'],
+        [host, 'GET', sdist],
+        ['pypi.org', 'GET', '/pypi/django/json'],
+        ['pypi.org', 'GET', '/pypi/Django/json'],
+      ]);
+      await waitFor(() => started.proxy.snapshot.activeUpstreams === 0);
+      expect(started.proxy.snapshot).toMatchObject({ clientAttempts: 2, derivedAttempts: 4, activeDerived: 0 });
+      await started.proxy.stop();
+      const derived = { name: 'django', version: '4.2.7' };
+      expect(readPackageAudit(auditLogPath)).toEqual([
+        expect.objectContaining({
+          decision: 'allow',
+          reasonCode: 'derived-metadata-redirected',
+          source: 'derived',
+          host: 'pypi.org',
+          path: '/pypi/django/json',
+          package: derived,
+        }),
+        expect.objectContaining({
+          decision: 'allow',
+          reasonCode: 'derived-metadata-fetched',
+          source: 'derived',
+          host: 'pypi.org',
+          path: '/pypi/Django/json',
+          package: derived,
+        }),
+        expect.objectContaining({ decision: 'allow', reasonCode: 'policy-allow', source: 'client', path: sdist }),
+        expect.objectContaining({ reasonCode: 'derived-metadata-redirected', path: '/pypi/django/json' }),
+        expect.objectContaining({ reasonCode: 'derived-metadata-fetched', path: '/pypi/Django/json' }),
+        expect.objectContaining({ decision: 'deny', reasonCode: 'policy-deny', source: 'client', path: freshWheel }),
+      ]);
+    });
+
+    it.each([
+      ['another project', 'https://pypi.org/pypi/flask/json'],
+      ['another fixed package host', 'https://files.pythonhosted.org/pypi/Django/json'],
+      ['a client route', 'https://pypi.org/simple/django/'],
+      ['a query-bearing document', 'https://pypi.org/pypi/Django/json?serial=1'],
+    ])('refuses a redirect to %s with a 502 and never contacts its target', async (_label, location) => {
+      const { fixture, started, auditLogPath } = await startRedirectingPypi({ '/pypi/django/json': location });
+
+      const response = await requestArtifact(started.socketPath, 'files.pythonhosted.org', sdist);
+
+      expect(response.statusCode).toBe(502);
+      expect(fixture.transport.seen.map(({ path }) => path)).toEqual(['/pypi/django/json']);
+      expect(started.proxy.snapshot).toMatchObject({ derivedAttempts: 1 });
+      await started.proxy.stop();
+      expect(readPackageAudit(auditLogPath)).toEqual([
+        expect.objectContaining({
+          decision: 'deny',
+          reasonCode: 'derived-metadata-failed',
+          reason: 'package metadata upstream returned status 301',
+          path: '/pypi/django/json',
+        }),
+      ]);
+    });
+
+    it('follows at most one redirect', async () => {
+      const { fixture, started, auditLogPath } = await startRedirectingPypi({
+        '/pypi/django/json': 'https://pypi.org/pypi/DJANGO/json',
+        '/pypi/DJANGO/json': 'https://pypi.org/pypi/Django/json',
+      });
+
+      expect((await requestArtifact(started.socketPath, 'files.pythonhosted.org', sdist)).statusCode).toBe(502);
+      expect(fixture.transport.seen.map(({ path }) => path)).toEqual(['/pypi/django/json', '/pypi/DJANGO/json']);
+      await started.proxy.stop();
+      expect(readPackageAudit(auditLogPath)).toEqual([
+        expect.objectContaining({ reasonCode: 'derived-metadata-redirected', path: '/pypi/django/json' }),
+        expect.objectContaining({ reasonCode: 'derived-metadata-failed', path: '/pypi/DJANGO/json' }),
+      ]);
+    });
+
+    it('never follows a redirect of derived npm metadata', async () => {
+      const fixture = await startFixture((request, response) => {
+        if (request.url === '/demo') {
+          response.writeHead(301, { Location: 'https://registry.npmjs.org/Demo' });
+          response.end();
+          return;
+        }
+        response.end('artifact-bytes');
+      });
+      const started = await startPolicyProxy(fixture.transport, {
+        auditLogPath: join(caDir, `package-egress-audit-${auditCounter++}.jsonl`),
+        policy: { validator: createPackageValidator({ quarantineDays: 2 }) },
+      });
+
+      const response = await requestArtifact(started.socketPath, 'registry.npmjs.org', '/demo/-/demo-1.0.0.tgz');
+
+      expect(response.statusCode).toBe(502);
+      expect(fixture.transport.seen.map(({ path }) => path)).toEqual(['/demo']);
+    });
+  });
+
+  it.each([
+    ['an allowlisted package', { allowedPackages: ['demo'], quarantineDays: 2 }],
+    ['a policy without a quarantine', { quarantineDays: 0 }],
+  ])('fetches no derived metadata for %s', async (_label, config) => {
+    const fixture = await startFixture((_request, response) => response.end('artifact-bytes'));
+    const auditLogPath = join(caDir, `package-egress-audit-${auditCounter++}.jsonl`);
+    const started = await startPolicyProxy(fixture.transport, {
+      auditLogPath,
+      policy: { validator: createPackageValidator(config) },
+    });
+
+    expect(await requestArtifact(started.socketPath, 'registry.npmjs.org', '/demo/-/demo-1.0.0.tgz')).toMatchObject({
+      statusCode: 200,
+      body: 'artifact-bytes',
+    });
+    expect(fixture.transport.seen.map(({ path }) => path)).toEqual(['/demo/-/demo-1.0.0.tgz']);
+    expect(started.proxy.snapshot).toMatchObject({ derivedAttempts: 0 });
+    await started.proxy.stop();
+    expect(readPackageAudit(auditLogPath)).toEqual([
+      expect.objectContaining({ decision: 'allow', reasonCode: 'policy-allow', source: 'client' }),
+    ]);
+  });
+
+  it.each([true, false])(
+    'refuses derived metadata over its ceiling with a 413 that names the ceiling (Content-Length: %s)',
+    async (declareLength) => {
+      const metadata = JSON.stringify({
+        versions: { '1.0.0': {} },
+        time: { '1.0.0': OLD },
+        readme: 'x'.repeat(40_000),
+      });
+      const fixture = await startFixture((request, response) => {
+        if (request.url !== '/demo') {
+          response.end('artifact-bytes');
+          return;
+        }
+        if (declareLength) {
+          response.end(metadata);
+        } else {
+          response.write(metadata.slice(0, 1_000));
+          response.end(metadata.slice(1_000));
+        }
+      });
+      const auditLogPath = join(caDir, `package-egress-audit-${auditCounter++}.jsonl`);
+      const started = await startPolicyProxy(fixture.transport, {
+        auditLogPath,
+        policy: { validator: createPackageValidator({ quarantineDays: 2 }) },
+        limits: { maxDerivedMetadataBytes: 16_384 },
+      });
+
+      const res = await requestArtifact(started.socketPath, 'registry.npmjs.org', '/demo/-/demo-1.0.0.tgz');
+
+      expect(res.statusCode).toBe(413);
+      expect(res.body).toContain('16384 bytes metadata ceiling');
+      expect(fixture.transport.seen.map(({ path }) => path)).toEqual(['/demo']);
+      await started.proxy.stop();
+      expect(readPackageAudit(auditLogPath)).toEqual([
+        expect.objectContaining({
+          decision: 'deny',
+          reasonCode: 'derived-metadata-failed',
+          reason: 'package metadata exceeds the 16384 bytes metadata ceiling',
+        }),
+      ]);
+    },
+  );
+
+  it('has a default derived-metadata ceiling above the largest real packument', () => {
+    expect(DEFAULT_PACKAGE_EGRESS_LIMITS.maxDerivedMetadataBytes).toBeGreaterThanOrEqual(128 * 1024 * 1024);
+  });
+
+  it('aborts the derived metadata fetch when its client disconnects', async () => {
+    const fixture = await startFixture((request, response) => {
+      if (request.url !== '/demo') {
+        response.end('artifact-bytes');
+        return;
+      }
+      // Hold the metadata response open.
+      response.writeHead(200, { 'Content-Type': 'application/json' });
+      response.write('{"versions":{');
+    });
+    const auditLogPath = join(caDir, `package-egress-audit-${auditCounter++}.jsonl`);
+    const started = await startPolicyProxy(fixture.transport, {
+      auditLogPath,
+      policy: { validator: createPackageValidator({ quarantineDays: 2 }) },
+    });
+    const tunnel = await sendConnect(started.socketPath, 'registry.npmjs.org');
+    if (tunnel.socket === null) throw new Error('expected CONNECT socket');
+    const client = tls.connect({ socket: tunnel.socket, servername: 'registry.npmjs.org', ca: ca.certPem }, () => {
+      client.write('GET /demo/-/demo-1.0.0.tgz HTTP/1.1\r\nHost: registry.npmjs.org\r\nConnection: close\r\n\r\n');
+    });
+    client.on('error', () => undefined);
+    await waitFor(
+      () => started.proxy.snapshot.activeDerived === 1 && fixture.transport.activeSockets.size === 1,
+      5_000,
+    );
+
+    client.destroy();
+
+    await waitFor(
+      () =>
+        started.proxy.snapshot.activeDerived === 0 &&
+        started.proxy.snapshot.activeClients === 0 &&
+        fixture.transport.activeSockets.size === 0,
+      5_000,
+    );
+    await started.proxy.stop();
+    expect(readPackageAudit(auditLogPath)).toEqual([
+      expect.objectContaining({ decision: 'deny', reasonCode: 'derived-metadata-failed', source: 'derived' }),
+    ]);
+  });
+});

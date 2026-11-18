@@ -1,13 +1,55 @@
 # Hermetic IronCurtain-in-IronCurtain Slice
 
-**Status:** proposed implementation slice
-**Updated:** 2026-09-03
+**Status (2026-11-14):** Reserved, not scheduled. None of the slice's product wiring exists, and running IronCurtain inside an IronCurtain nested-Docker session has no supported or qualified path. See [Implementation status](#implementation-status).
+
+**Updated:** 2026-11-11
 **Applies to:** the supported macOS nested-Docker developer backends, with a topology contract reusable by
 future native Linux Docker
 **Related:**
 [`secure-nested-runtime-implementation-plan.md`](./secure-nested-runtime-implementation-plan.md),
 [`implementation and acceptance`](./linux-nested-docker-implementation-plan.md),
 [`secure-nested-runtime-public-network.md`](./secure-nested-runtime-public-network.md)
+
+## Implementation status
+
+This design remains the plan of record, but the slice is reserved: self-hosting is not a current
+priority and the work is not scheduled. None of its product mechanisms or gates exist. There is no
+`src/docker/nested-parent-bootstrap.ts` or parent-bootstrap manifest, no `/run/ironcurtain-nested` path on
+either backend, no Docker Desktop exchange volume, no product selection of the parent transport, no
+hermetic inner agent image, and no acceptance harness.
+
+Three foundations ship anyway. Each is tested, and none is wired into the product for its intended use:
+
+- **`paths.exchangeRoot`** in every Docker-workload lease (`src/docker-workload/bundle-lease.ts`).
+  Admission records `<stateRoot>/exchange` but no longer creates it, and the version-2 observed-disk
+  watchdog policy does not measure it. Cleanup still removes it when an older generation created it
+  (`0700`); those generations froze the version-1 policy, whose optional `exchange-state` class sampled
+  it. Nothing mounts it into an agent, daemon or relay. Keep the field required in every lease schema
+  version (1 to 3), and keep writing it (see below).
+- **`createParentProxyOutboundTransport()`** (`src/docker/outbound-transport.ts`). An exact UDS or TCP
+  fixed-parent transport with local address screening, covered by the transport, two-MITM cascade and
+  registry-egress tests. Production uses only the direct transport, and package egress refuses an
+  injected one. It is not a configuration surface: only trusted bootstrap state may select it (delivery
+  step 3).
+- **`src/docker/linux-dependency-abi.ts`**. A strict Linux dependency ABI manifest, volume name and
+  in-container `isolated-vm`/`node-pty` load probe, covered by its own test. It is the foundation for the
+  Linux-built dependency artifact the harness needs ([common rules](#common-rules)) and for native Linux
+  work.
+
+The lease field cannot simply be deleted. The `paths` object is strict, and every lease ever written
+carries `exchangeRoot`. Reconciliation parses every lease directory, closed ones included (closed lease
+directories are never pruned), and fences all nested-Docker admission when one cannot be read. A detached
+supervisor from an older release also keeps rereading its own lease while newer code updates it. Dropping
+or renaming the field therefore needs a lease schema version bump that keeps the old versions readable.
+The host directory is also not the exchange path this design needs: Docker Desktop needs a ledgered,
+generation-scoped named volume shared by agent and daemon, and Apple a VM-local path. An implementation
+adds that volume as a new ledgered outer resource instead of mounting `<stateRoot>/exchange`.
+
+`test/docker-workload/ironcurtain-in-ironcurtain-reserved.test.ts` pins this status. It parses lease
+records in the shapes earlier releases wrote and admits a new bundle beside them. It also fails when one
+of the three foundations gains a new production use, or when this section or the foundation's module
+comment stops calling it reserved, so wiring one forces its documentation to change with it. Scheduling
+the slice means updating this section, those comments, `src/docker/CLAUDE.md` and that guard together.
 
 ## Decision summary
 
@@ -62,8 +104,10 @@ macOS-host reachability constraint, not a Docker-runtime requirement.
 
 The current tree already has:
 
-- a destination-bound fixed-parent transport supporting an exact UDS or TCP parent;
+- a destination-bound fixed-parent transport supporting an exact UDS or TCP parent (no production
+  caller yet);
 - a hermetic unit test for two-MITM sentinel substitution and parent-loss failure;
+- a Linux dependency ABI manifest and native-load probe (no production caller yet);
 - a private Docker API and managed inner network on Apple Container and Docker Desktop;
 - shared admission, outer-resource ledgering, watchdog, activation, and cleanup;
 - exact `/workspace` path equivalence between the outer agent and Docker Desktop daemon sidecar; and
@@ -333,7 +377,8 @@ Keep the production delta narrow and reuse current ownership:
 - `src/docker-workload/docker-desktop-sidecar.ts` — retain the exact workspace mount and add/adjudicate the
   exchange volume and path.
 - `src/docker-workload/infrastructure.ts`, lease evidence, and revocation helpers — add the exchange volume
-  as another ordinary ledgered outer resource; do not invent a second ledger.
+  as another ordinary ledgered outer resource; do not invent a second ledger or mount the reserved
+  `paths.exchangeRoot` host directory.
 - `docker/nested-daemon/Dockerfile` and Apple base-image setup — create the fixed exchange target with exact
   ownership.
 - `test/docker/mitm-cascade.test.ts` — retain transport-level foundation coverage.

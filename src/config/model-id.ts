@@ -1,11 +1,19 @@
+import { closestMatch } from '../utils/edit-distance.js';
+
 /** Supported LLM provider identifiers. */
 export type ProviderId = 'anthropic' | 'google' | 'openai';
 
 /** Default provider when no prefix is specified. */
 const DEFAULT_PROVIDER: ProviderId = 'anthropic';
 
+/** Known provider identifiers, in display order. */
+export const KNOWN_PROVIDER_IDS: readonly ProviderId[] = ['anthropic', 'google', 'openai'];
+
 /** Known provider identifiers for validation. */
-const KNOWN_PROVIDERS = new Set<string>(['anthropic', 'google', 'openai']);
+const KNOWN_PROVIDERS = new Set<string>(KNOWN_PROVIDER_IDS);
+
+/** Largest edit distance at which an unknown prefix counts as a misspelled provider. */
+const NEAR_MISS_MAX_DISTANCE = 2;
 
 /**
  * Environment variable that supplies each provider's API key.
@@ -60,4 +68,25 @@ export function parseModelId(qualifiedId: string): ParsedModelId {
   }
 
   return { provider: prefix as ProviderId, modelId };
+}
+
+/**
+ * The provider that the prefix of `qualifiedId` (the text before its first
+ * colon) looks like a misspelling of, such as "openai" for "opnai:gpt-5" or
+ * "anthropic" for "Anthropic:claude-x". Undefined when there is no prefix,
+ * when it already names a provider, or when it looks like the name half of an
+ * Ollama-style "name:tag" ID instead: it contains a "/" or a "." (as in
+ * "glm-5.1:cloud" or "jaahas/qwen3.5:35b") or is more than two edits (after
+ * lowercasing) from every provider name.
+ *
+ * {@link parseModelId} sends any unknown prefix, typo or not, to the default
+ * provider as part of the model ID, so validators use this to reject the typo
+ * before a request fails at the provider mid-session.
+ */
+export function nearMissProviderPrefix(qualifiedId: string): ProviderId | undefined {
+  const colonIndex = qualifiedId.indexOf(':');
+  if (colonIndex <= 0) return undefined;
+  const prefix = qualifiedId.substring(0, colonIndex);
+  if (KNOWN_PROVIDERS.has(prefix) || prefix.includes('/') || prefix.includes('.')) return undefined;
+  return closestMatch(prefix.toLowerCase(), KNOWN_PROVIDER_IDS, NEAR_MISS_MAX_DISTANCE);
 }

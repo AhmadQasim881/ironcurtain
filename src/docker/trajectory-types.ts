@@ -9,6 +9,7 @@
  */
 
 import type { SessionId } from '../session/types.js';
+import { COOKIE_HEADER_NAMES, CREDENTIAL_HEADER_NAMES } from './credential-carriers.js';
 
 /**
  * Provider identity. `unknown` is reserved for hosts the capture sees but
@@ -237,12 +238,16 @@ export interface ReassemblyResult {
  * Headers/body redaction is centralized so the writer-input unit test
  * (§12 test #2(a)) can drive the redaction layer directly without a
  * proxy.
+ *
+ * Built from the credential carriers (`credential-carriers.ts`): every
+ * provider's key header is one of them by type (`KeyInjection.headerName`),
+ * so a provider's key header (`x-goog-api-key` for Gemini, ...) is always
+ * redacted, plus cookies, `set-cookie` and `proxy-authorization`.
  */
 export const REDACTED_HEADER_NAMES: ReadonlySet<string> = new Set([
-  'authorization',
-  'x-api-key',
+  ...CREDENTIAL_HEADER_NAMES,
+  ...COOKIE_HEADER_NAMES,
   'proxy-authorization',
-  'cookie',
   'set-cookie',
 ]);
 

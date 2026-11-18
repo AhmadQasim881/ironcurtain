@@ -28,6 +28,7 @@ import type {
   ContainerRuntime,
   DockerContainerConfig,
   DockerExecResult,
+  DockerImageInfo,
   DockerMount,
   DockerNamedVolumeMount,
   DockerTrustedDeviceMapping,
@@ -66,13 +67,24 @@ export const DOCKER_DESKTOP_SIDECAR_DOCKER_HOST = `unix://${DOCKER_DESKTOP_SIDEC
 export const DOCKER_DESKTOP_SIDECAR_ENTRYPOINT = '/usr/local/lib/ironcurtain/daemon-entrypoint.sh';
 export const DOCKER_DESKTOP_SIDECAR_HOME_STATE_ROOT = '/home/rootless/.local/share/docker';
 // Keep BuildKit's executor tree at the common path consumed by the existing
-// build-trust runtime in both supported daemon placements.
+// build-trust runtime in both supported daemon placements. The data root lives
+// on the API volume inside the Desktop VM disk, never on the host: the
+// observed-disk watchdog sizes that volume through the outer Engine and reads
+// the VM disk's free space with `statfs` at this path's parent mount point
+// (`DOCKER_DESKTOP_RUNTIME_DISK_PATH` in `observed-storage.ts`).
 export const DOCKER_DESKTOP_SIDECAR_DATA_ROOT = '/home/codespace/.local/share/docker';
 export const DOCKER_DESKTOP_RUNC_SHIM_PATH = '/usr/local/lib/ironcurtain/runc';
 export const DOCKER_DESKTOP_RUNC_VERSION_PREFIX = 'runc version 1.3.4';
+/**
+ * The only capabilities the sidecar gets beyond `--cap-drop ALL`: RootlessKit's
+ * UID/GID mapping needs them. The profile-ceiling test checks that every seccomp
+ * rule allowing a forbidden syscall is gated on a capability outside this set.
+ */
+export const DOCKER_DESKTOP_SIDECAR_CAP_ADD: readonly string[] = Object.freeze(['SETUID', 'SETGID']);
 
 const DAEMON_IMAGE_ROLE_LABEL = 'com.ironcurtain.docker-workload.image-role';
 const DAEMON_IMAGE_ROLE = 'nested-daemon';
+const BUILD_HASH_LABEL = 'ironcurtain.build-hash';
 const STOCK_RUNC_PATH = '/usr/local/bin/runc';
 const RUNC_SHIM_RUNTIME_NAME = 'ic-no-new-keyring';
 const DEFAULT_READINESS_TIMEOUT_MS = 120_000;
@@ -94,6 +106,44 @@ export interface DockerDesktopP2SeccompProfile {
   readonly path: string;
   readonly definition: NestedDaemonSeccompProfile;
   readonly systemPathsSecurityOption: typeof SYSTEM_PATHS_SECURITY_OPTION;
+}
+
+/**
+ * One exact daemon image build, resolved once during preparation. The sidecar
+ * is created from this immutable ID, never from the shared mutable tag, which
+ * a concurrent install of another version may retag in the meantime.
+ */
+export interface DockerDesktopSidecarImage {
+  readonly imageId: string;
+  /** The `ironcurtain.build-hash` the exact image must carry. */
+  readonly buildHash: string;
+}
+
+/**
+ * Throw unless `inspected` is an immutable nested-daemon image carrying
+ * `expected.buildHash` (and, when given, exactly `expected.imageId`).
+ */
+export function assertDockerDesktopSidecarImage(
+  inspected: DockerImageInfo | undefined,
+  expected: { readonly buildHash: string; readonly imageId?: string },
+  reference: string,
+): DockerDesktopSidecarImage {
+  if (inspected === undefined) throw new Error(`Docker Desktop daemon image is absent: ${reference}`);
+  if (!IMMUTABLE_ID.test(inspected.id)) {
+    throw new Error('Docker Desktop daemon image resolved to an invalid immutable ID');
+  }
+  if (expected.imageId !== undefined && inspected.id !== expected.imageId) {
+    throw new Error(`Docker Desktop daemon image ${reference} resolved to a different immutable ID`);
+  }
+  if (inspected.labels[DAEMON_IMAGE_ROLE_LABEL] !== DAEMON_IMAGE_ROLE) {
+    throw new Error('Docker Desktop daemon image is missing its exact nested-daemon role label');
+  }
+  if (inspected.labels[BUILD_HASH_LABEL] !== expected.buildHash) {
+    throw new Error(
+      `Docker Desktop daemon image ${reference} does not carry the expected build hash; another IronCurtain version may have rebuilt the shared image`,
+    );
+  }
+  return { imageId: inspected.id, buildHash: expected.buildHash };
 }
 
 /** The minimal runtime surface the focused sidecar lifecycle consumes. */
@@ -138,7 +188,8 @@ interface DockerDesktopActivationHandle {
 
 export interface StartDockerDesktopSidecarOptions {
   readonly runtime: DockerDesktopSidecarRuntime;
-  readonly sidecarImage: string;
+  /** Exact build from preparation; re-verified on that immutable ID immediately before create. */
+  readonly sidecarImage: DockerDesktopSidecarImage;
   readonly identity: NestedDaemonIdentity;
   readonly hostConfigDirectory: string;
   readonly clientManifest: LoadedClientToolchainManifest;
@@ -209,15 +260,16 @@ export async function startDockerDesktopSidecar(
   const execUser = `${options.identity.uid}:${options.identity.gid}`;
   const profile = loadDockerDesktopP2SeccompProfile(options.hostConfigDirectory);
   const clientManifest = options.clientManifest;
-  const inspectedSidecarImage = await options.runtime.inspectImage(options.sidecarImage);
-  if (inspectedSidecarImage === undefined)
-    throw new Error(`Docker Desktop daemon image is absent: ${options.sidecarImage}`);
-  if (!IMMUTABLE_ID.test(inspectedSidecarImage.id)) {
-    throw new Error('Docker Desktop daemon image resolved to an invalid immutable ID');
+  if (!IMMUTABLE_ID.test(options.sidecarImage.imageId)) {
+    throw new Error('Docker Desktop daemon image ID is not immutable');
   }
-  if (inspectedSidecarImage.labels[DAEMON_IMAGE_ROLE_LABEL] !== DAEMON_IMAGE_ROLE) {
-    throw new Error('Docker Desktop daemon image is missing its exact nested-daemon role label');
-  }
+  // Inspect the exact prepared ID, not the tag: the create below consumes this
+  // ID, so the build-hash check covers precisely the image that runs.
+  const inspectedSidecarImage = assertDockerDesktopSidecarImage(
+    await options.runtime.inspectImage(options.sidecarImage.imageId),
+    options.sidecarImage,
+    options.sidecarImage.imageId,
+  );
 
   let apiVolumeName: string | undefined;
   let containerId: string | undefined;
@@ -265,7 +317,7 @@ export async function startDockerDesktopSidecar(
       },
       async (name, labels) => {
         const config = buildSidecarConfig({
-          imageId: inspectedSidecarImage.id,
+          imageId: inspectedSidecarImage.imageId,
           name,
           labels,
           apiVolumeName: ownedApiVolumeName,
@@ -457,7 +509,7 @@ function buildSidecarConfig(options: {
     ],
     labels: options.labels,
     resources: { memoryMb: options.resources.memoryMb, cpus: options.resources.cpus },
-    capAdd: ['SETUID', 'SETGID'],
+    capAdd: DOCKER_DESKTOP_SIDECAR_CAP_ADD,
     trustedCreateOptions: {
       namedVolumeMounts: [
         {
@@ -545,7 +597,9 @@ function assertStoppedSidecarProfile(
   assertCapabilitySet(hostConfig.CapDrop, ['ALL'], 'dropped capabilities', mismatch);
   assertCapabilitySet(hostConfig.CapAdd, config.capAdd ?? [], 'added capabilities', mismatch);
   if (hostConfig.Memory !== (config.resources?.memoryMb ?? 0) * 1024 * 1024) mismatch('memory limit');
-  if (hostConfig.NanoCpus !== (config.resources?.cpus ?? 0) * 1_000_000_000) mismatch('CPU limit');
+  // Docker stores the exact decimal `--cpus` value in nanocpus; compare in
+  // that unit so binary rounding of the configured share never reads as drift.
+  if (hostConfig.NanoCpus !== Math.round((config.resources?.cpus ?? 0) * 1_000_000_000)) mismatch('CPU limit');
   if (hostConfig.PidsLimit !== config.trustedCreateOptions?.pidsLimit) mismatch('PID limit');
   const portBindings = hostConfig.PortBindings;
   if (portBindings !== null && (!isRecord(portBindings) || Object.keys(portBindings).length !== 0)) {
@@ -762,6 +816,11 @@ function validateResources(resources: DockerDesktopSidecarResources): void {
   }
   if (!Number.isFinite(resources.cpus) || resources.cpus < 0.25) {
     throw new Error('Docker Desktop sidecar CPUs must be at least 0.25');
+  }
+  // `--cpus` takes the decimal text of this number; a value finer than a
+  // millicpu (binary noise from arithmetic) is one Docker rejects as too precise.
+  if (Math.abs(resources.cpus * 1000 - Math.round(resources.cpus * 1000)) > 1e-6) {
+    throw new Error('Docker Desktop sidecar CPUs must be a whole number of millicpus');
   }
   if (!Number.isSafeInteger(resources.pidsLimit) || resources.pidsLimit < 16) {
     throw new Error('Docker Desktop sidecar PID limit must be an integer of at least 16');

@@ -2,15 +2,16 @@
  * Job-related JSON-RPC method dispatch.
  *
  * Handles all `jobs.*` methods: list, remove, enable, disable,
- * recompile, reload, run, logs.
+ * recompile, refreshLists, reload, run, logs.
  */
 
 import { z } from 'zod';
 
 import { type DispatchContext, validateParams } from './types.js';
-import { type JobListDto, MethodNotFoundError } from '../web-ui-types.js';
+import { type JobListDto, MethodNotFoundError, RpcError } from '../web-ui-types.js';
+import type { JobRunStart } from '../../daemon/control-socket.js';
 import { loadRecentRuns } from '../../cron/job-store.js';
-import type { JobId } from '../../cron/types.js';
+import { isJobAlreadyRunningError, isJobNotFoundError, type JobId } from '../../cron/types.js';
 
 // ---------------------------------------------------------------------------
 // Param validation schemas
@@ -18,6 +19,11 @@ import type { JobId } from '../../cron/types.js';
 
 const jobIdSchema = z.object({ jobId: z.string().min(1) });
 const jobLogsSchema = z.object({ jobId: z.string().min(1), limit: z.number().int().positive().optional() });
+const jobRefreshListsSchema = z.object({
+  jobId: z.string().min(1),
+  list: z.string().min(1).optional(),
+  withMcp: z.boolean().optional(),
+});
 
 // ---------------------------------------------------------------------------
 // Job dispatch
@@ -33,37 +39,61 @@ export async function jobDispatch(
       return listJobs(ctx);
     case 'jobs.remove': {
       const { jobId } = validateParams(jobIdSchema, params);
-      await ctx.handler.removeJob(jobId);
+      await jobOperation(ctx.handler.removeJob(jobId));
       ctx.eventBus.emit('job.list_changed', {});
       return;
     }
     case 'jobs.enable': {
       const { jobId } = validateParams(jobIdSchema, params);
-      await ctx.handler.enableJob(jobId);
+      await jobOperation(ctx.handler.enableJob(jobId));
       ctx.eventBus.emit('job.list_changed', {});
       return;
     }
     case 'jobs.disable': {
       const { jobId } = validateParams(jobIdSchema, params);
-      await ctx.handler.disableJob(jobId);
+      await jobOperation(ctx.handler.disableJob(jobId));
       ctx.eventBus.emit('job.list_changed', {});
       return;
     }
     case 'jobs.recompile': {
       const { jobId } = validateParams(jobIdSchema, params);
-      await ctx.handler.recompileJob(jobId);
+      await jobOperation(ctx.handler.recompileJob(jobId));
+      // A recompile also reloads the job, which schedules one whose policy
+      // never compiled before, so its next run can change.
+      ctx.eventBus.emit('job.list_changed', {});
       return;
+    }
+    case 'jobs.refreshLists': {
+      const { jobId, list, withMcp } = validateParams(jobRefreshListsSchema, params);
+      return jobOperation(
+        ctx.handler.refreshLists({
+          target: { kind: 'job', name: jobId },
+          ...(list !== undefined ? { list } : {}),
+          ...(withMcp !== undefined ? { withMcp } : {}),
+        }),
+      );
     }
     case 'jobs.reload': {
       const { jobId } = validateParams(jobIdSchema, params);
-      await ctx.handler.reloadJob(jobId);
+      await jobOperation(ctx.handler.reloadJob(jobId));
       ctx.eventBus.emit('job.list_changed', {});
       return;
     }
     case 'jobs.run': {
       const { jobId } = validateParams(jobIdSchema, params);
-      ctx.handler
-        .runJobNow(jobId)
+      // The run is fire-and-forget, so the refusal must happen before the
+      // reply: startJobRun reserves the job synchronously and throws while a
+      // scheduled, CLI or earlier web run of it is still in progress, or for
+      // an unknown job.
+      let started: JobRunStart;
+      try {
+        started = ctx.handler.startJobRun(jobId);
+      } catch (err) {
+        if (isJobAlreadyRunningError(err)) throw new RpcError('JOB_ALREADY_RUNNING', err.message);
+        if (isJobNotFoundError(err)) throw new RpcError('JOB_NOT_FOUND', err.message);
+        throw err;
+      }
+      started.completion
         .then((record) => ctx.eventBus.emit('job.completed', { jobId, record }))
         .catch((err: unknown) => {
           const message = err instanceof Error ? err.message : String(err);
@@ -85,11 +115,22 @@ export async function jobDispatch(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** Awaits a job operation, reporting an unknown job id as `JOB_NOT_FOUND` rather than an internal error. */
+async function jobOperation<T>(operation: Promise<T>): Promise<T> {
+  try {
+    return await operation;
+  } catch (err) {
+    if (isJobNotFoundError(err)) throw new RpcError('JOB_NOT_FOUND', err.message);
+    throw err;
+  }
+}
+
 function listJobs(ctx: DispatchContext): JobListDto[] {
   return ctx.handler.listJobs().map((j) => ({
     job: j.job,
     nextRun: j.nextRun?.toISOString() ?? null,
     lastRun: j.lastRun ?? null,
     isRunning: j.isRunning,
+    consecutiveFailures: j.consecutiveFailures,
   }));
 }

@@ -1,5 +1,7 @@
 # Auto-Constitution Generation for Cron Jobs
 
+**Status (2026-11-14):** Implemented (`src/cron/constitution-generator.ts`); for a job with a git repository the generator reads a throwaway clone of it (WP-134).
+
 ## Overview
 
 This feature auto-generates a task constitution from a cron job's task description by running an LLM through Code Mode with a **read-only policy**. The LLM can explore MCP servers (list files, read repos, check git status, fetch URLs) to gather context, then produces a draft constitution. After generation, the user enters an optional interactive edit session (reusing the existing `constitution-customizer.ts` patterns) to refine the draft. The edit session is available both during `add-job` and via `edit-job`.
@@ -142,15 +144,18 @@ This extension is used both for:
 ```
 1. User enters task description in add-job wizard
 2. User enters optional git repo URI
-3. (Git repo cloned if specified)
+3. (The job workspace itself is cloned only once the job is confirmed; generation
+   never touches it and uses its own throwaway clone, step 5a)
 4. CLI offers: "Generate constitution from task description? [Y/n]"
    - If no: fall through to manual editor (existing behavior)
    - If yes: continue to step 5
 5. Start constitution generation:
-   a. Create a temporary Code Mode session with read-only policy
+   a. Clone the git repo (if specified) into a throwaway directory under the OS
+      temp dir, and create a temporary Code Mode session with read-only policy
+      whose workspace is that directory
    b. LLM explores MCP servers using execute_code
    c. LLM returns structured constitution text
-   d. Session is closed (resources released)
+   d. Session is closed (resources released) and the throwaway directory deleted
 6. Display generated constitution to user
 7. Offer interactive customizer session (optional):
    - "Looks good" -> accept as-is
@@ -188,12 +193,14 @@ export interface ConstitutionGenerationResult {
 export interface ConstitutionGeneratorOptions {
   /** The task description to generate a constitution for. */
   readonly taskDescription: string;
-  /** Path to the job workspace (for filesystem exploration). */
-  readonly workspacePath: string;
-  /** Optional git repo URI (included in context for the LLM). */
+  /** Workspace path shown to the LLM (the persona workspace); unused when `gitRepo` is set. */
+  readonly workspacePath?: string;
+  /** Optional git repo URI, cloned into the session's throwaway exploration directory. */
   readonly gitRepo?: string;
   /** Progress callback for spinner updates. */
   readonly onProgress?: (message: string) => void;
+  /** Cancels the generation while the repository is being cloned. */
+  readonly signal?: AbortSignal;
 }
 
 /**
@@ -222,7 +229,17 @@ The implementation:
 
 1. Create a session via `createSession()` with:
    - `policyDir` pointing to `src/config/generated-readonly/` (the read-only compiled policy)
-   - `workspacePath` pointing to the job workspace (for filesystem exploration)
+   - `workspacePath` pointing to a throwaway exploration directory under the OS temp
+     dir, holding a clone of the job's git repository (empty when it has none). It
+     is never the real job workspace: that is a protected path (under the
+     IronCurtain home) the session could not read, and a session gets structural
+     write access to its workspace. The clone goes through the hardened cron git
+     sync (`syncGitRepo`: validated URI, a bare mirror kept outside the session's
+     workspace, an IronCurtain-written `.git`), and the whole directory is deleted
+     when generation ends, also on failure or cancellation. An exit hook deletes
+     it, and kills a clone still running, when the process exits mid-generation
+     (in a terminal the wizards' spinner exits the process on Ctrl-C or Escape).
+     A clone that fails fails the generation before any session starts.
    - `disableAutoApprove: true` (no auto-approver during exploration)
    - A constitution-generation system prompt (see Section 4)
 2. Send a single message with the task description and structured output instructions
@@ -235,13 +252,14 @@ async function generateConstitution(
 ): Promise<ConstitutionGenerationResult> {
   const readOnlyPolicyDir = getReadOnlyPolicyDir(); // resolves to generated-readonly/
 
+  // explorationDir: the throwaway directory, with options.gitRepo cloned into it.
   const session = await createSession({
     policyDir: readOnlyPolicyDir,
-    workspacePath: options.workspacePath,
+    workspacePath: explorationDir,
     disableAutoApprove: true,
     systemPromptExtra: buildConstitutionGeneratorSystemPrompt(
       options.taskDescription,
-      options.workspacePath,
+      explorationDir,
       options.gitRepo,
     ),
   });
@@ -303,7 +321,7 @@ ${taskDescription}
 ## Workspace
 
 The job workspace is: ${workspacePath}
-${gitRepo ? `Git repository: ${gitRepo}` : 'No git repository configured.'}
+${gitRepo ? `Git repository: ${stripUrlCredentials(gitRepo)}` : 'No git repository configured.'}
 
 ## Your Process
 
@@ -348,6 +366,8 @@ output a JSON block with:
  - The agent may list and read GitHub issues and pull requests
  - The agent must ask for approval before creating or closing GitHub issues
 ```
+
+The workspace shown to a job's generator is the throwaway clone of its repository (section 3.3). A job without a git repository has no project files to explore, so its prompt says so and leaves out the README/package.json step. The prompt names the repository without the credentials its URL may embed (`stripUrlCredentials` in `src/cron/git-sync.ts`: the whole userinfo of an http(s) URL, the password of any other), and the clone's `origin` remote omits them too; only the host-side clone uses them.
 
 ### 4.2 Structured Output Parsing
 
@@ -462,9 +482,10 @@ case 'generateConstitution': {
   const spinner = p.spinner();
   spinner.start('Generating constitution...');
   try {
+    // No workspacePath: the generator explores its own throwaway clone of
+    // job.gitRepo, so nothing is created under jobs/<id>/ before the job is saved.
     const result = await generateConstitution({
       taskDescription: job.taskDescription,
-      workspacePath: getJobWorkspaceDir(job.id),
       gitRepo: job.gitRepo,
       onProgress: (msg) => { spinner.message = msg; },
     });
@@ -578,9 +599,11 @@ export interface ConstitutionGenerationResult {
 
 export interface ConstitutionGeneratorOptions {
   readonly taskDescription: string;
-  readonly workspacePath: string;
+  readonly workspacePath?: string;
   readonly gitRepo?: string;
   readonly onProgress?: (message: string) => void;
+  readonly context?: GenerationContext;
+  readonly signal?: AbortSignal;
 }
 ```
 
@@ -590,6 +613,7 @@ export interface ConstitutionGeneratorOptions {
 job-commands.ts
   ├── constitution-generator.ts  (NEW)
   │     ├── session/index.ts     (existing -- createSession with policyDir)
+  │     ├── cron/git-sync.ts     (existing -- syncGitRepo for the throwaway clone)
   │     └── config/paths.ts      (existing -- getReadOnlyPolicyDir)
   ├── job-customizer.ts          (NEW)
   │     ├── constitution-customizer.ts  (existing -- schema, applyChanges, diff, callLlm)

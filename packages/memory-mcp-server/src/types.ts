@@ -3,6 +3,28 @@
  * Used by both the engine layer and the MCP tool handlers.
  */
 
+/** The kinds of session that write memories, as the host that spawns the server reports them. */
+export const MEMORY_WRITER_KINDS = ['interactive', 'cron', 'workflow'] as const;
+export type MemoryWriterKind = (typeof MEMORY_WRITER_KINDS)[number];
+
+/**
+ * Who wrote a memory: set by the host on the server's environment
+ * (MEMORY_WRITER_KIND, MEMORY_SESSION_ID, MEMORY_WRITER_SCOPE) and stamped into
+ * the row's `metadata.writer` when the row is written. Never taken from tool
+ * arguments.
+ */
+export interface MemoryWriter {
+  kind: MemoryWriterKind;
+  /** The host's id for the session that wrote the memory, when it gave one. */
+  session_id?: string;
+  /**
+   * The unattended writer's scope (for example `job:<id>` or `workflow:<id>`):
+   * the runs that may see this writer's memories while they wait for review
+   * (utils/review.ts). Absent for interactive writers.
+   */
+  scope?: string;
+}
+
 export interface Memory {
   id: string;
   namespace: string;
@@ -58,8 +80,24 @@ export interface IngestResult {
   /** True when on_extraction_failure='skip' wrote nothing. */
   skipped?: boolean;
 
-  /** Count of `segments` rows written (omitted when 0 / dry_run). */
+  /**
+   * True when part of the content was not turned into facts: the ingest reached
+   * MAX_FACTS_PER_INGEST (the remaining chunks were not extracted, or the last
+   * chunk's extra facts were dropped) or the content ran past MAX_INGEST_CHUNKS.
+   * Omitted otherwise.
+   */
+  truncated?: boolean;
+  /** Chunks never sent to the extraction model because the fact cap was reached (omitted when 0). */
+  dropped_chunks?: number;
+
+  /**
+   * Count of `segments` rows this ingest wrote and left in place (omitted when 0 / dry_run).
+   * A chunk whose facts all merged into memories that keep their own source writes none.
+   */
   segments_created?: number;
+
+  /** Secret values removed from the content before extraction (omitted when 0). */
+  redacted_secrets?: number;
 }
 
 export interface RecallOptions {
@@ -86,14 +124,25 @@ export interface RecallResult {
   expanded?: boolean;
   /** The segment_ids that were expanded (every format; omitted/[] when none). */
   expanded_segment_ids?: string[];
+  /** The source segment of every returned fact that has one (what memory_expand takes). */
+  source_segment_ids?: string[];
 }
 
-/** Result of `memory_expand`: the parent segment's query-ranked passages. */
+/**
+ * Result of `memory_expand`: some passages of a parent segment. With a query, the
+ * passages most relevant to it, best first; without one, the segment's first passages
+ * in source order. At most `max_passages` either way (default 3).
+ */
 export interface ExpandResult {
   segment_id: string;
-  /** Query-ranked passages of the parent (or whole-segment passages when no query). */
+  /** The passages shown: the first `passages.length` by relevance, or in source order. */
   passages: string[];
-  /** False when the segment_id has no segment row (forgotten/never-ingested parent). */
+  /** How many passages the whole segment has (0 when it is not found). */
+  total_passages: number;
+  /**
+   * False when no live memory references the segment any more (its facts were forgotten,
+   * merged away, decayed or compacted) or there is no such segment.
+   */
   found: boolean;
 }
 
@@ -115,6 +164,13 @@ export interface ForgetResult {
   forgotten: number;
   memories?: Array<{ id: string; content: string }>;
   truncated?: boolean;
+  /**
+   * Path of the database snapshot written before this deletion removed anything:
+   * before every bulk deletion (tags, query or before), and before the first deletion
+   * of a server run. Absent for dry runs, later deletions by ids alone, deletions that
+   * matched nothing, and in-memory databases.
+   */
+  snapshot?: string;
 }
 
 export interface InspectOptions {

@@ -1,14 +1,20 @@
 /**
  * OAuth token persistence for third-party providers.
  *
- * Stores tokens as JSON files in ~/.ironcurtain/oauth/{providerId}.json
- * with owner-only (0o600) permissions, following the same pattern as
- * saveOAuthCredentials in src/docker/oauth-credentials.ts.
+ * Stores tokens as JSON files in ~/.ironcurtain/oauth/{providerId}.json.
+ * Every write is an atomic, owner-only (0o600) replacement made under the
+ * file's cross-process lock (`<file>.lock`): a crash or a full disk never
+ * leaves an empty or partial token file (which would force re-authorization),
+ * and an `ironcurtain auth` run and the relays that refresh the token apply
+ * their writes one after another.
  */
 
-import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { getOAuthDir, getOAuthTokenPath } from '../config/paths.js';
+import { writePrivateFileAtomicSync } from '../util/atomic-write.js';
+import { withFileLockSync } from '../util/file-lock.js';
 import type { StoredOAuthToken } from './oauth-provider.js';
+import { keepsStoredToken } from './refresh-write-back.js';
 
 /** 5-minute buffer before expiry, matching OAuthTokenManager convention. */
 const TOKEN_EXPIRY_BUFFER_MS = 5 * 60 * 1000;
@@ -30,19 +36,45 @@ export function loadOAuthToken(providerId: string): StoredOAuthToken | null {
 }
 
 /**
- * Saves an OAuth token for a provider.
- * Creates the oauth directory if it does not exist.
- * Sets file permissions to 0o600 (owner-only read/write).
+ * Saves an OAuth token for a provider, replacing whatever is stored. Used
+ * when the user authorizes (`ironcurtain auth`): a new grant, possibly with
+ * new scopes, always wins. Refresh write-backs use
+ * {@link saveRefreshedOAuthToken} instead.
+ *
+ * Creates the oauth directory (0o700) if it does not exist; the file is
+ * written atomically with owner-only (0o600) permissions.
  */
 export function saveOAuthToken(providerId: string, token: StoredOAuthToken): void {
-  const dir = getOAuthDir();
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const tokenPath = prepareTokenPath(providerId);
+  withFileLockSync(tokenPath, () => {
+    writeTokenFile(tokenPath, token);
+  });
+}
 
-  const tokenPath = getOAuthTokenPath(providerId);
-  writeFileSync(tokenPath, JSON.stringify(token, null, 2) + '\n', { mode: 0o600 });
-  // chmod after write -- writeFileSync's mode only applies when creating new files;
-  // existing files with broader permissions need an explicit chmod.
-  chmodSync(tokenPath, 0o600);
+/**
+ * Persists a token obtained by refreshing `refreshedFrom`, unless the store
+ * changed while the refresh was in flight, and returns the token now in
+ * effect.
+ *
+ * Under the token file's lock it re-reads the stored token and keeps it when
+ * it no longer holds `refreshedFrom` (another process refreshed with
+ * rotation, or the user re-authorized) and is still usable, or when it expires
+ * later than `refreshed` without holding the refresh token our grant just
+ * rotated away; see `refresh-write-back.ts`. A missing or unreadable file is
+ * replaced by `refreshed`.
+ */
+export function saveRefreshedOAuthToken(
+  providerId: string,
+  refreshed: StoredOAuthToken,
+  refreshedFrom: string,
+): StoredOAuthToken {
+  const tokenPath = prepareTokenPath(providerId);
+  return withFileLockSync(tokenPath, () => {
+    const stored = readStoredTokenIfValid(tokenPath);
+    if (stored !== null && keepsStoredToken(stored, refreshed, refreshedFrom)) return stored;
+    writeTokenFile(tokenPath, refreshed);
+    return refreshed;
+  });
 }
 
 /**
@@ -67,6 +99,33 @@ export function isTokenExpired(token: StoredOAuthToken): boolean {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/** Validates the provider id, creates the oauth directory (0o700) and returns the token path. */
+function prepareTokenPath(providerId: string): string {
+  const tokenPath = getOAuthTokenPath(providerId);
+  mkdirSync(getOAuthDir(), { recursive: true, mode: 0o700 });
+  return tokenPath;
+}
+
+function writeTokenFile(tokenPath: string, token: StoredOAuthToken): void {
+  writePrivateFileAtomicSync(tokenPath, JSON.stringify(token, null, 2) + '\n');
+}
+
+/** The stored token, or null when the file is missing or does not hold a valid token. */
+function readStoredTokenIfValid(tokenPath: string): StoredOAuthToken | null {
+  let raw: string;
+  try {
+    raw = readFileSync(tokenPath, 'utf-8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+  try {
+    return validateTokenShape(parseTokenJson(raw, tokenPath), tokenPath);
+  } catch {
+    return null;
+  }
+}
 
 function parseTokenJson(raw: string, filePath: string): unknown {
   try {

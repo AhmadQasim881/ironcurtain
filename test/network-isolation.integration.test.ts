@@ -1,7 +1,10 @@
 /**
  * Linux integration test: --network=none + UDS MITM proxy isolation.
  *
- * Requires Docker and the ironcurtain-base:latest image to be built.
+ * Requires Docker and an image with bash, socat, curl, pgrep and sleep:
+ * ironcurtain-base:latest by default, or the image named by
+ * NETWORK_ISOLATION_TEST_IMAGE. CI builds the small one in
+ * test/fixtures/network-isolation/Dockerfile (job "network-isolation").
  * Skipped unless INTEGRATION_TEST=1 is set (Docker/infrastructure integration).
  *
  * Run:  INTEGRATION_TEST=1 npm test -- test/network-isolation.integration.test.ts
@@ -21,7 +24,7 @@ import { generateFakeKey } from '../src/docker/fake-keys.js';
 
 const execFile = promisify(execFileCb);
 
-const IMAGE = 'ironcurtain-base:latest';
+const IMAGE = process.env.NETWORK_ISOLATION_TEST_IMAGE || 'ironcurtain-base:latest';
 const CONTAINER_NAME = `ironcurtain-net-iso-test-${Date.now()}`;
 
 async function docker(...args: string[]): Promise<string> {
@@ -170,6 +173,13 @@ describe.skipIf(skipLinuxDockerIntegration)('Network isolation (--network=none +
     }
   });
 
+  // Both CONNECT tests print the proxy's answer to the CONNECT itself
+  // (%{http_connect}). curl's exit code cannot tell the two cases apart: it
+  // is non-zero for a refused CONNECT (7 or 56, by curl version) and also for
+  // an accepted one, whose TLS handshake then fails because curl does not
+  // trust the test CA (60). Asserting only a non-zero exit would pass even if
+  // the proxy tunnelled every host.
+
   it('allows CONNECT tunnel to api.anthropic.com', async () => {
     const result = await dockerExec(
       containerId,
@@ -178,7 +188,7 @@ describe.skipIf(skipLinuxDockerIntegration)('Network isolation (--network=none +
       '-o',
       '/dev/null',
       '-w',
-      '%{http_code}',
+      '%{http_connect}',
       '--proxy',
       'http://127.0.0.1:18080',
       '--connect-timeout',
@@ -186,10 +196,9 @@ describe.skipIf(skipLinuxDockerIntegration)('Network isolation (--network=none +
       'https://api.anthropic.com/',
     );
 
-    // Tunnel succeeds — we get an HTTP response from the proxy (403 for non-allowed endpoint)
-    // or a TLS handshake (since curl doesn't trust our CA by default, it may fail there)
-    // The key test is that CONNECT itself succeeds (exit code 0 or curl gets past CONNECT)
-    expect(result.exitCode).toBeDefined();
+    // The proxy acknowledged the tunnel (200 Connection Established); the
+    // provider host is the one destination it intercepts.
+    expect(result.stdout.trim()).toBe('200');
   }, 30_000);
 
   it('blocks CONNECT tunnel to google.com', async () => {
@@ -200,7 +209,7 @@ describe.skipIf(skipLinuxDockerIntegration)('Network isolation (--network=none +
       '-o',
       '/dev/null',
       '-w',
-      '%{http_code}',
+      '%{http_connect}',
       '--proxy',
       'http://127.0.0.1:18080',
       '--connect-timeout',
@@ -208,7 +217,8 @@ describe.skipIf(skipLinuxDockerIntegration)('Network isolation (--network=none +
       'https://www.google.com/',
     );
 
-    // Proxy returns 403 → curl sees a failed CONNECT (exit code 56)
+    // Refused before any tunnel exists: the CONNECT itself is answered 403.
+    expect(result.stdout.trim()).toBe('403');
     expect(result.exitCode).not.toBe(0);
   }, 30_000);
 

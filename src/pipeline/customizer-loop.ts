@@ -3,7 +3,9 @@
  *
  * Used by both persona-customizer.ts and job-customizer.ts. Handles the
  * common infrastructure: TTY check, annotation loading, GitHub identity
- * discovery, LLM setup, and the outer/inner accept-refine-reject loop.
+ * discovery, LLM setup, the review of amendments learned from repeated human
+ * approvals (when the caller names the constitution's scope), and the
+ * outer/inner accept-refine-reject loop.
  */
 
 import * as p from '@clack/prompts';
@@ -23,9 +25,12 @@ import {
   type CustomizerResponse,
 } from './constitution-customizer.js';
 import { createPipelineLlm } from './pipeline-shared.js';
+import { reviewPendingAmendments } from './amendment-review.js';
+import type { ApprovalScope } from '../audit/approval-history.js';
 import { resolveGitHubToken, discoverGitHubIdentity } from './github-identity.js';
 import type { GitHubIdentity } from './github-identity.js';
 import type { ToolAnnotation } from './types.js';
+import { toDisplayText } from '../terminal/display-sanitize.js';
 
 /** Options for the shared customizer loop. */
 export interface CustomizerLoopOptions {
@@ -37,6 +42,14 @@ export interface CustomizerLoopOptions {
 
   /** Placeholder for the refine text input (optional). */
   refinePlaceholder?: string;
+
+  /**
+   * Scope of the constitution being edited (`persona:<name>`, `job:<id>`).
+   * When set, the amendments proposed from repeated human approvals under it
+   * are offered as diffs before the conversation; each is applied only when
+   * the user accepts it.
+   */
+  amendmentScope?: ApprovalScope;
 }
 
 /** Context provided to the system prompt builder callback. */
@@ -65,14 +78,15 @@ export async function runConstitutionCustomizerLoop(
     return undefined;
   }
 
-  // Load tool annotations
+  // Load tool annotations (user overlay layered over the package's)
   const generatedDir = getUserGeneratedDir();
   const packageGeneratedDir = getPackageGeneratedDir();
   let annotations: ToolAnnotation[];
   try {
     annotations = loadAnnotations(generatedDir, packageGeneratedDir);
-  } catch {
-    p.log.error("tool-annotations.json not found. Run 'ironcurtain annotate-tools' first.");
+  } catch (err) {
+    // loadAnnotations reports both a missing file and a damaged overlay.
+    p.log.error(toDisplayText(err instanceof Error ? err.message : String(err), { multiline: true }));
     return undefined;
   }
 
@@ -86,7 +100,7 @@ export async function runConstitutionCustomizerLoop(
     ghIdentity = await discoverGitHubIdentity(ghToken);
     if (ghIdentity) {
       const owners = [ghIdentity.login, ...ghIdentity.orgs].join(', ');
-      spinner.stop(`GitHub identity: ${owners}`);
+      spinner.stop(`GitHub identity: ${toDisplayText(owners)}`);
     } else {
       spinner.stop('GitHub identity discovery failed (continuing without it)');
     }
@@ -104,7 +118,19 @@ export async function runConstitutionCustomizerLoop(
   let currentConstitution = initialConstitution;
   const conversationHistory: ModelMessage[] = [];
 
-  p.note(currentConstitution.trim(), options.noteTitle);
+  p.note(toDisplayText(currentConstitution, { multiline: true }), options.noteTitle);
+
+  if (options.amendmentScope !== undefined) {
+    const review = await reviewPendingAmendments(options.amendmentScope, currentConstitution);
+    if (review?.cancelled === true) {
+      p.cancel('Customization cancelled.');
+      return undefined;
+    }
+    if (review !== undefined && review.accepted.length > 0) {
+      currentConstitution = review.constitution;
+      p.log.success(`${review.accepted.length} suggested amendment(s) accepted.`);
+    }
+  }
 
   // Main loop
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- interactive loop exited via break
@@ -138,7 +164,7 @@ export async function runConstitutionCustomizerLoop(
       llmSpinner.stop('Done.');
     } catch (err) {
       llmSpinner.stop('Failed.');
-      p.log.error(`LLM error: ${err instanceof Error ? err.message : String(err)}`);
+      p.log.error(`LLM error: ${toDisplayText(err instanceof Error ? err.message : String(err), { multiline: true })}`);
       conversationHistory.pop();
       continue;
     }
@@ -146,7 +172,7 @@ export async function runConstitutionCustomizerLoop(
     conversationHistory.push({ role: 'assistant', content: JSON.stringify(response) });
 
     if (response.type === 'question') {
-      p.log.info(response.question ?? 'Could you clarify your request?');
+      p.log.info(toDisplayText(response.question ?? 'Could you clarify your request?', { multiline: true }));
       continue;
     }
 
@@ -156,7 +182,10 @@ export async function runConstitutionCustomizerLoop(
       const proposed = applyChanges(currentConstitution, response.addRules ?? [], response.removeRules ?? []);
       const diff = computeLineDiff(currentConstitution, proposed);
       const diffText = formatDiff(diff);
-      p.note(`${diffText}\n\n${chalk.dim(response.summary ?? '')}`, 'Proposed changes');
+      p.note(
+        `${diffText}\n\n${chalk.dim(toDisplayText(response.summary ?? '', { multiline: true }))}`,
+        'Proposed changes',
+      );
 
       const action = await p.select({
         message: 'What would you like to do?',
@@ -201,7 +230,9 @@ export async function runConstitutionCustomizerLoop(
         refineSpinner.stop('Done.');
       } catch (err) {
         refineSpinner.stop('Failed.');
-        p.log.error(`LLM error: ${err instanceof Error ? err.message : String(err)}`);
+        p.log.error(
+          `LLM error: ${toDisplayText(err instanceof Error ? err.message : String(err), { multiline: true })}`,
+        );
         conversationHistory.pop();
         break;
       }
@@ -209,7 +240,7 @@ export async function runConstitutionCustomizerLoop(
       conversationHistory.push({ role: 'assistant', content: JSON.stringify(response) });
 
       if (response.type === 'question') {
-        p.log.info(response.question ?? 'Could you clarify your request?');
+        p.log.info(toDisplayText(response.question ?? 'Could you clarify your request?', { multiline: true }));
         break;
       }
     }

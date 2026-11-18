@@ -19,6 +19,7 @@ import { dirname, resolve, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import YAML from 'yaml';
 import { getUserWorkflowsDir } from '../config/paths.js';
+import { readRegularFileFollowingLinks, UntrustedFileError } from '../hardened-fs.js';
 import { isWithinDirectory } from '../types/argument-roles.js';
 
 // ---------------------------------------------------------------------------
@@ -58,6 +59,9 @@ const MAX_README_BYTES = 512 * 1024;
 /** Recognized YAML extensions for ad-hoc file-path workflow refs. */
 const YAML_EXTENSIONS = new Set(['.yaml', '.yml']);
 
+/** Largest workflow definition file read; a larger one is refused, never read whole. */
+export const MAX_WORKFLOW_DEFINITION_BYTES = 16 * 1024 * 1024;
+
 /**
  * Parses a workflow definition file. Dispatches on extension:
  *   - `.yaml` / `.yml` -> YAML parse with alias expansion disabled
@@ -66,6 +70,16 @@ const YAML_EXTENSIONS = new Set(['.yaml', '.yml']);
  *
  * Returns the parsed value unvalidated — the workflow definition Zod
  * schema enforces structure downstream.
+ *
+ * The path is not always the user's choice: an imported run without a
+ * definition copy, and a resumed one, name it in their checkpoint, and that
+ * file can ship inside the imported directory. So the extension is checked
+ * before anything is opened, and the file is read with
+ * `readRegularFileFollowingLinks`: links are followed (a symlinked manifest is
+ * legitimate), but only a regular file of at most
+ * {@link MAX_WORKFLOW_DEFINITION_BYTES} is read, and a FIFO, socket, device or
+ * directory is refused without being opened for a blocking read (a FIFO would
+ * otherwise block the daemon's event loop, `/dev/zero` exhaust its memory).
  *
  * Note on the JSON branch: user-facing manifests must be YAML; the
  * discovery layer (`discoverWorkflows`, `resolveWorkflowPath`) only
@@ -79,14 +93,38 @@ const YAML_EXTENSIONS = new Set(['.yaml', '.yml']);
  */
 export function parseDefinitionFile(filePath: string): unknown {
   const ext = extname(filePath).toLowerCase();
-  const content = readFileSync(filePath, 'utf-8');
-  if (ext === '.yaml' || ext === '.yml') {
-    return YAML.parse(content, { maxAliasCount: 0 });
+  if (!YAML_EXTENSIONS.has(ext) && ext !== '.json') {
+    throw new Error(`Unsupported workflow file extension: ${ext}`);
   }
-  if (ext === '.json') {
-    return JSON.parse(content);
+  const content = readDefinitionText(resolve(filePath));
+  return ext === '.json' ? JSON.parse(content) : YAML.parse(content, { maxAliasCount: 0 });
+}
+
+/** The text of a definition file (see {@link parseDefinitionFile}), with a readable error. */
+function readDefinitionText(path: string): string {
+  try {
+    return readRegularFileFollowingLinks(path, { maxBytes: MAX_WORKFLOW_DEFINITION_BYTES }).bytes.toString('utf8');
+  } catch (error) {
+    throw new Error(`Cannot read workflow definition ${path}: ${describeDefinitionReadError(error)}`, {
+      cause: error,
+    });
   }
-  throw new Error(`Unsupported workflow file extension: ${ext}`);
+}
+
+function describeDefinitionReadError(error: unknown): string {
+  switch (error instanceof UntrustedFileError ? error.code : undefined) {
+    case 'NOT_FOUND':
+      return 'no such file';
+    case 'NOT_REGULAR_FILE':
+      return 'not a regular file (a FIFO, socket, device or directory is never read)';
+    case 'TOO_LARGE':
+      return `larger than ${MAX_WORKFLOW_DEFINITION_BYTES} bytes`;
+    default: {
+      // Permissions, EIO, a symlink loop: the underlying error says which.
+      const cause = error instanceof Error && error.cause instanceof Error ? error.cause : error;
+      return cause instanceof Error ? cause.message : String(cause);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

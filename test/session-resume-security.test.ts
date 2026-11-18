@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { SessionSnapshot } from '../src/docker/pty-types.js';
@@ -150,7 +150,10 @@ describe('snapshot tampering resistance', () => {
     );
 
     const first = acquireResumeSessionLock('locked-session');
-    expect(() => acquireResumeSessionLock('locked-session')).toThrow('already being resumed');
+    // The claim every standalone session holds (src/session/session-lock.ts).
+    expect(() => acquireResumeSessionLock('locked-session')).toThrow(
+      /Cannot resume session "locked-session": it is already in use by a running session \(pid \d+\)/,
+    );
     first.release();
 
     const retry = acquireResumeSessionLock('locked-session');
@@ -203,6 +206,54 @@ describe('snapshot tampering resistance', () => {
 
     rmSync(workspaceDir, { recursive: true, force: true });
   });
+
+  it('resumes into the canonical workspace the validator approved, not the stored spelling', () => {
+    const sessionDir = join(baseDir, 'sessions', 'swapped-link');
+    mkdirSync(sessionDir, { recursive: true });
+    const outside = mkdtempSync(join(tmpdir(), 'sec-workspace-'));
+    try {
+      const realWorkspace = join(outside, 'project');
+      mkdirSync(realWorkspace);
+      const storedPath = join(outside, 'frontend');
+      symlinkSync(realWorkspace, storedPath);
+      writeFileSync(
+        join(sessionDir, SESSION_STATE_FILENAME),
+        JSON.stringify(makeSnapshot({ sessionId: 'swapped-link', workspacePath: storedPath })),
+      );
+
+      expect(validateResumeSession('swapped-link').workspacePath).toBe(realpathSync(realWorkspace));
+      // Listings keep the stored spelling for display.
+      expect(scanResumableSessions([]).find((s) => s.sessionId === 'swapped-link')?.workspacePath).toBe(storedPath);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses to resume when a stored workspace now leads to an ancestor of the IronCurtain home', () => {
+    const outside = mkdtempSync(join(tmpdir(), 'sec-workspace-'));
+    const savedHome = process.env.IRONCURTAIN_HOME;
+    try {
+      const icHome = join(outside, 'parent', 'ic-home');
+      process.env.IRONCURTAIN_HOME = icHome;
+      const sessionDir = join(icHome, 'sessions', 'link-to-parent');
+      mkdirSync(sessionDir, { recursive: true });
+      // The agent swapped the stored `frontend` directory for a link to the home's parent.
+      const storedPath = join(outside, 'frontend');
+      symlinkSync(join(outside, 'parent'), storedPath);
+      writeFileSync(
+        join(sessionDir, SESSION_STATE_FILENAME),
+        JSON.stringify(makeSnapshot({ sessionId: 'link-to-parent', workspacePath: storedPath })),
+      );
+
+      expect(() => validateResumeSession('link-to-parent')).toThrow(
+        /workspace path is unsafe: .*contains the IronCurtain home directory/,
+      );
+    } finally {
+      if (savedHome === undefined) delete process.env.IRONCURTAIN_HOME;
+      else process.env.IRONCURTAIN_HOME = savedHome;
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
 });
 
 // --- 3. Credential cleanup (defense-in-depth) ---
@@ -224,6 +275,7 @@ describe('credential cleanup on resume', () => {
       containerMountPath: '/root/.test/',
       seed: [],
       resumeFlags: [],
+      transcriptLayout: 'claude-projects',
     };
 
     // First run creates the directory
@@ -244,6 +296,7 @@ describe('credential cleanup on resume', () => {
       containerMountPath: '/root/.test/',
       seed: [{ path: 'config.json', content: '{}' }],
       resumeFlags: [],
+      transcriptLayout: 'claude-projects',
     };
 
     const stateDir = prepareConversationStateDir(sessionDir, config);
@@ -276,6 +329,7 @@ describe('seed file path traversal', () => {
       containerMountPath: '/root/.test/',
       seed: [{ path: '../escape.txt', content: 'should-fail' }],
       resumeFlags: [],
+      transcriptLayout: 'claude-projects',
     };
 
     expect(() => prepareConversationStateDir(sessionDir, config)).toThrow('Seed path escapes state directory');
@@ -289,6 +343,7 @@ describe('seed file path traversal', () => {
       containerMountPath: '/root/.test/',
       seed: [{ path: targetPath, content: 'escaped!' }],
       resumeFlags: [],
+      transcriptLayout: 'claude-projects',
     };
 
     // The containment check rejects absolute paths that resolve outside stateDir
@@ -392,6 +447,7 @@ describe('resume flags safety', () => {
       containerMountPath: '/root/.claude/',
       seed: [],
       resumeFlags: ['--continue'],
+      transcriptLayout: 'claude-projects',
     };
 
     const flagString = config.resumeFlags.join(' ');

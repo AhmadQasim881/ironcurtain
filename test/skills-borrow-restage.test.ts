@@ -32,6 +32,7 @@ import type { DockerInfrastructure } from '../src/docker/docker-infrastructure.j
 import { stageSkillsToBundle } from '../src/skills/staging.js';
 import type { ResolvedSkill } from '../src/skills/types.js';
 import type { AgentId } from '../src/docker/agent-adapter.js';
+import { writePersonaPolicy } from './fixtures/scoped-policy.js';
 
 const TEST_HOME = `${REAL_TMP}/ironcurtain-skills-borrow-test-${process.pid}`;
 
@@ -73,24 +74,33 @@ function createTestConfig(): IronCurtainConfig {
   } as unknown as IronCurtainConfig;
 }
 
+/**
+ * Minimal compiled policy that keeps the filesystem server, with the
+ * metadata fields the runtime schema requires (src/types/policy-schema.ts).
+ * `writePersonaPolicy` replaces `constitutionHash` with the persona's. The
+ * rule escalates: an unconditioned `allow` would grant broad access, which
+ * `resolvePersona` refuses for a persona without the broad-policy opt-in.
+ */
+const MINIMAL_POLICY = {
+  generatedAt: 'test',
+  constitutionHash: 'test',
+  inputHash: 'test',
+  rules: [
+    {
+      name: 'escalate-fs',
+      description: 'test',
+      principle: 'test',
+      if: { server: ['filesystem'] },
+      then: 'escalate',
+      reason: 'test',
+    },
+  ],
+};
+
 /** Writes a minimal compiled-policy.json so `loadGeneratedPolicy` succeeds. */
 function writeMinimalPolicy(dir: string): void {
   mkdirSync(dir, { recursive: true });
-  writeFileSync(
-    resolve(dir, 'compiled-policy.json'),
-    JSON.stringify({
-      rules: [
-        {
-          name: 'allow-fs',
-          description: 'test',
-          principle: 'test',
-          if: { server: ['filesystem'] },
-          then: 'allow',
-          reason: 'test',
-        },
-      ],
-    }),
-  );
+  writeFileSync(resolve(dir, 'compiled-policy.json'), JSON.stringify(MINIMAL_POLICY));
 }
 
 /** Writes a SKILL.md package under <root>/<dirName>/. */
@@ -113,7 +123,7 @@ function createTestPersona(name: string): void {
     resolve(personaDir, 'persona.json'),
     JSON.stringify({ name, description: `Test persona ${name}`, createdAt: '2026-04-27T00:00:00.000Z' }),
   );
-  writeMinimalPolicy(generatedDir);
+  writePersonaPolicy(personaDir, MINIMAL_POLICY);
 }
 
 function makeFakeBundle(skillsDir: string | undefined, bundleDir: string): DockerInfrastructure {

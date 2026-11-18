@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  matchesEndpointPattern,
   resolveCompletionEndpoint,
   validateCompletionEndpoints,
 } from '../../src/docker/llm-observation/completion-endpoint.js';
@@ -20,5 +21,23 @@ describe('completion endpoint routing', () => {
     expect(
       resolveCompletionEndpoint(endpoints, 'POST', '/v1beta/models/gemini-2.5-flash/generateContent'),
     ).toBeUndefined();
+  });
+
+  it('matches a wildcard only against unreserved characters that are not all dots', () => {
+    const endpoints = googleProvider.completionEndpoints ?? [];
+    for (const path of [
+      '/v1beta/models/..:generateContent',
+      '/v1beta/models/.:generateContent',
+      '/v1beta/models/..%2F..%2Fx:generateContent',
+      '/v1beta/models/x%2e%2e:generateContent',
+      '/v1beta/models/x\\y:generateContent',
+      '/v1beta/models/x;y:generateContent',
+    ]) {
+      expect(matchesEndpointPattern(endpoints[0], 'POST', path), path).toBe(false);
+      expect(resolveCompletionEndpoint(endpoints, 'POST', path), path).toBeUndefined();
+    }
+    expect(matchesEndpointPattern(endpoints[0], 'POST', '/v1beta/models/gemini-2.5-pro_x.y~z:generateContent')).toBe(
+      true,
+    );
   });
 });

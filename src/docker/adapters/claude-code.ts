@@ -1,5 +1,6 @@
 import { gatewayProfile, resolveMessagesClient, resolveGatewayCommandModel } from '../../config/gateway-client.js';
 import { gatewayProviders, gatewayCredential, gatewaySentinel } from '../gateway-runtime.js';
+import { mcpClientCommand, MCP_TCP_TOKEN_ENV } from '../mcp-client-command.js';
 /**
  * Claude Code agent adapter -- reference implementation.
  *
@@ -16,6 +17,7 @@ import { gatewayProviders, gatewayCredential, gatewaySentinel } from '../gateway
 
 import type {
   AgentAdapter,
+  AgentCommandOptions,
   AgentConfigFile,
   AgentId,
   AgentResponse,
@@ -26,9 +28,9 @@ import type {
 import type { DockerAuthKind, IronCurtainConfig } from '../../config/types.js';
 import type { ProviderConfig } from '../provider-config.js';
 import type { AuthMethod } from '../oauth-credentials.js';
-import type { ResolvedUserConfig } from '../../config/user-config.js';
 import { parseModelId } from '../../config/model-id.js';
 import { CONTAINER_RUNTIME_CA_CERT } from '../runtime-trust.js';
+import { CLAUDE_CODE_CLI_VERSION } from '../agent-cli-version.js';
 import {
   anthropicProvider,
   claudePlatformProvider,
@@ -93,9 +95,23 @@ ${buildAttributionSection()}
 `;
 }
 
-export function createClaudeCodeAdapter(userConfig?: ResolvedUserConfig): AgentAdapter {
-  const modelId = userConfig?.agentModelId ? parseModelId(userConfig.agentModelId).modelId : undefined;
+/**
+ * The bare Claude model name of a qualified agent model id, or `undefined`
+ * when none is configured (the CLI then uses its own default).
+ */
+function claudeModelName(qualifiedModelId: string | undefined): string | undefined {
+  return qualifiedModelId ? parseModelId(qualifiedModelId).modelId : undefined;
+}
 
+/**
+ * Creates the Claude Code adapter. It takes no configuration: the agent
+ * model comes from the per-session config (`buildEnv`) and the
+ * `buildCommand` options (`agentModelId`) on every call. The registry keeps
+ * one adapter per process, so a model captured here would apply the first
+ * registration's choice (or none, when the first-start wizard registered
+ * the adapters) to every later session.
+ */
+export function createClaudeCodeAdapter(): AgentAdapter {
   return {
     id: 'claude-code' as AgentId,
     displayName: 'Claude Code',
@@ -110,20 +126,23 @@ export function createClaudeCodeAdapter(userConfig?: ResolvedUserConfig): AgentA
       return CLAUDE_CODE_IMAGE;
     },
 
-    // Claude Code is installed unpinned in the image; log the resolved version
-    // at infra prep so a silent minor bump (which can change subagent semantics
-    // — issue #367) is visible.
+    // The image pins Claude Code (docker/Dockerfile.claude-code); infra prep
+    // checks the baked version against the qualified range once per build, so
+    // an overridden or drifted CLI (a minor bump can change subagent semantics:
+    // issue #367) is visible.
     versionProbe: ['claude', '--version'],
+    cliVersion: CLAUDE_CODE_CLI_VERSION,
 
     // Generates MCP config file passed via --mcp-config on the command line.
     // socketPath is either a UDS path or a TCP host:port address.
     generateMcpConfig(socketPath: string): AgentConfigFile[] {
-      const isTcp = socketPath.includes(':');
+      const transport = mcpClientCommand(socketPath);
       const mcpConfig = {
         mcpServers: {
           ironcurtain: {
-            command: 'socat',
-            args: isTcp ? ['STDIO', `TCP:${socketPath}`] : ['STDIO', `UNIX-CONNECT:${socketPath}`],
+            command: transport.command,
+            args: transport.args,
+            ...(transport.tcp ? { env: { [MCP_TCP_TOKEN_ENV]: `\${${MCP_TCP_TOKEN_ENV}:-}` } } : {}),
           },
         },
       };
@@ -204,16 +223,7 @@ exit $STATUS
       ];
     },
 
-    buildCommand(
-      message: string,
-      systemPrompt: string,
-      options: {
-        readonly sessionId: string;
-        readonly firstTurn: boolean;
-        readonly modelOverride?: string;
-        readonly providerProfile?: import('../../config/user-config.js').ResolvedProviderProfile;
-      },
-    ): readonly string[] {
+    buildCommand(message: string, systemPrompt: string, options: AgentCommandOptions): readonly string[] {
       // `claude -p --continue` in non-interactive print mode does NOT update
       // ~/.claude.json's project->session mapping, so subsequent `--continue`
       // calls silently start new sessions. Instead, pin the session UUID on
@@ -231,12 +241,22 @@ exit $STATUS
         '--append-system-prompt',
         systemPrompt,
       ];
-      const selected = options.modelOverride ? parseModelId(options.modelOverride).modelId : modelId;
+      // A per-turn override wins over the session's configured agent model.
+      const selected = claudeModelName(options.modelOverride ?? options.agentModelId);
       const effectiveModelId = selected
         ? (resolveGatewayCommandModel(options.providerProfile, selected, 'claude-code') ?? selected)
         : undefined;
       if (effectiveModelId) {
         cmd.push('--model', effectiveModelId);
+      }
+      // Per-invocation agentic-turn cap from `resourceBudget.maxSteps`
+      // (defence in depth; see AgentAdapter.buildCommand). The CLI ends the
+      // run with an `error_max_turns` result envelope when it is reached.
+      if (options.maxAgentTurns !== undefined) {
+        if (!Number.isSafeInteger(options.maxAgentTurns) || options.maxAgentTurns <= 0) {
+          throw new Error(`maxAgentTurns must be a positive integer, got ${String(options.maxAgentTurns)}`);
+        }
+        cmd.push('--max-turns', String(options.maxAgentTurns));
       }
       cmd.push('-p', message);
       return cmd;
@@ -283,6 +303,12 @@ exit $STATUS
         NODE_EXTRA_CA_CERTS: CONTAINER_RUNTIME_CA_CERT,
       };
 
+      // PTY start-claude.sh passes this as --model. Read per session: the
+      // daemon reloads config for every session while the adapter lives on,
+      // and buildSessionConfig puts the session's own model here (`--model`,
+      // a workflow model, else the persona's agentModelId, else the global
+      // one), so one session's model never leaks into another's.
+      const modelId = claudeModelName(config.agentModelId);
       if (modelId) {
         env.IRONCURTAIN_MODEL = modelId;
       }
@@ -334,7 +360,7 @@ exit $STATUS
         // returns immediately and the parent is "notified automatically when it
         // completes" via a persistent supervisor that re-fires the session. We
         // invoke `claude -p` as a one-shot subprocess with no such supervisor, so
-        // when a workflow agent (e.g. vuln-discovery `analyze`) fans out to
+        // when a workflow agent fans out to
         // parallel subagents, the turn never receives their completions and stalls
         // ("Response stalled mid-stream" / no `agent_status` block). This env var
         // restores the pre-2.1.198 synchronous behavior, which the FSM's
@@ -363,9 +389,10 @@ exit $STATUS
         // until generation completes. For those, no idle value below the full
         // generation time can ever pass — the ceiling is unreachable by
         // construction. Turning the watchdog off is the only setting that
-        // tolerates them; the orchestrator's per-turn wall-clock budget
-        // (`resourceBudget.maxSessionSeconds`, applied as the docker-exec
-        // timeout) remains the backstop against a genuinely wedged upstream.
+        // tolerates them; the per-turn wall-clock budget
+        // (`resourceBudget.maxSessionSeconds`, enforced inside the container
+        // by the `timeout` wrapper in turn-timeout.ts) remains the backstop
+        // against a genuinely wedged upstream.
         CLAUDE_ENABLE_BYTE_WATCHDOG: '0',
         // Kept at the ceiling so that if the watchdog is ever re-enabled
         // (host env / future default flip), the deadline is as generous as
@@ -457,6 +484,7 @@ exit $STATUS
           { path: 'projects/', content: '' }, // directory, populated by Claude Code
         ],
         resumeFlags: ['--continue'],
+        transcriptLayout: 'claude-projects',
       };
     },
   };

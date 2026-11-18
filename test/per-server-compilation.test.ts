@@ -5,15 +5,16 @@
  * and filtering helpers used by the per-server compilation path.
  */
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import type { CompiledRule, ListDefinition } from '../src/pipeline/types.js';
+import { POLICY_COMPILER_EPOCH } from '../src/policy-artifacts/provenance.js';
 import {
   computeServerPolicyHash,
-  deduplicateListDefinitions,
   getHandwrittenScenariosForServer,
   mergeServerResults,
   validateServerScoping,
 } from '../src/pipeline/pipeline-runner.js';
+import { planListMerge } from '../src/pipeline/list-merge.js';
 
 // ---------------------------------------------------------------------------
 // validateServerScoping
@@ -60,54 +61,144 @@ describe('validateServerScoping', () => {
 });
 
 // ---------------------------------------------------------------------------
-// deduplicateListDefinitions
+// mergeServerResults: dynamic lists across servers (WP-62, PIP-6)
 // ---------------------------------------------------------------------------
 
-describe('deduplicateListDefinitions', () => {
-  const makeDef = (name: string, prompt: string): ListDefinition => ({
+describe('mergeServerResults: dynamic lists across servers', () => {
+  const makeDef = (name: string, prompt: string, overrides: Partial<ListDefinition> = {}): ListDefinition => ({
     name,
     type: 'domains',
     principle: 'test',
     generationPrompt: prompt,
     requiresMcp: false,
+    ...overrides,
   });
 
-  beforeEach(() => {
-    vi.spyOn(console, 'error').mockImplementation(() => {});
+  const listRule = (server: string, list: string): CompiledRule => ({
+    name: `${server}-uses-${list}`,
+    description: 'test',
+    principle: 'test',
+    if: { server: [server], domains: { roles: ['fetch-url'], allowed: [`@${list}`] } },
+    then: 'allow',
+    reason: 'test',
   });
 
-  afterEach(() => {
-    vi.restoreAllMocks();
+  const result = (serverName: string, defs: ListDefinition[]) => ({
+    serverName,
+    rules: defs.map((d) => listRule(serverName, d.name)),
+    listDefinitions: defs,
+    scenarios: [],
+    inputHash: `hash-${serverName}`,
+    constitutionHash: 'c',
   });
 
-  it('returns empty array for empty input', () => {
-    expect(deduplicateListDefinitions([])).toEqual([]);
+  const allowedOf = (rule: CompiledRule): string[] => rule.if.domains?.allowed ?? [];
+  const quiet = (): void => {};
+
+  it('shares a list that servers define identically', () => {
+    const merged = mergeServerResults(
+      [result('zeta', [makeDef('trusted-hosts', 'same')]), result('alpha', [makeDef('trusted-hosts', 'same')])],
+      'h',
+      undefined,
+      quiet,
+    );
+    expect(merged.listDefinitions?.map((d) => d.name)).toEqual(['trusted-hosts']);
+    expect(merged.listDefinitions?.[0].sourceName).toBeUndefined();
+    expect(merged.rules.map(allowedOf)).toEqual([['@trusted-hosts'], ['@trusted-hosts']]);
   });
 
-  it('keeps all unique list definitions', () => {
-    const defs = [makeDef('list-a', 'prompt a'), makeDef('list-b', 'prompt b')];
-    const result = deduplicateListDefinitions(defs);
-    expect(result).toHaveLength(2);
-    expect(result.map((d) => d.name)).toEqual(['list-a', 'list-b']);
+  it('keeps apart a list name that servers define differently, in their rules and definitions', () => {
+    const logged: string[] = [];
+    const merged = mergeServerResults(
+      [
+        result('zeta', [makeDef('trusted-hosts', 'docs sites to READ')]),
+        result('alpha', [makeDef('trusted-hosts', 'company host we may PUSH to')]),
+      ],
+      'h',
+      undefined,
+      (msg) => logged.push(msg),
+    );
+
+    expect(merged.listDefinitions).toEqual([
+      makeDef('alpha--trusted-hosts', 'company host we may PUSH to', { sourceName: 'trusted-hosts' }),
+      makeDef('zeta--trusted-hosts', 'docs sites to READ', { sourceName: 'trusted-hosts' }),
+    ]);
+    // Each server's rules use its own copy (rules are in alphabetical server order).
+    expect(merged.rules.map((r) => [r.if.server, allowedOf(r)])).toEqual([
+      [['alpha'], ['@alpha--trusted-hosts']],
+      [['zeta'], ['@zeta--trusted-hosts']],
+    ]);
+    expect(logged.join('\n')).toMatch(/alpha, zeta define list "trusted-hosts" differently/);
   });
 
-  it('deduplicates by name, keeping the first definition', () => {
-    const defs = [makeDef('list-a', 'first prompt'), makeDef('list-a', 'second prompt')];
-    const result = deduplicateListDefinitions(defs);
-    expect(result).toHaveLength(1);
-    expect(result[0].generationPrompt).toBe('first prompt');
+  it('rewrites references in lists[] conditions too', () => {
+    const def = (prompt: string) => makeDef('my-contacts', prompt, { type: 'emails' });
+    const emailRule = (server: string): CompiledRule => ({
+      name: `${server}-send`,
+      description: 'test',
+      principle: 'test',
+      if: { server: [server], lists: [{ roles: ['email-address'], allowed: ['@my-contacts'], matchType: 'emails' }] },
+      then: 'allow',
+      reason: 'test',
+    });
+    const merged = mergeServerResults(
+      [
+        { ...result('gmail', [def('a')]), rules: [emailRule('gmail')] },
+        { ...result('slack', [def('b')]), rules: [emailRule('slack')] },
+      ],
+      'h',
+      undefined,
+      quiet,
+    );
+    expect(merged.rules.map((r) => r.if.lists?.[0].allowed)).toEqual([
+      ['@gmail--my-contacts'],
+      ['@slack--my-contacts'],
+    ]);
   });
 
-  it('logs a warning when duplicate names have different prompts', () => {
-    const defs = [makeDef('list-a', 'first prompt'), makeDef('list-a', 'different prompt')];
-    deduplicateListDefinitions(defs);
-    expect(console.error).toHaveBeenCalledWith(expect.stringContaining('divergent generation prompts'));
+  it('treats a different type, requiresMcp or MCP server as a different definition, but not the principle', () => {
+    const differs = (a: ListDefinition, b: ListDefinition): boolean =>
+      planListMerge([result('a', [a]), result('b', [b])]).divergent.has('l');
+    const base = makeDef('l', 'p');
+    expect(differs(base, { ...base, type: 'identifiers' })).toBe(true);
+    expect(differs(base, { ...base, requiresMcp: true, mcpServerHint: 'b' })).toBe(true);
+    expect(
+      differs({ ...base, requiresMcp: true, mcpServerHint: 'x' }, { ...base, requiresMcp: true, mcpServerHint: 'y' }),
+    ).toBe(true);
+    expect(differs(base, { ...base, principle: 'other words' })).toBe(false);
   });
 
-  it('does not warn when duplicate names have identical prompts', () => {
-    const defs = [makeDef('list-a', 'same prompt'), makeDef('list-a', 'same prompt')];
-    deduplicateListDefinitions(defs);
-    expect(console.error).not.toHaveBeenCalled();
+  it('takes the last definition of a name a server repeats, as its validation and list resolution do', () => {
+    const merged = mergeServerResults(
+      [result('alpha', [makeDef('l', 'first'), makeDef('l', 'last')])],
+      'h',
+      undefined,
+      quiet,
+    );
+    expect(merged.listDefinitions?.map((d) => [d.name, d.generationPrompt])).toEqual([['l', 'last']]);
+  });
+
+  it('does not depend on the order of the results', () => {
+    const results = [result('zeta', [makeDef('l', 'z')]), result('alpha', [makeDef('l', 'a')])];
+    const forward = mergeServerResults(results, 'h', undefined, quiet);
+    const reverse = mergeServerResults([...results].reverse(), 'h', undefined, quiet);
+    expect(reverse.listDefinitions).toEqual(forward.listDefinitions);
+    expect(reverse.rules).toEqual(forward.rules);
+  });
+
+  it("fails instead of letting a renamed list take another list's name", () => {
+    // alpha's and beta's "c" are kept apart as alpha--c and beta--c, but alpha
+    // also defines a list literally named "beta--c".
+    const results = [
+      result('alpha', [makeDef('c', 'one'), makeDef('beta--c', 'other')]),
+      result('beta', [makeDef('c', 'two')]),
+    ];
+    expect(() => mergeServerResults(results, 'h', undefined, quiet)).toThrow(/collision/);
+  });
+
+  it('fails when the merged rules do not validate against the merged definitions', () => {
+    const broken = { ...result('alpha', []), rules: [listRule('alpha', 'undefined-list')] };
+    expect(() => mergeServerResults([broken], 'h', undefined, quiet)).toThrow(/merged policy failed validation/);
   });
 });
 
@@ -221,6 +312,12 @@ describe('computeServerPolicyHash', () => {
     const h1 = computeServerPolicyHash('fs', 'c', annotations, 'prompt-v1');
     const h2 = computeServerPolicyHash('fs', 'c', annotations, 'prompt-v2');
     expect(h1).not.toBe(h2);
+  });
+
+  it('includes the policy-compiler epoch: bumping it invalidates every cached server', () => {
+    const current = computeServerPolicyHash('fs', 'c', annotations, 'p');
+    expect(computeServerPolicyHash('fs', 'c', annotations, 'p', POLICY_COMPILER_EPOCH)).toBe(current);
+    expect(computeServerPolicyHash('fs', 'c', annotations, 'p', POLICY_COMPILER_EPOCH + 1)).not.toBe(current);
   });
 });
 

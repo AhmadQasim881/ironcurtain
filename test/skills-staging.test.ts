@@ -3,7 +3,18 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, statSync } from 'node:fs';
+import {
+  chmodSync,
+  mkdtempSync,
+  mkdirSync,
+  realpathSync,
+  writeFileSync,
+  readFileSync,
+  existsSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+} from 'node:fs';
 import { resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { stageSkillsToBundle, createCachedStager, validateSkillName } from '../src/skills/staging.js';
@@ -12,7 +23,7 @@ import type { ResolvedSkill } from '../src/skills/types.js';
 let tempDir: string;
 
 function createTempDir(): string {
-  return mkdtempSync(resolve(tmpdir(), 'ironcurtain-skills-stage-test-'));
+  return realpathSync(mkdtempSync(resolve(tmpdir(), 'ironcurtain-skills-stage-test-')));
 }
 
 /**
@@ -83,6 +94,20 @@ describe('stageSkillsToBundle', () => {
     stageSkillsToBundle([skill], dest);
     expect(existsSync(resolve(dest, 'canonical', 'SKILL.md'))).toBe(true);
     expect(existsSync(resolve(dest, 'src-dir-name'))).toBe(false);
+  });
+
+  it('copies regular assets and executable modes without carrying symbolic links', () => {
+    const source = writeSourceSkill(resolve(tempDir, 'sources'), 'ordinary', {
+      'tool.sh': '#!/bin/sh\ntrue\n',
+      'assets/note.txt': 'ordinary fixture',
+    });
+    chmodSync(resolve(source, 'tool.sh'), 0o755);
+    symlinkSync('assets/note.txt', resolve(source, 'note-link'));
+    const dest = resolve(tempDir, 'staged');
+    stageSkillsToBundle([{ name: 'ordinary', source: 'workflow', sourceDir: source, description: '' }], dest);
+    expect(readFileSync(resolve(dest, 'ordinary/assets/note.txt'), 'utf8')).toBe('ordinary fixture');
+    expect(statSync(resolve(dest, 'ordinary/tool.sh')).mode & 0o777).toBe(0o755);
+    expect(existsSync(resolve(dest, 'ordinary/note-link'))).toBe(false);
   });
 
   it('wipes stale entries before re-staging (idempotent)', () => {

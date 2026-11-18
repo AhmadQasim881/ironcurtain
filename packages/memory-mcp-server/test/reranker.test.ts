@@ -1,9 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { MemoryRow } from '../src/storage/database.js';
 import type { ScoredMemory } from '../src/retrieval/scoring.js';
-import { rerank, resetReranker } from '../src/retrieval/reranker.js';
+import { RERANKER_DTYPE, rerank, resetReranker } from '../src/retrieval/reranker.js';
 import type { MemoryConfig } from '../src/config.js';
 import { loadConfig } from '../src/config.js';
+import { ModelStoreError, ensureModel } from '../src/models/model-store.js';
 
 function makeScored(overrides: Partial<MemoryRow & ScoredMemory> = {}): ScoredMemory {
   const now = Date.now();
@@ -29,14 +30,25 @@ function makeScored(overrides: Partial<MemoryRow & ScoredMemory> = {}): ScoredMe
 }
 
 function makeConfig(overrides: Partial<MemoryConfig> = {}): MemoryConfig {
-  return { ...loadConfig({}), ...overrides };
+  return { ...loadConfig({ MEMORY_MODELS_DIR: '/models' }), ...overrides };
 }
+
+/** Where the (mocked) model store says the verified cross-encoder lives. */
+const VERIFIED_DIR = '/models/Xenova/ms-marco-MiniLM-L-6-v2/0123456789abcdef0123456789abcdef01234567';
+
+// The model store verifies files on disk; here it just answers with a directory.
+vi.mock('../src/models/model-store.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/models/model-store.js')>()),
+  ensureModel: vi.fn(),
+}));
 
 // Mock transformers with AutoTokenizer and AutoModelForSequenceClassification
 const mockTokenizer = vi.fn();
 const mockModel = vi.fn();
+const transformersEnv = vi.hoisted((): Record<string, unknown> => ({}));
 
 vi.mock('@huggingface/transformers', () => ({
+  env: transformersEnv,
   AutoTokenizer: {
     from_pretrained: vi.fn().mockResolvedValue(mockTokenizer),
   },
@@ -50,6 +62,8 @@ describe('rerank', () => {
     resetReranker();
     mockTokenizer.mockReset();
     mockModel.mockReset();
+    vi.mocked(ensureModel).mockReset();
+    vi.mocked(ensureModel).mockResolvedValue(VERIFIED_DIR);
     // Default: tokenizer returns a dummy inputs object
     mockTokenizer.mockReturnValue({ input_ids: 'mock' });
   });
@@ -150,5 +164,46 @@ describe('rerank', () => {
 
     // Model loaded only once
     expect(transformers.AutoModelForSequenceClassification.from_pretrained).toHaveBeenCalledTimes(1);
+  });
+
+  it('loads the cross-encoder from the verified model store only', async () => {
+    const transformers = await import('@huggingface/transformers');
+    mockModel.mockResolvedValue({ logits: { data: new Float32Array([1]), dims: [1, 1] } });
+    vi.mocked(transformers.AutoTokenizer.from_pretrained).mockClear();
+    vi.mocked(transformers.AutoModelForSequenceClassification.from_pretrained).mockClear();
+    const config = makeConfig();
+
+    await rerank('query', [makeScored({ id: 'a', content: 'test' })], config);
+
+    // The pinned model, checked by the store, then read from the directory it verified.
+    expect(ensureModel).toHaveBeenCalledWith(
+      { repo: config.rerankerModel, dtype: RERANKER_DTYPE },
+      expect.objectContaining({ modelsDir: '/models', manifest: config.modelManifest, offline: false }),
+    );
+    expect(transformers.AutoTokenizer.from_pretrained).toHaveBeenCalledWith(VERIFIED_DIR, { local_files_only: true });
+    expect(transformers.AutoModelForSequenceClassification.from_pretrained).toHaveBeenCalledWith(VERIFIED_DIR, {
+      dtype: 'q8',
+      local_files_only: true,
+    });
+    // transformers.js may not fetch, and caches nothing inside node_modules.
+    expect(transformersEnv).toMatchObject({
+      allowRemoteModels: false,
+      useFSCache: false,
+      cacheDir: '/models',
+      localModelPath: '/models',
+    });
+  });
+
+  it('never hands transformers.js a model the store refused', async () => {
+    const transformers = await import('@huggingface/transformers');
+    vi.mocked(transformers.AutoModelForSequenceClassification.from_pretrained).mockClear();
+    vi.mocked(ensureModel).mockRejectedValue(
+      new ModelStoreError('MODEL_INTEGRITY', 'onnx/model_quantized.onnx failed verification'),
+    );
+
+    await expect(rerank('query', [makeScored({ id: 'a', content: 'test' })], makeConfig())).rejects.toMatchObject({
+      code: 'MODEL_INTEGRITY',
+    });
+    expect(transformers.AutoModelForSequenceClassification.from_pretrained).not.toHaveBeenCalled();
   });
 });

@@ -7,6 +7,13 @@ settings:
   mode: docker
   dockerAgent: claude-code
   sharedContainer: true
+  # `fetch` (exec-assistant) and `summarize` (global) deliberately share the
+  # primary container: this fixture exercises policy hot-swap and skill
+  # restaging across a persona change in one container. A shared scope is one
+  # trust domain (what `fetch` leaves running or plants in the workspace or
+  # ~/.claude also acts during `summarize`, under its policy), so mixing
+  # personas in it is an explicit opt-in.
+  allowMixedPersonas: true
   model: anthropic:claude-haiku-4-5
 
 states:

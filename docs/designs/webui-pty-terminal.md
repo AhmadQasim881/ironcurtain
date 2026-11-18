@@ -1,6 +1,8 @@
 # Web-UI PTY Terminal — Vetted Implementation Design
 
-_Status: design, ready for implementation. Synthesized and judged from two competing
+**Status (2026-11-14):** Implemented (`src/web-ui/pty-session-manager.ts`, with the shared `PtyBridge` in `src/pty/`). Since then the chatbox was removed for builtin (Code Mode) sessions too (commit "Remove chatbox mode from web UI", issue #368), contrary to the decision below that Code Mode keeps it: the browser shows only container terminal sessions, and a builtin session gets an "unsupported session type" panel. Whether to restore a chat view is deferred (WP-125).
+
+_Design record: synthesized and judged from two competing
 design passes (max-reuse "A" and clean-shared-core "B") and two adversarial reviews
 (plumbing-reality + lifecycle/race/security). This document is the authoritative spec;
 where it differs from A or B the ruling here wins._
@@ -60,7 +62,7 @@ Confirmed reuse points (plumbing review, 9/9 core claims verified):
 | Host-TTY pipe (NOT touched) | `attachPty` | `pty-session.ts:840` | untouched |
 | Escalation dir watch + resolve-by-response-file | `createEscalationWatcher` / `.resolve` | `escalation-watcher.ts:60,131` | as-is (same leaf mux uses at `mux-escalation-manager.ts:134`) |
 | PTY registration (sessionId + escalationDir) | registry file | `pty-session.ts:1207-1219` → `~/.ironcurtain/pty-registry/session-<id>.json` | as-is |
-| Container resize all the way down | `bridge.resize` → SIGWINCH → `attachPty` `stdout.on('resize')` → `resize-pty.sh` | `pty-bridge.ts:238`, `pty-session.ts:973,927` | as-is |
+| Container resize all the way down | `bridge.resize` → SIGWINCH → `attachPty` `stdout.on('resize')` → serialized resize queue → `resize-pty.sh` | `pty-bridge.ts:238`, `pty-session.ts`, `pty-resize-queue.ts` | one exec in flight, latest size wins, verified |
 | Container teardown + resume snapshot on normal termination | `runPtySession` finally | `pty-session.ts:734` | SIGTERM gets cleanup grace; force-kill may interrupt; reconcile/GC backstop |
 | Per-session targeted WS streaming + subscribe + `removeAllForClient` | `sendToSubscribers`, token-stream pattern | `web-ui-server.ts:241`, `token-stream-dispatch.ts` | pattern reused |
 | Shared label space (distinct kind) | `reserveLabel()` | `session-manager.ts:119` | as-is (same as workflow-agent labels) |
@@ -128,6 +130,15 @@ child.onData((data) => {
 });
 ```
 
+**Terminal queries.** Programs ask their terminal for the cursor position (DSR 6), device
+attributes or a mode's state and wait for the reply. The headless terminal answers on its own
+`terminal.onData`; with `PtyBridgeOptions.answerTerminalQueries` the bridge writes those replies
+back to the child's PTY (and only there, never to the host terminal). The mux sets it: it
+re-renders cells, so nothing else can answer. The web UI leaves it off: the browser's xterm
+answers through the input path, and a second reply would reach the program twice. (A web PTY
+session with no browser attached therefore gets no reply, and one with several gets one from
+each.)
+
 **Core ordering invariant (load-bearing for reconnect safety, §Fork 4):** `onData` fires *inside*
 the `terminal.write` completion callback, i.e. after the headless buffer already reflects `data`.
 Therefore any chunk a subscriber receives is already captured by a `serialize()` taken before the
@@ -175,6 +186,15 @@ synchronously: (1) `serialize()` the bridge's headless buffer, (2) send `session
 *that one* client, (3) add client to `subscribers`. The manager keeps a single per-session
 `bridge.onData` fan-out to the whole subscriber set. The §3 ordering invariant closes the
 serialize/subscribe race; late joiners each get their own fresh replay at one subscription cost.
+The browser re-attaches on its own after every WebSocket reconnect: the daemon drops the old
+socket's subscription on close (and arms the idle reaper), so the Sessions route's attach effect
+is keyed on the store's `connected` flag and re-sends `sessions.ptyAttach` on every new socket;
+the replay repaints the terminal. It deliberately does not wait for `connectionGeneration`, which
+is bumped only when every RPC of the reconnect's state refresh succeeds. The per-label
+sink/terminal binding is torn down only when the selection changes, never on reconnect. While
+disconnected (and until the re-attach succeeds) the route shows a detached/reattaching banner.
+Without this the terminal stayed frozen after any socket drop while keystrokes still reached the
+agent, and the reaper killed the in-use session 30 minutes later.
 
 **Fork 5 — escalation overlay → B, plus a race fix.** Once `bridge.onSessionDiscovered` yields
 `escalationDir`, `PtyWebSession` starts `createEscalationWatcher(escalationDir, …)` and re-emits
@@ -192,12 +212,27 @@ works unchanged. **Race fix (from lifecycle review):**
 hangs waiting for an approval the operator never sees. Make the watcher **poll immediately on
 `start()`**, and add a unit test that writes `request-*.json` *before* `start()` and asserts
 `onEscalation` fires. (Benefits mux too.)
+Pending escalations do not outlive their session: `handleExit` (and daemon-shutdown `close()`)
+emit `escalation.expired` for every still-pending escalation **before** `session.ended`, and the
+frontend also drops a session's cards on `session.ended` (belt and braces for older daemons).
+`resolveEscalation` emits `escalation.resolved` only when the watcher confirms the proxy still had
+the request; an answer that arrives after the proxy timed out emits `escalation.expired` and the
+RPC fails with `ESCALATION_EXPIRED` instead of reporting a denied call as approved. The modal
+catches resolve failures and shows them inline.
 
 **Fork 6 — resize → B.** `@xterm/addon-fit` computes cols/rows → `sessions.ptyResize` →
 `bridge.resize` → node-pty SIGWINCH → child `attachPty` → `resize-pty.sh`. Identical chain to mux;
-the web is just a different resize source. Multiple browsers on one PTY share one winsize
+the web is just a different resize source. The child coalesces resize bursts (an unthrottled
+fit loop included): at most one `resize-pty.sh` exec runs at a time, the latest size always wins,
+and the settled size is verified (`src/docker/pty-resize-queue.ts`). Multiple browsers on one PTY share one winsize
 (shared-tmux semantics): **last-writer-wins**, documented; a "primary driver" designation is a
 follow-up. Add a small UI note that resizing a shared PTY affects all viewers.
+Sizes are bounded: `sessions.ptyResize` accepts `cols` 2..1000 and `rows` 1..500
+(`src/pty/pty-size.ts`), and `PtyBridge.resize` clamps again for every source (web, mux, initial
+spawn). The browser clamps its fitted size into the same range before sending, so a zoomed-out or
+ultra-wide terminal resizes the PTY to the maximum instead of having its frames rejected. The headless xterm allocates `3 × cols` 32-bit cells per row, so one unbounded frame could
+allocate gigabytes off-heap (20000×20000 measured at ~4.9 GB, outside `--max-old-space-size`), and
+node-pty writes the winsize as unsigned shorts, which would silently wrap above 65535.
 
 **Fork 7 — frontend → B.** New presentational
 `packages/web-ui/src/lib/components/features/terminal-console.svelte` wrapping xterm.js + FitAddon.
@@ -217,7 +252,8 @@ session; it must forward keystrokes but consciously mirror mux's mouse stance (m
 mouse to the container — `mux-app.ts:611-670`).
 - **Keyboard.** The browser xterm captures keys only when focused. The route `.focus()`es the
   terminal on select/attach and **refocuses it when the escalation overlay closes** (the overlay
-  steals focus). `term.onData(b => oninput(b64(b)))` forwards every keystroke — control chars,
+  takes no focus when it opens, but the user may have clicked into it to decide).
+  `term.onData(b => oninput(b64(b)))` forwards every keystroke — control chars,
   arrows, function keys, bracketed paste — to `sessions.ptyInput` → `bridge.write()` → child stdin.
   **`onData` alone is sufficient for keyboard.**
 - **Copy / paste.** Terminal semantics: **Ctrl/Cmd+C is SIGINT to the agent, not copy.** Copy is
@@ -266,7 +302,8 @@ feature.**
 
 **Ruling — mux-faithful with a guarded backstop:**
 1. PTY sessions are **not** subject to the existing 60s turn-based orphan sweep. A transient
-   disconnect detaches the client only; the child + container keep running and reconnect replays.
+   disconnect detaches the client only; the child + container keep running, the browser
+   re-attaches automatically when its connection returns (Fork 4), and the reconnect replays.
 2. **`sessions.end` is a termination request, not proof of reaping.** It asks the bridge to begin
    shutdown and marks the session as stopping; the session is removed and `session.ended` is emitted
    only after the lifecycle observes the child's `onExit`. The normal **SIGTERM** path receives a
@@ -285,6 +322,13 @@ feature.**
    config schema / Settings surface for it. A backstop that is rarely tuned does not justify the
    config surface (trusted-host / right-altitude); promote it to a config knob only if a real need
    appears. `0`/absence must be expressible as "disabled" in the constant for local testing.
+   The countdown is **arm-once**: it starts when a session loses its last subscriber (or is
+   created with none) and is left alone by later unrelated disconnects — `removeAllForClient` and
+   `detach` only touch sessions the client was actually attached to, and `startIdleTimer` is a
+   no-op while a timer is already armed — so churn from `workflow status/await` CLI connections,
+   stale-client terminations or a reconnect loop cannot defer reaping indefinitely. Input, prompt
+   or resize from a client that is **not** attached (its socket dropped and it has not re-attached
+   yet) is real activity and restarts the countdown for that session only.
 4. Abandoned PTY sessions remain **visible in the session list** (they're labeled sessions), so the
    operator can end them manually. Surface `alive` + last-attached time in the DTO.
 
@@ -479,6 +523,8 @@ not v1.
 
 **Change-list additions (augment §8):**
 - New: `src/pty/resolve-ironcurtain-bin.ts` (extracted; mux import updated in the move commit).
+- New: `src/pty/pty-size.ts` — shared PTY size bounds + `clampPtySize`, used by the `ptyResize`
+  schema and by `PtyBridge.resize` / the initial spawn size.
 - `src/web-ui/pty-session-manager.ts` — add `.size`/`.count`; `resolveEscalation` emits
   `escalation.resolved`; initial-size default + `ptyResize`-on-attach; node-pty/addon preflight;
   `PTY_IDLE_TTL_MS` timer.

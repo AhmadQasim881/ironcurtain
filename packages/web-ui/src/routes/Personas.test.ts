@@ -27,6 +27,7 @@ const mockEditPersonaConstitution = vi.fn();
 const mockSetPersonaMemory = vi.fn();
 const mockSetPersonaBroadPolicyOptIn = vi.fn();
 const mockDeletePersona = vi.fn();
+const mockListPersonaServers = vi.fn<() => Promise<string[]>>();
 
 // Default to mutation-allowed so the existing compile/edit suites can exercise
 // the gated controls. The flag-OFF (controls hidden) path is covered by the
@@ -51,6 +52,7 @@ vi.mock('$lib/stores.svelte.js', () => ({
   setPersonaMemory: (...args: unknown[]) => mockSetPersonaMemory(...args),
   setPersonaBroadPolicyOptIn: (...args: unknown[]) => mockSetPersonaBroadPolicyOptIn(...args),
   deletePersona: (...args: unknown[]) => mockDeletePersona(...args),
+  listPersonaServers: (...args: unknown[]) => mockListPersonaServers(...(args as [])),
   get appState() {
     return appStateMock;
   },
@@ -99,6 +101,8 @@ describe('Personas', () => {
     vi.restoreAllMocks();
     mockListPersonas.mockResolvedValue([]);
     mockHydratePersonaCompiles.mockResolvedValue(new Set());
+    mockListPersonaServers.mockReset();
+    mockListPersonaServers.mockResolvedValue(['filesystem', 'git', 'fetch', 'github', 'google-workspace']);
     appStateMock.personaCompiles = new Map();
     appStateMock.daemonStatus = { allowPolicyMutation: true };
     connectionGenerationMock.value = 0;
@@ -327,6 +331,75 @@ describe('Personas', () => {
     });
   });
 
+  function doneCompile(result: PersonaCompileOperationDto['result']): PersonaCompileOperationDto {
+    return {
+      operationId: 'op-done',
+      name: 'researcher',
+      phase: 'done',
+      startedAt: '2026-01-15T10:00:00Z',
+      endedAt: '2026-01-15T10:01:00Z',
+      actor: 'web',
+      result,
+    };
+  }
+
+  async function compileTo(record: PersonaCompileOperationDto): Promise<void> {
+    mockStartPersonaCompile.mockResolvedValue({ accepted: true, name: 'researcher', operationId: record.operationId });
+    appStateMock.personaCompiles = new Map([[record.operationId, record]]);
+    await renderAndNavigateToDetail();
+    await vi.waitFor(() => expect(screen.getByTestId('compile-button')).toBeTruthy());
+    await fireEvent.click(screen.getByTestId('compile-button'));
+  }
+
+  it('reports a partial compile with its failed servers instead of an unqualified success', async () => {
+    await compileTo(
+      doneCompile({
+        success: true,
+        ruleCount: 4,
+        failedServers: [{ serverName: 'filesystem', phase: 'verifying', reason: 'Verification still failing.' }],
+      }),
+    );
+
+    await vi.waitFor(() => {
+      expect(screen.getByTestId('compile-partial').textContent).toContain('1 server(s) failed');
+    });
+    expect(screen.queryByTestId('compile-success')).toBeNull();
+    const failed = screen.getByTestId('compile-failed-server').textContent ?? '';
+    expect(failed).toContain('filesystem');
+    expect(failed).toContain('Verifying');
+    expect(failed).toContain('Verification still failing.');
+  });
+
+  it('reports an unqualified success when no server failed', async () => {
+    await compileTo(doneCompile({ success: true, ruleCount: 4 }));
+
+    await vi.waitFor(() => {
+      expect(screen.getByTestId('compile-success').textContent).toContain('4 rules');
+    });
+    expect(screen.queryByTestId('compile-partial')).toBeNull();
+    expect(screen.queryByTestId('compile-failed-servers')).toBeNull();
+  });
+
+  it('shows the policy-lint findings of a compile the lint refused', async () => {
+    const message =
+      'The compiled policy failed the policy checks, so nothing was written: Rule "allow-docs" allows *.com.';
+    await compileTo({
+      operationId: 'op-lint',
+      name: 'researcher',
+      phase: 'failed',
+      startedAt: '2026-01-15T10:00:00Z',
+      actor: 'web',
+      error: { code: 'POLICY_LINT_FAILED', message },
+    });
+
+    await vi.waitFor(() => {
+      expect(screen.getByTestId('compile-error-code').textContent).toBe('POLICY_LINT_FAILED');
+    });
+    expect(screen.getByTestId('compile-error-detail').textContent).toBe(message);
+    expect(screen.getByTestId('compile-error').textContent).toContain('failed the policy checks');
+    expect(screen.getByTestId('compile-error').textContent).not.toContain('The operation could not be completed.');
+  });
+
   it('renders a typed error affordance when compileStream is rejected (gated)', async () => {
     mockStartPersonaCompile.mockRejectedValue({
       code: 'POLICY_MUTATION_FORBIDDEN',
@@ -503,6 +576,7 @@ describe('Personas', () => {
     await fireEvent.click(screen.getByTestId('new-persona-button'));
     await fireEvent.input(screen.getByTestId('new-persona-name'), { target: { value: 'narrow' } });
     await fireEvent.input(screen.getByTestId('new-persona-description'), { target: { value: 'desc' } });
+    await vi.waitFor(() => expect(screen.getByTestId('new-persona-narrow-servers')).toBeTruthy());
     await fireEvent.click(screen.getByTestId('new-persona-narrow-servers'));
     await fireEvent.click(screen.getByTestId('new-persona-server-filesystem'));
     await fireEvent.click(screen.getByTestId('create-persona-button'));
@@ -510,6 +584,77 @@ describe('Personas', () => {
     await vi.waitFor(() => {
       expect(mockCreatePersona).toHaveBeenCalledWith(expect.objectContaining({ servers: ['filesystem'] }));
     });
+  });
+
+  // The picker used to be a static list: it offered a nonexistent `web-search`
+  // server and lacked `fetch` and every server the user added.
+  it('builds the server picker from the configured servers the daemon lists', async () => {
+    mockListPersonaServers.mockResolvedValue(['filesystem', 'git', 'fetch', 'notes']);
+    mockCreatePersona.mockResolvedValue(makeDetail({ name: 'reader' }));
+    mockGetPersonaDetail.mockResolvedValue(makeDetail({ name: 'reader' }));
+    render(Personas);
+
+    await vi.waitFor(() => expect(screen.getByTestId('new-persona-button')).toBeTruthy());
+    await fireEvent.click(screen.getByTestId('new-persona-button'));
+    await fireEvent.input(screen.getByTestId('new-persona-name'), { target: { value: 'reader' } });
+    await fireEvent.input(screen.getByTestId('new-persona-description'), { target: { value: 'desc' } });
+    await vi.waitFor(() => expect(screen.getByTestId('new-persona-narrow-servers')).toBeTruthy());
+    await fireEvent.click(screen.getByTestId('new-persona-narrow-servers'));
+
+    for (const server of ['filesystem', 'git', 'fetch', 'notes']) {
+      expect(screen.getByTestId(`new-persona-server-${server}`)).toBeTruthy();
+    }
+    expect(screen.queryByTestId('new-persona-server-web-search')).toBeNull();
+    expect(mockListPersonaServers).toHaveBeenCalledTimes(1);
+
+    // Sent in the configured order, whatever the order of the clicks.
+    await fireEvent.click(screen.getByTestId('new-persona-server-notes'));
+    await fireEvent.click(screen.getByTestId('new-persona-server-fetch'));
+    await fireEvent.click(screen.getByTestId('create-persona-button'));
+
+    await vi.waitFor(() => {
+      expect(mockCreatePersona).toHaveBeenCalledWith(expect.objectContaining({ servers: ['fetch', 'notes'] }));
+    });
+  });
+
+  it('offers no narrowing when the server list cannot be loaded', async () => {
+    mockListPersonaServers.mockRejectedValue({ code: 'INTERNAL_ERROR', message: 'mcp-servers.json is invalid' });
+    mockCreatePersona.mockResolvedValue(makeDetail({ name: 'everything' }));
+    mockGetPersonaDetail.mockResolvedValue(makeDetail({ name: 'everything' }));
+    render(Personas);
+
+    await vi.waitFor(() => expect(screen.getByTestId('new-persona-button')).toBeTruthy());
+    await fireEvent.click(screen.getByTestId('new-persona-button'));
+
+    await vi.waitFor(() => expect(screen.getByTestId('new-persona-servers-unavailable')).toBeTruthy());
+    expect(screen.queryByTestId('new-persona-narrow-servers')).toBeNull();
+    expect(screen.getByTestId('new-persona-all-servers')).toBeTruthy();
+
+    await fireEvent.input(screen.getByTestId('new-persona-name'), { target: { value: 'everything' } });
+    await fireEvent.input(screen.getByTestId('new-persona-description'), { target: { value: 'desc' } });
+    await fireEvent.click(screen.getByTestId('create-persona-button'));
+
+    await vi.waitFor(() => {
+      expect(mockCreatePersona).toHaveBeenCalledWith(expect.objectContaining({ servers: undefined }));
+    });
+  });
+
+  it('does not create a narrowed persona with no server selected (that would mean all servers)', async () => {
+    render(Personas);
+
+    await vi.waitFor(() => expect(screen.getByTestId('new-persona-button')).toBeTruthy());
+    await fireEvent.click(screen.getByTestId('new-persona-button'));
+    await fireEvent.input(screen.getByTestId('new-persona-name'), { target: { value: 'narrow' } });
+    await fireEvent.input(screen.getByTestId('new-persona-description'), { target: { value: 'desc' } });
+    await vi.waitFor(() => expect(screen.getByTestId('new-persona-narrow-servers')).toBeTruthy());
+    await fireEvent.click(screen.getByTestId('new-persona-narrow-servers'));
+
+    const create = screen.getByTestId('create-persona-button') as HTMLButtonElement;
+    expect(create.disabled).toBe(true);
+    expect(screen.getByTestId('new-persona-servers-none-selected')).toBeTruthy();
+
+    await fireEvent.click(screen.getByTestId('new-persona-server-git'));
+    expect(create.disabled).toBe(false);
   });
 
   it('shows an inline PERSONA_EXISTS error on the name field', async () => {
@@ -542,6 +687,31 @@ describe('Personas', () => {
       expect(mockEditPersonaConstitution).toHaveBeenCalledWith('researcher', '# Changed');
       expect(screen.getByTestId('stale-badge')).toBeTruthy();
     });
+  });
+
+  it('shows the stale badge when the daemon reports the compiled policy stale', async () => {
+    await renderAndNavigateToDetail(
+      { hasPolicy: true, policyRuleCount: 4, stale: 'constitution' },
+      { compiled: true, stale: 'constitution' },
+    );
+
+    await vi.waitFor(() => {
+      expect(screen.getByTestId('stale-badge')).toBeTruthy();
+    });
+  });
+
+  it('marks stale personas in the list', async () => {
+    mockListPersonas.mockResolvedValue([
+      makePersona({ name: 'researcher', compiled: true, stale: 'constitution' }),
+      makePersona({ name: 'writer', compiled: true }),
+    ]);
+    render(Personas);
+
+    await vi.waitFor(() => {
+      expect(screen.getByTestId('persona-stale-researcher')).toBeTruthy();
+    });
+    expect(screen.queryByTestId('persona-stale-writer')).toBeNull();
+    expect(screen.getByText('Compiled')).toBeTruthy();
   });
 
   // ── Phase 1c: memory toggle ───────────────────────────────────────
@@ -581,6 +751,11 @@ describe('Personas', () => {
     await vi.waitFor(() => expect(screen.getByTestId('delete-button')).toBeTruthy());
     await fireEvent.click(screen.getByTestId('delete-button'));
     await vi.waitFor(() => expect(screen.getByTestId('confirm-delete-button')).toBeTruthy());
+    // A soft-deleted persona is purged once the trash retention expires: the
+    // dialog says so, and how to restore it before then.
+    const note = screen.getByTestId('delete-soft-note').textContent ?? '';
+    expect(note).toContain('ironcurtain persona trash restore researcher');
+    expect(note).toContain('before it expires');
     await fireEvent.click(screen.getByTestId('confirm-delete-button'));
 
     await vi.waitFor(() => {
@@ -600,6 +775,77 @@ describe('Personas', () => {
 
     await vi.waitFor(() => {
       expect(mockDeletePersona).toHaveBeenCalledWith('researcher', { force: true });
+    });
+  });
+
+  // ── Phase 1c: rule delta on the done card ─────────────────────────
+
+  it('shows unconstrained allow rules and broad escalations from the rule delta', async () => {
+    appStateMock.personaCompiles = new Map([
+      [
+        'op-delta',
+        {
+          operationId: 'op-delta',
+          name: 'researcher',
+          phase: 'done',
+          startedAt: '2026-01-15T10:00:00Z',
+          actor: 'test',
+          result: {
+            success: true,
+            ruleCount: 2,
+            ruleDelta: {
+              added: 2,
+              loosened: 0,
+              removed: 0,
+              broadenedDomains: [],
+              outOfWorkspacePaths: [],
+              unconstrainedAllows: ['allow-any-fetch: fetch-url on fetch/http_fetch'],
+              escalateBreadth: ['escalate-other-urls: *'],
+            },
+          },
+        },
+      ],
+    ]);
+    mockStartPersonaCompile.mockResolvedValue({ accepted: true, name: 'researcher', operationId: 'op-delta' });
+    await renderAndNavigateToDetail();
+
+    await vi.waitFor(() => expect(screen.getByTestId('compile-button')).toBeTruthy());
+    await fireEvent.click(screen.getByTestId('compile-button'));
+
+    await vi.waitFor(() => {
+      expect(screen.getByTestId('rule-delta-unconstrained').textContent).toContain(
+        'allow-any-fetch: fetch-url on fetch/http_fetch',
+      );
+      expect(screen.getByTestId('rule-delta-escalate').textContent).toContain('escalate-other-urls: *');
+    });
+    expect(screen.queryByTestId('rule-delta-domains')).toBeNull();
+  });
+
+  it('shows what made a rejected compile broad', async () => {
+    const message =
+      'Compiled policy is too broad (allow rule(s) with unconstrained arguments: allow-any-fetch: fetch-url on fetch/http_fetch).';
+    appStateMock.personaCompiles = new Map([
+      [
+        'op-broad',
+        {
+          operationId: 'op-broad',
+          name: 'researcher',
+          phase: 'failed',
+          startedAt: '2026-01-15T10:00:00Z',
+          actor: 'test',
+          error: { code: 'BROAD_POLICY_REJECTED', message },
+        },
+      ],
+    ]);
+    mockStartPersonaCompile.mockResolvedValue({ accepted: true, name: 'researcher', operationId: 'op-broad' });
+    await renderAndNavigateToDetail();
+
+    await vi.waitFor(() => expect(screen.getByTestId('compile-button')).toBeTruthy());
+    await fireEvent.click(screen.getByTestId('compile-button'));
+
+    await vi.waitFor(() => {
+      expect(screen.getByTestId('compile-error-code').textContent).toBe('BROAD_POLICY_REJECTED');
+      expect(screen.getByTestId('compile-error-detail').textContent).toBe(message);
     });
   });
 

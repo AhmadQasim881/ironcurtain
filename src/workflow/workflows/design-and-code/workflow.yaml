@@ -41,8 +41,14 @@ states:
     present:
       - plan
     transitions:
+      # isRoundLimitReached (review below) counts the visits of EVERY state, so
+      # plan revisions would otherwise eat into the coder-critic round budget.
+      # Approving the plan closes that phase: reset its count. Same for design.
       - to: design
         event: APPROVE
+        actions:
+          - type: resetVisitCounts
+            stateIds: [plan]
       - to: plan
         event: FORCE_REVISION
       - to: aborted
@@ -82,6 +88,9 @@ states:
     transitions:
       - to: implement
         event: APPROVE
+        actions:
+          - type: resetVisitCounts
+            stateIds: [design]
       - to: design
         event: FORCE_REVISION
       - to: aborted
@@ -115,6 +124,11 @@ states:
     type: agent
     description: Reviews code against the spec for correctness and quality
     persona: global
+    # Least privilege for the critic: it reads code it did not write, so it
+    # runs read-only. /workspace is mounted read-only and policy denies every
+    # change outside `.workflow/reviews/`, which it writes through the
+    # filesystem tool. The implementer remains the only state that edits code.
+    workspaceAccess: read-only
     prompt: |
       You are a code reviewer.
 
@@ -124,7 +138,10 @@ states:
       - Evaluate code quality, naming, and structure
       - Assess test coverage and test quality
 
-      Output: Create a `.workflow/reviews/` directory with a `review.md` file.
+      You review without changing anything: do not edit, fix, build or run the code.
+      Put every problem you find in the review instead.
+
+      Output: Write your review to `.workflow/reviews/review.md`.
       If issues are found, set verdict to "rejected" with specific, actionable feedback.
       If the code is solid, set verdict to "approved".
     inputs:

@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   ResourceWatchdog,
   sampleResourceState,
-  type ResourceWatchdogPolicy,
+  type HostDirectoryWatchdogPolicy,
   type ResourceWatchdogSample,
 } from '../../src/docker/resource-watchdog.js';
 
@@ -189,6 +189,107 @@ describe('resource watchdog', () => {
     expect(onTrip).not.toHaveBeenCalled();
   });
 
+  it('ignores a 10-minute wall-clock jump while the monotonic clock stands still', async () => {
+    const policy = syntheticPolicy();
+    let wallMs = 1_000;
+    let samples = 0;
+    const onTrip = vi.fn(async () => {});
+    const watchdog = new ResourceWatchdog(policy, {
+      sample: async () => {
+        samples += 1;
+        return syntheticSample(policy);
+      },
+      onTrip,
+      now: () => wallMs,
+      monotonicNow: () => 5_000,
+      schedule: false,
+    });
+    await watchdog.start();
+
+    wallMs += 10 * 60_000;
+    watchdog.assertFresh();
+    await watchdog.tick();
+
+    expect(samples).toBe(2);
+    expect(watchdog.trip).toBeUndefined();
+    expect(onTrip).not.toHaveBeenCalled();
+  });
+
+  it('judges the fresh sample, never its own lateness, after it stalls on both clocks', async () => {
+    const policy = syntheticPolicy();
+    let nowMs = 1_000;
+    let allocatedBytes = 150;
+    const onTrip = vi.fn(async () => {});
+    const watchdog = new ResourceWatchdog(policy, {
+      sample: async () => syntheticSample(policy, { allocatedBytes }),
+      onTrip,
+      now: () => nowMs,
+      monotonicNow: () => nowMs,
+      schedule: false,
+    });
+    await watchdog.start();
+
+    nowMs += policy.staleAfterMs * 10;
+    expect(() => watchdog.assertFresh()).toThrow(/stale or absent/u);
+    await watchdog.tick();
+    expect(watchdog.trip).toBeUndefined();
+    watchdog.assertFresh();
+
+    nowMs += policy.staleAfterMs * 10;
+    allocatedBytes = policy.hardSafetyBytes + 1;
+    await watchdog.tick();
+    expect(watchdog.trip?.code).toBe('hard-state-threshold');
+    expect(onTrip).toHaveBeenCalledTimes(1);
+  });
+
+  it('takes one fresh sample when its own sample deadline fires a full interval late', async () => {
+    const policy = syntheticPolicy();
+    let nowMs = 1_000;
+    let attempts = 0;
+    const onTrip = vi.fn(async () => {});
+    const watchdog = new ResourceWatchdog(policy, {
+      sample: (signal) => {
+        attempts += 1;
+        if (attempts !== 2) return Promise.resolve(syntheticSample(policy));
+        return pausedMidSample(signal, () => (nowMs += policy.sampleTimeoutMs + policy.sampleIntervalMs));
+      },
+      onTrip,
+      now: () => nowMs,
+      monotonicNow: () => nowMs,
+      schedule: false,
+    });
+    await watchdog.start();
+
+    await expect(watchdog.tick()).resolves.toBeDefined();
+
+    expect(attempts).toBe(3);
+    expect(watchdog.trip).toBeUndefined();
+    expect(onTrip).not.toHaveBeenCalled();
+  });
+
+  it('still trips when the fresh attempt after a late deadline also times out', async () => {
+    const policy = syntheticPolicy();
+    let nowMs = 1_000;
+    let attempts = 0;
+    const watchdog = new ResourceWatchdog(policy, {
+      sample: (signal) => {
+        attempts += 1;
+        if (attempts === 1) return Promise.resolve(syntheticSample(policy));
+        return pausedMidSample(signal, () => (nowMs += policy.sampleTimeoutMs + policy.sampleIntervalMs));
+      },
+      onTrip: async () => {},
+      now: () => nowMs,
+      monotonicNow: () => nowMs,
+      schedule: false,
+    });
+    await watchdog.start();
+
+    await watchdog.tick();
+
+    expect(attempts).toBe(3);
+    expect(watchdog.trip).toMatchObject({ code: 'sample-error', detail: 'resource sample timed out' });
+  });
+
   it('surfaces a failed revocation instead of treating a trip as handled', async () => {
     const policy = syntheticPolicy();
     const watchdog = new ResourceWatchdog(policy, {
@@ -241,13 +342,29 @@ describe('resource watchdog', () => {
   });
 });
 
+/**
+ * A sample that hangs until the watchdog aborts it, after the injected clocks
+ * moved as if this process had been paused while the sample was in flight.
+ */
+function pausedMidSample(signal: AbortSignal, pause: () => void): Promise<ResourceWatchdogSample> {
+  pause();
+  return new Promise((_resolve, reject) => {
+    signal.addEventListener(
+      'abort',
+      () => reject(signal.reason instanceof Error ? signal.reason : new Error('sample aborted')),
+      { once: true },
+    );
+  });
+}
+
 function tempRoot(): string {
   const root = mkdtempSync(join(tmpdir(), 'resource-watchdog-'));
   temporaryDirectories.push(root);
   return root;
 }
 
-function makePolicy(root: string): ResourceWatchdogPolicy {
+/** A version-1 (host-directory) policy: the state classes these tests sample are host directories. */
+function makePolicy(root: string): HostDirectoryWatchdogPolicy {
   const stats = lstatSync(root);
   return {
     ...syntheticPolicy(),
@@ -261,7 +378,7 @@ function makePolicy(root: string): ResourceWatchdogPolicy {
   };
 }
 
-function syntheticPolicy(): ResourceWatchdogPolicy {
+function syntheticPolicy(): HostDirectoryWatchdogPolicy {
   return {
     schemaVersion: 1,
     policyId: 'apple-observed-disk-v1',
@@ -284,7 +401,7 @@ function syntheticPolicy(): ResourceWatchdogPolicy {
 }
 
 function syntheticSample(
-  policy: ResourceWatchdogPolicy,
+  policy: HostDirectoryWatchdogPolicy,
   changes: Partial<ResourceWatchdogSample> = {},
 ): ResourceWatchdogSample {
   const allocatedBytes = changes.allocatedBytes ?? 150;

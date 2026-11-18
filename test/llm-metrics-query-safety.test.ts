@@ -1,231 +1,127 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { LlmStatisticsQueryService } from '../src/llm-metrics/query-service.js';
-import { STATISTICS_MEASURES } from '../src/llm-metrics/query-contract.js';
+import { STATISTICS_MEASURES, StatisticsLimitError } from '../src/llm-metrics/query-contract.js';
+import {
+  openSqliteLlmMetricsReader,
+  type SqliteLlmMetricsReader,
+} from '../src/llm-metrics/persistence/sqlite-repository.js';
 import type {
   LlmDimensionCount,
   LlmExchangeScanQuery,
-  LlmMetricsRepository,
+  LlmMetricsReadRepository,
   StoredLlmExchange,
 } from '../src/llm-metrics/persistence/repository.js';
+import {
+  createStatisticsTestDatabase,
+  statisticsRow,
+  type StatisticsTestDatabase,
+  type StatisticsTestRow,
+} from './helpers/llm-statistics-db.js';
 
 const BASE_TIME = Date.parse('2026-08-15T12:00:00.000Z');
 const ALL_MEASURES = STATISTICS_MEASURES;
 
-function row(index: number, overrides: Partial<StoredLlmExchange> = {}): StoredLlmExchange {
-  return {
+function row(index: number, overrides: Partial<StoredLlmExchange> = {}): StatisticsTestRow {
+  return statisticsRow({
     exchangeId: `exchange-${index}`,
     completedAtMs: BASE_TIME + index,
     servedModel: 'model-1',
     sessionId: 'session-1',
     providerProfile: 'profile-1',
-    refusal: false,
-    outcome: 'stop',
-    inputTokens: 10,
-    uncachedInputTokens: 8,
-    cacheReadInputTokens: 2,
-    cacheWriteInputTokens: 0,
-    toolUseInputTokens: 0,
-    thinkingTokens: 2,
-    nonThinkingOutputTokens: 3,
-    outputTokens: 5,
-    totalTokens: 15,
-    costUsd: 0.001,
-    firstReasoningOffsetMs: 10,
-    firstOutputOffsetMs: 20,
-    lastOutputOffsetMs: 40,
-    upstreamResponseEndOffsetMs: 50,
-    clientDeliveryEndOffsetMs: 60,
-    clientAborted: false,
-    qualityFlags: ['output_timing_population_exact'],
     ...overrides,
-  } as StoredLlmExchange;
+  });
 }
 
-function repository(
+/** In-memory repository for the paths that still page raw rows (exchange lists) or read dimension counts. */
+function fakeRepository(
   rows: readonly StoredLlmExchange[],
   dimensionValues: readonly LlmDimensionCount[] = [],
-): LlmMetricsRepository {
+): LlmMetricsReadRepository {
+  const unexpected = () => Promise.reject(new Error('aggregation is not expected here'));
   return {
-    enqueue: vi.fn().mockReturnValue(true),
-    flush: vi.fn().mockResolvedValue(undefined),
-    close: vi.fn().mockResolvedValue(undefined),
-    health: vi.fn().mockReturnValue({ state: 'ready', schemaVersion: 1 }),
+    health: vi.fn().mockReturnValue({ state: 'ready', schemaVersion: 1, readerState: 'ready' }),
     snapshotMaxSequence: vi.fn().mockResolvedValue(rows.length),
-    scan: vi.fn().mockImplementation((query: LlmExchangeScanQuery) => {
-      const start =
-        query.cursor === undefined
-          ? 0
-          : Math.max(
-              0,
-              rows.findIndex(
-                (candidate) =>
-                  candidate.completedAtMs === query.cursor?.completedAtMs &&
-                  candidate.exchangeId === query.cursor.exchangeId,
-              ) + 1,
-            );
-      return Promise.resolve(rows.slice(start, start + query.limit));
-    }),
+    scan: vi.fn().mockImplementation((query: LlmExchangeScanQuery) => Promise.resolve(rows.slice(0, query.limit))),
     dimensionValues: vi.fn().mockResolvedValue(dimensionValues),
-    deleteBefore: vi.fn().mockResolvedValue({
-      status: 'complete',
-      cutoffMs: 0,
-      snapshotMaxSequence: null,
-      deletedCount: 0,
-      chunksProcessed: 0,
-    }),
+    aggregate: vi.fn(unexpected),
+    distribution: vi.fn(unexpected),
+    sessionTotals: vi.fn(unexpected),
   };
 }
 
 describe('LLM statistics query output safety', () => {
-  it('paginates a stable snapshot beyond the former 10,000-row aggregation limit', async () => {
-    const rows = Array.from({ length: 10_001 }, (_, index) => row(index));
-    const backing = repository(rows);
-    const service = new LlmStatisticsQueryService(backing);
-    await expect(
-      service.summarize({
-        fromMs: BASE_TIME,
-        toMs: BASE_TIME + 20_000,
-        measures: ['requestCount'],
-      }),
-    ).resolves.toMatchObject([{ measure: 'requestCount', value: 10_001 }]);
-    expect(backing.scan).toHaveBeenCalledTimes(11);
-    expect(vi.mocked(backing.scan).mock.calls.every(([query]) => query.snapshotMaxSequence === rows.length)).toBe(true);
-  });
+  const databases: StatisticsTestDatabase[] = [];
+  const readers: SqliteLlmMetricsReader[] = [];
 
-  it('rejects a pathological 100,000-row by 20-measure query before measure sorting', async () => {
-    const rows = Array.from(
-      { length: 100_000 },
-      (_, index) => ({ exchangeId: `minimal-${index}`, completedAtMs: BASE_TIME + index }) as StoredLlmExchange,
-    );
-    const service = new LlmStatisticsQueryService(repository(rows));
-
-    await expect(
-      service.summarize({
-        fromMs: BASE_TIME,
-        toMs: BASE_TIME + rows.length,
-        measures: ALL_MEASURES,
-      }),
-    ).rejects.toThrow('Statistics query exceeds the aggregation-work limit');
-  });
-
-  it('yields to the event loop between expensive aggregation operations', async () => {
-    const rows = Array.from({ length: 5_000 }, (_, index) => row(index));
-    const service = new LlmStatisticsQueryService(repository(rows));
-    let heartbeats = 0;
-    const heartbeat = setInterval(() => heartbeats++, 0);
-    try {
-      await service.summarize({
-        fromMs: BASE_TIME,
-        toMs: BASE_TIME + rows.length,
-        measures: ALL_MEASURES,
-      });
-    } finally {
-      clearInterval(heartbeat);
-    }
-    expect(heartbeats).toBeGreaterThan(0);
-  });
-
-  it('yields while assigning a large calendar series to local-day buckets', async () => {
-    const rows = Array.from({ length: 30_000 }, (_, index) => row(index));
-    const service = new LlmStatisticsQueryService(repository(rows));
-    const originalFormatToParts = Intl.DateTimeFormat.prototype.formatToParts;
-    let formatCalls = 0;
-    const formatSpy = vi.spyOn(Intl.DateTimeFormat.prototype, 'formatToParts').mockImplementation(function (
-      this: Intl.DateTimeFormat,
-      value?: number | Date,
-    ) {
-      formatCalls += 1;
-      return originalFormatToParts.call(this, value);
-    });
-    let active = true;
-    let observedIntermediateProgress = false;
-    const pulse = (): void => {
-      setImmediate(() => {
-        if (formatCalls > 0 && formatCalls < rows.length) observedIntermediateProgress = true;
-        if (active) pulse();
-      });
-    };
-    pulse();
-
-    try {
-      const result = await service.timeSeries({
-        fromMs: BASE_TIME,
-        toMs: BASE_TIME + rows.length,
-        measures: ['requestCount'],
-        calendarBucket: { unit: 'day', timeZone: 'America/Los_Angeles' },
-      });
-      expect(result).toMatchObject([{ summaries: [{ measure: 'requestCount', value: rows.length }] }]);
-    } finally {
-      active = false;
-      formatSpy.mockRestore();
-    }
-    expect(observedIntermediateProgress).toBe(true);
-  });
-
-  it('yields while ranking top groups over a large snapshot', async () => {
-    let aggregationStarted = false;
-    let dimensionReads = 0;
-    const rows = Array.from({ length: 30_000 }, (_, index) => {
-      const item = row(index);
-      Object.defineProperty(item, 'servedModel', {
-        configurable: true,
-        enumerable: true,
-        get() {
-          if (aggregationStarted) dimensionReads += 1;
-          return `model-${index % 10}`;
+  /** A real reader over rows seeded into a fresh database; `scan` is counted. */
+  function seeded(rows: readonly StatisticsTestRow[]): { repository: LlmMetricsReadRepository; scans: () => number } {
+    const database = createStatisticsTestDatabase();
+    databases.push(database);
+    database.insert(rows);
+    const reader = openSqliteLlmMetricsReader({ databasePath: database.databasePath });
+    readers.push(reader);
+    let scans = 0;
+    return {
+      repository: {
+        ...reader,
+        scan: (query) => {
+          scans += 1;
+          return reader.scan(query);
         },
-      });
-      return item;
-    });
-    const backing = repository(rows);
-    vi.mocked(backing.scan).mockImplementation((query: LlmExchangeScanQuery) => {
-      const start =
-        query.cursor === undefined
-          ? 0
-          : Math.max(
-              0,
-              rows.findIndex(
-                (candidate) =>
-                  candidate.completedAtMs === query.cursor?.completedAtMs &&
-                  candidate.exchangeId === query.cursor.exchangeId,
-              ) + 1,
-            );
-      const page = rows.slice(start, start + query.limit);
-      if (page.length === 0) aggregationStarted = true;
-      return Promise.resolve(page);
-    });
-    const service = new LlmStatisticsQueryService(backing);
-    let active = true;
-    let observedIntermediateProgress = false;
-    const pulse = (): void => {
-      setImmediate(() => {
-        if (dimensionReads > 0 && dimensionReads < rows.length) observedIntermediateProgress = true;
-        if (active) pulse();
-      });
+      },
+      scans: () => scans,
     };
-    pulse();
+  }
 
-    try {
-      const result = await service.summarize({
-        fromMs: BASE_TIME,
-        toMs: BASE_TIME + rows.length,
-        measures: ['requestCount'],
-        groupBy: ['servedModel'],
-        topGroups: 8,
-      });
-      expect(result).toHaveLength(8);
-      expect(result.every((summary) => summary.value === 3_000)).toBe(true);
-      expect(result.map((summary) => summary.dimensions.servedModel)).toEqual(
-        Array.from({ length: 8 }, (_, index) => `model-${index}`),
-      );
-    } finally {
-      active = false;
-    }
-    expect(observedIntermediateProgress).toBe(true);
+  afterEach(async () => {
+    await Promise.all(readers.splice(0).map((reader) => reader.close()));
+    for (const database of databases.splice(0)) database.remove();
+    vi.restoreAllMocks();
   });
 
-  it('ranks top groups over the stable snapshot and retains a ranked null-identity group', async () => {
+  it('summarizes past the former 10,000-row and scanned-byte limits without paging rows into this thread', async () => {
+    const rows = Array.from({ length: 40_001 }, (_, index) =>
+      row(index, { qualityFlags: ['router_metadata_present', 'usage_only_observation'] }),
+    );
+    const { repository, scans } = seeded(rows);
+    const service = new LlmStatisticsQueryService(repository);
+    await expect(
+      service.summarize({ fromMs: BASE_TIME, toMs: BASE_TIME + 50_000, measures: ['requestCount', 'totalTokens'] }),
+    ).resolves.toMatchObject([
+      { measure: 'requestCount', value: 40_001 },
+      { measure: 'totalTokens', value: 40_001 * 15 },
+    ]);
+    expect(scans()).toBe(0);
+  });
+
+  it('rejects a query over the scanned-row limit before aggregating', async () => {
+    const { repository } = seeded(Array.from({ length: 1_001 }, (_, index) => row(index)));
+    const service = new LlmStatisticsQueryService(repository, { limits: { maxScannedRows: 1_000 } });
+    const query = { fromMs: BASE_TIME, toMs: BASE_TIME + 2_000, measures: ALL_MEASURES };
+
+    const rejection = service.summarize(query);
+    await expect(rejection).rejects.toBeInstanceOf(StatisticsLimitError);
+    await expect(rejection).rejects.toMatchObject({ code: 'STATISTICS_LIMIT', limit: 'scannedRows', maximum: 1_000 });
+    await expect(service.summarize({ ...query, toMs: BASE_TIME + 999 })).resolves.toHaveLength(ALL_MEASURES.length);
+  });
+
+  it('assigns calendar buckets without per-row work on this thread', async () => {
+    const rows = Array.from({ length: 5_000 }, (_, index) => row(index, { completedAtMs: BASE_TIME + index * 1_000 }));
+    const service = new LlmStatisticsQueryService(seeded(rows).repository);
+    const formatToParts = vi.spyOn(Intl.DateTimeFormat.prototype, 'formatToParts');
+    const result = await service.timeSeries({
+      fromMs: BASE_TIME,
+      toMs: BASE_TIME + 5_000_000,
+      measures: ['requestCount'],
+      calendarBucket: { unit: 'day', timeZone: 'America/Los_Angeles' },
+    });
+    expect(result.reduce((total, bucket) => total + (bucket.summaries[0]?.value ?? 0), 0)).toBe(rows.length);
+    // Day boundaries are computed once per query inside the reader worker, never per row here.
+    expect(formatToParts).not.toHaveBeenCalled();
+  });
+
+  it('ranks top groups over the whole range and retains a ranked null-identity group', async () => {
     const rows = [
       row(0, { completedAtMs: BASE_TIME, servedModel: null }),
       row(1, { completedAtMs: BASE_TIME + 1, servedModel: null }),
@@ -240,7 +136,7 @@ describe('LLM statistics query output safety', () => {
       row(10, { completedAtMs: BASE_TIME + 60_004, servedModel: 'model-a' }),
       row(11, { completedAtMs: BASE_TIME + 60_005, servedModel: 'model-a' }),
     ];
-    const service = new LlmStatisticsQueryService(repository(rows));
+    const service = new LlmStatisticsQueryService(seeded(rows).repository);
 
     const summary = await service.summarize({
       fromMs: BASE_TIME,
@@ -249,13 +145,10 @@ describe('LLM statistics query output safety', () => {
       groupBy: ['servedModel'],
       topGroups: 2,
     });
-    expect(summary).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ dimensions: { servedModel: 'model-a' }, value: 5 }),
-        expect.objectContaining({ dimensions: { servedModel: null }, value: 4 }),
-      ]),
-    );
-    expect(summary).toHaveLength(2);
+    expect(summary).toEqual([
+      expect.objectContaining({ dimensions: { servedModel: 'model-a' }, value: 5 }),
+      expect.objectContaining({ dimensions: { servedModel: null }, value: 4 }),
+    ]);
 
     const series = await service.timeSeries({
       fromMs: BASE_TIME,
@@ -266,12 +159,26 @@ describe('LLM statistics query output safety', () => {
       bucketMs: 60_000,
     });
     expect(series).toHaveLength(2);
-    expect(series.flatMap((bucket) => bucket.summaries)).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ dimensions: { servedModel: 'model-a' }, value: 1 }),
-        expect.objectContaining({ dimensions: { servedModel: 'model-a' }, value: 4 }),
-      ]),
+    expect(series.flatMap((bucket) => bucket.summaries)).toEqual([
+      expect.objectContaining({ dimensions: { servedModel: 'model-a' }, value: 1 }),
+      expect.objectContaining({ dimensions: { servedModel: 'model-a' }, value: 4 }),
+    ]);
+  });
+
+  it('breaks top-group ties deterministically by value', async () => {
+    const rows = Array.from({ length: 30 }, (_, index) => row(index, { servedModel: `model-${index % 10}` }));
+    const service = new LlmStatisticsQueryService(seeded(rows).repository);
+    const result = await service.summarize({
+      fromMs: BASE_TIME,
+      toMs: BASE_TIME + 100,
+      measures: ['requestCount'],
+      groupBy: ['servedModel'],
+      topGroups: 8,
+    });
+    expect(result.map((summary) => summary.dimensions.servedModel)).toEqual(
+      Array.from({ length: 8 }, (_, index) => `model-${index}`),
     );
+    expect(result.every((summary) => summary.value === 3)).toBe(true);
   });
 
   it('retains authoritative daily signals outside the grouped top-provider cutoff', async () => {
@@ -288,7 +195,7 @@ describe('LLM statistics query output safety', () => {
         outcome: outsideTopGroups ? 'error' : 'stop',
       });
     });
-    const service = new LlmStatisticsQueryService(repository(rows));
+    const service = new LlmStatisticsQueryService(seeded(rows).repository);
 
     const grouped = await service.timeSeries({
       fromMs: dayFromMs,
@@ -301,12 +208,7 @@ describe('LLM statistics query output safety', () => {
     const groupedSummaries = grouped.flatMap((bucket) => bucket.summaries);
     expect(groupedSummaries).toHaveLength(16);
     expect(groupedSummaries.some((summary) => summary.dimensions.logicalProvider === 'provider-09')).toBe(false);
-    expect(groupedSummaries.filter((summary) => summary.measure === 'refusalCount')).toSatisfy(
-      (summaries: typeof groupedSummaries) => summaries.every((summary) => summary.value === 0),
-    );
-    expect(groupedSummaries.filter((summary) => summary.measure === 'errorCount')).toSatisfy(
-      (summaries: typeof groupedSummaries) => summaries.every((summary) => summary.value === 0),
-    );
+    expect(groupedSummaries.every((summary) => summary.value === 0)).toBe(true);
 
     const authoritative = await service.timeSeries({
       fromMs: dayFromMs,
@@ -315,12 +217,10 @@ describe('LLM statistics query output safety', () => {
       calendarBucket: { unit: 'day', timeZone: 'UTC' },
     });
     expect(authoritative).toHaveLength(1);
-    expect(authoritative[0]?.summaries).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ dimensions: {}, measure: 'refusalCount', value: 1 }),
-        expect.objectContaining({ dimensions: {}, measure: 'errorCount', value: 1 }),
-      ]),
-    );
+    expect(authoritative[0]?.summaries).toEqual([
+      expect.objectContaining({ dimensions: {}, measure: 'refusalCount', value: 1 }),
+      expect.objectContaining({ dimensions: {}, measure: 'errorCount', value: 1 }),
+    ]);
   });
 
   it('rejects a list page whose valid bounded rows exceed the byte budget', async () => {
@@ -328,11 +228,11 @@ describe('LLM statistics query output safety', () => {
     const rows = Array.from({ length: 300 }, (_, index) =>
       row(index, { qualityFlags: Array.from({ length: 64 }, () => longFlag) }),
     );
-    const service = new LlmStatisticsQueryService(repository(rows));
+    const service = new LlmStatisticsQueryService(fakeRepository(rows));
 
-    await expect(service.listExchanges({ fromMs: BASE_TIME, toMs: BASE_TIME + 1_000, limit: 500 })).rejects.toThrow(
-      'Statistics response exceeds the output-byte limit',
-    );
+    const rejection = service.listExchanges({ fromMs: BASE_TIME, toMs: BASE_TIME + 1_000, limit: 500 });
+    await expect(rejection).rejects.toThrow('Statistics response exceeds the output-byte limit');
+    await expect(rejection).rejects.toMatchObject({ code: 'STATISTICS_LIMIT', limit: 'outputBytes' });
   });
 
   it('rejects grouped summaries with high-cardinality maximum-length identifiers', async () => {
@@ -346,7 +246,7 @@ describe('LLM statistics query output safety', () => {
         providerProfile: longProfile,
       });
     });
-    const service = new LlmStatisticsQueryService(repository(rows));
+    const service = new LlmStatisticsQueryService(seeded(rows).repository);
 
     await expect(
       service.summarize({
@@ -359,17 +259,31 @@ describe('LLM statistics query output safety', () => {
   });
 
   it('caps buckets multiplied by measures across an entire time series', async () => {
-    const rows = Array.from({ length: 501 }, (_, index) => row(index, { completedAtMs: BASE_TIME + index * 60_000 }));
-    const service = new LlmStatisticsQueryService(repository(rows));
+    const rows = Array.from({ length: 600 }, (_, index) => row(index, { completedAtMs: BASE_TIME + index * 60_000 }));
+    const service = new LlmStatisticsQueryService(seeded(rows).repository);
 
     await expect(
       service.timeSeries({
         fromMs: BASE_TIME,
-        toMs: BASE_TIME + 500 * 60_000,
+        toMs: BASE_TIME + 600 * 60_000,
         bucketMs: 60_000,
         measures: ALL_MEASURES,
       }),
     ).rejects.toThrow('Statistics response exceeds the output-cardinality limit');
+  });
+
+  it('caps the groups of one summary', async () => {
+    const rows = Array.from({ length: 501 }, (_, index) => row(index, { sessionId: `session-${index}` }));
+    const service = new LlmStatisticsQueryService(seeded(rows).repository);
+
+    await expect(
+      service.summarize({
+        fromMs: BASE_TIME,
+        toMs: BASE_TIME + 1_000,
+        measures: ['requestCount'],
+        groupBy: ['sessionId'],
+      }),
+    ).rejects.toMatchObject({ code: 'STATISTICS_LIMIT', limit: 'groups', maximum: 500 });
   });
 
   it('enforces the byte budget on dimension results', async () => {
@@ -377,7 +291,7 @@ describe('LLM statistics query output safety', () => {
       value: `dimension-${index}-${'x'.repeat(10_000)}`,
       count: 1,
     }));
-    const service = new LlmStatisticsQueryService(repository([], values));
+    const service = new LlmStatisticsQueryService(fakeRepository([], values));
 
     await expect(
       service.dimensions({ fromMs: BASE_TIME, toMs: BASE_TIME + 1_000, dimension: 'servedModel', limit: 500 }),
@@ -385,17 +299,15 @@ describe('LLM statistics query output safety', () => {
   });
 
   it('preserves normal list, summary, series, and dimension queries', async () => {
-    const rows = [row(0), row(1, { completedAtMs: BASE_TIME + 60_000 })];
-    const service = new LlmStatisticsQueryService(
-      repository(rows, [
-        { value: 'model-1', count: 2 },
-        { value: null, count: 1 },
-      ]),
-    );
+    const rows = [row(0), row(1, { completedAtMs: BASE_TIME + 60_000, servedModel: null })];
+    const service = new LlmStatisticsQueryService(seeded(rows).repository);
 
     await expect(
       service.listExchanges({ fromMs: BASE_TIME, toMs: BASE_TIME + 120_000, limit: 2 }),
-    ).resolves.toMatchObject({ items: rows, nextCursor: null });
+    ).resolves.toMatchObject({
+      items: [{ exchangeId: rows[1]?.exchangeId }, { exchangeId: rows[0]?.exchangeId }],
+      nextCursor: null,
+    });
     await expect(
       service.summarize({
         fromMs: BASE_TIME,
@@ -413,7 +325,10 @@ describe('LLM statistics query output safety', () => {
     ).resolves.toHaveLength(2);
     await expect(
       service.dimensions({ fromMs: BASE_TIME, toMs: BASE_TIME + 120_000, dimension: 'servedModel' }),
-    ).resolves.toHaveLength(2);
+    ).resolves.toEqual([
+      { value: null, count: 1 },
+      { value: 'model-1', count: 1 },
+    ]);
   });
 
   it('returns sample-session counts and a bounded coverage-aware distribution', async () => {
@@ -423,7 +338,7 @@ describe('LLM statistics query output safety', () => {
       row(2, { sessionId: 'session-2', outputTokens: 30, clientDeliveryEndOffsetMs: 100 }),
       row(3, { sessionId: null, outputTokens: null, clientDeliveryEndOffsetMs: 100 }),
     ];
-    const service = new LlmStatisticsQueryService(repository(rows));
+    const service = new LlmStatisticsQueryService(seeded(rows).repository);
 
     await expect(
       service.summarize({
@@ -433,7 +348,7 @@ describe('LLM statistics query output safety', () => {
       }),
     ).resolves.toMatchObject([
       { measure: 'requestCount', sampleCount: 4, sampleSessionCount: 2 },
-      { measure: 'effectiveOutputTokensPerSecond', sampleCount: 3, sampleSessionCount: 2 },
+      { measure: 'effectiveOutputTokensPerSecond', sampleCount: 3, sampleSessionCount: 2, median: 200 },
     ]);
 
     const distribution = await service.distribution({
@@ -459,7 +374,7 @@ describe('LLM statistics query output safety', () => {
       row(0, { completedAtMs: Date.parse('2026-11-01T08:00:00.000Z') }),
       row(1, { completedAtMs: Date.parse('2026-11-02T09:00:00.000Z') }),
     ];
-    const service = new LlmStatisticsQueryService(repository(rows));
+    const service = new LlmStatisticsQueryService(seeded(rows).repository);
     const buckets = await service.timeSeries({
       fromMs: Date.parse('2026-11-01T07:00:00.000Z'),
       toMs: Date.parse('2026-11-03T07:59:59.999Z'),
@@ -476,7 +391,7 @@ describe('LLM statistics query output safety', () => {
 
   it('uses a 23-hour IANA calendar day across daylight-saving spring-forward', async () => {
     const service = new LlmStatisticsQueryService(
-      repository([row(0, { completedAtMs: Date.parse('2026-03-08T12:00:00.000Z') })]),
+      seeded([row(0, { completedAtMs: Date.parse('2026-03-08T12:00:00.000Z') })]).repository,
     );
     const buckets = await service.timeSeries({
       fromMs: Date.parse('2026-03-08T08:00:00.000Z'),
@@ -492,5 +407,25 @@ describe('LLM statistics query output safety', () => {
       },
     ]);
     expect(buckets[0].toMs - buckets[0].fromMs).toBe(23 * 60 * 60 * 1_000);
+  });
+
+  it('starts a bucket at a mid-day range start and skips a calendar day a time zone never had', async () => {
+    // Pacific/Apia skipped 2011-12-30 entirely when it moved across the date line.
+    const rows = [
+      row(0, { completedAtMs: Date.parse('2011-12-29T12:00:00.000Z') }),
+      row(1, { completedAtMs: Date.parse('2011-12-30T12:00:00.000Z') }),
+    ];
+    const service = new LlmStatisticsQueryService(seeded(rows).repository);
+    const buckets = await service.timeSeries({
+      fromMs: Date.parse('2011-12-29T11:00:00.000Z'),
+      toMs: Date.parse('2011-12-31T10:59:59.999Z'),
+      measures: ['requestCount'],
+      calendarBucket: { unit: 'day', timeZone: 'Pacific/Apia' },
+    });
+    expect(buckets.map((bucket) => bucket.summaries[0]?.value)).toEqual([1, 1]);
+    expect(buckets[0]?.fromMs).toBe(Date.parse('2011-12-29T11:00:00.000Z'));
+    // The local day after 2011-12-29 is 2011-12-31, which starts at 2011-12-30T10:00Z.
+    expect(buckets[0]?.toMs).toBe(Date.parse('2011-12-30T10:00:00.000Z'));
+    expect(buckets[1]?.fromMs).toBe(Date.parse('2011-12-30T10:00:00.000Z'));
   });
 });

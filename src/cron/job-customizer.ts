@@ -9,6 +9,7 @@ import { buildSystemPrompt } from '../pipeline/constitution-customizer.js';
 import { runConstitutionCustomizerLoop, type CustomizerLoopContext } from '../pipeline/customizer-loop.js';
 import type { GitHubIdentity } from '../pipeline/github-identity.js';
 import type { ToolAnnotation } from '../pipeline/types.js';
+import type { ApprovalScope } from '../audit/approval-history.js';
 
 // ---------------------------------------------------------------------------
 // Job-Scoped System Prompt
@@ -48,11 +49,14 @@ broad permissions unless the task requires them.`;
  *
  * @param initialConstitution - Starting constitution text (from generator or existing job)
  * @param taskDescription - The task description (context for the LLM)
+ * @param amendmentScope - The job's approval scope when editing an existing job:
+ *   amendments learned from its repeated human approvals are offered first
  * @returns The final constitution text, or undefined if the user cancelled
  */
 export async function runJobConstitutionCustomizer(
   initialConstitution: string,
   taskDescription: string,
+  amendmentScope?: ApprovalScope,
 ): Promise<string | undefined> {
   return runConstitutionCustomizerLoop(
     initialConstitution,
@@ -62,6 +66,7 @@ export async function runJobConstitutionCustomizer(
       stepName: 'job-customize-policy',
       noteTitle: 'Current Job Constitution',
       refinePlaceholder: 'e.g., "also allow git push to origin"',
+      ...(amendmentScope !== undefined ? { amendmentScope } : {}),
     },
   );
 }

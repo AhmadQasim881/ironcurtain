@@ -17,6 +17,7 @@ import { arch } from 'node:os';
 import { resolve } from 'node:path';
 import { z } from 'zod';
 import { getIronCurtainHome } from '../config/paths.js';
+import { canonicalPathBelowHome, resolveCanonicalIronCurtainHome } from '../docker-workload/canonical-home.js';
 import { computeHash, sha256HexSchema } from '../hash.js';
 import { loadImmutableHostJson, writeStableJsonAtomic } from '../hardened-fs.js';
 import { verifyOciImageArchive } from './oci-image-archive.js';
@@ -105,8 +106,24 @@ export function prepareSelectedAgentArtifact(
 ): Promise<SelectedAgentArtifact> {
   if (!/^[a-f0-9]{64}$/u.test(options.buildHash)) throw new Error('selected agent build hash is invalid');
   const architecture = options.architecture ?? hostArchitecture();
-  const cacheRoot = options.cacheRoot ?? resolve(getIronCurtainHome(), 'docker-workload', 'agent-artifacts');
+  const cacheRoot = options.cacheRoot ?? defaultSelectedAgentArtifactCacheRoot();
   return resolveCurrentArtifact({ ...options, architecture, cacheRoot });
+}
+
+/**
+ * The canonical cache below the IronCurtain home. The home itself may be
+ * reached through a symlink; the cache's private-directory checks and the
+ * archive later hard-linked into lease staging need its real location.
+ */
+function defaultSelectedAgentArtifactCacheRoot(): string {
+  const configuredHome = getIronCurtainHome();
+  mkdirSync(configuredHome, { recursive: true, mode: 0o700 });
+  const home = resolveCanonicalIronCurtainHome(configuredHome);
+  return canonicalPathBelowHome(
+    home,
+    resolve(configuredHome, 'docker-workload', 'agent-artifacts'),
+    'selected agent artifact cache',
+  );
 }
 
 async function resolveCurrentArtifact(
@@ -244,7 +261,9 @@ async function prepareSelectedAgentArtifactUncached(
         if (!published) rmSync(temporaryDirectory, { recursive: true, force: true });
       }
     },
-    { maxWaitMs: 60 * 60_000, staleMs: 60 * 60_000 },
+    // A live holder is never stolen from (see provision-lock.ts); a waiter
+    // gives up after an hour instead.
+    { maxWaitMs: 60 * 60_000 },
   );
 }
 

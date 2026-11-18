@@ -1,5 +1,7 @@
 # Workflow CLI Subcommand Design
 
+**Status (2026-11-14):** Implemented, and grown since: named YAML definitions, `workflow list`, and the daemon-backed `run`, `await`, `status`, `gate`, `show` and `escalation` commands (`src/workflow/workflow-command.ts`, `WORKFLOWS.md`).
+
 ## Overview
 
 The `ironcurtain workflow` subcommand graduates the spike script (`examples/workflow-real-spike.ts`) into a proper CLI command. It provides `start`, `resume`, and `inspect` operations for running multi-agent workflows from the terminal with interactive gate handling.
@@ -21,7 +23,7 @@ ironcurtain workflow --help
 | `resume`   | `<baseDir>`                  | `--state <name>` (optional, synthesize checkpoint at this state), `--model <id>` (optional, override model for this run) |
 | `inspect`  | `<baseDir>`                  | `--all` (optional, show full message log instead of last 20)                                                             |
 
-Argument parsing uses `node:util parseArgs` consistent with the rest of the CLI. The `workflow` case in `src/cli.ts` passes `process.argv.slice(3)` to the workflow command module, which re-parses to determine the sub-subcommand (`start`/`resume`/`inspect`).
+Argument parsing uses `node:util parseArgs` consistent with the rest of the CLI. The `workflow` case in `src/cli.ts` passes the arguments after `workflow` to the workflow command module, which re-parses to determine the sub-subcommand (`start`/`resume`/`inspect`). Before dispatching, `src/cli.ts` runs the V8 sandbox preflight only for the subcommands that run agent sessions in the CLI process (`start`, `resume-standalone`, `run-state`, and any unknown one); help and the read-only or daemon-backed subcommands (`list`, `inspect`, `lint`, `watch`, `run`, `resume`, `status`, `await`, `gate`, `escalation`, `show`) skip it, so they work on a host where isolated-vm cannot load (`sandboxPreflightRequired` in `src/cli-routing.ts`).
 
 ## Module Decomposition
 
@@ -102,7 +104,7 @@ Add to the switch statement:
 ```typescript
 case 'workflow': {
   const { main: workflowMain } = await import('./workflow/workflow-command.js');
-  await workflowMain(process.argv.slice(3));
+  await workflowMain(args); // the arguments after the command name
   break;
 }
 ```
@@ -220,6 +222,8 @@ process.exit(controller.signal.aborted ? 130 : exitCodeFromStatus(orchestrator, 
 ```
 
 No hard `process.exit(1)` during the poll loop. The abort signal allows the event loop to finish its current iteration and exit cleanly.
+
+As implemented, `installWorkflowShutdownSignals` (`src/workflow/shutdown-signals.ts`, a wrapper over the shared `installShutdownSignals` in `src/utils/shutdown-signals.ts`) handles SIGINT, SIGTERM and SIGHUP: the first signal aborts the controller and arms a 30 s force exit, a later SIGINT or SIGTERM exits at once. A repeated SIGHUP does not, because a closing terminal delivers two and the teardown the first one started must still drain; stdio stream errors (EIO from the hung-up terminal) are ignored from the first signal on. After a signal the `finally` calls `shutdownAll(workflowStopOptionsForSignal(signal))`, which records the runs as `Workflow interrupted by <signal>` and bounds `snapshotOnStop` commits to 15 s so the force exit never lands mid-commit. `abort()` itself stops in-flight work before it snapshots: a session created after it is closed unused, fan-out lanes are stopped, and a running host command is killed. The daemon uses the same helper (`installDaemonShutdownSignals`) for SIGINT and SIGTERM, and for SIGHUP while its stdout or stderr is a terminal (closing it drains the daemon). Outside a terminal (`nohup`, a service manager, the `--ensure-daemon` child) the daemon ignores SIGHUP with a listener of its own: Node resets the ignored disposition `nohup` sets to the default action at startup, so leaving SIGHUP unhandled would let a logout kill the daemon with no drain. It drains its own workflows in `IronCurtainDaemon.shutdown()`.
 
 ## Exit Codes
 

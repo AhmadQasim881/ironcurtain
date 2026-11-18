@@ -44,14 +44,17 @@ async function createHostPolicyListener(response = 'desktop-host-loopback-target
     socket.setTimeout(5_000, () => socket.destroy());
     socket.once('data', () => socket.end(response));
   });
+  // Production binds the Docker Desktop egress (and MITM) listeners to
+  // loopback: Desktop delivers host.docker.internal traffic to the host as
+  // loopback, so this fixture proves the relay path works with that bind.
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
-    server.listen(0, '0.0.0.0', resolve);
+    server.listen(0, '127.0.0.1', resolve);
   });
   const address = server.address();
-  if (address === null || typeof address === 'string' || address.address !== '0.0.0.0') {
+  if (address === null || typeof address === 'string' || address.address !== '127.0.0.1') {
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    throw new Error('Desktop relay integration listener did not bind the production IPv4 wildcard address');
+    throw new Error('Desktop relay integration listener did not bind the production loopback address');
   }
   return { server, port: address.port, remoteAddresses };
 }

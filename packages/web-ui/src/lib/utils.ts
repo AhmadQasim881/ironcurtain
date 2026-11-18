@@ -22,6 +22,8 @@ export function phaseBadgeVariant(
       return 'secondary';
     case 'interrupted':
       return 'warning';
+    case 'running_elsewhere':
+      return 'outline';
     default:
       return 'outline';
   }

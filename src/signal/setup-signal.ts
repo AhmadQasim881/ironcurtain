@@ -1,11 +1,15 @@
 /**
  * Interactive Signal onboarding wizard.
  *
- * Implements `ironcurtain setup-signal` with two modes:
+ * Implements `ironcurtain setup-signal` with three modes:
  * - Full setup: Docker check, container start, registration,
  *   recipient identity verification, and config save.
  * - Re-trust (`--re-trust`): Re-verify a changed identity key without
  *   repeating the full registration flow.
+ * - Image update (`--update-image`): pull the current signal-cli image,
+ *   show its digest and, once confirmed, pin it in config.json. This is the
+ *   only way the bridge image changes (see `signal-image.ts`); the full setup
+ *   offers the same step when the configured image is not usable without it.
  *
  * Uses @clack/prompts for consistent terminal UI with other IronCurtain
  * interactive commands (config, first-start).
@@ -16,14 +20,36 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import * as p from '@clack/prompts';
 import { createDockerManager } from '../docker/docker-manager.js';
-import { saveUserConfig, loadUserConfig } from '../config/user-config.js';
+import type { ContainerRuntime } from '../docker/types.js';
+import { saveUserConfig, loadUserConfig, loadSavedSignalContainerConfig } from '../config/user-config.js';
 import {
   createSignalContainerManager,
   type SignalContainerManager,
   type SignalContainerConfig,
 } from './signal-container.js';
 import { SIGNAL_DEFAULTS, resolveSignalConfig, getSignalDataDir } from './signal-config.js';
+import {
+  SIGNAL_IMAGE_DIGEST_PLACEHOLDER,
+  SIGNAL_IMAGE_UPDATE_TAG,
+  SIGNAL_BRIDGE_LOCAL_IMAGE,
+  SIGNAL_BRIDGE_BUILD_COMMAND,
+  discardSignalImageCandidate,
+  hasSignalImageErrorCode,
+  parseImageReference,
+  pullSignalImageCandidate,
+  tagNotRestoredMessage,
+  type SignalImageCandidate,
+} from './signal-image.js';
+import { selectRecipientIdentity } from './recipient-identity.js';
 import { checkDockerAvailable } from '../docker/docker-probe.js';
+import type { SignalBridgeClient } from './signal-bridge-client.js';
+
+function localImageBuildGuidance(): string {
+  return (
+    `Build the local authenticated Signal bridge by running "${SIGNAL_BRIDGE_BUILD_COMMAND}" in the IronCurtain ` +
+    'source checkout, then retry. Alternatively, configure signal.container.image with a reviewed published authenticated image.'
+  );
+}
 
 // ---- Cancel handling ------------------------------------------------
 
@@ -73,63 +99,230 @@ async function validateDocker(): Promise<void> {
 
 // ---- Container setup ------------------------------------------------
 
+/**
+ * The container settings for the wizard: the image and port saved in
+ * config.json (an image pinned earlier, a custom port), else the defaults.
+ */
 function resolveContainerConfig(): SignalContainerConfig {
+  const saved = loadSavedSignalContainerConfig();
   return {
-    image: SIGNAL_DEFAULTS.image,
-    port: SIGNAL_DEFAULTS.port,
+    image: saved?.image ?? SIGNAL_DEFAULTS.image,
+    port: saved?.port ?? SIGNAL_DEFAULTS.port,
     dataDir: getSignalDataDir(),
     containerName: SIGNAL_DEFAULTS.containerName,
   };
 }
 
-async function startContainer(
-  manager: SignalContainerManager,
-  containerConfig: SignalContainerConfig,
-): Promise<string> {
-  const startSpinner = p.spinner();
-  startSpinner.start('Starting signal-cli container (pulling image if needed)...');
-  try {
-    const baseUrl = await manager.ensureRunning();
+interface StartedContainer {
+  readonly client: SignalBridgeClient;
+  readonly manager: SignalContainerManager;
+  /** The settings the container runs with (the image may have been pinned just now). */
+  readonly containerConfig: SignalContainerConfig;
+}
+
+/**
+ * Starts the container and waits for it to become healthy. When the
+ * configured image cannot be used without an explicit pull (this build has
+ * no reviewed digest, or a tag is not present locally), offers to pull the
+ * current image and pin its digest, then starts from that.
+ */
+async function startContainer(docker: ContainerRuntime, initial: SignalContainerConfig): Promise<StartedContainer> {
+  let containerConfig = initial;
+  for (;;) {
+    const manager = createSignalContainerManager(docker, containerConfig);
+    const startSpinner = p.spinner();
+    startSpinner.start('Starting signal-cli container...');
+    let client: SignalBridgeClient;
+    try {
+      client = await manager.ensureRunning();
+    } catch (err) {
+      if (
+        containerConfig.image === SIGNAL_BRIDGE_LOCAL_IMAGE &&
+        hasSignalImageErrorCode(err, 'SIGNAL_IMAGE_NOT_PINNED')
+      ) {
+        startSpinner.stop('Local authenticated Signal bridge image is missing');
+        p.log.error(localImageBuildGuidance());
+        process.exit(1);
+      }
+      if (containerConfig === initial && hasSignalImageErrorCode(err, 'SIGNAL_IMAGE_NOT_PINNED')) {
+        startSpinner.stop('The signal-cli image is not pinned yet');
+        const pinned = await pinImageInteractively(docker, containerConfig.image);
+        containerConfig = { ...containerConfig, image: pinned.reference };
+        continue;
+      }
+      startSpinner.stop('Container start failed');
+      reportContainerStartFailure(err, containerConfig);
+      process.exit(1);
+    }
     startSpinner.stop(`Container started on port ${containerConfig.port}`);
 
     const healthSpinner = p.spinner();
     healthSpinner.start('Waiting for signal-cli to become healthy...');
     try {
-      await manager.waitForHealthy(baseUrl);
+      await manager.waitForHealthy(client);
       healthSpinner.stop('Health check passed');
     } catch (err) {
+      client.close();
       healthSpinner.stop('Health check failed');
-      p.log.error(`signal-cli container did not become healthy: ${err instanceof Error ? err.message : String(err)}`);
+      p.log.error(`signal-cli container did not become healthy: ${errorText(err)}`);
       process.exit(1);
     }
 
-    return baseUrl;
-  } catch (err) {
-    startSpinner.stop('Container start failed');
-    const message = err instanceof Error ? err.message : String(err);
+    return { client, manager, containerConfig };
+  }
+}
 
-    if (message.includes('port') && message.includes('already')) {
-      p.log.error(
-        `Port ${containerConfig.port} is already in use.\n` +
-          'Either stop the conflicting service or configure a different port\n' +
-          'in ~/.ironcurtain/config.json under signal.container.port.',
-      );
-    } else {
-      p.log.error(`Failed to start container: ${message}`);
-    }
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function reportContainerStartFailure(err: unknown, containerConfig: SignalContainerConfig): void {
+  const message = errorText(err);
+  if (message.includes('port') && message.includes('already')) {
+    p.log.error(
+      `Port ${containerConfig.port} is already in use.\n` +
+        'Either stop the conflicting service or configure a different port\n' +
+        'in ~/.ironcurtain/config.json under signal.container.port.',
+    );
+  } else {
+    p.log.error(`Failed to start container: ${message}`);
+  }
+}
+
+// ---- Image pinning --------------------------------------------------
+
+/**
+ * Pulls the current image for `currentImage` (its repository, at the tag it
+ * names or `latest`) and shows its digest. Exits when the pull fails.
+ */
+async function pullCandidate(docker: ContainerRuntime, currentImage: string): Promise<SignalImageCandidate> {
+  const reference = parseImageReference(currentImage);
+  const spinner = p.spinner();
+  spinner.start(
+    `Pulling ${reference ? `${reference.repository}:${reference.tag ?? SIGNAL_IMAGE_UPDATE_TAG}` : currentImage}...`,
+  );
+  let candidate: SignalImageCandidate;
+  try {
+    candidate = await pullSignalImageCandidate(docker, currentImage);
+  } catch (err) {
+    spinner.stop('Pull failed');
+    p.log.error(errorText(err));
     process.exit(1);
   }
+  spinner.stop(`Pulled ${candidate.source}`);
+
+  const current =
+    reference?.digest === SIGNAL_IMAGE_DIGEST_PLACEHOLDER
+      ? `${currentImage}\n                  (placeholder: no reviewed digest in this build)`
+      : currentImage;
+  p.note(
+    `Pulled:           ${candidate.source}\n` +
+      `Digest:           ${candidate.digest}\n` +
+      `Image ID:         ${candidate.imageId}\n` +
+      `Built:            ${candidate.created || 'unknown'}\n` +
+      `Configured now:   ${current}\n\n` +
+      'Compare the digest with the one the image publisher lists for this tag before you pin it.\n' +
+      'The signal-cli container sees every message and every identity check, so it can approve escalations.',
+    'signal-cli image',
+  );
+  return candidate;
+}
+
+/**
+ * Asks whether to pin `candidate`. When the user declines or cancels, the
+ * pull is undone first (a configured tag goes back to the image it named),
+ * so declining leaves the bridge image as it was; returns false then.
+ */
+async function confirmCandidate(
+  docker: ContainerRuntime,
+  candidate: SignalImageCandidate,
+  message: string,
+): Promise<boolean> {
+  const confirmed = await p.confirm({ message, initialValue: true });
+  if (confirmed === true) return true;
+  if (!(await discardSignalImageCandidate(docker, candidate))) p.log.error(tagNotRestoredMessage(candidate.source));
+  handleCancel(confirmed);
+  return false;
+}
+
+/**
+ * The wizard's pin step: explains why, pulls the current image, shows its
+ * digest and asks to pin it. Exits when the user declines (setup cannot go
+ * on without an image).
+ */
+async function pinImageInteractively(docker: ContainerRuntime, currentImage: string): Promise<SignalImageCandidate> {
+  p.log.warn(
+    'IronCurtain runs the signal-cli bridge only from an image pinned by digest, and the configured image\n' +
+      `(${currentImage}) cannot be used without pulling one first. The wizard can pull the current image\n` +
+      'now, show its digest and pin it in ~/.ironcurtain/config.json.',
+  );
+  const candidate = await pullCandidate(docker, currentImage);
+  if (!(await confirmCandidate(docker, candidate, `Pin ${candidate.reference} and use it?`))) {
+    p.cancel('Setup cancelled: no pinned signal-cli image. Set signal.container.image to an image pinned by digest.');
+    process.exit(0);
+  }
+  return candidate;
+}
+
+/**
+ * `ironcurtain setup-signal --update-image`: pulls the current signal-cli
+ * image, shows its digest and, once confirmed, records
+ * `<repository>@<digest>` as `signal.container.image`. The container is
+ * recreated from it the next time the bot or daemon starts it. Declining
+ * changes nothing: a configured tag the pull moved is put back.
+ */
+export async function runUpdateImage(): Promise<void> {
+  p.intro('Signal Bridge Image Update');
+
+  const saved = loadSavedSignalContainerConfig();
+  const currentImage = saved?.image ?? SIGNAL_DEFAULTS.image;
+  if (currentImage === SIGNAL_BRIDGE_LOCAL_IMAGE) {
+    p.log.info(localImageBuildGuidance());
+    p.outro('Rebuild the local authenticated image to update it.');
+    return;
+  }
+  if (parseImageReference(currentImage) === undefined) {
+    p.log.error(
+      `signal.container.image is not a valid image reference: ${JSON.stringify(currentImage)}. ` +
+        'Fix or remove it in ~/.ironcurtain/config.json and try again.',
+    );
+    process.exit(1);
+  }
+
+  await validateDocker();
+  const docker = createDockerManager();
+  const candidate = await pullCandidate(docker, currentImage);
+
+  if (parseImageReference(currentImage)?.digest === candidate.digest) {
+    p.outro('Already pinned to this image. Nothing changed.');
+    return;
+  }
+
+  if (!(await confirmCandidate(docker, candidate, `Pin ${candidate.reference}?`))) {
+    p.cancel('Image not changed.');
+    return;
+  }
+
+  saveUserConfig({ signal: { container: { ...saved, image: candidate.reference } } });
+  p.outro(
+    `Pinned ${candidate.reference}. Restart \`ironcurtain bot\` or the daemon to switch: ` +
+      'the signal-cli container is recreated from the pinned image when it next starts.',
+  );
 }
 
 // ---- Account discovery -----------------------------------------------
 
-async function fetchAccounts(baseUrl: string): Promise<string[]> {
+async function fetchAccounts(client: SignalBridgeClient): Promise<string[]> {
   try {
-    const resp = await fetch(`${baseUrl}/v1/accounts`);
+    const resp = await client.request('/v1/accounts');
+    if (resp.status === 401 || resp.status === 403) {
+      throw new Error('Signal bridge authentication failed');
+    }
     if (!resp.ok) return [];
     const accounts = (await resp.json()) as string[];
     if (accounts.length > 0) return accounts;
-  } catch {
+  } catch (err) {
+    if (err instanceof Error && err.message === 'Signal bridge authentication failed') throw err;
     // Fall through to local check
   }
 
@@ -162,7 +355,7 @@ function readAccountsFromDataDir(): string[] {
  * Registers a new phone number with Signal via the signal-cli REST API.
  * Handles the captcha and SMS verification code flow.
  */
-export async function registerNewNumber(baseUrl: string): Promise<string> {
+export async function registerNewNumber(client: SignalBridgeClient): Promise<string> {
   const phoneNumber = await p.text({
     message: 'Enter the phone number to register (with country code):',
     placeholder: '+15551234567',
@@ -194,20 +387,19 @@ export async function registerNewNumber(baseUrl: string): Promise<string> {
   const registerSpinner = p.spinner();
   registerSpinner.start(`Registering ${phoneNumber as string}...`);
 
-  const registerResp = await fetch(`${baseUrl}/v1/register/${encodeURIComponent(phoneNumber as string)}`, {
+  const registerResp = await client.request(`/v1/register/${encodeURIComponent(phoneNumber as string)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ captcha }),
   });
   if (!registerResp.ok) {
     registerSpinner.stop('Registration failed');
-    const body = await registerResp.text();
     if (registerResp.status === 400) {
-      p.log.error(`Captcha rejected by Signal. Please try again with a new captcha.\n` + `Server response: ${body}`);
+      p.log.error('Captcha rejected by Signal. Please try again with a new captcha.');
     } else {
-      p.log.error(`Registration failed: ${registerResp.status} ${body}`);
+      p.log.error(`Registration failed: ${registerResp.status}`);
     }
-    throw new Error(`Registration failed: ${registerResp.status} ${body}`);
+    throw new Error(`Registration failed: ${registerResp.status}`);
   }
   registerSpinner.stop('Registration request sent');
 
@@ -224,15 +416,14 @@ export async function registerNewNumber(baseUrl: string): Promise<string> {
   const verifySpinner = p.spinner();
   verifySpinner.start('Verifying...');
 
-  const verifyResp = await fetch(
-    `${baseUrl}/v1/register/${encodeURIComponent(phoneNumber as string)}/verify/${normalizedCode}`,
+  const verifyResp = await client.request(
+    `/v1/register/${encodeURIComponent(phoneNumber as string)}/verify/${normalizedCode}`,
     { method: 'POST' },
   );
   if (!verifyResp.ok) {
     verifySpinner.stop('Verification failed');
-    const body = await verifyResp.text();
-    p.log.error(`Verification failed: ${verifyResp.status} ${body}`);
-    throw new Error(`Verification failed: ${verifyResp.status} ${body}`);
+    p.log.error(`Verification failed: ${verifyResp.status}`);
+    throw new Error(`Verification failed: ${verifyResp.status}`);
   }
 
   verifySpinner.stop('Phone number verified!');
@@ -241,13 +432,15 @@ export async function registerNewNumber(baseUrl: string): Promise<string> {
 
 // ---- Challenge-response identity verification -----------------------
 
-/** Response shape from signal-cli's identity endpoint. */
-interface SignalIdentity {
-  number: string;
-  safety_number: string;
-  fingerprint: string;
-  added: string;
-  status: string;
+/** The recipient's identity as captured by the challenge-response exchange. */
+export interface CapturedIdentity {
+  /** The identity key fingerprint (no whitespace), stored as `recipientIdentityKey`. */
+  readonly identityKey: string;
+  /**
+   * The account UUID signal-cli lists for that key, when any, stored as
+   * `recipientUuid` so the runtime check verifies this very record.
+   */
+  readonly uuid?: string;
 }
 
 /**
@@ -259,15 +452,15 @@ interface SignalIdentity {
  * after a successful message exchange has occurred.
  */
 export async function verifyRecipientIdentity(
-  baseUrl: string,
+  client: SignalBridgeClient,
   botNumber: string,
   recipientNumber: string,
-): Promise<string> {
+): Promise<CapturedIdentity> {
   const challengeCode = String(randomInt(100000, 999999));
 
   // Send the challenge via Signal
   p.log.info('A 6-digit challenge code has been sent to your Signal app.');
-  const sendResp = await fetch(`${baseUrl}/v2/send`, {
+  const sendResp = await client.request('/v2/send', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -306,37 +499,43 @@ export async function verifyRecipientIdentity(
   }
 
   // Capture the recipient's identity key from signal-cli
-  return fetchIdentityKey(baseUrl, botNumber, recipientNumber);
+  return fetchIdentityKey(client, botNumber, recipientNumber);
 }
 
 /**
  * Fetches the recipient's identity key from signal-cli's trust store.
  * Retries once after a short delay if the key is not yet available
  * (signal-cli may need time to process the message exchange).
+ *
+ * The record is chosen by number (the newest one), exactly as the runtime
+ * check chooses it for a configuration without a UUID; its UUID is captured
+ * so that later checks verify this record (see `recipient-identity.ts`).
  */
-async function fetchIdentityKey(baseUrl: string, botNumber: string, recipientNumber: string): Promise<string> {
-  const fetchKey = async (): Promise<string | null> => {
+async function fetchIdentityKey(
+  client: SignalBridgeClient,
+  botNumber: string,
+  recipientNumber: string,
+): Promise<CapturedIdentity> {
+  const fetchKey = async (): Promise<CapturedIdentity | undefined> => {
     // The per-recipient endpoint (/v1/identities/{bot}/{recipient}) is not
     // available in all versions. Use the all-identities endpoint and filter.
-    const resp = await fetch(`${baseUrl}/v1/identities/${encodeURIComponent(botNumber)}`);
-    if (!resp.ok) return null;
+    const resp = await client.request(`/v1/identities/${encodeURIComponent(botNumber)}`);
+    if (!resp.ok) return undefined;
 
-    const identities = (await resp.json()) as SignalIdentity[];
-    const match = identities.find((id) => id.number === recipientNumber);
-    if (!match) return null;
-
-    // Fingerprint may contain spaces (e.g., "05 a1 b2 ...") - normalize to compact hex
-    return match.fingerprint.replace(/\s+/g, '');
+    // The fingerprint comes back without whitespace (signal-cli may list "05 a1 b2 ...").
+    const selected = selectRecipientIdentity(await resp.json(), { number: recipientNumber });
+    if (selected === undefined) return undefined;
+    return { identityKey: selected.fingerprint, ...(selected.uuid !== undefined ? { uuid: selected.uuid } : {}) };
   };
 
-  let fingerprint = await fetchKey();
-  if (!fingerprint) {
+  let identity = await fetchKey();
+  if (!identity) {
     // Retry after a short delay - signal-cli may still be processing
     await new Promise((resolve) => setTimeout(resolve, 2000));
-    fingerprint = await fetchKey();
+    identity = await fetchKey();
   }
 
-  if (!fingerprint) {
+  if (!identity) {
     throw new Error(
       'Identity key could not be retrieved. ' +
         'This may indicate signal-cli has not yet exchanged keys with the recipient.',
@@ -344,10 +543,12 @@ async function fetchIdentityKey(baseUrl: string, botNumber: string, recipientNum
   }
 
   p.log.success(
-    `Identity verified! Signal identity key recorded.\n` + `  Fingerprint: ${fingerprint.substring(0, 20)}...`,
+    `Identity verified! Signal identity key recorded.\n` +
+      `  Fingerprint: ${identity.identityKey.substring(0, 20)}...` +
+      (identity.uuid !== undefined ? `\n  Account UUID: ${identity.uuid}` : ''),
   );
 
-  return fingerprint;
+  return identity;
 }
 
 // ---- Re-trust flow --------------------------------------------------
@@ -368,7 +569,6 @@ export async function runReTrust(): Promise<void> {
   }
 
   const { botNumber, recipientNumber, recipientIdentityKey: previousKey } = signalConfig;
-  const baseUrl = `http://127.0.0.1:${signalConfig.container.port}`;
 
   p.note(
     `The Signal identity key for ${recipientNumber} has changed.\n` +
@@ -380,40 +580,47 @@ export async function runReTrust(): Promise<void> {
     'Identity changed',
   );
 
-  // Verify the container is running before attempting to send
+  // Validate the bridge's security configuration even when it is running.
   const docker = createDockerManager();
   const containerManager = createSignalContainerManager(docker, signalConfig.container);
-  if (!(await containerManager.isRunning())) {
-    const startSpinner = p.spinner();
-    startSpinner.start('Starting signal-cli container...');
-    try {
-      await containerManager.ensureRunning();
-      await containerManager.waitForHealthy(baseUrl);
-      startSpinner.stop('Container started');
-    } catch (err) {
-      startSpinner.stop('Failed to start container');
-      p.log.error(`Could not start signal-cli container: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
-    }
+  const startSpinner = p.spinner();
+  startSpinner.start('Starting signal-cli container...');
+  let client: SignalBridgeClient | undefined;
+  try {
+    client = await containerManager.ensureRunning();
+    await containerManager.waitForHealthy(client);
+    startSpinner.stop('Container started');
+  } catch (err) {
+    client?.close();
+    startSpinner.stop('Failed to start container');
+    p.log.error(`Could not start signal-cli container: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
   }
 
-  const newKey = await verifyRecipientIdentity(baseUrl, botNumber, recipientNumber);
+  try {
+    const identity = await verifyRecipientIdentity(client, botNumber, recipientNumber);
+    const newKey = identity.identityKey;
 
-  // Save the new identity key
-  saveUserConfig({
-    signal: {
-      botNumber,
-      recipientNumber,
-      recipientIdentityKey: newKey,
-    },
-  });
+    // Save the new identity key, with the UUID of its record. An absent UUID
+    // removes the old one, which names the record of the previous key.
+    saveUserConfig({
+      signal: {
+        botNumber,
+        recipientNumber,
+        recipientIdentityKey: newKey,
+        recipientUuid: identity.uuid,
+      },
+    });
 
-  p.note(
-    `Previous key: ${previousKey.substring(0, 20)}...\n` + `New key:      ${newKey.substring(0, 20)}...`,
-    'Key updated',
-  );
+    p.note(
+      `Previous key: ${previousKey.substring(0, 20)}...\n` + `New key:      ${newKey.substring(0, 20)}...`,
+      'Key updated',
+    );
 
-  p.outro('Transport unlocked. Sessions will now accept messages.');
+    p.outro('Transport unlocked. Sessions will now accept messages.');
+  } finally {
+    client.close();
+  }
 }
 
 // ---- Main setup wizard ----------------------------------------------
@@ -423,16 +630,21 @@ export async function runReTrust(): Promise<void> {
  *
  * Steps:
  * 1. Validate Docker availability
- * 2. Pull and start signal-cli container
+ * 2. Start the signal-cli container from the pinned image (offering to pin
+ *    the current one when the configured image needs it)
  * 3. Register new number (or reuse existing account)
  * 4. Configure recipient number
  * 5. Challenge-response identity verification
  * 6. Capture and store identity key
  * 7. Save config
  */
-export async function runSignalSetup(options?: { reTrust?: boolean }): Promise<void> {
+export async function runSignalSetup(options?: { reTrust?: boolean; updateImage?: boolean }): Promise<void> {
   if (options?.reTrust) {
     await runReTrust();
+    return;
+  }
+  if (options?.updateImage) {
+    await runUpdateImage();
     return;
   }
 
@@ -456,88 +668,103 @@ export async function runSignalSetup(options?: { reTrust?: boolean }): Promise<v
     process.exit(0);
   }
 
+  // The final save refuses to replace a config.json it cannot parse (it holds
+  // API keys and credentials), so stop now rather than after registering a number.
+  try {
+    loadUserConfig({ readOnly: true });
+  } catch (err) {
+    p.log.error(`Cannot update the IronCurtain config: ${err instanceof Error ? err.message : String(err)}`);
+    p.log.info('Fix the config file (or move it aside) and re-run setup-signal.');
+    process.exit(1);
+  }
+
   // Step 1: Docker check
   await validateDocker();
   const docker = createDockerManager();
 
-  // Step 2: Pull image and start container
-  const containerConfig = resolveContainerConfig();
-  const manager = createSignalContainerManager(docker, containerConfig);
-  const baseUrl = await startContainer(manager, containerConfig);
-
-  // Step 3: Check for existing accounts, then register
-  let botNumber: string;
-
-  const existingAccounts = await fetchAccounts(baseUrl);
-  if (existingAccounts.length > 0) {
-    const useExisting = await p.select({
-      message: `Found existing account: ${existingAccounts.join(', ')}. What would you like to do?`,
-      options: [
-        { value: 'use', label: `Use ${existingAccounts[0]}`, hint: 'skip registration' },
-        { value: 'register', label: 'Register a new phone number' },
-      ],
-    });
-    handleCancel(useExisting);
-
-    if (useExisting === 'use') {
-      botNumber = existingAccounts[0];
-      p.log.success(`Using existing account: ${botNumber}`);
-    } else {
-      botNumber = await registerNewNumber(baseUrl);
-    }
-  } else {
-    botNumber = await registerNewNumber(baseUrl);
-  }
-
-  // In json-rpc mode, signal-cli loads accounts at startup. After registration
-  // or when the account was found only in the data directory, restart the
-  // container so the daemon picks up the account for subsequent API calls.
-  const restartSpinner = p.spinner();
-  restartSpinner.start('Restarting signal-cli to load account...');
+  // Step 2: Start the container from the pinned image (pinning one first if needed)
+  const { client, manager, containerConfig } = await startContainer(docker, resolveContainerConfig());
   try {
-    await docker.stop(containerConfig.containerName);
-    await docker.start(containerConfig.containerName);
-    await manager.waitForHealthy(baseUrl);
-    restartSpinner.stop('signal-cli restarted');
-  } catch (err) {
-    restartSpinner.stop('Restart failed');
-    p.log.error(`Failed to restart container: ${err instanceof Error ? err.message : String(err)}`);
-    process.exit(1);
-  }
+    // Step 3: Check for existing accounts, then register
+    let botNumber: string;
 
-  // Step 4: Recipient number
-  const recipientNumber = await p.text({
-    message: 'Enter YOUR Signal phone number (to receive agent messages):',
-    placeholder: '+15559876543',
-    validate: validatePhoneNumber,
-  });
-  handleCancel(recipientNumber);
+    const existingAccounts = await fetchAccounts(client);
+    if (existingAccounts.length > 0) {
+      const useExisting = await p.select({
+        message: `Found existing account: ${existingAccounts.join(', ')}. What would you like to do?`,
+        options: [
+          { value: 'use', label: `Use ${existingAccounts[0]}`, hint: 'skip registration' },
+          { value: 'register', label: 'Register a new phone number' },
+        ],
+      });
+      handleCancel(useExisting);
 
-  // Step 5: Challenge-response identity verification
-  const identityKey = await verifyRecipientIdentity(baseUrl, botNumber, recipientNumber as string);
+      if (useExisting === 'use') {
+        botNumber = existingAccounts[0];
+        p.log.success(`Using existing account: ${botNumber}`);
+      } else {
+        botNumber = await registerNewNumber(client);
+      }
+    } else {
+      botNumber = await registerNewNumber(client);
+    }
 
-  // Step 6: Save config
-  saveUserConfig({
-    signal: {
-      botNumber,
-      recipientNumber: recipientNumber as string,
-      recipientIdentityKey: identityKey,
-      container: {
-        image: containerConfig.image,
-        port: containerConfig.port,
+    // In json-rpc mode, signal-cli loads accounts at startup. After registration
+    // or when the account was found only in the data directory, restart the
+    // container so the daemon picks up the account for subsequent API calls.
+    const restartSpinner = p.spinner();
+    restartSpinner.start('Restarting signal-cli to load account...');
+    try {
+      await docker.stop(containerConfig.containerName);
+      await docker.start(containerConfig.containerName);
+      await manager.waitForHealthy(client);
+      restartSpinner.stop('signal-cli restarted');
+    } catch (err) {
+      restartSpinner.stop('Restart failed');
+      p.log.error(`Failed to restart container: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+
+    // Step 4: Recipient number
+    const recipientNumber = await p.text({
+      message: 'Enter YOUR Signal phone number (to receive agent messages):',
+      placeholder: '+15559876543',
+      validate: validatePhoneNumber,
+    });
+    handleCancel(recipientNumber);
+
+    // Step 5: Challenge-response identity verification
+    const identity = await verifyRecipientIdentity(client, botNumber, recipientNumber as string);
+
+    // Step 6: Save config. The image is recorded only when it is not the
+    // built-in default, so a later release's reviewed default pin applies to
+    // this install; an image pinned by the user (or just now) is kept.
+    saveUserConfig({
+      signal: {
+        botNumber,
+        recipientNumber: recipientNumber as string,
+        recipientIdentityKey: identity.identityKey,
+        recipientUuid: identity.uuid,
+        container: {
+          ...(containerConfig.image !== SIGNAL_DEFAULTS.image ? { image: containerConfig.image } : {}),
+          port: containerConfig.port,
+        },
       },
-    },
-  });
+    });
 
-  // Summary
-  p.note(
-    `Bot number:       ${botNumber}\n` +
-      `Your number:      ${recipientNumber as string}\n` +
-      `Identity key:     ${identityKey.substring(0, 20)}...\n` +
-      `Container:        ${containerConfig.containerName}\n` +
-      `API port:         ${containerConfig.port}`,
-    'Configuration saved',
-  );
+    // Summary
+    p.note(
+      `Bot number:       ${botNumber}\n` +
+        `Your number:      ${recipientNumber as string}\n` +
+        `Identity key:     ${identity.identityKey.substring(0, 20)}...\n` +
+        `Image:            ${containerConfig.image}\n` +
+        `Container:        ${containerConfig.containerName}\n` +
+        `API port:         ${containerConfig.port}`,
+      'Configuration saved',
+    );
 
-  p.outro('Setup complete. Run: ironcurtain bot');
+    p.outro('Setup complete. Run: ironcurtain bot');
+  } finally {
+    client.close();
+  }
 }

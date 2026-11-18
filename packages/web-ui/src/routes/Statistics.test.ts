@@ -393,6 +393,66 @@ describe('Statistics route', () => {
     }
   });
 
+  it('groups by persona and shows configured persona names instead of pseudonyms', async () => {
+    const named = 'hmac:0123456789abcdef0123456789abcdef';
+    const personaGroups = [
+      metric('requestCount', 7, { personaId: named }),
+      metric('outputTokens', 700, { personaId: named }),
+      metric('effectiveOutputTokensPerSecond', 41, { personaId: named }),
+    ].map((summary) => ({ ...summary, labels: { personaId: 'security-reviewer' } }));
+    mockSummary.mockImplementation((query) =>
+      Promise.resolve(query.groupBy?.[0] === 'personaId' ? personaGroups : query.groupBy ? grouped() : ungrouped()),
+    );
+    mockSeries.mockImplementation((query) =>
+      Promise.resolve(
+        query.groupBy?.[0] === 'personaId'
+          ? [
+              {
+                fromMs: Date.UTC(2026, 7, 14),
+                toMs: Date.UTC(2026, 7, 15) - 1,
+                summaries: [
+                  metric('effectiveOutputTokensPerSecond', 41, { personaId: named }),
+                  metric('refusalCount', 0, { personaId: named }),
+                  metric('errorCount', 0, { personaId: named }),
+                ].map((summary) => ({ ...summary, labels: { personaId: 'security-reviewer' } })),
+              },
+            ]
+          : buckets(),
+      ),
+    );
+
+    render(Statistics);
+    await screen.findByRole('heading', { name: 'LLM statistics' }, { timeout: 2_000 });
+    await fireEvent.click(screen.getByRole('button', { name: 'Persona' }));
+
+    expect(await screen.findByRole('heading', { name: 'Persona rail' }, { timeout: 2_000 })).toBeTruthy();
+    expect(screen.getAllByText('security-reviewer').length).toBeGreaterThan(0);
+    expect(document.body.textContent).not.toContain('hmac:');
+    expect(mockSummary).toHaveBeenCalledWith(expect.objectContaining({ groupBy: ['personaId'], topGroups: 8 }));
+    expect(mockSeries).toHaveBeenCalledWith(expect.objectContaining({ groupBy: ['personaId'] }));
+  });
+
+  it('groups by workflow run', async () => {
+    render(Statistics);
+    await screen.findByRole('heading', { name: 'LLM statistics' }, { timeout: 2_000 });
+    await fireEvent.click(screen.getByRole('button', { name: 'Workflow' }));
+    await vi.waitFor(
+      () => expect(mockSummary).toHaveBeenCalledWith(expect.objectContaining({ groupBy: ['workflowRunId'] })),
+      { timeout: 2_000 },
+    );
+    expect(await screen.findByRole('heading', { name: 'Workflow rail' }, { timeout: 2_000 })).toBeTruthy();
+  });
+
+  it('suggests a shorter range when a query exceeds a statistics limit', async () => {
+    mockSummary.mockRejectedValue(
+      Object.assign(new Error('Statistics query exceeds the scanned-row limit'), { code: 'STATISTICS_LIMIT' }),
+    );
+    render(Statistics);
+
+    expect(await screen.findByRole('heading', { name: 'Statistics unavailable' }, { timeout: 2_000 })).toBeTruthy();
+    expect(screen.getByRole('alert').textContent).toMatch(/Choose a shorter time range/);
+  });
+
   it('distinguishes disabled collection from an empty or failed query', async () => {
     mockCapabilities.mockResolvedValue({ ...capabilities(false), health: health({ state: 'disabled' }) });
     render(Statistics);
@@ -461,5 +521,17 @@ describe('Statistics route', () => {
     expect(await screen.findByRole('heading', { name: 'LLM statistics' }, { timeout: 2_000 })).toBeTruthy();
     expect(screen.getByText('Partial')).toBeTruthy();
     expect(screen.getByRole('status').textContent).toMatch(/statistics may be missing/i);
+  });
+
+  it('surfaces a restarting writer before it has dropped anything', async () => {
+    mockCapabilities.mockResolvedValue({
+      ...capabilities(),
+      health: health({ state: 'restarting', dropped: 0, lastError: 'LLM metrics worker exited with code 1' }),
+    });
+    render(Statistics);
+
+    expect(await screen.findByRole('heading', { name: 'LLM statistics' }, { timeout: 2_000 })).toBeTruthy();
+    expect(screen.getByText('Partial')).toBeTruthy();
+    expect(screen.getByRole('status').textContent).toMatch(/writer: restarting — LLM metrics worker exited/);
   });
 });

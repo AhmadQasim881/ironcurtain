@@ -3,9 +3,11 @@ import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 
 // Mock realpathSync so tests don't depend on real filesystem symlinks.
+// resolveRealPath calls realpathSync.native on macOS, so mock both.
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
-  return { ...actual, realpathSync: (p: string) => p };
+  const identity = (p: string): string => p;
+  return { ...actual, realpathSync: Object.assign(identity, { native: identity }) };
 });
 import { expandTilde, prepareToolArgs, rewriteResultContent } from '../src/trusted-process/path-utils.js';
 import type { ToolAnnotation } from '../src/pipeline/types.js';
@@ -158,14 +160,41 @@ describe('prepareToolArgs with allowedDirectory (sandbox-aware)', () => {
     },
   };
 
-  it('passes relative paths through unchanged for transport', () => {
-    const { argsForTransport } = prepareToolArgs(
+  it('sends transport the sandbox-resolved absolute path that policy evaluates', () => {
+    // A relative value left for the MCP server would be resolved against the
+    // server's own cwd (git: a per-server temp dir or the IronCurtain launch
+    // directory), not against the sandbox policy checked.
+    const { argsForTransport, argsForPolicy } = prepareToolArgs(
       { files: ['src/index.ts', 'README.md'], message: 'test' },
       readAnnotation,
       sandboxDir,
     );
-    expect(argsForTransport.files).toEqual(['src/index.ts', 'README.md']);
+    expect(argsForTransport.files).toEqual([`${sandboxDir}/src/index.ts`, `${sandboxDir}/README.md`]);
+    expect(argsForTransport.files).toEqual(argsForPolicy.files);
     expect(argsForTransport.message).toBe('test');
+  });
+
+  it('sends transport and policy the same value for every spelling of a path', () => {
+    for (const path of ['sub', './sub', '../outside', 'a/../b', '.', '/tmp/abs', '~/Documents/x']) {
+      const { argsForTransport, argsForPolicy } = prepareToolArgs({ path, content: 'x' }, writeAnnotation, sandboxDir);
+      expect(argsForTransport.path).toBe(argsForPolicy.path);
+      expect(String(argsForTransport.path).startsWith('/')).toBe(true);
+    }
+  });
+
+  it('treats ~name/... as relative (nothing expands it), resolving it against the sandbox', () => {
+    const { argsForTransport, argsForPolicy } = prepareToolArgs(
+      { path: '~bob/file.txt', content: 'hello' },
+      writeAnnotation,
+      sandboxDir,
+    );
+    expect(argsForPolicy.path).toBe(`${sandboxDir}/~bob/file.txt`);
+    expect(argsForTransport.path).toBe(`${sandboxDir}/~bob/file.txt`);
+  });
+
+  it('expands a bare ~ to the home directory', () => {
+    const { argsForTransport } = prepareToolArgs({ path: '~', content: 'hello' }, writeAnnotation, sandboxDir);
+    expect(argsForTransport.path).toBe(home);
   });
 
   it('resolves relative paths against sandbox for policy', () => {
@@ -204,10 +233,9 @@ describe('prepareToolArgs with allowedDirectory (sandbox-aware)', () => {
       writeAnnotation,
       sandboxDir,
     );
-    // Transport: pass through (MCP server resolves against its CWD)
-    expect(argsForTransport.path).toBe('./local/file.txt');
-    // Policy: resolve against sandbox
+    // Resolved against the sandbox for both policy and transport
     expect(argsForPolicy.path).toBe(`${sandboxDir}/local/file.txt`);
+    expect(argsForTransport.path).toBe(`${sandboxDir}/local/file.txt`);
   });
 
   it('handles dot-dot-relative paths as relative', () => {
@@ -216,10 +244,11 @@ describe('prepareToolArgs with allowedDirectory (sandbox-aware)', () => {
       writeAnnotation,
       sandboxDir,
     );
-    expect(argsForTransport.path).toBe('../sibling/file.txt');
     // resolve() collapses the ..: /home/user/sandbox/project/../sibling/file.txt
-    // → /home/user/sandbox/sibling/file.txt
+    // → /home/user/sandbox/sibling/file.txt (policy sees it outside the sandbox,
+    // and the server receives that same path)
     expect(argsForPolicy.path).toBe('/home/user/sandbox/sibling/file.txt');
+    expect(argsForTransport.path).toBe('/home/user/sandbox/sibling/file.txt');
   });
 
   it('handles bare relative paths (no prefix)', () => {
@@ -228,7 +257,7 @@ describe('prepareToolArgs with allowedDirectory (sandbox-aware)', () => {
       readAnnotation,
       sandboxDir,
     );
-    expect(argsForTransport.files).toEqual(['src/content/pages/links.mdx']);
+    expect(argsForTransport.files).toEqual([`${sandboxDir}/src/content/pages/links.mdx`]);
     expect(argsForPolicy.files).toEqual([`${sandboxDir}/src/content/pages/links.mdx`]);
   });
 
@@ -368,15 +397,17 @@ describe('prepareToolArgs with containerWorkspaceDir (Docker agent mode)', () =>
     expect(argsForTransport.path).toBe('/tmp/output.txt');
   });
 
-  it('does not rewrite relative paths', () => {
-    const { argsForTransport } = prepareToolArgs(
+  it('resolves relative paths against the host sandbox (no container rewrite needed)', () => {
+    const { argsForTransport, argsForPolicy } = prepareToolArgs(
       { files: ['src/index.ts', 'README.md'], message: 'test' },
       readAnnotation,
       sandboxDir,
       containerDir,
     );
-    // Relative paths pass through for transport
-    expect(argsForTransport.files).toEqual(['src/index.ts', 'README.md']);
+    // The host-side server receives the host path policy evaluated, never a
+    // relative path it would resolve against its own working directory.
+    expect(argsForTransport.files).toEqual([`${sandboxDir}/src/index.ts`, `${sandboxDir}/README.md`]);
+    expect(argsForPolicy.files).toEqual(argsForTransport.files);
   });
 
   it('rewrites string arrays containing container paths', () => {

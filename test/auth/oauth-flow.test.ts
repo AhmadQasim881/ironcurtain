@@ -1,8 +1,14 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createHash } from 'node:crypto';
 import { URL } from 'node:url';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { generateCodeVerifier, computeCodeChallenge, runOAuthFlow, OAuthFlowError } from '../../src/auth/oauth-flow.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  generateCodeVerifier,
+  computeCodeChallenge,
+  runOAuthFlow,
+  OAuthFlowError,
+  type PasteRedirectRequest,
+} from '../../src/auth/oauth-flow.js';
 import type { OAuthProviderConfig, OAuthClientCredentials } from '../../src/auth/oauth-provider.js';
 
 // ---------------------------------------------------------------------------
@@ -243,32 +249,58 @@ describe('runOAuthFlow', () => {
     flowPromise.catch(() => {});
 
     const authUrl = await urlPromise;
+    const state = new URL(authUrl).searchParams.get('state')!;
 
-    // Simulate error callback (user denied access)
+    // Simulate error callback (user denied access); the provider echoes the state.
     await simulateCallback(authUrl, {
       error: 'access_denied',
       error_description: 'User denied access',
+      state,
     });
 
     await expect(flowPromise).rejects.toThrow(OAuthFlowError);
     await expect(flowPromise).rejects.toThrow(/User denied access/);
   });
 
-  it('throws OAuthFlowError on state mismatch', async () => {
+  // Regression: a callback with a missing or wrong state used to end the flow,
+  // and an `error=` callback was honoured before the state was checked, so any
+  // local process could abort an authorization in progress.
+  it('refuses a callback with a wrong or missing state and keeps waiting for the real one', async () => {
     const provider = makeProvider(mockTokenServer.port());
     const { openUrl, urlPromise } = captureAuthUrl();
 
     const flowPromise = runOAuthFlow(provider, testCredentials, undefined, 10_000, { openUrl });
-    // Attach catch immediately to prevent unhandled rejection
     flowPromise.catch(() => {});
 
     const authUrl = await urlPromise;
+    const state = new URL(authUrl).searchParams.get('state')!;
 
-    // Send callback with wrong state
+    const wrongState = await simulateCallback(authUrl, { code: 'test-code', state: 'wrong-state' });
+    expect(wrongState.status).toBe(400);
+    const errorWithoutState = await simulateCallback(authUrl, { error: 'access_denied' });
+    expect(errorWithoutState.status).toBe(400);
+    const errorWithWrongState = await simulateCallback(authUrl, { error: 'access_denied', state: 'wrong-state' });
+    expect(errorWithWrongState.status).toBe(400);
+
+    // The genuine response still completes the flow.
+    const genuine = await simulateCallback(authUrl, { code: 'test-auth-code', state });
+    expect(genuine.status).toBe(200);
+    const result = await flowPromise;
+    expect(result.token.accessToken).toBe('mock-access-token');
+    expect(mockTokenServer.lastRequest()?.code).toBe('test-auth-code');
+  });
+
+  it('times out instead of failing early when only callbacks with the wrong state arrive', async () => {
+    const provider = makeProvider(mockTokenServer.port());
+    const { openUrl, urlPromise } = captureAuthUrl();
+
+    const flowPromise = runOAuthFlow(provider, testCredentials, undefined, 500, { openUrl });
+    flowPromise.catch(() => {});
+
+    const authUrl = await urlPromise;
     await simulateCallback(authUrl, { code: 'test-code', state: 'wrong-state' });
 
-    await expect(flowPromise).rejects.toThrow(OAuthFlowError);
-    await expect(flowPromise).rejects.toThrow(/State parameter mismatch/);
+    await expect(flowPromise).rejects.toThrow(/timed out/);
   });
 
   it('uses custom scopes when provided', async () => {
@@ -311,5 +343,128 @@ describe('runOAuthFlow', () => {
     await expect(flowPromise).rejects.toThrow(/Token exchange failed/);
 
     badTokenServer.close();
+  });
+});
+
+describe('runOAuthFlow headless (--no-browser) paste mode', () => {
+  let mockTokenServer: ReturnType<typeof startMockTokenServer>;
+
+  beforeEach(async () => {
+    mockTokenServer = startMockTokenServer();
+    await waitForServer(mockTokenServer.server);
+  });
+
+  afterEach(() => {
+    mockTokenServer.close();
+  });
+
+  /** The URL the browser would be redirected to, with `params` in its query. */
+  function redirectedUrl(authUrl: string, params: Record<string, string>): string {
+    const url = new URL(new URL(authUrl).searchParams.get('redirect_uri')!);
+    for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+    return url.toString();
+  }
+
+  it('completes with a pasted redirect URL and never opens a browser', async () => {
+    const provider = makeProvider(mockTokenServer.port());
+    const openUrl = vi.fn();
+    const requests: PasteRedirectRequest[] = [];
+    const flow = runOAuthFlow(provider, testCredentials, undefined, 10_000, {
+      openUrl,
+      pasteRedirectUrl: (request) => {
+        requests.push(request);
+        const state = new URL(request.authUrl).searchParams.get('state')!;
+        return Promise.resolve(`  ${redirectedUrl(request.authUrl, { code: 'pasted-code', state })}\n`);
+      },
+    });
+
+    const result = await flow;
+
+    expect(result.token.accessToken).toBe('mock-access-token');
+    expect(openUrl).not.toHaveBeenCalled();
+    expect(requests).toHaveLength(1);
+    expect(requests[0].problem).toBeUndefined();
+    const exchange = mockTokenServer.lastRequest();
+    expect(exchange?.code).toBe('pasted-code');
+    // The exchange names the same loopback redirect URI the authorization request used.
+    expect(exchange?.redirect_uri).toBe(new URL(requests[0].authUrl).searchParams.get('redirect_uri'));
+  });
+
+  it('asks again, saying why, when a pasted URL has the wrong state or is not the redirect', async () => {
+    const provider = makeProvider(mockTokenServer.port());
+    const answers = [
+      (authUrl: string) => redirectedUrl(authUrl, { code: 'stale-code', state: 'from-an-earlier-attempt' }),
+      () => 'https://example.com/callback?code=x',
+      () => 'not a url at all',
+      (authUrl: string) =>
+        redirectedUrl(authUrl, { code: 'good-code', state: new URL(authUrl).searchParams.get('state')! }),
+    ];
+    const problems: (string | undefined)[] = [];
+    const result = await runOAuthFlow(provider, testCredentials, undefined, 10_000, {
+      pasteRedirectUrl: (request) => {
+        problems.push(request.problem);
+        const next = answers.shift();
+        return Promise.resolve(next?.(request.authUrl));
+      },
+    });
+
+    expect(result.token.accessToken).toBe('mock-access-token');
+    expect(mockTokenServer.lastRequest()?.code).toBe('good-code');
+    expect(problems[0]).toBeUndefined();
+    expect(problems[1]).toMatch(/does not carry the state/);
+    expect(problems[2]).toMatch(/does not start with http:\/\/127\.0\.0\.1:/);
+    expect(problems[3]).toMatch(/is not a URL/);
+  });
+
+  it('honours a pasted error response only when it carries the state', async () => {
+    const provider = makeProvider(mockTokenServer.port());
+    const flow = runOAuthFlow(provider, testCredentials, undefined, 10_000, {
+      pasteRedirectUrl: (request) => {
+        const state = new URL(request.authUrl).searchParams.get('state')!;
+        return Promise.resolve(redirectedUrl(request.authUrl, { error: 'access_denied', state }));
+      },
+    });
+
+    await expect(flow).rejects.toThrow(/Authorization failed: access_denied/);
+  });
+
+  it('fails when the user cancels the paste prompt', async () => {
+    const provider = makeProvider(mockTokenServer.port());
+    const flow = runOAuthFlow(provider, testCredentials, undefined, 10_000, {
+      pasteRedirectUrl: () => Promise.resolve(undefined),
+    });
+
+    await expect(flow).rejects.toThrow(/Authorization cancelled/);
+  });
+
+  it('still accepts the loopback callback, and then ends the pending paste prompt', async () => {
+    const provider = makeProvider(mockTokenServer.port());
+    let signal: AbortSignal | undefined;
+    let authUrl = '';
+    const results: string[] = [];
+    const prompted = new Promise<void>((resolvePrompted) => {
+      void runOAuthFlow(provider, testCredentials, undefined, 10_000, {
+        pasteRedirectUrl: (request) => {
+          signal = request.signal;
+          authUrl = request.authUrl;
+          resolvePrompted();
+          // Like a prompt: settles only when its signal aborts.
+          return new Promise((resolveAnswer) =>
+            request.signal.addEventListener('abort', () => resolveAnswer(undefined)),
+          );
+        },
+      }).then(
+        (result) => results.push(result.token.accessToken),
+        (err: unknown) => results.push(String(err)),
+      );
+    });
+    await prompted;
+
+    const state = new URL(authUrl).searchParams.get('state')!;
+    const callback = await simulateCallback(authUrl, { code: 'browser-code', state });
+    expect(callback.status).toBe(200);
+    await vi.waitFor(() => expect(results).toEqual(['mock-access-token']));
+    expect(signal?.aborted).toBe(true);
+    expect(mockTokenServer.lastRequest()?.code).toBe('browser-code');
   });
 });

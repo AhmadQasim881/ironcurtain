@@ -10,8 +10,13 @@
  * This is the SANCTIONED pipeline value-import seam (see
  * test/pipeline-import-boundary.test.ts + the ESLint no-restricted-imports
  * rule). It is reached ONLY via `await import(...)` from
- * persona-compile-orchestrator.ts; nothing on the live runtime path imports it
- * statically.
+ * persona-compile-service.ts (`runPersonaCompile`), the one path CLI and
+ * web-UI compiles share, which holds the compile lock, passes the
+ * broad-policy validator as `validateCompiled` and writes the audit record.
+ * Calling it directly would skip all three; test/persona-compile-paths.test.ts
+ * keeps it the only importer, and the boundary test fails when another
+ * persona module, the web UI or a live-runtime module reaches it (or any
+ * pipeline module) statically.
  */
 
 import { readFileSync } from 'node:fs';
@@ -27,14 +32,15 @@ import {
   applyServerAllowlist,
 } from './resolve.js';
 import type { PersonaName } from './types.js';
-import type { CompiledPolicyFile, DynamicListsFile } from '../pipeline/types.js';
+import type { CompiledPolicyFile, CompiledPolicyValidator } from '../pipeline/types.js';
 import type { ServerProgressReporter } from '../pipeline/pipeline-shared.js';
 
 /**
- * Options for a streamed persona compile (Phase 1b). Threads the long-running
- * concerns through to `PipelineRunner.run`. All fields are optional; absent =>
- * the legacy CLI behavior (no reporter factory, no signal, not quiet, MCP lists
- * allowed, workspace-bound allowedDirectory).
+ * Options for a persona compile. Threads the long-running concerns through to
+ * `PipelineRunner.run`. All fields are optional; absent => no reporter factory
+ * (console output), no signal, not quiet, MCP lists allowed,
+ * workspace-bound allowedDirectory. `runPersonaCompile` always passes a
+ * signal (its wall-clock cap), an operationId and `validateCompiled`.
  */
 export interface CompilePersonaOptions {
   /** Per-server progress reporter factory (the EventBusProgressReporter). */
@@ -50,7 +56,8 @@ export interface CompilePersonaOptions {
   readonly operationId?: string;
   /**
    * Whether the list resolver may connect to live MCP servers. The WS path
-   * passes false (no live MCP) so MCP-backed lists fail fast.
+   * passes false (no live MCP) so MCP-backed lists fail fast; the CLI passes
+   * true.
    */
   readonly allowMcpLists?: boolean;
   /**
@@ -61,12 +68,15 @@ export interface CompilePersonaOptions {
   readonly allowedDirectory?: string;
   /**
    * Optional validation hook invoked on the in-memory compiled policy BEFORE any
-   * artifact is written (threads through to `PipelineRunner.run`). Throwing
-   * rejects the compile and leaves prior artifacts intact. Phase 1c uses this to
-   * enforce the broad-policy invariant (reject `'*'` domains/lists or
-   * out-of-workspace `paths.within` unless the persona is opted in).
+   * artifact is written (threads through to `PipelineRunner.run`), with the
+   * resolved dynamic lists and the stored tool annotations the compile used.
+   * Throwing rejects the compile and leaves prior artifacts intact.
+   * `runPersonaCompile` uses this to enforce the broad-policy invariant on
+   * every compile (reject broad wildcard domains/lists, out-of-workspace
+   * `paths.within` and allow rules that leave a resource argument
+   * unconstrained, unless the persona is opted in).
    */
-  readonly validateCompiled?: (policy: CompiledPolicyFile, dynamicLists?: DynamicListsFile) => void;
+  readonly validateCompiled?: CompiledPolicyValidator;
   /**
    * TEST-ONLY injection seam: pre-built PipelineModels (fake LLM). When absent,
    * `createPipelineModels` is called (real provider). Production callers never
@@ -96,7 +106,7 @@ export async function compilePersonaPolicy(
 
   // Per-operation LLM log path when an operationId is supplied:
   // `generated/llm-interactions/<operationId>.jsonl`. The pipeline truncates the
-  // file when it initializes the log (createLlmLoggingMiddleware -> initLogFile)
+  // file when it initializes the log (createLlmLoggingMiddleware -> preparePrivateLogFile)
   // and appends thereafter; because the operationId is interpolated into the
   // FILENAME (not just used as a presence check), each compile writes to its own
   // fresh file, so concurrent/successive compiles of the same persona never
@@ -118,6 +128,12 @@ export async function compilePersonaPolicy(
   // bound) rather than the daemon's process.env.ALLOWED_DIRECTORY fallback.
   const allowedDirectory = opts.allowedDirectory ?? getPersonaWorkspaceDir(name);
 
+  // The policy lint (pipeline/policy-lint.ts) rejects broad domain access
+  // unless the persona carries the gated broad-policy opt-in. A directive in
+  // the persona constitution does not count: it can be drafted by an LLM
+  // from untrusted content.
+  const allowBroadDomains = persona.allowBroadPolicy === true;
+
   return runner.run({
     constitutionInput: constitutionText,
     constitutionKind: 'constitution',
@@ -127,8 +143,12 @@ export async function compilePersonaPolicy(
     allowedDirectory,
     protectedPaths: config.protectedPaths,
     mcpServers,
-    includeHandwrittenScenarios: false,
+    // The universal invariants (writes and moves under /etc must not be
+    // allowed) hold for every persona; they are the only scenarios the
+    // persona constitution and the policy under test cannot shape.
+    includeHandwrittenScenarios: true,
     prefilterText: constitutionText,
+    allowBroadDomains,
     ...(opts.reporterFactory ? { reporterFactory: opts.reporterFactory } : {}),
     ...(opts.signal ? { signal: opts.signal } : {}),
     ...(opts.quiet !== undefined ? { quiet: opts.quiet } : {}),

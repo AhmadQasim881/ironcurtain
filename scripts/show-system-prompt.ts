@@ -3,10 +3,11 @@
  * Developer script: connects to configured MCP servers, lists their tools,
  * and prints the system prompts for both session types (agent / Docker agent).
  *
- * Usage: npx tsx scripts/show-system-prompt.ts
+ * Usage: npx tsx scripts/show-system-prompt.ts [--env-file <path>]
+ * (credentials come from ~/.ironcurtain/.env or --env-file, never from ./.env)
  */
 
-import 'dotenv/config';
+import { bootstrapTrustedEnvForProcess } from '../src/config/trusted-env.js';
 import { loadConfig } from '../src/config/index.js';
 import { toCallableName, extractRequiredParams } from '../src/sandbox/index.js';
 import { buildSystemPrompt } from '../src/session/prompts.js';
@@ -16,6 +17,7 @@ import { CONTAINER_WORKSPACE_DIR, type OrientationContext } from '../src/docker/
 import { discoverTools, buildServerListings } from './mcp-discovery.js';
 
 async function main(): Promise<void> {
+  bootstrapTrustedEnvForProcess();
   const config = loadConfig();
   const allTools = await discoverTools(config, 'show-system-prompt');
 

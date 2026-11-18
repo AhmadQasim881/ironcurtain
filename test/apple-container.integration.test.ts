@@ -9,8 +9,9 @@
  * subnet-guarded 0.0.0.0 listener (the tcp-hostonly topology's exact
  * proxy arrangement).
  *
- * Uses the small `alpine/socat` image (also used by the Docker sidecar
- * path), pulling it if absent.
+ * Uses the small `alpine/socat` image as a test fixture, pulling it if
+ * absent. (Production no longer runs it: the Docker sidecar is built
+ * locally, see src/docker/transport-sidecar-image.ts.)
  */
 
 import { createServer, type Server } from 'node:net';

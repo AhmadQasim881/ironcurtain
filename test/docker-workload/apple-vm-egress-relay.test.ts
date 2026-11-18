@@ -85,7 +85,7 @@ function listen(server: Server, target: string | number): Promise<void> {
 
 function closeServer(server: Server): Promise<void> {
   if (!server.listening) return Promise.resolve();
-  return new Promise((resolveClose) => server.close(resolveClose));
+  return new Promise((resolveClose) => server.close(() => resolveClose()));
 }
 
 async function reservePort(): Promise<number> {

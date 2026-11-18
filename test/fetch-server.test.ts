@@ -1,16 +1,31 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { createServer, type Server as HttpServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { getDefaultEnvironment, StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { stripHtmlFallback } from '../src/servers/fetch-server.js';
+import { FETCH_ALLOW_PRIVATE_NETWORKS_ENV } from '../src/servers/fetch-env.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const projectRoot = resolve(__dirname, '..');
 const fetchServerPath = resolve(projectRoot, 'src/servers/fetch-server.ts');
 const tsxBin = resolve(projectRoot, 'node_modules/.bin/tsx');
+
+/** "Café crème brûlée" is not valid UTF-8 once encoded as ISO-8859-1. */
+const LATIN1_TEXT = 'Café crème brûlée';
+
+const XHTML_DOC = `<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>XHTML Page</title></head>
+<body><script>var leaked = 1;</script><main><h1>XHTML Heading</h1><p>Served as application/xhtml+xml.</p></main></body></html>`;
+
+/** A PNG signature followed by an IHDR chunk header: binary by any measure. */
+const PNG_BYTES = Buffer.from([
+  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00,
+  0x01,
+]);
 
 const TEST_HTML = `<!DOCTYPE html>
 <html><head><title>Test Page</title></head>
@@ -75,13 +90,75 @@ const ARTICLE_HTML = `<!DOCTYPE html>
 </body></html>`;
 
 let httpServer: HttpServer;
+let port: number;
 let baseUrl: string;
+/**
+ * Fetch server spawned with the host-set private-network opt-in, so the
+ * tests can reach the loopback fixture server. The agent cannot set this:
+ * it lives in the server's environment, not in any tool argument.
+ */
 let client: Client;
+let clientStderr = '';
+/** Fetch server spawned without the opt-in, as shipped by default. */
+let strictClient: Client;
+let strictStderr = '';
+
+/** Stand-in for an internal service (metadata, admin API) on another loopback port. */
+let internalServer: HttpServer;
+let internalUrl: string;
+let internalHits = 0;
 
 beforeAll(async () => {
   // Start a local HTTP server with controlled responses
   httpServer = createServer((req, res) => {
-    if (req.url === '/html') {
+    const chain = /^\/chain\/(\d+)$/u.exec(req.url ?? '');
+    if (chain) {
+      const remaining = Number(chain[1]);
+      if (remaining === 0) {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('end of chain');
+      } else {
+        res.writeHead(302, { Location: `/chain/${remaining - 1}` });
+        res.end();
+      }
+    } else if (req.url === '/redirect-internal') {
+      // Cross-origin (different port) redirect to an internal service.
+      res.writeHead(302, { Location: `${internalUrl}/latest/meta-data/iam/security-credentials/` });
+      res.end();
+    } else if (req.url === '/redirect-metadata') {
+      res.writeHead(302, { Location: 'http://169.254.169.254/latest/meta-data/' });
+      res.end();
+    } else if (req.url === '/echo-headers') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(req.headers));
+    } else if (req.url === '/latin1') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=ISO-8859-1' });
+      res.end(Buffer.from(`<html><body><main><p>${LATIN1_TEXT}</p></main></body></html>`, 'latin1'));
+    } else if (req.url === '/latin1-meta') {
+      // No charset on the header; the document declares it.
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(
+        Buffer.from(
+          `<html><head><meta charset="iso-8859-1"><title>t</title></head><body><p>${LATIN1_TEXT}</p></body></html>`,
+          'latin1',
+        ),
+      );
+    } else if (req.url === '/latin1-plain') {
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset="windows-1252"' });
+      res.end(Buffer.from(LATIN1_TEXT, 'latin1'));
+    } else if (req.url === '/xhtml') {
+      res.writeHead(200, { 'Content-Type': 'application/xhtml+xml' });
+      res.end(XHTML_DOC);
+    } else if (req.url === '/png') {
+      res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': String(PNG_BYTES.length) });
+      res.end(PNG_BYTES);
+    } else if (req.url === '/octet-binary') {
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+      res.end(Buffer.from([0x00, 0x01, 0x02, 0x03, 0xff, 0xfe]));
+    } else if (req.url === '/octet-text') {
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+      res.end('plain words served as octet-stream');
+    } else if (req.url === '/html') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(TEST_HTML);
     } else if (req.url === '/article') {
@@ -119,25 +196,54 @@ beforeAll(async () => {
   await new Promise<void>((resolve) => {
     httpServer.listen(0, '127.0.0.1', resolve);
   });
-  const addr = httpServer.address() as { port: number };
-  baseUrl = `http://127.0.0.1:${addr.port}`;
+  port = (httpServer.address() as AddressInfo).port;
+  baseUrl = `http://127.0.0.1:${port}`;
 
-  // Spawn fetch server via MCP SDK
+  internalServer = createServer((_req, res) => {
+    internalHits += 1;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('{"access_token":"ya29.SECRET"}');
+  });
+  await new Promise<void>((resolve) => {
+    internalServer.listen(0, '127.0.0.1', resolve);
+  });
+  internalUrl = `http://127.0.0.1:${(internalServer.address() as AddressInfo).port}`;
+
+  // Spawn fetch servers via MCP SDK: one with the host-set opt-in, one without.
   const transport = new StdioClientTransport({
     command: tsxBin,
     args: [fetchServerPath],
+    env: { ...getDefaultEnvironment(), [FETCH_ALLOW_PRIVATE_NETWORKS_ENV]: '1' },
+    stderr: 'pipe',
+  });
+  transport.stderr?.on('data', (chunk: Buffer) => {
+    clientStderr += chunk.toString();
   });
   client = new Client({ name: 'test-client', version: '1.0.0' });
-  await client.connect(transport);
+
+  const strictTransport = new StdioClientTransport({
+    command: tsxBin,
+    args: [fetchServerPath],
+    env: { ...getDefaultEnvironment(), [FETCH_ALLOW_PRIVATE_NETWORKS_ENV]: '0' },
+    stderr: 'pipe',
+  });
+  strictTransport.stderr?.on('data', (chunk: Buffer) => {
+    strictStderr += chunk.toString();
+  });
+  strictClient = new Client({ name: 'test-client-strict', version: '1.0.0' });
+
+  await Promise.all([client.connect(transport), strictClient.connect(strictTransport)]);
 }, 30_000);
 
 afterAll(async () => {
-  await client.close();
+  await Promise.all([client.close(), strictClient.close()]);
   // Force-close any lingering connections (e.g. the never-responding /slow
   // request) so the server socket actually releases and doesn't keep the event
   // loop alive past teardown.
   httpServer.closeAllConnections();
+  internalServer.closeAllConnections();
   await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+  await new Promise<void>((resolve) => internalServer.close(() => resolve()));
 });
 
 /** Extracts the text content from an MCP tool call result. */
@@ -147,9 +253,21 @@ function resultText(result: Awaited<ReturnType<typeof client.callTool>>): string
 
 interface FetchResult {
   status: number;
+  url: string;
+  redirects: { status: number; url: string; location: string }[];
   headers: Record<string, string>;
   body: string;
   truncated: boolean;
+  redirect?: { location: string; followed: boolean; reason: string };
+  binary?: { contentType: string | null; size: number | null };
+}
+
+interface FetchErrorResult {
+  error: string;
+  code?: string;
+  url?: string;
+  redirects?: { status: number; url: string; location: string }[];
+  location?: string;
 }
 
 function resultJson(result: Awaited<ReturnType<typeof client.callTool>>): FetchResult {
@@ -157,6 +275,13 @@ function resultJson(result: Awaited<ReturnType<typeof client.callTool>>): FetchR
     throw new Error(`Expected success but got error: ${resultText(result)}`);
   }
   return JSON.parse(resultText(result)) as FetchResult;
+}
+
+function errorJson(result: Awaited<ReturnType<typeof client.callTool>>): FetchErrorResult {
+  if (!result.isError) {
+    throw new Error(`Expected an error but got: ${resultText(result)}`);
+  }
+  return JSON.parse(resultText(result)) as FetchErrorResult;
 }
 
 describe('fetch-server', () => {
@@ -378,6 +503,181 @@ describe('fetch-server', () => {
       expect(json.body).toContain('Element Heavy');
       // No readability metadata header since maxElemsToParse was exceeded
       expect(json.body).not.toContain('Title:');
+    });
+  });
+
+  describe('result metadata and request headers', () => {
+    it('reports the final URL and an empty redirect chain for a direct response', async () => {
+      const json = resultJson(await client.callTool({ name: 'http_fetch', arguments: { url: `${baseUrl}/plain` } }));
+      expect(json.url).toBe(`${baseUrl}/plain`);
+      expect(json.redirects).toEqual([]);
+      expect(json.redirect).toBeUndefined();
+    });
+
+    it('sends agent headers but always its own User-Agent, whatever spelling the agent uses', async () => {
+      const json = resultJson(
+        await client.callTool({
+          name: 'http_fetch',
+          arguments: { url: `${baseUrl}/echo-headers`, headers: { 'user-agent': 'spoofed', 'X-Custom': 'kept' } },
+        }),
+      );
+      const echoed = JSON.parse(json.body) as Record<string, string>;
+      expect(echoed['user-agent']).toMatch(/^IronCurtain\//u);
+      expect(echoed['x-custom']).toBe('kept');
+    });
+
+    it('rejects a headers argument that is not an object of strings', async () => {
+      const result = await client.callTool({
+        name: 'http_fetch',
+        arguments: { url: `${baseUrl}/plain`, headers: { 'X-Count': 3 } },
+      });
+      expect(errorJson(result).error).toMatch(/Invalid headers/u);
+    });
+
+    it('refuses non-HTTP schemes', async () => {
+      const result = await client.callTool({ name: 'http_fetch', arguments: { url: 'file:///etc/passwd' } });
+      expect(errorJson(result).code).toBe('INVALID_URL');
+    });
+  });
+
+  describe('redirects', () => {
+    it('returns a cross-origin redirect to an internal service instead of following it', async () => {
+      const json = resultJson(
+        await client.callTool({
+          name: 'http_fetch',
+          arguments: { url: `${baseUrl}/redirect-internal`, headers: { 'Metadata-Flavor': 'Google' } },
+        }),
+      );
+      const target = `${internalUrl}/latest/meta-data/iam/security-credentials/`;
+      expect(json.status).toBe(302);
+      expect(json.url).toBe(`${baseUrl}/redirect-internal`);
+      expect(json.body).toBe('');
+      expect(json.redirect).toEqual({ location: target, followed: false, reason: 'cross-origin' });
+      expect(json.headers.location).toBe(target);
+      expect(internalHits).toBe(0);
+    });
+
+    it('does not follow a redirect to 169.254.169.254, and refuses it when requested directly', async () => {
+      const json = resultJson(
+        await client.callTool({ name: 'http_fetch', arguments: { url: `${baseUrl}/redirect-metadata` } }),
+      );
+      expect(json.status).toBe(302);
+      expect(json.redirect?.location).toBe('http://169.254.169.254/latest/meta-data/');
+
+      // Following it is a new, policy-evaluated call, and the address guard
+      // refuses the metadata address even with the private-network opt-in.
+      const direct = errorJson(
+        await client.callTool({ name: 'http_fetch', arguments: { url: 'http://169.254.169.254/latest/meta-data/' } }),
+      );
+      expect(direct.code).toBe('DESTINATION_NOT_ALLOWED');
+    });
+
+    it('refuses metadata endpoints inside the private ranges the opt-in admits', async () => {
+      for (const url of ['http://[fd20:ce::254]/computeMetadata/v1/', 'http://[fd00:ec2::23]/']) {
+        const error = errorJson(await client.callTool({ name: 'http_fetch', arguments: { url, timeout: 2 } }));
+        expect(error.code).toBe('DESTINATION_NOT_ALLOWED');
+      }
+    });
+
+    it('follows five same-origin redirects and reports the chain', async () => {
+      const json = resultJson(await client.callTool({ name: 'http_fetch', arguments: { url: `${baseUrl}/chain/5` } }));
+      expect(json.status).toBe(200);
+      expect(json.body).toContain('end of chain');
+      expect(json.url).toBe(`${baseUrl}/chain/0`);
+      expect(json.redirects.map((hop) => hop.location)).toEqual(
+        [4, 3, 2, 1, 0].map((remaining) => `${baseUrl}/chain/${remaining}`),
+      );
+    });
+
+    it('refuses a sixth same-origin redirect', async () => {
+      const error = errorJson(await client.callTool({ name: 'http_fetch', arguments: { url: `${baseUrl}/chain/6` } }));
+      expect(error.code).toBe('REDIRECT_LIMIT');
+      expect(error.redirects).toHaveLength(5);
+      expect(error.location).toBe(`${baseUrl}/chain/0`);
+    });
+  });
+
+  describe('private destinations without the opt-in (default)', () => {
+    it('refuses a loopback IP literal', async () => {
+      const error = errorJson(
+        await strictClient.callTool({ name: 'http_fetch', arguments: { url: `${baseUrl}/html` } }),
+      );
+      expect(error.code).toBe('DESTINATION_NOT_ALLOWED');
+    });
+
+    it('refuses a hostname that resolves to loopback', async () => {
+      const error = errorJson(
+        await strictClient.callTool({ name: 'http_fetch', arguments: { url: `http://localhost:${port}/html` } }),
+      );
+      expect(error.code).toBe('DESTINATION_NOT_ALLOWED');
+    });
+
+    it('refuses the internal service even when asked for it directly', async () => {
+      const error = errorJson(
+        await strictClient.callTool({ name: 'http_fetch', arguments: { url: `${internalUrl}/latest/meta-data/` } }),
+      );
+      expect(error.code).toBe('DESTINATION_NOT_ALLOWED');
+      expect(internalHits).toBe(0);
+    });
+
+    it('announces the opt-in on stderr only when it is enabled', () => {
+      expect(clientStderr).toContain('allowPrivateNetworks is enabled');
+      expect(strictStderr).not.toContain('allowPrivateNetworks is enabled');
+    });
+  });
+
+  describe('charset-aware decoding', () => {
+    it('decodes an ISO-8859-1 page by its Content-Type charset', async () => {
+      const json = resultJson(await client.callTool({ name: 'http_fetch', arguments: { url: `${baseUrl}/latin1` } }));
+      expect(json.body).toContain(LATIN1_TEXT);
+      expect(json.body).not.toContain('�');
+    });
+
+    it('decodes by the <meta charset> declaration when the header has no charset', async () => {
+      const json = resultJson(
+        await client.callTool({ name: 'http_fetch', arguments: { url: `${baseUrl}/latin1-meta`, format: 'text' } }),
+      );
+      expect(json.body).toContain(LATIN1_TEXT);
+    });
+
+    it('decodes plain text by a quoted charset parameter', async () => {
+      const json = resultJson(
+        await client.callTool({ name: 'http_fetch', arguments: { url: `${baseUrl}/latin1-plain` } }),
+      );
+      expect(json.body).toBe(LATIN1_TEXT);
+    });
+
+    it('treats application/xhtml+xml as HTML', async () => {
+      const json = resultJson(await client.callTool({ name: 'http_fetch', arguments: { url: `${baseUrl}/xhtml` } }));
+      expect(json.body).toContain('# XHTML Heading');
+      expect(json.body).not.toContain('var leaked');
+      expect(json.body).not.toContain('<h1>');
+    });
+  });
+
+  describe('binary responses', () => {
+    it('returns metadata instead of a decoded body for an image', async () => {
+      const json = resultJson(await client.callTool({ name: 'http_fetch', arguments: { url: `${baseUrl}/png` } }));
+      expect(json.status).toBe(200);
+      expect(json.body).toBe('');
+      expect(json.truncated).toBe(false);
+      expect(json.binary).toEqual({ contentType: 'image/png', size: PNG_BYTES.length });
+    });
+
+    it('sniffs application/octet-stream: binary bytes give metadata', async () => {
+      const json = resultJson(
+        await client.callTool({ name: 'http_fetch', arguments: { url: `${baseUrl}/octet-binary` } }),
+      );
+      expect(json.body).toBe('');
+      expect(json.binary).toEqual({ contentType: 'application/octet-stream', size: 6 });
+    });
+
+    it('sniffs application/octet-stream: text bytes come back as text', async () => {
+      const json = resultJson(
+        await client.callTool({ name: 'http_fetch', arguments: { url: `${baseUrl}/octet-text` } }),
+      );
+      expect(json.binary).toBeUndefined();
+      expect(json.body).toBe('plain words served as octet-stream');
     });
   });
 

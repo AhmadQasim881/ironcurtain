@@ -2,8 +2,12 @@
  * Validates test scenario arguments against tool input schemas.
  *
  * Catches common LLM errors: wrong argument names, missing required fields,
- * and invalid enum values. Uses the JSON Schema stored in tool annotations
- * (captured from MCP servers at annotation time).
+ * and invalid enum values. Validates against the schema the live server
+ * reports when the caller reached the server (`compile-policy` without
+ * `--no-mcp`), otherwise against the JSON Schema stored in the tool
+ * annotations (captured from the MCP server at annotation time). Only the
+ * live schema can reject a shape the server itself rejects after a release
+ * renamed an argument; the stored one is as old as the annotation.
  */
 
 import { z } from 'zod';
@@ -27,6 +31,18 @@ function asJsonSchema(raw: Record<string, unknown>): JsonSchema {
   return raw;
 }
 
+/**
+ * Live input schemas keyed by {@link liveSchemaKey}. Built by
+ * `live-tools.ts` from the servers `compile-policy` could reach; a tool
+ * absent from the index is validated against its stored schema.
+ */
+export type LiveSchemaIndex = ReadonlyMap<string, Record<string, unknown>>;
+
+/** The key of a tool's live schema in a {@link LiveSchemaIndex}. */
+export function liveSchemaKey(serverName: string, toolName: string): string {
+  return `${serverName}__${toolName}`;
+}
+
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
@@ -36,21 +52,24 @@ export interface SchemaValidationError {
 }
 
 /**
- * Validates a scenario's arguments against the matching tool's inputSchema.
+ * Validates a scenario's arguments against the matching tool's input schema:
+ * the live one when `liveSchemas` has it, else the stored annotation's.
  *
- * Returns an empty array if the scenario is valid or if no matching
- * annotation/schema is found (graceful skip).
+ * Returns an empty array if the scenario is valid or if no schema is known
+ * for the tool (graceful skip).
  */
 export function validateScenarioArgs(
   scenario: TestScenario,
   storedAnnotations: StoredToolAnnotation[],
+  liveSchemas?: LiveSchemaIndex,
 ): SchemaValidationError[] {
-  const annotation = storedAnnotations.find(
-    (a) => a.serverName === scenario.request.serverName && a.toolName === scenario.request.toolName,
-  );
-  if (!annotation?.inputSchema) return [];
+  const { serverName, toolName } = scenario.request;
+  const live = liveSchemas?.get(liveSchemaKey(serverName, toolName));
+  const stored = storedAnnotations.find((a) => a.serverName === serverName && a.toolName === toolName)?.inputSchema;
+  const rawSchema = live ?? stored;
+  if (!rawSchema) return [];
 
-  const schema = asJsonSchema(annotation.inputSchema);
+  const schema = asJsonSchema(rawSchema);
   if (!schema.properties) return [];
 
   const errors: SchemaValidationError[] = [];
@@ -90,17 +109,19 @@ export function validateScenarioArgs(
 /**
  * Filters scenarios with invalid arguments, returning valid and discarded sets.
  *
- * Scenarios without a matching annotation or inputSchema are kept (not discarded).
+ * Scenarios without a known schema (no live schema, no matching annotation
+ * or an annotation without inputSchema) are kept (not discarded).
  */
 export function filterInvalidSchemaScenarios(
   scenarios: TestScenario[],
   storedAnnotations: StoredToolAnnotation[],
+  liveSchemas?: LiveSchemaIndex,
 ): { valid: TestScenario[]; discarded: DiscardedScenario[] } {
   const valid: TestScenario[] = [];
   const discarded: DiscardedScenario[] = [];
 
   for (const scenario of scenarios) {
-    const errors = validateScenarioArgs(scenario, storedAnnotations);
+    const errors = validateScenarioArgs(scenario, storedAnnotations, liveSchemas);
     if (errors.length > 0) {
       discarded.push({
         scenario,

@@ -4,16 +4,31 @@ import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import type { SessionOptions } from '../../src/session/types.js';
-import type { WorkflowId, HumanGateRequest, WorkflowDefinition } from '../../src/workflow/types.js';
+import type {
+  WorkflowId,
+  HumanGateRequest,
+  WorkflowCheckpoint,
+  WorkflowContext,
+  WorkflowDefinition,
+  DeterministicStateDefinition,
+} from '../../src/workflow/types.js';
 import { WorkflowOrchestrator, type WorkflowLifecycleEvent } from '../../src/workflow/orchestrator.js';
 import { FileCheckpointStore } from '../../src/workflow/checkpoint.js';
 import {
+  buildDeterministicInvokeInput,
+  type DeterministicInvokeInput,
+  type DeterministicInvokeResult,
+} from '../../src/workflow/machine-builder.js';
+import { RESUME_NOTICE } from '../../src/workflow/prompt-builder.js';
+import {
+  resolveActiveGate,
   MockSession,
   approvedResponse,
   rejectedResponse,
   simulateArtifacts,
   createArtifactAwareSession,
   writeDefinitionFile,
+  checkpointDirFor,
   createCheckpointStore,
   createDeps,
   waitForGate,
@@ -95,6 +110,41 @@ const simpleAgentDef: WorkflowDefinition = {
     done: { type: 'terminal', description: 'Done' },
   },
 };
+
+/** An agent state that goes round again on `rejected` and finishes otherwise. */
+const selfLoopDef: WorkflowDefinition = {
+  name: 'self-loop',
+  description: 'An agent state that loops on itself until approved',
+  initial: 'work',
+  settings: { mode: 'builtin' },
+  states: {
+    work: {
+      type: 'agent',
+      description: 'Works until approved',
+      persona: 'coder',
+      prompt: 'You are a coder.',
+      inputs: [],
+      outputs: ['code'],
+      transitions: [{ to: 'work', when: { verdict: 'rejected' } }, { to: 'done' }],
+    },
+    done: { type: 'terminal', description: 'Done' },
+  },
+};
+
+/** `[from, to]` of each recorded transition. */
+function transitionPairs(checkpoint: WorkflowCheckpoint | undefined): string[][] {
+  return (checkpoint?.transitionHistory ?? []).map(({ from, to }) => [from, to]);
+}
+
+/** `[from, to]` of each `state_transition` entry in the run's message log. */
+function loggedTransitions(baseDir: string, workflowId: WorkflowId): string[][] {
+  return readFileSync(resolve(baseDir, workflowId, 'messages.jsonl'), 'utf8')
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line) as { type?: unknown; from?: unknown; event?: unknown })
+    .filter((entry) => entry.type === 'state_transition')
+    .map((entry) => [String(entry.from), String(entry.event)]);
+}
 
 function terminalControlPhases(baseDir: string, workflowId: WorkflowId): string[] {
   const lines = readFileSync(resolve(baseDir, workflowId, 'messages.jsonl'), 'utf8')
@@ -230,9 +280,6 @@ describe('WorkflowOrchestrator checkpoint + resume', () => {
     }
     cleanupPersonas?.();
     rmSync(tmpDir, { recursive: true, force: true });
-    const baseName = resolve(tmpDir).split('/').pop()!;
-    const ckptDir = resolve(tmpDir, '..', `${baseName}-ckpt`);
-    rmSync(ckptDir, { recursive: true, force: true });
   });
 
   function trackOrchestrator(o: WorkflowOrchestrator): WorkflowOrchestrator {
@@ -318,13 +365,100 @@ describe('WorkflowOrchestrator checkpoint + resume', () => {
     expect(checkpoint!.transitionHistory.length).toBeGreaterThan(0);
 
     // Approve gate -> implement -> review -> done
-    orchestrator.resolveGate(workflowId, { type: 'APPROVE' });
+    resolveActiveGate(orchestrator, workflowId, { type: 'APPROVE' });
     await waitForCompletion(orchestrator, workflowId);
 
     // Checkpoints were saved during execution for intermediate states; the
     // final retained checkpoint (tested separately in test 2) carries
     // `finalStatus`.
     expect(checkpoint!.context.taskDescription).toBe('build API');
+  });
+
+  // A transition back onto the same state re-enters it (`reenter: true`): the
+  // state value stays the same, and the new visit shows in its visit count.
+  it('records and checkpoints each re-entry of a self-looping agent state', async () => {
+    const defPath = writeDefinitionFile(tmpDir, selfLoopDef);
+    const checkpointStore = createCheckpointStore(tmpDir);
+    const saved: WorkflowCheckpoint[] = [];
+    const save = checkpointStore.save.bind(checkpointStore);
+    vi.spyOn(checkpointStore, 'save').mockImplementation((id, checkpoint) => {
+      saved.push(structuredClone(checkpoint));
+      save(id, checkpoint);
+    });
+    let calls = 0;
+    const createSession = vi.fn(async () => {
+      calls++;
+      const text = calls === 1 ? rejectedResponse('needs another pass') : approvedResponse('good now');
+      return createArtifactAwareSession([{ text, artifacts: ['code'] }], tmpDir);
+    });
+    const orchestrator = trackOrchestrator(
+      new WorkflowOrchestrator(createDeps(tmpDir, { createSession, checkpointStore })),
+    );
+
+    const workflowId = await orchestrator.start(defPath, 'task');
+    await waitForCompletion(orchestrator, workflowId);
+
+    expect(createSession).toHaveBeenCalledTimes(2);
+    const loop = saved.find((checkpoint) => checkpoint.context.visitCounts.work === 2);
+    expect(loop?.machineState).toBe('work');
+    expect(loop?.finalStatus).toBeUndefined();
+    expect(transitionPairs(loop)).toEqual([['work', 'work']]);
+    expect(loop?.transitionHistory[0].agentMessage).toBe('Found issues.');
+    expect(loop?.context.previousAgentNotes).toBe('needs another pass');
+    expect(transitionPairs(checkpointStore.load(workflowId))).toEqual([
+      ['work', 'work'],
+      ['work', 'done'],
+    ]);
+    expect(loggedTransitions(tmpDir, workflowId)).toEqual([
+      ['work', 'work'],
+      ['work', 'done'],
+    ]);
+  });
+
+  it('resumes a self-loop from its latest iteration', async () => {
+    const defPath = writeDefinitionFile(tmpDir, selfLoopDef);
+    const checkpointStore = createCheckpointStore(tmpDir);
+    let calls = 0;
+    const createSession = vi.fn(async () => {
+      calls++;
+      if (calls === 1)
+        return createArtifactAwareSession([{ text: rejectedResponse('again'), artifacts: ['code'] }], tmpDir);
+      return new Promise<never>(() => {
+        /* the second iteration is still running when the run stops */
+      });
+    });
+    const orchestrator = trackOrchestrator(
+      new WorkflowOrchestrator(createDeps(tmpDir, { createSession, checkpointStore })),
+    );
+    const workflowId = await orchestrator.start(defPath, 'task');
+    await vi.waitFor(() => expect(createSession).toHaveBeenCalledTimes(2), { timeout: 5000, interval: 10 });
+    await orchestrator.abort(workflowId);
+
+    const stopped = checkpointStore.load(workflowId);
+    // Resume re-runs the second iteration, not the first: a maxVisits cap counts it once.
+    expect(stopped?.machineState).toBe('work');
+    expect(stopped?.context.visitCounts.work).toBe(2);
+    expect(stopped?.context.previousAgentNotes).toBe('again');
+    expect(transitionPairs(stopped)).toEqual([['work', 'work']]);
+
+    const resumed = trackOrchestrator(
+      new WorkflowOrchestrator(
+        createDeps(tmpDir, {
+          checkpointStore,
+          createSession: async () =>
+            createArtifactAwareSession([{ text: approvedResponse('done'), artifacts: ['code'] }], tmpDir),
+        }),
+      ),
+    );
+    await resumed.resume(workflowId);
+    await waitForCompletion(resumed, workflowId);
+
+    const finished = checkpointStore.load(workflowId);
+    expect(finished?.context.visitCounts.work).toBe(2);
+    expect(transitionPairs(finished)).toEqual([
+      ['work', 'work'],
+      ['work', 'done'],
+    ]);
   });
 
   // -----------------------------------------------------------------------
@@ -432,7 +566,7 @@ describe('WorkflowOrchestrator checkpoint + resume', () => {
     });
 
     const corruptId = 'wf-corrupt' as WorkflowId;
-    const checkpointBase = resolve(tmpDir, '..', `${resolve(tmpDir).split('/').pop()!}-ckpt`);
+    const checkpointBase = checkpointDirFor(tmpDir);
     mkdirSync(resolve(checkpointBase, corruptId), { recursive: true });
     writeFileSync(resolve(checkpointBase, corruptId, 'checkpoint.json'), '{nope');
     await expect(orchestrator.resume(corruptId)).rejects.toMatchObject({ code: 'WORKFLOW_CHECKPOINT_CORRUPTED' });
@@ -479,10 +613,13 @@ describe('WorkflowOrchestrator checkpoint + resume', () => {
     await expect(orchestrator.resume(completedId)).rejects.toMatchObject({ code: 'WORKFLOW_NOT_RESUMABLE' });
 
     const missingDefinitionId = 'wf-missing-definition' as WorkflowId;
-    const resumableCheckpoint = checkpointStore.load(completedId)!;
-    delete resumableCheckpoint.finalStatus;
+    const completedCheckpoint = checkpointStore.load(completedId);
+    if (completedCheckpoint === undefined) throw new Error('expected the completed checkpoint to be stored');
+    // The same checkpoint without a final status (JSON drops the undefined
+    // field): resumable, but its definition is gone.
     checkpointStore.save(missingDefinitionId, {
-      ...resumableCheckpoint,
+      ...completedCheckpoint,
+      finalStatus: undefined,
       definitionPath: resolve(tmpDir, 'missing-definition.json'),
     });
     await expect(orchestrator.resume(missingDefinitionId)).rejects.toMatchObject({
@@ -545,7 +682,7 @@ describe('WorkflowOrchestrator checkpoint + resume', () => {
     const workflowId = await orchestrator.start(defPath, 'build a thing');
 
     await waitForGate(raiseGate, 1);
-    orchestrator.resolveGate(workflowId, { type: 'ABORT' });
+    resolveActiveGate(orchestrator, workflowId, { type: 'ABORT' });
     await waitForCompletion(orchestrator, workflowId);
 
     const surviving = checkpointStore.load(workflowId);
@@ -617,7 +754,7 @@ describe('WorkflowOrchestrator checkpoint + resume', () => {
 
     // Resolve the gate with ABORT, which drives the machine into the
     // `aborted` terminal state via handleWorkflowComplete.
-    orchestrator.resolveGate(workflowId, { type: 'ABORT' });
+    resolveActiveGate(orchestrator, workflowId, { type: 'ABORT' });
     await waitForCompletion(orchestrator, workflowId);
 
     expect(orchestrator.getStatus(workflowId)?.phase).toBe('aborted');
@@ -661,7 +798,7 @@ describe('WorkflowOrchestrator checkpoint + resume', () => {
     expect(preAbort?.machineState).toBe('plan_gate');
 
     // Drive into the `aborted` terminal via ABORT.
-    orchestrator.resolveGate(workflowId, { type: 'ABORT' });
+    resolveActiveGate(orchestrator, workflowId, { type: 'ABORT' });
     await waitForCompletion(orchestrator, workflowId);
 
     const surviving = checkpointStore.load(workflowId);
@@ -738,7 +875,7 @@ describe('WorkflowOrchestrator checkpoint + resume', () => {
     await waitForGate(raiseGate2, 1);
 
     // Approve the gate to retry (APPROVE goes to 'done' in this definition)
-    orchestrator2.resolveGate(workflowId, { type: 'APPROVE' });
+    resolveActiveGate(orchestrator2, workflowId, { type: 'APPROVE' });
     await waitForCompletion(orchestrator2, workflowId);
     expect(orchestrator2.getStatus(workflowId)?.phase).toBe('completed');
   });
@@ -792,7 +929,7 @@ describe('WorkflowOrchestrator checkpoint + resume', () => {
     await waitForGate(raiseGate1, 1);
 
     // Approve gate to continue: error_gate APPROVE -> implement
-    orchestrator1.resolveGate(workflowId, { type: 'APPROVE' });
+    resolveActiveGate(orchestrator1, workflowId, { type: 'APPROVE' });
 
     // Flow continues: implement -> review(reject) -> error_gate again
     await waitForGate(raiseGate1, 2);
@@ -837,7 +974,7 @@ describe('WorkflowOrchestrator checkpoint + resume', () => {
     await waitForGate(raiseGate2, 1);
 
     // Approve -> implement -> review(approve) -> done
-    orchestrator2.resolveGate(workflowId, { type: 'APPROVE' });
+    resolveActiveGate(orchestrator2, workflowId, { type: 'APPROVE' });
     await waitForCompletion(orchestrator2, workflowId);
 
     expect(orchestrator2.getStatus(workflowId)?.phase).toBe('completed');
@@ -938,7 +1075,7 @@ describe('WorkflowOrchestrator checkpoint + resume', () => {
     expect(gateRequests[0].stateName).toBe('plan_gate');
 
     // Approve the gate
-    orchestrator2.resolveGate(workflowId, { type: 'APPROVE' });
+    resolveActiveGate(orchestrator2, workflowId, { type: 'APPROVE' });
     await waitForCompletion(orchestrator2, workflowId);
     expect(orchestrator2.getStatus(workflowId)?.phase).toBe('completed');
   });
@@ -1261,6 +1398,318 @@ describe('WorkflowOrchestrator checkpoint + resume', () => {
   });
 
   // -----------------------------------------------------------------------
+  // Resume replays the interrupted state with the machine's own inputs
+  // -----------------------------------------------------------------------
+
+  /** Context of a checkpoint written on entry to `state` (visit counts already bumped). */
+  function entryContext(taskDescription: string, visitCounts: Record<string, number>): WorkflowContext {
+    return {
+      taskDescription,
+      artifacts: {},
+      round: 0,
+      maxRounds: 4,
+      previousOutputHashes: {},
+      previousTestCount: null,
+      humanPrompt: null,
+      reviewHistory: [],
+      totalTokens: 0,
+      lastError: null,
+      agentConversationsByState: {},
+      previousAgentOutput: null,
+      previousAgentNotes: null,
+      previousStateName: null,
+      visitCounts,
+    };
+  }
+
+  /** Writes the run's definition copy and a checkpoint taken on entry to `machineState`. */
+  function seedCheckpoint(
+    workflowId: WorkflowId,
+    definition: WorkflowDefinition,
+    machineState: string,
+    context: WorkflowContext,
+  ): FileCheckpointStore {
+    const defPath = writeDefinitionFile(tmpDir, definition);
+    const checkpointStore = createCheckpointStore(tmpDir);
+    const workspacePath = resolve(tmpDir, workflowId, 'workspace');
+    mkdirSync(resolve(workspacePath, '.workflow'), { recursive: true });
+    writeFileSync(resolve(tmpDir, workflowId, 'definition.json'), JSON.stringify(definition));
+    checkpointStore.save(workflowId, {
+      machineState,
+      context,
+      timestamp: new Date().toISOString(),
+      transitionHistory: [],
+      definitionPath: defPath,
+      workspacePath,
+    });
+    return checkpointStore;
+  }
+
+  it('requires a run-local definition when resuming an external run', async () => {
+    const workflowId = 'external-definition-copy' as WorkflowId;
+    const checkpointStore = seedCheckpoint(workflowId, linearWorkflowDef, 'plan_gate', entryContext('resume', {}));
+    rmSync(resolve(tmpDir, workflowId, 'definition.json'));
+    const createSession = vi.fn(async () => new MockSession({ responses: [] }));
+    const orchestrator = trackOrchestrator(
+      new WorkflowOrchestrator(createDeps(tmpDir, { checkpointStore, createSession })),
+    );
+    await expect(orchestrator.resume(workflowId)).rejects.toMatchObject({
+      code: 'WORKFLOW_CHECKPOINT_CORRUPTED',
+      message: expect.stringContaining('requires its own definition.json'),
+    });
+    expect(createSession).not.toHaveBeenCalled();
+  });
+
+  it('resume replays a deterministic state with lane placeholders resolved, like a normal entry', async () => {
+    // A top-level (non-fan-out) deterministic state may use lane placeholders;
+    // with no lane active they resolve to the default current/ directory and
+    // lane 0. The replay used to pass the raw `run`/`resultFile`, so the
+    // resumed command got a literal "{laneDir}" and the result read failed.
+    const placeholderDef: WorkflowDefinition = {
+      name: 'placeholder-deterministic',
+      description: 'Top-level deterministic state that uses lane placeholders',
+      initial: 'check',
+      settings: { mode: 'docker', dockerAgent: 'claude-code', sharedContainer: true },
+      states: {
+        check: {
+          type: 'deterministic',
+          description: 'Runs a check in the shared container',
+          container: true,
+          run: [['/workflow-scripts/check.py', '--out', '{laneDir}/check.json', '--lane-id', '{laneId}']],
+          resultFile: '{laneRelDir}/check.json',
+          transitions: [{ to: 'done', when: { verdict: 'ok' } }, { to: 'failed' }],
+        },
+        done: { type: 'terminal', description: 'Done' },
+        failed: { type: 'terminal', description: 'Failed' },
+      },
+    };
+    const workflowId = 'resume-placeholder-test' as WorkflowId;
+    const checkpointStore = seedCheckpoint(workflowId, placeholderDef, 'check', entryContext('check it', {}));
+
+    const orchestrator = trackOrchestrator(new WorkflowOrchestrator(createDeps(tmpDir, { checkpointStore })));
+    const replayed: DeterministicInvokeInput[] = [];
+    // Replace the executor (it would exec in a container) and record the input
+    // the replay hands it.
+    (
+      orchestrator as unknown as {
+        executeDeterministicState: (
+          id: WorkflowId,
+          input: DeterministicInvokeInput,
+        ) => Promise<DeterministicInvokeResult>;
+      }
+    ).executeDeterministicState = async (_id, input) => {
+      replayed.push(input);
+      return { passed: true, verdict: 'ok' };
+    };
+
+    await orchestrator.resume(workflowId);
+    await waitForCompletion(orchestrator, workflowId, 5000);
+
+    expect(orchestrator.getStatus(workflowId)?.phase).toBe('completed');
+    expect(replayed).toHaveLength(1);
+    expect(replayed[0].commands).toEqual([
+      ['/workflow-scripts/check.py', '--out', '/workspace/.evolve_runs/main/current/check.json', '--lane-id', '0'],
+    ]);
+    expect(replayed[0].resultFile).toBe('.evolve_runs/main/current/check.json');
+    expect(replayed[0]).toEqual(
+      buildDeterministicInvokeInput(
+        'check',
+        placeholderDef.states.check as DeterministicStateDefinition,
+        replayed[0].context,
+      ),
+    );
+  });
+
+  it('resume replays a host: true deterministic state with its acknowledgement, on the real host runner', async () => {
+    // The host runner refuses a state whose invoke input lacks host: true. The
+    // replay used to set it inline; it now comes from the shared builder, so a
+    // builder that dropped it would make every resumed host state fail here
+    // (the marker would never be written).
+    const marker = join(tmpDir, 'host-replay-marker.txt');
+    const hostDef: WorkflowDefinition = {
+      name: 'host-deterministic-replay',
+      description: 'A builtin workflow whose only work is an acknowledged host state',
+      initial: 'check',
+      settings: { mode: 'builtin' },
+      states: {
+        check: {
+          type: 'deterministic',
+          description: 'Runs on the host',
+          host: true,
+          run: [
+            [
+              'node',
+              '-e',
+              "require('fs').writeFileSync(process.argv[1], 'lane=' + process.argv[2])",
+              marker,
+              '{laneId}',
+            ],
+          ],
+          transitions: [{ to: 'done' }],
+        },
+        done: { type: 'terminal', description: 'Done' },
+      },
+    };
+    const workflowId = 'resume-host-replay-test' as WorkflowId;
+    const checkpointStore = seedCheckpoint(workflowId, hostDef, 'check', entryContext('check it', {}));
+
+    const orchestrator = trackOrchestrator(new WorkflowOrchestrator(createDeps(tmpDir, { checkpointStore })));
+    await orchestrator.resume(workflowId);
+    await waitForCompletion(orchestrator, workflowId, 10_000);
+
+    expect(orchestrator.getStatus(workflowId)?.phase).toBe('completed');
+    // Ran on the host, with the lane placeholder resolved like a normal entry.
+    expect(existsSync(marker)).toBe(true);
+    expect(readFileSync(marker, 'utf8')).toBe('lane=0');
+  });
+
+  it('resume tells the replayed agent that an earlier attempt may have run, and only that agent', async () => {
+    const workflowId = 'resume-notice-test' as WorkflowId;
+    const checkpointStore = seedCheckpoint(
+      workflowId,
+      linearWorkflowDef,
+      'implement',
+      entryContext('build an API', { plan: 1, implement: 1 }),
+    );
+    simulateArtifacts(resolve(tmpDir, workflowId), ['plan']);
+
+    const sessionsByPersona = new Map<string, MockSession>();
+    const sessionFactory = vi.fn(async (opts: SessionOptions) => {
+      const persona = opts.persona ?? 'none';
+      const session =
+        persona === 'coder'
+          ? createArtifactAwareSession([{ text: approvedResponse('implemented'), artifacts: ['code'] }], tmpDir)
+          : createArtifactAwareSession([{ text: approvedResponse('looks good'), artifacts: ['reviews'] }], tmpDir);
+      sessionsByPersona.set(persona, session);
+      return session;
+    });
+
+    const orchestrator = trackOrchestrator(
+      new WorkflowOrchestrator(createDeps(tmpDir, { createSession: sessionFactory, checkpointStore })),
+    );
+    await orchestrator.resume(workflowId);
+    await waitForCompletion(orchestrator, workflowId, 5000);
+    expect(orchestrator.getStatus(workflowId)?.phase).toBe('completed');
+
+    // The replayed `implement` opens with the notice...
+    const coderPrompt = sessionsByPersona.get('coder')?.sentMessages[0] ?? '';
+    expect(coderPrompt.startsWith(RESUME_NOTICE)).toBe(true);
+    expect(coderPrompt).toContain('You are a coder.');
+    // ...while `review`, entered normally afterwards, does not.
+    const reviewerPrompt = sessionsByPersona.get('reviewer')?.sentMessages[0] ?? '';
+    expect(reviewerPrompt).toContain('You are a reviewer.');
+    expect(reviewerPrompt).not.toContain('Resumed after an interruption');
+
+    // The message log records the prompt that was actually sent.
+    const sent = readFileSync(resolve(tmpDir, workflowId, 'messages.jsonl'), 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as { type?: string; state?: string; message?: string })
+      .filter((entry) => entry.type === 'agent_sent');
+    expect(sent.map((entry) => entry.state)).toEqual(['implement', 'review']);
+    expect(sent[0].message?.startsWith(RESUME_NOTICE)).toBe(true);
+    expect(sent[1].message).not.toContain('Resumed after an interruption');
+  });
+
+  it('resume repeats the notice in the fresh replacement prompt after status recovery runs out', async () => {
+    // `review` routes on its verdict, so a replayed review that never commits a
+    // status block ends in one fresh replacement execution. That opens a new
+    // conversation, so it must carry the notice again; the status reprompts
+    // inside the first conversation must not.
+    const workflowId = 'resume-notice-replacement-test' as WorkflowId;
+    const checkpointStore = seedCheckpoint(
+      workflowId,
+      linearWorkflowDef,
+      'review',
+      entryContext('build an API', { plan: 1, implement: 1, review: 1 }),
+    );
+    simulateArtifacts(resolve(tmpDir, workflowId), ['plan', 'code']);
+
+    const session: MockSession = new MockSession({
+      responses: () => {
+        const turn = session.sentMessages.length;
+        if (turn === 1) simulateArtifacts(resolve(tmpDir, workflowId), ['reviews']);
+        return turn <= 3 ? 'Reviewed the code, but no status block.' : approvedResponse('looks good');
+      },
+    });
+    const orchestrator = trackOrchestrator(
+      new WorkflowOrchestrator(createDeps(tmpDir, { createSession: vi.fn(async () => session), checkpointStore })),
+    );
+    await orchestrator.resume(workflowId);
+    await waitForCompletion(orchestrator, workflowId, 5000);
+
+    expect(orchestrator.getStatus(workflowId)?.phase).toBe('completed');
+    expect(session.sentMessages).toHaveLength(4);
+    // The conversation rotates once, right before the replacement (turn 4).
+    expect(session.rotateCalls).toEqual([3]);
+    const [first, statusReprompt1, statusReprompt2, replacement] = session.sentMessages;
+    expect(first.startsWith(RESUME_NOTICE)).toBe(true);
+    expect(statusReprompt1).not.toContain('Resumed after an interruption');
+    expect(statusReprompt2).not.toContain('Resumed after an interruption');
+    expect(replacement.startsWith(RESUME_NOTICE)).toBe(true);
+    expect(replacement).toContain('## Recovery handoff');
+  });
+
+  it('resume pairs the notice with the workflow_commit instructions of the replayed invocation', async () => {
+    // The same replay as above, with an agent that commits through the
+    // coordinator-owned workflow_commit tool (WP-133): the prompts that open
+    // a conversation carry both the resume notice and the commit
+    // instructions for the one invocation, whose id stays the same in the
+    // fresh replacement.
+    const workflowId = 'resume-notice-commit-test' as WorkflowId;
+    const checkpointStore = seedCheckpoint(
+      workflowId,
+      linearWorkflowDef,
+      'review',
+      entryContext('build an API', { plan: 1, implement: 1, review: 1 }),
+    );
+    simulateArtifacts(resolve(tmpDir, workflowId), ['plan', 'code']);
+
+    const invocationIdOf = (prompt: string): string => /invocation: "([0-9a-f-]{36})"/.exec(prompt)?.[1] ?? '';
+    let session: MockSession | undefined;
+    const createSession = vi.fn(async (opts: SessionOptions) => {
+      // A builtin state builds its own coordinator, which offers the tool
+      // and attaches the state's commit target.
+      const handler = opts.workflow?.workflowCommit;
+      if (!handler) throw new Error('builtin workflow state without a commit target');
+      handler.attach();
+      const created: MockSession = new MockSession({
+        responses: (prompt) => {
+          const turn = created.sentMessages.length;
+          if (turn === 1) simulateArtifacts(resolve(tmpDir, workflowId), ['reviews']);
+          if (turn <= 3) return 'Reviewed the code, but did not commit.';
+          const outcome = handler.commit({ invocation: invocationIdOf(prompt), verdict: 'approved' });
+          if (!outcome.accepted) throw new Error(`commit refused: ${outcome.reason}`);
+          return 'Committed.';
+        },
+      });
+      session = created;
+      return created;
+    });
+    const orchestrator = trackOrchestrator(
+      new WorkflowOrchestrator(createDeps(tmpDir, { createSession, checkpointStore })),
+    );
+    await orchestrator.resume(workflowId);
+    await waitForCompletion(orchestrator, workflowId, 5000);
+
+    expect(orchestrator.getStatus(workflowId)?.phase).toBe('completed');
+    const sent = session?.sentMessages ?? [];
+    expect(sent).toHaveLength(4);
+    const [first, continuation1, continuation2, replacement] = sent;
+    const invocationId = invocationIdOf(first);
+    expect(invocationId).not.toBe('');
+    expect(first.startsWith(RESUME_NOTICE)).toBe(true);
+    expect(first).toContain('workflow.commit({');
+    for (const continuation of [continuation1, continuation2]) {
+      expect(continuation).toContain('this state has not committed');
+      expect(continuation).not.toContain('Resumed after an interruption');
+    }
+    expect(replacement.startsWith(RESUME_NOTICE)).toBe(true);
+    expect(replacement).toContain('## Recovery handoff');
+    expect(invocationIdOf(replacement)).toBe(invocationId);
+  });
+
+  // -----------------------------------------------------------------------
   // Test 10: Session IDs survive checkpoint and resume
   // -----------------------------------------------------------------------
 
@@ -1352,7 +1801,7 @@ describe('WorkflowOrchestrator checkpoint + resume', () => {
     await waitForGate(raiseGate2, 1);
 
     // Approve gate -> implement(coder round 2) -> review(approve) -> done
-    orchestrator2.resolveGate(workflowId, { type: 'APPROVE' });
+    resolveActiveGate(orchestrator2, workflowId, { type: 'APPROVE' });
     await waitForCompletion(orchestrator2, workflowId);
 
     expect(orchestrator2.getStatus(workflowId)?.phase).toBe('completed');
@@ -1499,7 +1948,7 @@ describe('WorkflowOrchestrator checkpoint + resume', () => {
     // would require introspection. Instead, drive a definition that
     // re-enters an agent state on APPROVE so we can capture the
     // `workflowSkillsDir` argument.
-    orchestrator2.resolveGate(workflowId, { type: 'APPROVE' });
+    resolveActiveGate(orchestrator2, workflowId, { type: 'APPROVE' });
     await waitForCompletion(orchestrator2, workflowId);
 
     // The staged skills directory MUST still resolve and contain the
@@ -1516,7 +1965,10 @@ describe('WorkflowOrchestrator checkpoint + resume', () => {
     expect(finalCheckpoint?.workflowSkillsDir).toBe(runStagedDir);
   });
 
-  it('resume re-stages workflow-skills from the original package when the per-run copy is gone', async () => {
+  it.each(['own home', 'external'] as const)('resume package recovery for a run in %s', async (location) => {
+    const ownHome = location === 'own home';
+    const base = ownHome ? resolve(process.env.IRONCURTAIN_HOME ?? tmpDir, 'workflow-runs') : tmpDir;
+    mkdirSync(base, { recursive: true });
     // Recovery path: if both the staged copy under the run dir AND the
     // checkpointed path were lost (e.g. someone manually pruned the run
     // tree), but the original package's `skills/` is still on disk,
@@ -1558,14 +2010,14 @@ describe('WorkflowOrchestrator checkpoint + resume', () => {
     writeFileSync(resolve(fetcherSkillDir, 'SKILL.md'), '---\nname: fetcher\ndescription: fetches things\n---\nbody\n');
 
     const defPath = writeDefinitionFile(tmpDir, skillsAwareDef);
-    const checkpointStore = createCheckpointStore(tmpDir);
+    const checkpointStore = createCheckpointStore(base);
 
     const sessionFactory1 = vi.fn(async () => {
       return createArtifactAwareSession([{ text: approvedResponse('initial'), artifacts: ['code'] }], tmpDir);
     });
 
     const raiseGate1 = vi.fn();
-    const deps1 = createDeps(tmpDir, {
+    const deps1 = createDeps(base, {
       createSession: sessionFactory1,
       raiseGate: raiseGate1,
       checkpointStore,
@@ -1575,7 +2027,7 @@ describe('WorkflowOrchestrator checkpoint + resume', () => {
     const workflowId = await orchestrator1.start(defPath, 'do work');
     await waitForGate(raiseGate1, 1);
 
-    const runStagedDir = resolve(tmpDir, workflowId, 'workflow-skills');
+    const runStagedDir = resolve(base, workflowId, 'workflow-skills');
     expect(existsSync(runStagedDir)).toBe(true);
     await orchestrator1.shutdownAll();
 
@@ -1600,7 +2052,7 @@ describe('WorkflowOrchestrator checkpoint + resume', () => {
     });
 
     const raiseGate2 = vi.fn();
-    const deps2 = createDeps(tmpDir, {
+    const deps2 = createDeps(base, {
       createSession: sessionFactory2,
       raiseGate: raiseGate2,
       checkpointStore,
@@ -1612,13 +2064,13 @@ describe('WorkflowOrchestrator checkpoint + resume', () => {
 
     // Resume re-staged from the source — the run dir now contains a
     // fresh copy of the skills tree.
-    expect(existsSync(resolve(runStagedDir, 'fetcher', 'SKILL.md'))).toBe(true);
+    expect(existsSync(resolve(runStagedDir, 'fetcher', 'SKILL.md'))).toBe(ownHome);
 
     // The post-resume checkpoint persists the freshly-staged path so a
     // future resume sees the staged copy first (not the recovery path).
-    orchestrator2.resolveGate(workflowId, { type: 'APPROVE' });
+    resolveActiveGate(orchestrator2, workflowId, { type: 'APPROVE' });
     await waitForCompletion(orchestrator2, workflowId);
     const finalCheckpoint = checkpointStore.load(workflowId);
-    expect(finalCheckpoint?.workflowSkillsDir).toBe(runStagedDir);
+    expect(finalCheckpoint?.workflowSkillsDir).toBe(ownHome ? runStagedDir : undefined);
   });
 });

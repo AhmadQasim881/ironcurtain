@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import * as dns from 'node:dns';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import * as http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,6 +11,10 @@ import {
   type RegistryEgressGuard,
   type RegistryPullProvenance,
 } from '../../src/docker/registry-egress-proxy.js';
+import {
+  createRegistryPullProvenanceSink,
+  REGISTRY_PULL_PROVENANCE_FILE,
+} from '../../src/docker-workload/pull-provenance.js';
 import type { RegistryEgressManifest } from '../../src/docker/registry-egress-policy.js';
 import {
   createParentProxyOutboundTransport,
@@ -46,7 +50,11 @@ describe('registry-egress guard construction (fail-closed)', () => {
   it('fails closed when the frozen manifest is missing', () => {
     const directory = tempDirectory();
     expect(() =>
-      createRegistryEgressGuard({ mode: 'public-registry', manifestPath: join(directory, 'absent.json') }),
+      createRegistryEgressGuard({
+        mode: 'public-registry',
+        manifestPath: join(directory, 'absent.json'),
+        manifestPackageRoot: directory,
+      }),
     ).toThrow(/readable regular non-symlink/u);
   });
 
@@ -62,9 +70,9 @@ describe('registry-egress guard construction (fail-closed)', () => {
     const directory = tempDirectory();
     const path = join(directory, 'draft.json');
     writeFileSync(path, JSON.stringify({ ...manifest(), status: 'draft' }), { mode: 0o400 });
-    expect(() => createRegistryEgressGuard({ mode: 'public-registry', manifestPath: path })).toThrow(
-      /frozen manifest/u,
-    );
+    expect(() =>
+      createRegistryEgressGuard({ mode: 'public-registry', manifestPath: path, manifestPackageRoot: directory }),
+    ).toThrow(/frozen manifest/u);
   });
 
   it('serves a draft manifest only with the explicit unfrozen opt-in', () => {
@@ -74,6 +82,7 @@ describe('registry-egress guard construction (fail-closed)', () => {
     const guard = createRegistryEgressGuard({
       mode: 'public-registry',
       manifestPath: path,
+      manifestPackageRoot: directory,
       allowUnfrozenManifest: true,
     });
     expect(guard.manifest?.status).toBe('draft');
@@ -218,6 +227,10 @@ describe('registry-egress proxy seam (enabled)', () => {
     expect(provenance).toEqual([
       {
         originId: 'registry',
+        operation: 'blob-pull',
+        method: 'GET',
+        destination: { hostname: 'registry.test', port: 443 },
+        status: 200,
         repository: 'library/app',
         reference: digest,
         requestedDigest: digest,
@@ -249,6 +262,10 @@ describe('registry-egress proxy seam (enabled)', () => {
     expect(provenance).toEqual([
       {
         originId: 'registry',
+        operation: 'manifest-pull',
+        method: 'GET',
+        destination: { hostname: 'registry.test', port: 443 },
+        status: 200,
         repository: 'library/app',
         reference: '1.0',
         requestedDigest: undefined,
@@ -256,6 +273,152 @@ describe('registry-egress proxy seam (enabled)', () => {
         sizeBytes: body.length,
       },
     ]);
+  });
+
+  it('records pulled digests in the lease-owned provenance JSONL', async () => {
+    const body = Buffer.from('delivered-blob-bytes');
+    const digest = digestOf(body);
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/octet-stream', 'docker-content-digest': digest });
+      res.end(body);
+    });
+    const evidence = join(tempDirectory(), 'evidence');
+    mkdirSync(evidence, { mode: 0o700 });
+    const logPath = join(evidence, REGISTRY_PULL_PROVENANCE_FILE);
+    const sink = createRegistryPullProvenanceSink(logPath, {
+      leaseId: 'dw-pull-evidence',
+      generation: 'gen-pull-evidence',
+      bundleId: 'bundle-pull-evidence',
+    });
+
+    const result = await driveThroughSeam({
+      guard: fixtureGuard(),
+      transport: routingTransport({ 'registry.test': upstream.port }),
+      targetHost: 'registry.test',
+      path: `/v2/library/app/blobs/${digest}`,
+      recordProvenance: (record) => sink.append(record, new Date('2026-11-11T10:00:00.000Z')),
+    });
+
+    expect(result.statusCode).toBe(200);
+    const lines = readFileSync(logPath, 'utf8').trimEnd().split('\n');
+    expect(lines.map((line) => JSON.parse(line) as unknown)).toEqual([
+      {
+        schemaVersion: 1,
+        kind: 'registry-pull',
+        at: '2026-11-11T10:00:00.000Z',
+        leaseId: 'dw-pull-evidence',
+        generation: 'gen-pull-evidence',
+        bundleId: 'bundle-pull-evidence',
+        originId: 'registry',
+        operation: 'blob-pull',
+        method: 'GET',
+        destination: { hostname: 'registry.test', port: 443 },
+        status: 200,
+        repository: 'library/app',
+        reference: digest,
+        requestedDigest: digest,
+        resolvedDigest: digest,
+        sizeBytes: body.length,
+      },
+    ]);
+  });
+
+  it('records a CDN-served blob pull in the provenance JSONL with its derived origin and final destination', async () => {
+    // Docker Hub serves blobs through an unlisted CDN: the followed redirect
+    // marks the origin `<origin>:cdn`, which the durable record must accept.
+    const body = Buffer.from('cdn-delivered-layer');
+    const digest = digestOf(body);
+    const cdn = await startUpstream((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/octet-stream', 'docker-content-digest': digest });
+      res.end(body);
+    });
+    const registry = await startUpstream((_req, res) => {
+      res.writeHead(307, { location: 'https://cdn.example.com/layers/real?token=abc' });
+      res.end();
+    });
+    const evidence = join(tempDirectory(), 'evidence');
+    mkdirSync(evidence, { mode: 0o700 });
+    const logPath = join(evidence, REGISTRY_PULL_PROVENANCE_FILE);
+    const sink = createRegistryPullProvenanceSink(logPath, {
+      leaseId: 'dw-pull-evidence',
+      generation: 'gen-pull-evidence',
+      bundleId: 'bundle-pull-evidence',
+    });
+
+    const result = await driveThroughSeam({
+      guard: fixtureGuard(),
+      transport: routingTransport({ 'registry.test': registry.port, 'cdn.example.com': cdn.port }),
+      targetHost: 'registry.test',
+      path: `/v2/library/app/blobs/${digest}`,
+      recordProvenance: (record) => sink.append(record, new Date('2026-11-11T10:00:00.000Z')),
+    });
+
+    expect(result.statusCode).toBe(200);
+    expect(existsSync(logPath)).toBe(true);
+    const lines = readFileSync(logPath, 'utf8').trimEnd().split('\n');
+    expect(lines.map((line) => JSON.parse(line) as unknown)).toEqual([
+      expect.objectContaining({
+        kind: 'registry-pull',
+        originId: 'registry:cdn',
+        destination: { hostname: 'cdn.example.com', port: 443 },
+        status: 200,
+        operation: 'blob-pull',
+        requestedDigest: digest,
+        resolvedDigest: digest,
+        sizeBytes: body.length,
+      }),
+    ]);
+  });
+
+  it('records the registry status, so a refused or missing pull never reads as a successful one', async () => {
+    const body = Buffer.from('{"errors":[{"code":"MANIFEST_UNKNOWN"}]}');
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(body);
+    });
+    const provenance: RegistryPullProvenance[] = [];
+
+    const result = await driveThroughSeam({
+      guard: fixtureGuard(),
+      transport: routingTransport({ 'registry.test': upstream.port }),
+      targetHost: 'registry.test',
+      path: '/v2/library/app/manifests/missing',
+      recordProvenance: (record) => provenance.push(record),
+    });
+
+    expect(result.statusCode).toBe(404);
+    expect(provenance).toEqual([
+      expect.objectContaining({
+        operation: 'manifest-pull',
+        reference: 'missing',
+        status: 404,
+        resolvedDigest: undefined,
+        sizeBytes: body.length,
+      }),
+    ]);
+  });
+
+  it('delivers the pull even when the provenance sink fails', async () => {
+    const body = Buffer.from('{"schemaVersion":2}');
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/vnd.oci.image.manifest.v1+json' });
+      res.end(body);
+    });
+    let attempts = 0;
+
+    const result = await driveThroughSeam({
+      guard: fixtureGuard(),
+      transport: routingTransport({ 'registry.test': upstream.port }),
+      targetHost: 'registry.test',
+      path: '/v2/library/app/manifests/1.0',
+      recordProvenance: () => {
+        attempts += 1;
+        throw new Error('evidence volume is full');
+      },
+    });
+
+    expect(result).toMatchObject({ statusCode: 200, body: body.toString('utf8'), aborted: false });
+    expect(attempts).toBe(1);
   });
 
   it('streams response chunks to the daemon before the upstream finishes (backpressure, not buffered)', async () => {
@@ -681,7 +844,7 @@ function fixtureGuard(overrides: ManifestOverrides = {}): RegistryEgressGuard {
   const directory = tempDirectory();
   const path = join(directory, 'manifest.json');
   writeFileSync(path, JSON.stringify(manifest(overrides)), { mode: 0o400 });
-  return createRegistryEgressGuard({ mode: 'public-registry', manifestPath: path });
+  return createRegistryEgressGuard({ mode: 'public-registry', manifestPath: path, manifestPackageRoot: directory });
 }
 
 /** A destination-bound transport that dials a loopback upstream per hostname. */

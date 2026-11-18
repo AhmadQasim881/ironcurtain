@@ -8,14 +8,19 @@ import { resolveHostModelApiKey } from '../config/model-provider.js';
 
 import chalk from 'chalk';
 import { randomBytes } from 'node:crypto';
-import { chmodSync, constants, mkdirSync, statSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { mkdirSync } from 'node:fs';
 import { getPtyRegistryDir } from '../config/paths.js';
+import {
+  NODE_PTY_BUILD_NOTE,
+  NODE_PTY_SPAWN_HELPER_ISSUE_URL,
+  nodePtyRemediation,
+  repairNodePtySpawnHelper,
+} from '../pty/node-pty-loader.js';
 import type { ResolvedUserConfig } from '../config/user-config.js';
 import { parseModelId } from '../config/model-provider.js';
-import { modelFlagMisusedAsAgent } from '../config/agent-model-guard.js';
+import { modelFlagProblem } from '../config/agent-model-guard.js';
 import { loadConfig } from '../config/index.js';
+import { formatSetupPendingNotice, readFirstStartSetupState } from '../config/setup-state.js';
 import { checkHelp, parseArgsStrict, type CommandSpec } from '../cli-help.js';
 import {
   resolveSessionMode as defaultResolveSessionMode,
@@ -40,6 +45,12 @@ const muxSpec: CommandSpec = {
       description: 'Capture LLM API traces for sessions spawned by this mux (overrides config)',
     },
   ],
+  examples: [
+    'ironcurtain mux --agent claude-code   # then /new to spawn a session',
+    // Task scoping is per session and opt-in: the tab's child compiles (or
+    // reuses) the task scope before its session starts.
+    'ironcurtain mux                       # /new [persona] --task-scoped <task>: escalate calls the task does not need',
+  ],
 };
 
 /** Test injection points; production callers pass nothing. */
@@ -50,49 +61,45 @@ export interface MuxMainDeps {
   readonly sleep?: (ms: number) => Promise<void>;
 }
 
+/**
+ * node-pty and terminal-kit are optional dependencies. Runs after `--help`,
+ * which needs neither. The remediation names commands that work for a global
+ * install: `npm install <pkg>` in the current directory does not, since a
+ * global IronCurtain resolves modules from its own package directory.
+ */
 async function probeNativeDependencies(): Promise<void> {
   try {
     await import('node-pty');
   } catch {
     process.stderr.write(
-      chalk.red('Error: ironcurtain mux requires the node-pty package.\n') + 'Install it with: npm install node-pty\n',
+      chalk.red('Error: ironcurtain mux needs the optional node-pty package, which could not be loaded.\n') +
+        `${NODE_PTY_BUILD_NOTE}\n${nodePtyRemediation()}\n` +
+        'Run `ironcurtain doctor` to check the installation.\n',
     );
     process.exit(1);
   }
 
-  // On macOS, node-pty <=1.1.0 ships spawn-helper without the execute bit
-  // (https://github.com/microsoft/node-pty/issues/850), causing
-  // "posix_spawnp failed" at runtime.  Try to fix it; if we can't (e.g.
-  // read-only npx cache), give the user an actionable error message.
-  if (process.platform === 'darwin') {
-    try {
-      const nodePtyEntry = fileURLToPath(import.meta.resolve('node-pty'));
-      const helperPath = join(dirname(nodePtyEntry), '..', 'prebuilds', `darwin-${process.arch}`, 'spawn-helper');
-      const st = statSync(helperPath);
-      if (!(st.mode & constants.S_IXUSR)) {
-        try {
-          chmodSync(helperPath, st.mode | constants.S_IXUSR | constants.S_IXGRP | constants.S_IXOTH);
-        } catch {
-          process.stderr.write(
-            chalk.red('Error: node-pty spawn-helper is not executable and cannot be fixed automatically.\n') +
-              `Run: chmod +x "${helperPath}"\n` +
-              'See: https://github.com/microsoft/node-pty/issues/850\n',
-          );
-          process.exit(1);
-        }
-      }
-    } catch {
-      // Could not locate spawn-helper; not fatal — let node-pty report
-      // its own error if spawning fails.
-    }
+  // On macOS, node-pty <=1.1.0 ships spawn-helper without the execute bit,
+  // causing "posix_spawnp failed" at runtime. Try to fix it; if we can't
+  // (e.g. read-only npx cache), give the user an actionable error message.
+  const spawnHelper = repairNodePtySpawnHelper();
+  if (spawnHelper.status === 'not-executable') {
+    process.stderr.write(
+      chalk.red('Error: node-pty spawn-helper is not executable and cannot be fixed automatically.\n') +
+        `Run: chmod +x "${spawnHelper.helperPath}"\n` +
+        `See: ${NODE_PTY_SPAWN_HELPER_ISSUE_URL}\n`,
+    );
+    process.exit(1);
   }
 
   try {
     await import('terminal-kit');
   } catch {
+    // Pure JavaScript: missing only when optional dependencies were omitted.
     process.stderr.write(
-      chalk.red('Error: ironcurtain mux requires the terminal-kit package.\n') +
-        'Install it with: npm install terminal-kit\n',
+      chalk.red('Error: ironcurtain mux needs the optional terminal-kit package, which is not installed.\n') +
+        'Reinstall IronCurtain with its optional dependencies (without --omit=optional): ' +
+        '`npm install -g @provos/ironcurtain`, or `npm install` in a source checkout.\n',
     );
     process.exit(1);
   }
@@ -115,14 +122,22 @@ function emitAutoApproveWarning(userConfig: ResolvedUserConfig): boolean {
   return true;
 }
 
+/**
+ * Points out a home where the first-start wizard never completed (see
+ * config/setup-state.ts). The mux's own sessions never run the wizard, and
+ * its config load has created config.json by now. Returns true if the note
+ * was printed (caller should pause before fullscreen).
+ */
+function emitSetupPendingNotice(): boolean {
+  if (readFirstStartSetupState() !== 'pending') return false;
+  process.stderr.write(chalk.yellow(`${formatSetupPendingNotice()}\n`));
+  return true;
+}
+
 export async function main(args?: string[], deps: MuxMainDeps = {}): Promise<void> {
   const resolveSessionMode = deps.resolveSessionMode ?? defaultResolveSessionMode;
   const createApp = deps.createMuxApp ?? createMuxApp;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-
-  if (!deps.skipNativeProbes) {
-    await probeNativeDependencies();
-  }
 
   // Parse args
   const { values } = parseArgsStrict(
@@ -139,11 +154,17 @@ export async function main(args?: string[], deps: MuxMainDeps = {}): Promise<voi
     muxSpec.name,
   );
 
+  // Help and argument errors need no native module: answer them before the
+  // node-pty probe, so `ironcurtain mux --help` works where node-pty is missing.
   if (checkHelp(values, muxSpec)) return;
+
+  if (!deps.skipNativeProbes) {
+    await probeNativeDependencies();
+  }
 
   const requestedAgentRaw = values.agent as string | undefined;
   const model = values.model as string | undefined;
-  const modelMisuse = modelFlagMisusedAsAgent(model);
+  const modelMisuse = modelFlagProblem(model);
   if (modelMisuse) {
     process.stderr.write(chalk.red(`${modelMisuse}\n`));
     process.exit(1);
@@ -187,8 +208,9 @@ export async function main(args?: string[], deps: MuxMainDeps = {}): Promise<voi
   const nestedDockerStatus = formatDockerWorkloadStatus(config.userConfig.dockerWorkload);
   if (nestedDockerStatus) process.stderr.write(chalk.dim(nestedDockerStatus) + '\n');
 
-  const hasWarnings = emitAutoApproveWarning(config.userConfig);
-  if (hasWarnings) {
+  const autoApproveWarned = emitAutoApproveWarning(config.userConfig);
+  const setupNoticed = emitSetupPendingNotice();
+  if (autoApproveWarned || setupNoticed) {
     process.stderr.write(chalk.dim('\nStarting in 3 seconds...\n'));
     await sleep(3000);
   }

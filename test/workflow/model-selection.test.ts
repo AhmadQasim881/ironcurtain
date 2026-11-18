@@ -179,9 +179,6 @@ describe('orchestrator model routing', () => {
     if (activeOrchestrator) await activeOrchestrator.shutdownAll();
     cleanupPersonas?.();
     rmSync(tmpDir, { recursive: true, force: true });
-    const baseName = resolve(tmpDir).split('/').pop() ?? '';
-    const ckptDir = resolve(tmpDir, '..', `${baseName}-ckpt`);
-    rmSync(ckptDir, { recursive: true, force: true });
   });
 
   /**
@@ -523,9 +520,6 @@ describe('model selection end-to-end (YAML through real session factory)', () =>
     cleanupPersonas?.();
     rmSync(tmpDir, { recursive: true, force: true });
     rmSync(`${tmpDir}-defs`, { recursive: true, force: true });
-    const baseName = resolve(tmpDir).split('/').pop() ?? '';
-    const ckptDir = resolve(tmpDir, '..', `${baseName}-ckpt`);
-    rmSync(ckptDir, { recursive: true, force: true });
   });
 
   /**

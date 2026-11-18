@@ -4,6 +4,7 @@ import {
   cpSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   renameSync,
   rmSync,
   statSync,
@@ -59,7 +60,9 @@ describe('JsonlTailer', () => {
     const seen: string[] = [];
     const warnings: string[] = [];
     const tailer = new JsonlTailer(path, {
-      onLine: ({ raw: line }) => seen.push(line),
+      onLine: ({ raw: line }) => {
+        seen.push(line);
+      },
       onWarning: (warning) => warnings.push(warning),
     });
     expect(await tailer.poll()).toBe(0);
@@ -78,7 +81,9 @@ describe('JsonlTailer', () => {
     writeFileSync(path, raw.slice(0, 200_000));
     const seen: string[] = [];
     const tailer = new JsonlTailer(path, {
-      onLine: ({ raw: line }) => seen.push(line),
+      onLine: ({ raw: line }) => {
+        seen.push(line);
+      },
       onWarning: vi.fn(),
     });
 
@@ -101,7 +106,9 @@ describe('JsonlTailer', () => {
     const seen: string[] = [];
     const warnings: string[] = [];
     const tailer = new JsonlTailer(path, {
-      onLine: ({ raw }) => seen.push(raw),
+      onLine: ({ raw }) => {
+        seen.push(raw);
+      },
       onWarning: (warning) => warnings.push(warning),
     });
 
@@ -117,7 +124,9 @@ describe('JsonlTailer', () => {
     const seen: string[] = [];
     const warnings: string[] = [];
     const tailer = new JsonlTailer(path, {
-      onLine: ({ record: parsed }) => seen.push(parsed.type),
+      onLine: ({ record: parsed }) => {
+        seen.push(parsed.type);
+      },
       onWarning: (warning) => warnings.push(warning),
     });
 
@@ -133,7 +142,9 @@ describe('JsonlTailer', () => {
     writeFileSync(path, `${first}\n`);
     const seen: string[] = [];
     const tailer = new JsonlTailer(path, {
-      onLine: ({ raw }) => seen.push(raw),
+      onLine: ({ raw }) => {
+        seen.push(raw);
+      },
       onWarning: vi.fn(),
     });
     expect(await tailer.poll()).toBe(1);
@@ -154,7 +165,9 @@ describe('JsonlTailer', () => {
     writeFileSync(path, `${duplicate}\n${duplicate}\n`);
     const seen: string[] = [];
     const tailer = new JsonlTailer(path, {
-      onLine: ({ raw }) => seen.push(raw),
+      onLine: ({ raw }) => {
+        seen.push(raw);
+      },
       onWarning: vi.fn(),
     });
 
@@ -171,7 +184,9 @@ describe('JsonlTailer', () => {
     writeFileSync(path, `${records.join('\n')}\n`);
     const seen: string[] = [];
     const tailer = new JsonlTailer(path, {
-      onLine: ({ raw }) => seen.push(raw),
+      onLine: ({ raw }) => {
+        seen.push(raw);
+      },
       onWarning: vi.fn(),
     });
 
@@ -212,7 +227,9 @@ describe('workflow watch', () => {
     const watching = runWorkflowWatch([runDir, '--lines', '2', '--json', '--events', 'error'], {
       installProcessSignals: false,
       maxRecordsPerPoll: 1,
-      writeStdout: (text) => output.push(text),
+      writeStdout: (text) => {
+        output.push(text);
+      },
       writeStderr: vi.fn(),
     });
     setTimeout(() => appendFileSync(path, `${appended}\n`), 0);
@@ -241,7 +258,9 @@ describe('workflow watch', () => {
     expect(
       await runWorkflowWatch([runDir, '--lines', '5', '--json', '--since', at, '--events', 'error'], {
         installProcessSignals: false,
-        writeStdout: (text) => output.push(text),
+        writeStdout: (text) => {
+          output.push(text);
+        },
         writeStderr: (text) => diagnostics.push(text),
       }),
     ).toBe(0);
@@ -352,7 +371,9 @@ describe('workflow watch', () => {
       installProcessSignals: false,
       pollIntervalMs: 1,
       quiescenceMs: 1,
-      writeStdout: (text) => output.push(text),
+      writeStdout: (text) => {
+        output.push(text);
+      },
       writeStderr: vi.fn(),
     });
 
@@ -377,7 +398,9 @@ describe('workflow watch', () => {
         installProcessSignals: false,
         pollIntervalMs: 1,
         quiescenceMs: 1,
-        writeStdout: (text) => output.push(text),
+        writeStdout: (text) => {
+          output.push(text);
+        },
         writeStderr: vi.fn(),
       }),
     ).toBe(0);
@@ -649,11 +672,35 @@ describe('workflow watch', () => {
         installProcessSignals: false,
         pollIntervalMs: 1,
         quiescenceMs: 1,
-        writeStdout: (text) => output.push(text),
+        writeStdout: (text) => {
+          output.push(text);
+        },
         writeStderr: vi.fn(),
       }),
     ).toBe(130);
     expect(output).toEqual([]);
+  });
+
+  it('escapes JSONL output while preserving the full record and source bytes', async () => {
+    const runDir = temporaryRun();
+    const message = 'Neutral note\u0085\u202e\u034f';
+    const line = record('error', '2026-08-21T12:00:00.000Z', { error: message }).replace('"error":', '\r\t"error":');
+    writeFileSync(resolve(runDir, 'messages.jsonl'), `${line}\n`);
+    const output: string[] = [];
+    expect(
+      await runWorkflowWatch([runDir, '--json', '--lines', '1'], {
+        installProcessSignals: false,
+        writeStdout: (text) => {
+          output.push(text);
+        },
+        writeStderr: vi.fn(),
+      }),
+    ).toBe(0);
+    const out = output.join('');
+    expect(out).not.toMatch(/\u0085|\u202e|\u034f/u);
+    expect(out).not.toMatch(/[\r\t]/u);
+    expect(JSON.parse(out)).toEqual(JSON.parse(line));
+    expect(readFileSync(resolve(runDir, 'messages.jsonl'), 'utf8')).toBe(`${line}\n`);
   });
 
   it('sanitizes every human-rendered field into one inert line', async () => {
@@ -672,7 +719,9 @@ describe('workflow watch', () => {
         installProcessSignals: false,
         pollIntervalMs: 1,
         quiescenceMs: 1,
-        writeStdout: (text) => output.push(text),
+        writeStdout: (text) => {
+          output.push(text);
+        },
         writeStderr: vi.fn(),
       }),
     ).toBe(0);

@@ -1,5 +1,5 @@
 import type { Transport } from './transport.js';
-import type { Session } from './types.js';
+import type { SendMessageOptions, Session } from './types.js';
 import { InteractionLog, type InteractionEntry } from './interaction-log.js';
 import { getSessionInteractionLogPath } from '../config/paths.js';
 import { saveSessionMemory } from '../memory/auto-save.js';
@@ -37,7 +37,10 @@ export abstract class BaseTransport implements Transport {
 
   async run(session: Session): Promise<void> {
     const logPath = getSessionInteractionLogPath(session.getInfo().id);
-    this.interactionLog = new InteractionLog(logPath);
+    // The session knows its configuration's redaction (audit redactor plus
+    // known credential values, or none when auditRedaction is off); a session
+    // that does not say gets the audit redactor's patterns.
+    this.interactionLog = new InteractionLog(logPath, { redaction: session.getLogRedaction?.() });
     try {
       await this.runSession(session);
       await this.autoSaveIfEnabled(session);
@@ -52,7 +55,7 @@ export abstract class BaseTransport implements Transport {
     logger.info('[BaseTransport] Auto-saving session memory...');
     await saveSessionMemory(session, {
       dockerMode: this.dockerMode,
-      sendFn: (msg) => this.sendAndLog(session, msg),
+      sendFn: (msg, options) => this.sendAndLog(session, msg, options),
     });
   }
 
@@ -61,13 +64,20 @@ export abstract class BaseTransport implements Transport {
 
   abstract close(): void;
 
-  /** Sends a message through the session and logs both sides. */
-  protected async sendAndLog(session: Session, userMessage: string): Promise<string> {
+  /**
+   * Sends a message through the session and logs both sides. `options`
+   * (the message's origin) is passed to the session unchanged, so a
+   * system-generated turn is never recorded as trusted user context.
+   */
+  protected async sendAndLog(session: Session, userMessage: string, options?: SendMessageOptions): Promise<string> {
     const turnNumber = ++this.turnCounter;
     const sessionId = session.getInfo().id;
 
     this.logEntry({ sessionId, turnNumber, role: 'user', content: userMessage });
-    const response = await session.sendMessage(userMessage);
+    // A plain user turn keeps the one-argument call; only a turn with an
+    // explicit origin passes the options.
+    const response =
+      options === undefined ? await session.sendMessage(userMessage) : await session.sendMessage(userMessage, options);
     this.logEntry({ sessionId, turnNumber, role: 'assistant', content: response });
 
     return response;

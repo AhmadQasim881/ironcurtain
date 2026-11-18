@@ -4,6 +4,7 @@ import { dispatch } from '../json-rpc-dispatch.js';
 import type { WorkflowDispatchContext } from '../dispatch/workflow-dispatch.js';
 import type { LlmStatisticsReader } from '../../llm-metrics/query-service.js';
 import { LlmMetricsRepositoryUnavailableError } from '../../llm-metrics/persistence/repository.js';
+import { StatisticsLimitError } from '../../llm-metrics/query-contract.js';
 
 function context(reader?: LlmStatisticsReader): WorkflowDispatchContext {
   return { statisticsReader: reader } as unknown as WorkflowDispatchContext;
@@ -31,14 +32,62 @@ function reader(): LlmStatisticsReader {
 }
 
 describe('statistics WebSocket dispatch', () => {
-  it('reports disabled capabilities without requiring a repository', async () => {
+  it('reports disabled capabilities, with the enforced limits, without requiring a repository', async () => {
     await expect(dispatch(context(), 'statistics.capabilities', {})).resolves.toMatchObject({
       available: false,
-      dtoVersion: 2,
-      maxScannedRows: 100_000,
+      dtoVersion: 3,
+      formulaVersion: 4,
+      maxScannedRows: 1_000_000,
+      maxGroups: 500,
+      maxOutputItems: 10_000,
+      maxTimeSeriesBuckets: 1_000,
+      maxRangeDays: 366,
+      quantileSampleSize: 2_048,
       allowedCalendarBucketUnits: ['day'],
       health: { state: 'disabled' },
     });
+  });
+
+  it('reports a well-formed query over a statistics limit as STATISTICS_LIMIT, not invalid parameters', async () => {
+    const statisticsReader = reader();
+    vi.spyOn(statisticsReader, 'summarize').mockRejectedValue(
+      new StatisticsLimitError('scannedRows', 1_000_000, 'Statistics query exceeds the scanned-row limit'),
+    );
+    const failure = dispatch(context(statisticsReader), 'statistics.summary', {
+      fromMs: 0,
+      toMs: 1,
+      measures: ['requestCount'],
+    });
+    await expect(failure).rejects.toMatchObject({
+      code: 'STATISTICS_LIMIT',
+      message: 'Statistics query exceeds the scanned-row limit',
+      data: { limit: 'scannedRows', maximum: 1_000_000 },
+    });
+
+    vi.spyOn(statisticsReader, 'summarize').mockRejectedValue(new Error('Invalid statistics grouping'));
+    await expect(
+      dispatch(context(statisticsReader), 'statistics.summary', { fromMs: 0, toMs: 1, measures: ['requestCount'] }),
+    ).rejects.toMatchObject({ code: 'INVALID_PARAMS' });
+  });
+
+  it('no longer offers the unprovable observable stream-span rate', async () => {
+    const statisticsReader = reader();
+    const summarize = vi.spyOn(statisticsReader, 'summarize');
+    await expect(
+      dispatch(context(statisticsReader), 'statistics.summary', {
+        fromMs: 0,
+        toMs: 1,
+        measures: ['observableOutputTokensPerSecond'],
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_PARAMS' });
+    await expect(
+      dispatch(context(statisticsReader), 'statistics.distribution', {
+        fromMs: 0,
+        toMs: 1,
+        measure: 'observableOutputTokensPerSecond',
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_PARAMS' });
+    expect(summarize).not.toHaveBeenCalled();
   });
 
   it('delegates bounded summary queries to the daemon-owned reader', async () => {

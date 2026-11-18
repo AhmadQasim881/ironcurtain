@@ -4,6 +4,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   createDockerManager,
   buildCreateArgs,
+  defaultExecFile,
   BUILD_IDLE_TIMEOUT_MS,
   PULL_IDLE_TIMEOUT_MS,
   type ExecFileFn,
@@ -110,8 +111,8 @@ interface SpawnCall {
 
 interface FakeChildHandle {
   child: ChildProcess;
-  emitStdout: (chunk: string) => void;
-  emitStderr: (chunk: string) => void;
+  emitStdout: (chunk: string | Buffer) => void;
+  emitStderr: (chunk: string | Buffer) => void;
   exit: (code: number | null, signal?: NodeJS.Signals | null) => void;
   spawnError: (err: Error) => void;
 }
@@ -147,8 +148,8 @@ function createMockSpawn(): MockSpawn {
 
     handles.push({
       child,
-      emitStdout: (chunk: string) => stdout.write(chunk),
-      emitStderr: (chunk: string) => stderr.write(chunk),
+      emitStdout: (chunk: string | Buffer) => stdout.write(chunk),
+      emitStderr: (chunk: string | Buffer) => stderr.write(chunk),
       exit: (code: number | null, signal: NodeJS.Signals | null = null) => {
         child.emit('close', code, signal);
       },
@@ -384,6 +385,43 @@ describe('DockerManager', () => {
       expect(buildCreateArgs(sampleConfig)).not.toContain('--read-only');
     });
 
+    it('pins --memory-swap to --memory so a bounded container cannot swap (DINF-11)', () => {
+      const args = buildCreateArgs(sampleConfig);
+      expect(args[args.indexOf('--memory') + 1]).toBe('4096m');
+      expect(args[args.indexOf('--memory-swap') + 1]).toBe('4096m');
+
+      const unbounded = buildCreateArgs({ ...sampleConfig, resources: { memoryMb: undefined, cpus: 2 } });
+      expect(unbounded).not.toContain('--memory');
+      expect(unbounded).not.toContain('--memory-swap');
+    });
+
+    it('emits pids and open-files bounds from trusted create options', () => {
+      const args = buildCreateArgs({
+        ...sampleConfig,
+        trustedCreateOptions: { pidsLimit: 4096, ulimits: [{ name: 'nofile', soft: 65_536, hard: 65_536 }] },
+      });
+
+      expect(args[args.indexOf('--pids-limit') + 1]).toBe('4096');
+      expect(args[args.indexOf('--ulimit') + 1]).toBe('nofile=65536:65536');
+      // The bounds are create flags: they precede the image and command.
+      expect(args.indexOf('--ulimit')).toBeLessThan(args.indexOf(sampleConfig.image));
+    });
+
+    it('rejects ulimits that would lift or garble a bound', () => {
+      const withUlimit = (ulimit: { name: string; soft: number; hard: number }) => () =>
+        buildCreateArgs({
+          ...sampleConfig,
+          trustedCreateOptions: { ulimits: [ulimit as { name: 'nofile'; soft: number; hard: number }] },
+        });
+      expect(withUlimit({ name: 'nofile', soft: -1, hard: -1 })).toThrow(/positive safe integers/u);
+      expect(withUlimit({ name: 'nofile', soft: 0, hard: 10 })).toThrow(/positive safe integers/u);
+      expect(withUlimit({ name: 'nofile', soft: 1.5, hard: 10 })).toThrow(/positive safe integers/u);
+      expect(withUlimit({ name: 'nofile', soft: 20, hard: 10 })).toThrow(/exceeds its hard limit/u);
+      // nproc counts every process of the (unremapped) host UID, not the container's.
+      expect(withUlimit({ name: 'nproc', soft: 10, hard: 10 })).toThrow(/unsupported ulimit name/u);
+      expect(withUlimit({ name: 'nofile=1:1 --privileged', soft: 1, hard: 1 })).toThrow(/unsupported ulimit name/u);
+    });
+
     it('rejects ambiguous or invalid trusted sidecar limits', () => {
       expect(() =>
         buildCreateArgs({
@@ -517,6 +555,19 @@ describe('DockerManager', () => {
       expect(args).toEqual(['exec', 'signal-cli', 'test', '-d', '/data']);
     });
 
+    it('uses the bundle default exec user, a numeric UID, for a sudo-off agent (DINF-3)', async () => {
+      mock.setResponse('ok');
+      const manager = createDockerManager(mock.mockExec, undefined, { defaultExecUser: '1000' });
+
+      await manager.exec('container-id', ['anything']);
+      await manager.exec('container-id', ['override'], undefined, 'codespace');
+      await manager.exec('signal-cli', ['none'], undefined, null);
+
+      expect(mock.calls[0].args.slice(0, 3)).toEqual(['exec', '--user', '1000']);
+      expect(mock.calls[1].args.slice(0, 3)).toEqual(['exec', '--user', 'codespace']);
+      expect(mock.calls[2].args).toEqual(['exec', 'signal-cli', 'none']);
+    });
+
     it('honors a custom execUser override (string value)', async () => {
       mock.setResponse('ok');
       const manager = createDockerManager(mock.mockExec);
@@ -597,7 +648,7 @@ describe('DockerManager', () => {
       expect(mock.calls[0].opts.timeout).toBe(timeoutMs);
     });
 
-    it('detects timeout errors and returns non-zero exit code', async () => {
+    it('reports a signal-killed timeout as timedOut with exit code 124', async () => {
       // Simulate the error shape Node.js execFile produces on timeout
       const mockExecTimeout: ExecFileFn = async (cmd, args, opts) => {
         mock.calls.push({ cmd, args, opts });
@@ -612,10 +663,131 @@ describe('DockerManager', () => {
       const manager = createDockerManager(mockExecTimeout);
 
       const result = await manager.exec('container-id', ['claude', '--continue']);
-      expect(result.exitCode).toBe(1);
-      expect(result.stdout).toBe('');
-      expect(result.stderr).toBe('');
+      expect(result).toEqual({ exitCode: 124, stdout: '', stderr: '', timedOut: true });
     });
+
+    it('never reports a timed-out exec as success when the docker CLI exits 0 on SIGTERM (DINF-8)', async () => {
+      // `docker exec` exits 0 when Node SIGTERMs it, so execFile RESOLVES;
+      // only the child's killed flag tells the two apart.
+      const mockExecKilledCleanExit: ExecFileFn = async (cmd, args, opts) => {
+        mock.calls.push({ cmd, args, opts });
+        return { stdout: 'started\n', stderr: '', killed: true };
+      };
+      const manager = createDockerManager(mockExecKilledCleanExit);
+
+      const result = await manager.exec('container-id', ['claude', '-p', 'x'], 2_000);
+      expect(result).toEqual({ exitCode: 124, stdout: 'started\n', stderr: '', timedOut: true });
+    });
+
+    it('detects a deadline hit from elapsed time when the exec function cannot report killed', async () => {
+      const slowExec: ExecFileFn = async (cmd, args, opts) => {
+        mock.calls.push({ cmd, args, opts });
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        return { stdout: '', stderr: '' };
+      };
+      const manager = createDockerManager(slowExec);
+
+      await expect(manager.exec('container-id', ['cmd'], 20)).resolves.toMatchObject({
+        exitCode: 124,
+        timedOut: true,
+      });
+      // No deadline (0) never classifies elapsed time as a timeout.
+      await expect(manager.exec('container-id', ['cmd'], 0)).resolves.toEqual({
+        exitCode: 0,
+        stdout: '',
+        stderr: '',
+      });
+    });
+
+    it('trusts a reported killed:false over elapsed time: Node never signalled the client', async () => {
+      // The default exec function always reports `killed`. An exec that took
+      // longer than its deadline without Node's timer firing (the timer is
+      // monotonic, so a host suspend does not advance it) finished on its own.
+      const slowButNotKilled: ExecFileFn = async (cmd, args, opts) => {
+        mock.calls.push({ cmd, args, opts });
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        return { stdout: 'done', stderr: '', killed: false };
+      };
+      await expect(createDockerManager(slowButNotKilled).exec('container-id', ['cmd'], 20)).resolves.toEqual({
+        exitCode: 0,
+        stdout: 'done',
+        stderr: '',
+      });
+    });
+
+    it('never reports a finished exec as timed out because the wall clock jumped (host sleep)', async () => {
+      // An exec implementation that cannot report `killed`, during which the
+      // host slept for an hour (or NTP stepped the clock): only monotonic time
+      // may decide the fallback, or a completed agent turn would be discarded
+      // as a wall-clock exhaustion.
+      let wallClock: { mockRestore(): void } | undefined;
+      const sleepsThroughWallClock: ExecFileFn = async (cmd, args, opts) => {
+        mock.calls.push({ cmd, args, opts });
+        const now = Date.now();
+        wallClock = vi.spyOn(Date, 'now').mockReturnValue(now + 3_600_000);
+        return { stdout: 'done', stderr: '' };
+      };
+      try {
+        await expect(createDockerManager(sleepsThroughWallClock).exec('container-id', ['cmd'], 5_000)).resolves.toEqual(
+          { exitCode: 0, stdout: 'done', stderr: '' },
+        );
+      } finally {
+        wallClock?.mockRestore();
+      }
+    });
+
+    it('reports a killed client that exited non-zero as timedOut rather than as its exit code', async () => {
+      const mockExecKilledNonZero: ExecFileFn = async (cmd, args, opts) => {
+        mock.calls.push({ cmd, args, opts });
+        throw Object.assign(new Error('Command failed'), {
+          code: 143,
+          killed: true,
+          signal: null,
+          stdout: 'partial',
+          stderr: '',
+        });
+      };
+      const manager = createDockerManager(mockExecKilledNonZero);
+
+      await expect(manager.exec('container-id', ['cmd'], 5_000)).resolves.toEqual({
+        exitCode: 124,
+        stdout: 'partial',
+        stderr: '',
+        timedOut: true,
+      });
+    });
+
+    it('leaves timedOut absent on ordinary results', async () => {
+      mock.setResponse('ok');
+      const manager = createDockerManager(mock.mockExec);
+      const ok = await manager.exec('container-id', ['cmd'], 5_000);
+      expect(ok).not.toHaveProperty('timedOut');
+
+      mock.setError(3, '', 'boom');
+      const failed = await manager.exec('container-id', ['cmd'], 5_000);
+      expect(failed).toEqual({ exitCode: 3, stdout: '', stderr: 'boom' });
+    });
+  });
+
+  describe('defaultExecFile', () => {
+    it.skipIf(process.platform === 'win32')(
+      'exposes the killed flag when a SIGTERM-ed child exits 0, and keeps promisify-style rejections',
+      async () => {
+        const killed = await defaultExecFile('/bin/sh', ['-c', 'trap "exit 0" TERM; while :; do sleep 0.05; done'], {
+          timeout: 200,
+        });
+        expect(killed).toMatchObject({ stdout: '', killed: true });
+
+        const finished = await defaultExecFile('/bin/sh', ['-c', 'echo done'], { timeout: 5_000 });
+        expect(finished).toEqual({ stdout: 'done\n', stderr: '', killed: false });
+
+        await expect(defaultExecFile('/bin/sh', ['-c', 'echo out; echo err >&2; exit 7'], {})).rejects.toMatchObject({
+          code: 7,
+          stdout: 'out\n',
+          stderr: 'err\n',
+        });
+      },
+    );
   });
 
   describe('stop', () => {
@@ -692,6 +864,83 @@ describe('DockerManager', () => {
     it('preserves an empty successful log read', async () => {
       mock.setResponse('');
       await expect(createDockerManager(mock.mockExec).readContainerLogTail!('empty')).resolves.toBe('');
+    });
+  });
+
+  describe('streamContainerLogs', () => {
+    function collectingSink(): { readonly sink: PassThrough; readonly text: () => string } {
+      const sink = new PassThrough();
+      let text = '';
+      sink.on('data', (chunk: Buffer) => (text += chunk.toString('utf8')));
+      return { sink, text: () => text };
+    }
+
+    it('streams the whole log, stdout and stderr, into the sink without capping it', async () => {
+      const spawnMock = createMockSpawn();
+      const manager = createDockerManager(mock.mockExec, undefined, { spawn: spawnMock.spawn });
+      const { sink, text } = collectingSink();
+      const big = 'x'.repeat(300 * 1024);
+
+      const pending = manager.streamContainerLogs!('container-id', sink);
+      spawnMock.handles[0].emitStdout(`${big}\n`);
+      spawnMock.handles[0].emitStderr('entrypoint error\n');
+      spawnMock.handles[0].exit(0);
+      await pending;
+
+      expect(spawnMock.calls[0].cmd).toBe('docker');
+      expect(spawnMock.calls[0].args).toEqual(['logs', 'container-id']);
+      expect(text()).toBe(`${big}\nentrypoint error\n`);
+      expect(mock.calls).toEqual([]);
+    });
+
+    it('writes characters split across output chunks whole, on stdout and stderr', async () => {
+      const spawnMock = createMockSpawn();
+      const manager = createDockerManager(mock.mockExec, undefined, { spawn: spawnMock.spawn });
+      const { sink, text } = collectingSink();
+      const out = Buffer.from('é ✓\n', 'utf8');
+      const err = Buffer.from('⏺ done\n', 'utf8');
+
+      const pending = manager.streamContainerLogs!('container-id', sink);
+      // Each split lands inside a multi-byte character.
+      spawnMock.handles[0].emitStdout(out.subarray(0, 1));
+      await new Promise((r) => setImmediate(r));
+      spawnMock.handles[0].emitStdout(out.subarray(1, 4));
+      await new Promise((r) => setImmediate(r));
+      spawnMock.handles[0].emitStdout(out.subarray(4));
+      await new Promise((r) => setImmediate(r));
+      spawnMock.handles[0].emitStderr(err.subarray(0, 2));
+      await new Promise((r) => setImmediate(r));
+      spawnMock.handles[0].emitStderr(err.subarray(2));
+      await new Promise((r) => setImmediate(r));
+      spawnMock.handles[0].exit(0);
+      await pending;
+
+      expect(text()).toBe('é ✓\n⏺ done\n');
+    });
+
+    it('keeps the bytes of a character the log ends inside, as a replacement character', async () => {
+      const spawnMock = createMockSpawn();
+      const manager = createDockerManager(mock.mockExec, undefined, { spawn: spawnMock.spawn });
+      const { sink, text } = collectingSink();
+
+      const pending = manager.streamContainerLogs!('container-id', sink);
+      spawnMock.handles[0].emitStdout(Buffer.from([0x6f, 0x6b, 0xe2, 0x9c]));
+      await new Promise((r) => setImmediate(r));
+      spawnMock.handles[0].exit(0);
+      await pending;
+
+      expect(text()).toBe('ok�');
+    });
+
+    it('rejects with the CLI error when the container is unknown', async () => {
+      const spawnMock = createMockSpawn();
+      const manager = createDockerManager(mock.mockExec, undefined, { spawn: spawnMock.spawn });
+
+      const pending = manager.streamContainerLogs!('missing', collectingSink().sink);
+      spawnMock.handles[0].emitStderr('Error response from daemon: No such container: missing\n');
+      spawnMock.handles[0].exit(1);
+
+      await expect(pending).rejects.toThrow('docker logs exited with code 1: Error response from daemon: No such');
     });
   });
 
@@ -913,6 +1162,83 @@ describe('DockerManager', () => {
         expect.objectContaining({ id: 'container-live', name: 'ironcurtain-live' }),
       ]);
     });
+
+    it('filters a network inventory on the daemon by label', async () => {
+      mock.setSequence([{ stdout: '' }]);
+      const manager = createDockerManager(mock.mockExec);
+
+      await expect(
+        manager.listNetworks?.({ labelFilter: 'com.ironcurtain.docker-workload.generation=generation-001' }),
+      ).resolves.toEqual([]);
+      expect(mock.calls[0].args).toEqual([
+        'network',
+        'ls',
+        '--no-trunc',
+        '--quiet',
+        '--filter',
+        'label=com.ironcurtain.docker-workload.generation=generation-001',
+      ]);
+    });
+
+    it('inspects exactly one container or network and reports only a not-found as absent', async () => {
+      mock.setSequence([
+        {
+          stdout: JSON.stringify([
+            {
+              Id: 'container-id',
+              Name: '/ic-dw-agent',
+              Created: '2026-01-01T00:00:00Z',
+              Config: { Labels: { 'com.ironcurtain.docker-workload.generation': 'generation-001' } },
+              State: { Running: false },
+            },
+          ]),
+        },
+        { error: true, code: 1, stderr: 'Error: No such container: container-gone' },
+        { error: true, code: 1, stderr: 'Cannot connect to the Docker daemon' },
+        { error: true, code: 1, stderr: 'Error response from daemon: network network-gone not found' },
+      ]);
+      const manager = createDockerManager(mock.mockExec);
+
+      await expect(manager.inspectContainer?.('container-id')).resolves.toEqual({
+        id: 'container-id',
+        name: 'ic-dw-agent',
+        created: '2026-01-01T00:00:00Z',
+        running: false,
+        labels: { 'com.ironcurtain.docker-workload.generation': 'generation-001' },
+      });
+      await expect(manager.inspectContainer?.('container-gone')).resolves.toBeUndefined();
+      // Absence is never inferred from a daemon failure.
+      await expect(manager.inspectContainer?.('container-id')).rejects.toMatchObject({
+        stderr: 'Cannot connect to the Docker daemon',
+      });
+      await expect(manager.inspectNetwork?.('network-gone')).resolves.toBeUndefined();
+      expect(mock.calls.map((call) => call.args)).toEqual([
+        ['container', 'inspect', 'container-id'],
+        ['container', 'inspect', 'container-gone'],
+        ['container', 'inspect', 'container-id'],
+        ['network', 'inspect', 'network-gone'],
+      ]);
+    });
+
+    it('chunks inspection so no single argv names more than 100 objects', async () => {
+      const ids = Array.from({ length: 250 }, (_, index) => `container-${index}`);
+      const inspectCalls: (readonly string[])[] = [];
+      const exec: ExecFileFn = async (_cmd, args) => {
+        if (args[0] === 'container' && args[1] === 'ls') return { stdout: `${ids.join('\n')}\n`, stderr: '' };
+        inspectCalls.push(args);
+        return {
+          stdout: JSON.stringify(
+            args.slice(2).map((id) => ({ Id: id, Name: `/${id}`, Config: { Labels: {} }, State: { Running: true } })),
+          ),
+          stderr: '',
+        };
+      };
+      const manager = createDockerManager(exec);
+
+      const containers = await manager.listContainers?.();
+      expect(containers?.map((container) => container.id)).toEqual(ids);
+      expect(inspectCalls.map((args) => args.length - 2)).toEqual([100, 100, 50]);
+    });
   });
 
   describe('named volume lifecycle', () => {
@@ -1072,7 +1398,7 @@ describe('DockerManager', () => {
       for (const call of mock.calls) expectCapturedEnvironment(call.opts.env);
     });
 
-    it.each(['build', 'pull', 'load'] as const)(
+    it.each(['build', 'pull', 'load', 'logs'] as const)(
       'keeps inherited routing and platform overrides out of streamed %s operations',
       async (operation) => {
         const spawnMock = createMockSpawn();
@@ -1087,7 +1413,9 @@ describe('DockerManager', () => {
             ? manager.buildImage('img:latest', '/Dockerfile', '/ctx')
             : operation === 'pull'
               ? manager.pullImage('img:latest')
-              : manager.loadImageArchive('/image.tar');
+              : operation === 'load'
+                ? manager.loadImageArchive('/image.tar')
+                : manager.streamContainerLogs!('container-id', nullSink());
         await Promise.resolve();
         spawnMock.handles[0].exit(0);
         await pending;
@@ -1099,6 +1427,7 @@ describe('DockerManager', () => {
           expect(call.options?.env?.BUILDX_BUILDER).toBe('changed-builder');
           expect(call.options?.env?.DOCKER_BUILDKIT).toBe('1');
         }
+        if (operation === 'logs') expect(call.args.slice(2)).toEqual(['logs', 'container-id']);
         expect(process.env.DOCKER_HOST).toBe(routingOverrides.DOCKER_HOST);
         expect(process.env.DOCKER_DEFAULT_PLATFORM).toBe(routingOverrides.DOCKER_DEFAULT_PLATFORM);
       },
@@ -1148,6 +1477,37 @@ describe('DockerManager', () => {
 
       const args = spawnMock.calls[0].args;
       expect(args).not.toContain('--label');
+    });
+
+    it('builds without the layer cache only when asked, with build args', async () => {
+      const spawnMock = createMockSpawn();
+      const manager = createDockerManager(mock.mockExec, undefined, {
+        spawn: spawnMock.spawn,
+        stdoutSink: nullSink(),
+        stderrSink: nullSink(),
+      });
+
+      const rebuild = manager.buildImage(
+        'agent:build-0123456789abcdef',
+        '/Dockerfile',
+        '/ctx',
+        undefined,
+        { CLAUDE_CODE_VERSION: 'latest' },
+        { noCache: true },
+      );
+      await Promise.resolve();
+      spawnMock.handles[0].exit(0);
+      await rebuild;
+      const ordinary = manager.buildImage('agent:build-0123456789abcdef', '/Dockerfile', '/ctx');
+      await Promise.resolve();
+      spawnMock.handles[1].exit(0);
+      await ordinary;
+
+      const args = spawnMock.calls[0].args;
+      expect(args).toContain('--no-cache');
+      expect(args[args.indexOf('--build-arg') + 1]).toBe('CLAUDE_CODE_VERSION=latest');
+      expect(args[args.length - 1]).toBe('/ctx');
+      expect(spawnMock.calls[1].args).not.toContain('--no-cache');
     });
 
     it('forces BuildKit and plain progress for streamed heartbeats', async () => {
@@ -1649,8 +2009,75 @@ describe('DockerManager', () => {
         tarPath,
         'ironcurtain-snapshot:wf-primary-stop',
       ]);
-      expect(mock.calls[1].opts.timeout).toBe(4321);
-      expect(mock.calls[2].opts.timeout).toBe(4321);
+      // The inspect, export and import share the commit's 4321 ms budget.
+      for (const call of mock.calls) {
+        expect(call.opts.timeout).toBeGreaterThan(0);
+        expect(call.opts.timeout).toBeLessThanOrEqual(4321);
+      }
+    });
+
+    it('excludes transient admission credentials from flattened image environment and import argv', async () => {
+      const digest = `sha256:${'d'.repeat(64)}`;
+      const transient = [
+        `IRONCURTAIN_MCP_TCP_TOKEN=${'a1'.repeat(32)}`,
+        'HTTP_PROXY=http://lease:ordinary-http-credential@127.0.0.1:18080',
+        'https_proxy=http://lease:ordinary-https-credential@127.0.0.1:18081',
+        'IRONCURTAIN_HTTP_PROXY_AUTHORIZATION=Basic ordinary-health-credential',
+        'IRONCURTAIN_FIXED_RELAY_PROXY_AUTHORIZATION=Basic ordinary-relay-credential',
+      ];
+      mock.setSequence([
+        {
+          stdout: JSON.stringify({
+            Env: ['PATH=/usr/bin', 'HOME=/home/codespace', 'APP_SETTING=ordinary', ...transient],
+          }),
+        },
+        { stdout: '' },
+        { stdout: `${digest}\n` },
+      ]);
+      const manager = createDockerManager(mock.mockExec);
+      await expect(manager.commit('container-id', { flatten: true })).resolves.toBe(digest);
+      const imported = mock.calls[2].args;
+      expect(imported).toContain('ENV PATH=/usr/bin');
+      expect(imported).toContain('ENV HOME=/home/codespace');
+      expect(imported).toContain('ENV APP_SETTING=ordinary');
+      for (const entry of transient) {
+        const split = entry.indexOf('=');
+        expect(imported.join('\n')).not.toContain(entry.slice(0, split));
+        expect(imported.join('\n')).not.toContain(entry.slice(split + 1));
+      }
+    });
+
+    it('bounds a flattened commit as a whole: its steps share one deadline', async () => {
+      // A caller with a deadline (a shutdown's snapshot budget) must be able
+      // to rely on timeoutMs; per-step timeouts would let the export and the
+      // import each take all of it.
+      let clock = 1_000_000;
+      const now = vi.spyOn(Date, 'now').mockImplementation(() => clock);
+      const digest = `sha256:${'c'.repeat(64)}`;
+      const calls: ExecCall[] = [];
+      const responses = [JSON.stringify({ Cmd: ['sleep', 'infinity'] }), '', `${digest}\n`];
+      // Every docker call takes 3 s.
+      const exec: ExecFileFn = async (cmd, args, opts) => {
+        calls.push({ cmd, args, opts });
+        const stdout = responses[calls.length - 1] ?? '';
+        clock += 3_000;
+        return { stdout, stderr: '' };
+      };
+      try {
+        const manager = createDockerManager(exec);
+        await expect(manager.commit('container-id', { flatten: true, timeoutMs: 8_000 })).resolves.toBe(digest);
+        expect(calls.map((call) => call.opts.timeout)).toEqual([8_000, 5_000, 2_000]);
+
+        // A budget the inspect and the export use up fails the commit before
+        // the import starts.
+        calls.length = 0;
+        await expect(manager.commit('container-id', { flatten: true, timeoutMs: 5_000 })).rejects.toThrow(
+          /did not finish within its 5000 ms timeout/,
+        );
+        expect(calls.map((call) => call.args[0])).toEqual(['container', 'export']);
+      } finally {
+        now.mockRestore();
+      }
     });
 
     it('flatten fails (no config-less image) when the container config cannot be read', async () => {
@@ -1751,6 +2178,45 @@ describe('DockerManager', () => {
         created: '2026-06-18T00:00:00Z',
       });
       await expect(manager.inspectImage('missing')).resolves.toBeUndefined();
+    });
+  });
+
+  describe('snapshot capacity probes', () => {
+    it("reads a container's full filesystem size with a bounded inspect --size", async () => {
+      mock.setSequence([{ stdout: '5368709120\n' }, { error: true, code: 1, stderr: 'No such container' }]);
+      const manager = createDockerManager(mock.mockExec);
+
+      await expect(manager.containerSize?.('c1', 5_000)).resolves.toBe(5 * 1024 * 1024 * 1024);
+      expect(mock.calls[0].args).toEqual(['container', 'inspect', '--size', '--format', '{{json .SizeRootFs}}', 'c1']);
+      expect(mock.calls[0].opts).toMatchObject({ timeout: 5_000 });
+      await expect(manager.containerSize?.('gone')).resolves.toBeUndefined();
+    });
+
+    it('treats a non-numeric size as unknown', async () => {
+      mock.setResponse('null\n');
+      await expect(createDockerManager(mock.mockExec).containerSize?.('c1')).resolves.toBeUndefined();
+    });
+
+    it('reports the data root only for an engine on this host whose path exists here', async () => {
+      const { hostname, tmpdir } = await import('node:os');
+      const existing = tmpdir();
+      mock.setSequence([
+        { stdout: JSON.stringify({ DockerRootDir: existing, Name: hostname() }) },
+        { stdout: JSON.stringify({ DockerRootDir: existing, Name: 'docker-desktop' }) },
+        { stdout: JSON.stringify({ DockerRootDir: '/definitely/not/here', Name: hostname() }) },
+        { error: true, code: 1, stderr: 'Cannot connect to the Docker daemon' },
+      ]);
+      const manager = createDockerManager(mock.mockExec);
+
+      await expect(manager.localDataRoot?.()).resolves.toBe(existing);
+      expect(mock.calls[0].args).toEqual(['info', '--format', '{{json .}}']);
+      expect(mock.calls[0].opts).toMatchObject({ timeout: 10_000 });
+      // A caller's shorter deadline bounds the probe; a longer one never stretches it.
+      await expect(manager.localDataRoot?.(2_500)).resolves.toBeUndefined();
+      expect(mock.calls[1].opts).toMatchObject({ timeout: 2_500 });
+      await expect(manager.localDataRoot?.(600_000)).resolves.toBeUndefined();
+      expect(mock.calls[2].opts).toMatchObject({ timeout: 10_000 });
+      await expect(manager.localDataRoot?.()).resolves.toBeUndefined();
     });
   });
 

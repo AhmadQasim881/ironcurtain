@@ -3,22 +3,40 @@ import { dirname } from 'node:path';
 import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from 'node:sqlite';
 import { isMainThread, parentPort, workerData } from 'node:worker_threads';
 
-import type { LlmExchangeCompleted } from '../types.js';
+import type { LlmCostSource, LlmExchangeCompleted, NormalizedUsage } from '../types.js';
 import type {
   LlmDimensionCount,
   LlmExchangeScanQuery,
+  LlmSessionTotalsQuery,
+  LlmSessionUsageTotalsResult,
+  LlmStatisticsAggregateQuery,
   LlmStatisticsDimension,
+  LlmStatisticsDistributionQuery,
+  LlmStatisticsDistributionResult,
+  LlmStatisticsPartition,
   StoredLlmExchange,
 } from './repository.js';
-import { LLM_METRICS_SCHEMA_VERSION, migrateLlmMetricsDatabase } from './migrations.js';
+import { assertLlmMetricsSchemaCompatible, migrateLlmMetricsDatabase } from './migrations.js';
 import { SQLITE_BUSY_TIMEOUT_MS, withSqliteBusyRetry } from './sqlite-busy-retry.js';
+import { classifyStorageError, isRecordScopedSqliteError, type LlmMetricsStorageErrorCode } from './storage-errors.js';
 import {
-  MAX_STATISTICS_FILTER_VALUES,
-  STATISTICS_IDENTIFIER_MAX_LENGTH,
-  STATISTICS_IDENTIFIER_PATTERN,
-  STATISTICS_PROVIDER_IDENTIFIER_MAX_LENGTH,
-  STATISTICS_PROVIDER_IDENTIFIER_PATTERN,
+  MAX_EXCHANGE_QUALITY_FLAGS,
+  STATISTICS_QUANTILE_SAMPLE_SIZE,
+  isStatisticsLimitError,
+  type StatisticsLimitName,
 } from '../query-contract.js';
+import {
+  DIMENSION_COLUMNS,
+  StatisticsQueryValidationError,
+  appendFilters,
+  decodeDimensionValue,
+  invalidQuery,
+  optionalProviderIdentifier,
+  queryIdentifier,
+  requiredIdentifier,
+} from './query-filters.js';
+import { aggregateStatistics, distributionStatistics, sessionTotalsStatistics } from './statistics-reader.js';
+import { registerStatisticsFunctions } from './statistics-functions.js';
 
 export interface SqliteWriterWorkerData {
   readonly role: 'writer';
@@ -42,6 +60,14 @@ export interface SqliteDeleteLeaseResult {
 export interface SqliteDeleteChunkResult {
   readonly deleted: number;
   readonly hasMore: boolean;
+}
+
+/** Outcome of one insert batch; the three counts add up to the batch size. */
+export interface SqliteInsertResult {
+  readonly inserted: number;
+  readonly duplicates: number;
+  /** Records refused as invalid, by reason. Only they were dropped; the rest of the batch was written. */
+  readonly rejected: Readonly<Record<string, number>>;
 }
 
 export type SqliteWorkerRequest =
@@ -72,6 +98,9 @@ export type SqliteWorkerRequest =
       readonly dimension: LlmStatisticsDimension;
       readonly query: Omit<LlmExchangeScanQuery, 'cursor'>;
     }
+  | { readonly id: number; readonly kind: 'aggregate'; readonly query: LlmStatisticsAggregateQuery }
+  | { readonly id: number; readonly kind: 'distribution'; readonly query: LlmStatisticsDistributionQuery }
+  | { readonly id: number; readonly kind: 'sessionTotals'; readonly query: LlmSessionTotalsQuery }
   | {
       readonly id: number;
       readonly kind: 'checkpoint';
@@ -91,7 +120,9 @@ export type SqliteWorkerRequest =
 
 export type SqliteReaderWorkerRequest = Extract<
   SqliteWorkerRequest,
-  { readonly kind: 'snapshotMaxSequence' | 'scan' | 'dimensionValues' }
+  {
+    readonly kind: 'snapshotMaxSequence' | 'scan' | 'dimensionValues' | 'aggregate' | 'distribution' | 'sessionTotals';
+  }
 >;
 
 type SqliteWriterWorkerRequest = Exclude<SqliteWorkerRequest, SqliteReaderWorkerRequest>;
@@ -102,25 +133,36 @@ export type SqliteWorkerResponse =
       readonly kind: 'result';
       readonly id: number;
       readonly value:
-        | { readonly inserted: number; readonly duplicates: number }
+        | SqliteInsertResult
         | SqliteDeleteLeaseResult
         | SqliteDeleteChunkResult
         | number
         | readonly StoredLlmExchange[]
         | readonly LlmDimensionCount[]
+        | readonly LlmStatisticsPartition[]
+        | LlmStatisticsDistributionResult
+        | LlmSessionUsageTotalsResult
         | null;
     }
   | {
       readonly kind: 'error';
       readonly id?: number;
       readonly message: string;
-      /** Reader errors distinguish rejected queries from broken storage. */
-      readonly category?: 'invalid_request' | 'unavailable';
+      /**
+       * Reader errors distinguish rejected queries (`invalid_request`) and
+       * well-formed queries over a statistics limit (`limit`) from broken
+       * storage (`unavailable`). Only the last retires the reader.
+       */
+      readonly category?: 'invalid_request' | 'limit' | 'unavailable';
+      /** Present for `limit`: which limit was exceeded, and its value. */
+      readonly limit?: { readonly name: StatisticsLimitName; readonly maximum: number };
+      /** Writer errors the repository acts on: requeue a busy batch, latch off on a permanent failure. */
+      readonly code?: LlmMetricsStorageErrorCode;
     };
 
-const MAX_QUALITY_FLAGS = 64;
 /** Must match the bounded gateway-adapter contract. */
 const MAX_ATTEMPTS = 64;
+const MAX_REJECTION_REASON_LENGTH = 120;
 const MAX_SCAN_LIMIT = 10_001;
 const MAX_DIMENSION_LIMIT = 500;
 const MAX_DELETE_CHUNK_SIZE = 1_000;
@@ -128,6 +170,12 @@ const MIN_MAINTENANCE_LEASE_MS = 100;
 const MAX_MAINTENANCE_LEASE_MS = 60_000;
 const MAINTENANCE_BUSY_TIMEOUT_MS = 250;
 const NORMAL_BUSY_TIMEOUT_MS = SQLITE_BUSY_TIMEOUT_MS;
+/**
+ * Page cache of the reader connection. Aggregations read every matching row
+ * once; a cache that holds a few months of rows keeps repeated dashboard
+ * queries from re-reading pages through the OS on every request.
+ */
+const READER_CACHE_KIB = 32 * 1024;
 const ATTRIBUTION_QUALITIES = ['exact', 'bundle_only', 'unattributed'] as const;
 const GATEWAY_KINDS = ['direct', 'openrouter', 'ironcurtain', 'opaque'] as const;
 const IDENTITY_SOURCES = [
@@ -168,6 +216,7 @@ const REFUSAL_SOURCES = [
 ] as const;
 const OUTPUT_TOKEN_SEMANTICS = ['includes_thinking', 'excludes_thinking', 'no_thinking_breakdown', 'unknown'] as const;
 const USAGE_COMPLETENESS = ['complete', 'partial', 'missing', 'invalid'] as const;
+const COST_SOURCES = ['gateway_reported', 'list_price'] as const satisfies readonly LlmCostSource[];
 const MEASUREMENT_ACCURACIES = [
   'reported_exact',
   'provider_estimate',
@@ -177,39 +226,6 @@ const MEASUREMENT_ACCURACIES = [
 ] as const;
 const TRANSPORT_OUTCOMES = ['response', 'auth_retry', 'error', 'aborted'] as const;
 const GATEWAY_ATTEMPT_SOURCES = ['router_metadata', 'trusted_gateway_header'] as const;
-
-const FILTER_COLUMNS: Readonly<Record<keyof NonNullable<LlmExchangeScanQuery['filters']>, string>> = {
-  agent: 'agent_name',
-  logicalProvider: 'logical_provider',
-  gateway: 'gateway_kind',
-  protocol: 'protocol',
-  providerProfile: 'provider_profile_id',
-  requestedModel: 'requested_model',
-  forwardedModel: 'forwarded_model',
-  responseModel: 'response_model',
-  servedModel: 'served_model',
-  servedProvider: 'served_provider',
-  reasoningMode: 'reasoning_mode',
-  requestedServiceTier: 'requested_service_tier',
-  actualServiceTier: 'actual_service_tier',
-  inputMeasurementProvenance: 'input_measurement_provenance',
-  outputMeasurementProvenance: 'output_measurement_provenance',
-  thinkingMeasurementProvenance: 'thinking_measurement_provenance',
-  nonThinkingMeasurementProvenance: 'non_thinking_measurement_provenance',
-  speedMode: 'speed_mode',
-  streaming: 'streaming',
-  outcome: 'termination_category',
-  refusal: 'refusal',
-  usageCompleteness: 'usage_completeness',
-  attributionQuality: 'attribution_quality',
-  sessionId: 'session_id',
-  workflowRunId: 'workflow_run_id',
-  stateId: 'state_id',
-  personaId: 'persona_id',
-  bundleId: 'bundle_id',
-};
-
-const DIMENSION_COLUMNS: Readonly<Record<LlmStatisticsDimension, string>> = FILTER_COLUMNS;
 
 const EXCHANGE_COLUMNS = `
   exchange_id AS exchangeId,
@@ -253,17 +269,22 @@ const EXCHANGE_COLUMNS = `
   provider_stop_reason AS providerStopReason,
   refusal,
   refusal_category AS refusalCategory,
+  input_tokens_reported AS inputTokensReported,
   input_tokens_total AS inputTokens,
   input_tokens_uncached AS uncachedInputTokens,
   cache_read_input_tokens AS cacheReadInputTokens,
   cache_write_input_tokens AS cacheWriteInputTokens,
   tool_use_input_tokens AS toolUseInputTokens,
+  output_tokens_reported AS outputTokensReported,
   output_tokens_total AS outputTokens,
   thinking_tokens AS thinkingTokens,
   non_thinking_output_tokens AS nonThinkingOutputTokens,
   provider_total_tokens AS providerTotalTokens,
   canonical_total_tokens AS totalTokens,
   cost_usd AS costUsd,
+  estimated_cost_usd AS estimatedCostUsd,
+  cost_source AS costSource,
+  pricing_version AS pricingVersion,
   usage_completeness AS usageCompleteness,
   usage_semantics_version AS usageSemanticsVersion,
   input_measurement_provenance AS inputMeasurementProvenance,
@@ -301,7 +322,8 @@ const INSERT_EXCHANGE_SQL = `
     input_tokens_reported, input_tokens_total, input_tokens_uncached, cache_read_input_tokens,
     cache_write_input_tokens, tool_use_input_tokens, output_tokens_reported, output_token_semantics,
     output_tokens_total, thinking_tokens, non_thinking_output_tokens, provider_total_tokens,
-    canonical_total_tokens, cost_usd, usage_source, usage_completeness, usage_semantics_version,
+    canonical_total_tokens, cost_usd, estimated_cost_usd, cost_source, pricing_version,
+    usage_source, usage_completeness, usage_semantics_version,
     input_measurement_provenance, output_measurement_provenance, thinking_measurement_provenance,
     non_thinking_measurement_provenance,
     request_body_complete_offset_ms, response_headers_offset_ms, first_upstream_body_byte_offset_ms,
@@ -324,7 +346,8 @@ const INSERT_EXCHANGE_SQL = `
     $inputTokensReported, $inputTokensTotal, $inputTokensUncached, $cacheReadInputTokens,
     $cacheWriteInputTokens, $toolUseInputTokens, $outputTokensReported, $outputTokenSemantics,
     $outputTokensTotal, $thinkingTokens, $nonThinkingOutputTokens, $providerTotalTokens,
-    $canonicalTotalTokens, $costUsd, $usageSource, $usageCompleteness, $usageSemanticsVersion,
+    $canonicalTotalTokens, $costUsd, $estimatedCostUsd, $costSource, $pricingVersion,
+    $usageSource, $usageCompleteness, $usageSemanticsVersion,
     $inputMeasurementProvenance, $outputMeasurementProvenance, $thinkingMeasurementProvenance,
     $nonThinkingMeasurementProvenance,
     $requestBodyCompleteOffsetMs, $responseHeadersOffsetMs, $firstUpstreamBodyByteOffsetMs,
@@ -337,17 +360,6 @@ const INSERT_EXCHANGE_SQL = `
 
 type SqlParameters = Record<string, SQLInputValue>;
 
-function requiredIdentifier(value: string, field: string): string {
-  if (
-    typeof value !== 'string' ||
-    value.length > STATISTICS_IDENTIFIER_MAX_LENGTH ||
-    !STATISTICS_IDENTIFIER_PATTERN.test(value)
-  ) {
-    throw new Error(`Invalid ${field}`);
-  }
-  return value;
-}
-
 function enumValue<const Value extends string>(value: string, allowed: readonly Value[], field: string): Value {
   if (!allowed.includes(value as Value)) throw new Error(`Invalid ${field}`);
   return value as Value;
@@ -355,18 +367,6 @@ function enumValue<const Value extends string>(value: string, allowed: readonly 
 
 function optionalIdentifier(value: string | null, field: string): string | null {
   return value === null ? null : requiredIdentifier(value, field);
-}
-
-function optionalProviderIdentifier(value: string | null, field: string): string | null {
-  if (value === null) return null;
-  if (
-    typeof value !== 'string' ||
-    value.length > STATISTICS_PROVIDER_IDENTIFIER_MAX_LENGTH ||
-    !STATISTICS_PROVIDER_IDENTIFIER_PATTERN.test(value)
-  ) {
-    throw new Error(`Invalid ${field}`);
-  }
-  return value;
 }
 
 function optionalBoolean(value: boolean | null): number | null {
@@ -393,6 +393,27 @@ function safeTokenCount(value: number | null, field: string): number | null {
   return value;
 }
 
+function optionalCost(value: number | null, field: string): number | null {
+  if (value === null) return null;
+  if (!Number.isFinite(value) || value < 0) throw new Error(`Invalid ${field}`);
+  return value;
+}
+
+/**
+ * The stored cost source, consistent with the costs stored alongside it: a
+ * source names the column that holds the exchange's cost, so a source whose
+ * column is empty would misreport where a cost came from.
+ */
+function costSource(usage: NormalizedUsage, costUsd: number | null, estimatedCostUsd: number | null): string | null {
+  const source = usage.costSource ?? (costUsd !== null ? 'gateway_reported' : null);
+  if (source === null) return null;
+  const checked = enumValue(source, COST_SOURCES, 'costSource');
+  if ((checked === 'gateway_reported' && costUsd === null) || (checked === 'list_price' && estimatedCostUsd === null)) {
+    throw new Error('Invalid costSource');
+  }
+  return checked;
+}
+
 function requestReceivedAtMs(exchange: LlmExchangeCompleted): number {
   const value = Date.parse(exchange.timing.requestReceivedAt);
   if (!Number.isFinite(value)) throw new Error('Invalid requestReceivedAt');
@@ -414,7 +435,7 @@ function completedAtMs(exchange: LlmExchangeCompleted, startedAtMs: number): num
 }
 
 function qualityFlagsJson(exchange: LlmExchangeCompleted): string {
-  if (exchange.qualityFlags.length > MAX_QUALITY_FLAGS) throw new Error('Too many quality flags');
+  if (exchange.qualityFlags.length > MAX_EXCHANGE_QUALITY_FLAGS) throw new Error('Too many quality flags');
   return JSON.stringify(exchange.qualityFlags.map((flag) => requiredIdentifier(flag, 'quality flag')));
 }
 
@@ -423,9 +444,8 @@ function exchangeParameters(exchange: LlmExchangeCompleted, processRunId: string
   if (schemaVersion !== 1) throw new Error('Unsupported exchange schemaVersion');
   const startedAtMs = requestReceivedAtMs(exchange);
   const { attribution, route, identity, responseMetadata, request, outcome, usage, timing } = exchange;
-  if (usage.costUsd !== null && (!Number.isFinite(usage.costUsd) || usage.costUsd < 0)) {
-    throw new Error('Invalid costUsd');
-  }
+  const costUsd = optionalCost(usage.costUsd, 'costUsd');
+  const estimatedCostUsd = optionalCost(usage.estimatedCostUsd ?? null, 'estimatedCostUsd');
   const usageSemanticsVersion: unknown = usage.usageSemanticsVersion;
   if (usageSemanticsVersion !== 1) throw new Error('Unsupported usageSemanticsVersion');
 
@@ -488,7 +508,10 @@ function exchangeParameters(exchange: LlmExchangeCompleted, processRunId: string
     nonThinkingOutputTokens: safeTokenCount(usage.nonThinkingOutputTokens, 'nonThinkingOutputTokens'),
     providerTotalTokens: safeTokenCount(usage.providerTotalTokens, 'providerTotalTokens'),
     canonicalTotalTokens: safeTokenCount(usage.canonicalTotalTokens, 'canonicalTotalTokens'),
-    costUsd: usage.costUsd,
+    costUsd,
+    estimatedCostUsd,
+    costSource: costSource(usage, costUsd, estimatedCostUsd),
+    pricingVersion: optionalIdentifier(usage.pricingVersion ?? null, 'pricingVersion'),
     usageSource: optionalIdentifier(usage.usageSource, 'usageSource'),
     usageCompleteness: enumValue(usage.usageCompleteness, USAGE_COMPLETENESS, 'usage completeness'),
     usageSemanticsVersion: usage.usageSemanticsVersion,
@@ -606,17 +629,28 @@ function storedExchange(row: Record<string, SQLOutputValue>): StoredLlmExchange 
     providerStopReason: asString(row.providerStopReason, 'providerStopReason'),
     refusal: row.refusal === null ? null : asNumber(row.refusal, 'refusal') === 1,
     refusalCategory: asNullableString(row.refusalCategory, 'refusalCategory'),
+    inputTokensReported: asNullableNumber(row.inputTokensReported, 'inputTokensReported'),
     inputTokens: asNullableNumber(row.inputTokens, 'inputTokens'),
     uncachedInputTokens: asNullableNumber(row.uncachedInputTokens, 'uncachedInputTokens'),
     cacheReadInputTokens: asNullableNumber(row.cacheReadInputTokens, 'cacheReadInputTokens'),
     cacheWriteInputTokens: asNullableNumber(row.cacheWriteInputTokens, 'cacheWriteInputTokens'),
     toolUseInputTokens: asNullableNumber(row.toolUseInputTokens, 'toolUseInputTokens'),
+    outputTokensReported: asNullableNumber(row.outputTokensReported, 'outputTokensReported'),
     outputTokens: asNullableNumber(row.outputTokens, 'outputTokens'),
     thinkingTokens: asNullableNumber(row.thinkingTokens, 'thinkingTokens'),
     nonThinkingOutputTokens: asNullableNumber(row.nonThinkingOutputTokens, 'nonThinkingOutputTokens'),
     providerTotalTokens: asNullableNumber(row.providerTotalTokens, 'providerTotalTokens'),
     totalTokens: asNullableNumber(row.totalTokens, 'totalTokens'),
     costUsd: asNullableNumber(row.costUsd, 'costUsd'),
+    estimatedCostUsd: asNullableNumber(row.estimatedCostUsd, 'estimatedCostUsd'),
+    // Rows written before schema 2 carry no source; their cost_usd was gateway-reported.
+    costSource:
+      row.costSource === null
+        ? row.costUsd === null
+          ? null
+          : 'gateway_reported'
+        : enumValue(asString(row.costSource, 'costSource'), COST_SOURCES, 'costSource'),
+    pricingVersion: asNullableString(row.pricingVersion, 'pricingVersion'),
     usageCompleteness: asString(row.usageCompleteness, 'usageCompleteness'),
     usageSemanticsVersion: asNumber(row.usageSemanticsVersion, 'usageSemanticsVersion'),
     inputMeasurementProvenance: asString(row.inputMeasurementProvenance, 'inputMeasurementProvenance'),
@@ -640,74 +674,6 @@ function storedExchange(row: Record<string, SQLOutputValue>): StoredLlmExchange 
     clientAborted: asString(row.clientDeliveryStatus, 'clientDeliveryStatus') === 'aborted',
     qualityFlags: parseQualityFlags(row.qualityFlagsJson),
   };
-}
-
-class StatisticsQueryValidationError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'StatisticsQueryValidationError';
-  }
-}
-
-function invalidQuery(message: string): never {
-  throw new StatisticsQueryValidationError(message);
-}
-
-function queryIdentifier(value: string, field: string): string {
-  try {
-    return requiredIdentifier(value, field);
-  } catch {
-    return invalidQuery(`Invalid ${field}`);
-  }
-}
-
-function queryProviderIdentifier(value: string, field: string): string {
-  try {
-    return optionalProviderIdentifier(value, field) ?? invalidQuery(`Invalid ${field}`);
-  } catch (error) {
-    if (error instanceof StatisticsQueryValidationError) throw error;
-    return invalidQuery(`Invalid ${field}`);
-  }
-}
-
-function appendFilters(
-  query: Pick<LlmExchangeScanQuery, 'fromMs' | 'toMs' | 'filters'>,
-  params: SQLInputValue[],
-): string[] {
-  if (!Number.isSafeInteger(query.fromMs) || !Number.isSafeInteger(query.toMs) || query.fromMs > query.toMs) {
-    invalidQuery('Invalid query time range');
-  }
-  const clauses = ['completed_at_ms >= ?', 'completed_at_ms <= ?'];
-  params.push(query.fromMs, query.toMs);
-
-  for (const [filter, values] of Object.entries(query.filters ?? {}) as [
-    keyof NonNullable<LlmExchangeScanQuery['filters']>,
-    readonly (string | boolean)[],
-  ][]) {
-    const untrustedValues: unknown = values;
-    if (!Array.isArray(untrustedValues)) invalidQuery(`Invalid ${filter} filter values`);
-    const filterValues = untrustedValues as readonly unknown[];
-    if (filterValues.length === 0) continue;
-    if (filterValues.length > MAX_STATISTICS_FILTER_VALUES) invalidQuery(`Too many ${filter} filter values`);
-    if (!Object.hasOwn(FILTER_COLUMNS, filter)) invalidQuery('Invalid statistics filter');
-    const column = FILTER_COLUMNS[filter];
-    clauses.push(`${column} IN (${filterValues.map(() => '?').join(', ')})`);
-    for (const value of filterValues) {
-      if (typeof value !== 'string' && typeof value !== 'boolean') {
-        invalidQuery(`Invalid ${filter} filter value`);
-      }
-      params.push(
-        typeof value === 'boolean'
-          ? value
-            ? 1
-            : 0
-          : filter === 'servedProvider'
-            ? queryProviderIdentifier(value, `${filter} filter`)
-            : queryIdentifier(value, `${filter} filter`),
-      );
-    }
-  }
-  return clauses;
 }
 
 function scan(database: DatabaseSync, query: LlmExchangeScanQuery): readonly StoredLlmExchange[] {
@@ -762,20 +728,10 @@ function dimensionValues(
         `WHERE ${clauses.join(' AND ')} GROUP BY ${column} ORDER BY count DESC, ${column} ASC LIMIT ?`,
     )
     .all(...params);
-  const booleanDimension = dimension === 'streaming' || dimension === 'refusal';
-  return rows.map((row) => {
-    let value: string | boolean | null;
-    if (!booleanDimension) {
-      value = asNullableString(row.value, 'dimension value');
-    } else if (row.value === null) {
-      value = null;
-    } else if (row.value === 0 || row.value === 1) {
-      value = row.value === 1;
-    } else {
-      throw new Error('Invalid boolean dimension value');
-    }
-    return { value, count: asNumber(row.count, 'dimension count') };
-  });
+  return rows.map((row) => ({
+    value: decodeDimensionValue(dimension, row.value),
+    count: asNumber(row.count, 'dimension count'),
+  }));
 }
 
 function initializeWriter(data: SqliteWriterWorkerData): { database: DatabaseSync; schemaVersion: number } {
@@ -789,13 +745,18 @@ function initializeWriter(data: SqliteWriterWorkerData): { database: DatabaseSyn
   try {
     const schemaVersion = migrateLlmMetricsDatabase(database);
     withSqliteBusyRetry(() => database.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;'));
+    // A restarted writer keeps its process run: the start marker is written
+    // once and the checkpoint counters stay process-lifetime monotonic, so
+    // the durable gap (enqueued minus persisted rows) still covers records
+    // lost with a crashed worker.
     withSqliteBusyRetry(() =>
       database
         .prepare(
           `INSERT INTO llm_process_runs (
             process_run_id, started_at_ms, last_checkpoint_at_ms,
             observed_count, finalized_count, enqueued_count, clean_ended_at_ms
-          ) VALUES (?, ?, ?, 0, 0, 0, NULL)`,
+          ) VALUES (?, ?, ?, 0, 0, 0, NULL)
+          ON CONFLICT (process_run_id) DO NOTHING`,
         )
         .run(requiredIdentifier(data.processRunId, 'processRunId'), data.startedAtMs, data.startedAtMs),
     );
@@ -822,21 +783,16 @@ function initializeReader(data: SqliteReaderWorkerData): { database: DatabaseSyn
     allowExtension: false,
   });
   try {
-    assertCompatibleSchema(database);
-    database.exec(`PRAGMA query_only = ON; PRAGMA busy_timeout = ${NORMAL_BUSY_TIMEOUT_MS};`);
-    return { database, schemaVersion: LLM_METRICS_SCHEMA_VERSION };
+    const schemaVersion = assertLlmMetricsSchemaCompatible(database, 'reader');
+    database.exec(
+      `PRAGMA query_only = ON; PRAGMA busy_timeout = ${NORMAL_BUSY_TIMEOUT_MS}; ` +
+        `PRAGMA cache_size = -${READER_CACHE_KIB};`,
+    );
+    registerStatisticsFunctions(database, STATISTICS_QUANTILE_SAMPLE_SIZE);
+    return { database, schemaVersion };
   } catch (error) {
     database.close();
     throw error;
-  }
-}
-
-function assertCompatibleSchema(database: DatabaseSync): void {
-  const version = database.prepare('PRAGMA user_version').get()?.user_version;
-  if (version !== LLM_METRICS_SCHEMA_VERSION) {
-    throw new Error(
-      `LLM metrics database schema ${String(version)} is not supported by writer schema ${LLM_METRICS_SCHEMA_VERSION}`,
-    );
   }
 }
 
@@ -906,7 +862,7 @@ function beginDeleteBefore(
   data: SqliteWriterWorkerData,
   request: Extract<SqliteWorkerRequest, { kind: 'beginDeleteBefore' }>,
 ): SqliteDeleteLeaseResult {
-  assertCompatibleSchema(database);
+  assertLlmMetricsSchemaCompatible(database, 'writer');
   const leaseName = requiredIdentifier(request.leaseName, 'maintenance lease name');
   const cutoffMs = boundedSafeInteger(request.cutoffMs, 0, Number.MAX_SAFE_INTEGER, 'delete cutoff');
   const leaseDurationMs = boundedSafeInteger(
@@ -986,7 +942,7 @@ function deleteBeforeChunk(
   data: SqliteWriterWorkerData,
   request: Extract<SqliteWorkerRequest, { kind: 'deleteBeforeChunk' }>,
 ): SqliteDeleteChunkResult {
-  assertCompatibleSchema(database);
+  assertLlmMetricsSchemaCompatible(database, 'writer');
   const leaseName = requiredIdentifier(request.leaseName, 'maintenance lease name');
   const cutoffMs = boundedSafeInteger(request.cutoffMs, 0, Number.MAX_SAFE_INTEGER, 'delete cutoff');
   const snapshotMaxSequence = boundedSafeInteger(
@@ -1051,7 +1007,7 @@ function releaseMaintenanceLease(
   data: SqliteWriterWorkerData,
   request: Extract<SqliteWorkerRequest, { kind: 'releaseMaintenanceLease' }>,
 ): void {
-  assertCompatibleSchema(database);
+  assertLlmMetricsSchemaCompatible(database, 'writer');
   const leaseName = requiredIdentifier(request.leaseName, 'maintenance lease name');
   withMaintenanceBusyTimeout(database, () => {
     withSqliteBusyRetry(() =>
@@ -1062,12 +1018,79 @@ function releaseMaintenanceLease(
   });
 }
 
+interface PreparedExchange {
+  readonly parameters: SqlParameters;
+  readonly transportAttempts: readonly (readonly SQLInputValue[])[];
+  readonly gatewayAttempts: readonly (readonly SQLInputValue[])[];
+}
+
+/** Validates one record completely, before any transaction opens. Throws when it is invalid. */
+function prepareExchange(exchange: LlmExchangeCompleted, processRunId: string): PreparedExchange {
+  const parameters = exchangeParameters(exchange, processRunId);
+  const exchangeId = requiredIdentifier(exchange.exchangeId, 'exchangeId');
+  if (exchange.transportAttempts.length > MAX_ATTEMPTS) throw new Error('Too many transport attempts');
+  if (exchange.gatewayRouteAttempts.length > MAX_ATTEMPTS) throw new Error('Too many gateway attempts');
+  return {
+    parameters,
+    transportAttempts: exchange.transportAttempts.map((attempt) => [
+      exchangeId,
+      safeTokenCount(attempt.ordinal, 'transport attempt ordinal'),
+      safeOffset(attempt.startedOffsetMs, 'transport attempt start'),
+      safeOffset(attempt.endedOffsetMs, 'transport attempt end'),
+      optionalHttpStatus(attempt.responseStatus, 'transport attempt status'),
+      enumValue(attempt.outcome, TRANSPORT_OUTCOMES, 'transport attempt outcome'),
+    ]),
+    gatewayAttempts: exchange.gatewayRouteAttempts.map((attempt) => [
+      exchangeId,
+      safeTokenCount(attempt.ordinal, 'gateway attempt ordinal'),
+      optionalProviderIdentifier(attempt.provider, 'gateway provider'),
+      optionalIdentifier(attempt.model, 'gateway model'),
+      optionalHttpStatus(attempt.status, 'gateway attempt status'),
+      optionalBoolean(attempt.selected),
+      enumValue(attempt.source, GATEWAY_ATTEMPT_SOURCES, 'gateway attempt source'),
+    ]),
+  };
+}
+
+/** Validation and constraint messages name fields, never record values; still bound them. */
+function rejectionReason(error: unknown): string {
+  const message = error instanceof Error ? error.message : '';
+  const reason = message
+    .replace(/\p{Cc}+/gu, ' ')
+    .trim()
+    .substring(0, MAX_REJECTION_REASON_LENGTH);
+  return reason.length > 0 ? reason : 'Invalid record';
+}
+
+function countRejection(rejected: Map<string, number>, error: unknown): void {
+  const reason = rejectionReason(error);
+  rejected.set(reason, (rejected.get(reason) ?? 0) + 1);
+}
+
+/**
+ * Writes one batch in one transaction. Each record is validated before the
+ * transaction and inserted inside its own savepoint, so an invalid record or a
+ * constraint failure on one record's rows drops that record alone, counted by
+ * reason. Storage failures (busy after the bounded retries, I/O, full, corrupt)
+ * still abort the whole batch; the repository decides whether to requeue it.
+ */
 function insertBatch(
   database: DatabaseSync,
   processRunId: string,
   exchanges: readonly LlmExchangeCompleted[],
-): { inserted: number; duplicates: number } {
-  assertCompatibleSchema(database);
+): SqliteInsertResult {
+  assertLlmMetricsSchemaCompatible(database, 'writer');
+  const rejected = new Map<string, number>();
+  const prepared: PreparedExchange[] = [];
+  for (const exchange of exchanges) {
+    try {
+      prepared.push(prepareExchange(exchange, processRunId));
+    } catch (error) {
+      countRejection(rejected, error);
+    }
+  }
+  if (prepared.length === 0) return { inserted: 0, duplicates: 0, rejected: Object.fromEntries(rejected) };
+
   const insertExchange = database.prepare(INSERT_EXCHANGE_SQL);
   const insertTransportAttempt = database.prepare(
     `INSERT INTO llm_transport_attempts
@@ -1079,43 +1102,36 @@ function insertBatch(
       (exchange_id, ordinal, provider, model, status_code, selected, source)
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
   );
-  return immediateTransaction(database, () => {
+  const written = immediateTransaction(database, () => {
     let inserted = 0;
     let duplicates = 0;
-    for (const exchange of exchanges) {
-      const result = insertExchange.run(exchangeParameters(exchange, processRunId));
-      const changes = typeof result.changes === 'bigint' ? Number(result.changes) : result.changes;
-      if (changes === 0) {
-        duplicates++;
-        continue;
-      }
-      inserted++;
-      if (exchange.transportAttempts.length > MAX_ATTEMPTS) throw new Error('Too many transport attempts');
-      for (const attempt of exchange.transportAttempts) {
-        insertTransportAttempt.run(
-          exchange.exchangeId,
-          safeTokenCount(attempt.ordinal, 'transport attempt ordinal'),
-          safeOffset(attempt.startedOffsetMs, 'transport attempt start'),
-          safeOffset(attempt.endedOffsetMs, 'transport attempt end'),
-          optionalHttpStatus(attempt.responseStatus, 'transport attempt status'),
-          enumValue(attempt.outcome, TRANSPORT_OUTCOMES, 'transport attempt outcome'),
-        );
-      }
-      if (exchange.gatewayRouteAttempts.length > MAX_ATTEMPTS) throw new Error('Too many gateway attempts');
-      for (const attempt of exchange.gatewayRouteAttempts) {
-        insertGatewayAttempt.run(
-          exchange.exchangeId,
-          safeTokenCount(attempt.ordinal, 'gateway attempt ordinal'),
-          optionalProviderIdentifier(attempt.provider, 'gateway provider'),
-          optionalIdentifier(attempt.model, 'gateway model'),
-          optionalHttpStatus(attempt.status, 'gateway attempt status'),
-          optionalBoolean(attempt.selected),
-          enumValue(attempt.source, GATEWAY_ATTEMPT_SOURCES, 'gateway attempt source'),
-        );
+    const refused = new Map<string, number>();
+    for (const record of prepared) {
+      database.exec('SAVEPOINT llm_exchange_record');
+      try {
+        const result = insertExchange.run(record.parameters);
+        const changes = typeof result.changes === 'bigint' ? Number(result.changes) : result.changes;
+        if (changes === 0) {
+          duplicates++;
+        } else {
+          for (const values of record.transportAttempts) insertTransportAttempt.run(...values);
+          for (const values of record.gatewayAttempts) insertGatewayAttempt.run(...values);
+          inserted++;
+        }
+        database.exec('RELEASE llm_exchange_record');
+      } catch (error) {
+        // A storage failure may already have rolled the transaction back;
+        // let immediateTransaction abort the batch.
+        if (!isRecordScopedSqliteError(error)) throw error;
+        database.exec('ROLLBACK TO llm_exchange_record');
+        database.exec('RELEASE llm_exchange_record');
+        countRejection(refused, error);
       }
     }
-    return { inserted, duplicates };
+    return { inserted, duplicates, refused };
   });
+  for (const [reason, count] of written.refused) rejected.set(reason, (rejected.get(reason) ?? 0) + count);
+  return { inserted: written.inserted, duplicates: written.duplicates, rejected: Object.fromEntries(rejected) };
 }
 
 function checkpoint(
@@ -1139,6 +1155,17 @@ function errorMessage(error: unknown): string {
   return message.substring(0, 500);
 }
 
+/** A writer failure, classified so the repository can requeue, restart, or latch persistence off. */
+function writerErrorResponse(error: unknown, id?: number): SqliteWorkerResponse {
+  const code = classifyStorageError(error);
+  return {
+    kind: 'error',
+    ...(id === undefined ? {} : { id }),
+    message: errorMessage(error),
+    ...(code === undefined ? {} : { code }),
+  };
+}
+
 function startWriterWorker(data: SqliteWriterWorkerData): void {
   if (parentPort === null) throw new Error('SQLite metrics worker has no parent port');
   const port = parentPort;
@@ -1148,7 +1175,7 @@ function startWriterWorker(data: SqliteWriterWorkerData): void {
     database = initialized.database;
     port.postMessage({ kind: 'ready', schemaVersion: initialized.schemaVersion } satisfies SqliteWorkerResponse);
   } catch (error) {
-    port.postMessage({ kind: 'error', message: errorMessage(error) } satisfies SqliteWorkerResponse);
+    port.postMessage(writerErrorResponse(error));
     return;
   }
 
@@ -1197,14 +1224,28 @@ function startWriterWorker(data: SqliteWriterWorkerData): void {
         }
         port.postMessage({ kind: 'result', id: request.id, value } satisfies SqliteWorkerResponse);
       } catch (error) {
-        port.postMessage({
-          kind: 'error',
-          id: request.id,
-          message: errorMessage(error),
-        } satisfies SqliteWorkerResponse);
+        port.postMessage(writerErrorResponse(error, request.id));
       }
     });
   });
+}
+
+function readerErrorResponse(id: number, error: unknown): SqliteWorkerResponse {
+  if (isStatisticsLimitError(error)) {
+    return {
+      kind: 'error',
+      id,
+      message: errorMessage(error),
+      category: 'limit',
+      limit: { name: error.limit, maximum: error.maximum },
+    };
+  }
+  return {
+    kind: 'error',
+    id,
+    message: errorMessage(error),
+    category: error instanceof StatisticsQueryValidationError ? 'invalid_request' : 'unavailable',
+  };
 }
 
 function startReaderWorker(data: SqliteReaderWorkerData): void {
@@ -1239,17 +1280,21 @@ function startReaderWorker(data: SqliteReaderWorkerData): void {
           case 'dimensionValues':
             value = dimensionValues(database, request.dimension, request.query);
             break;
+          case 'aggregate':
+            value = aggregateStatistics(database, request.query);
+            break;
+          case 'distribution':
+            value = distributionStatistics(database, request.query);
+            break;
+          case 'sessionTotals':
+            value = sessionTotalsStatistics(database, request.query);
+            break;
           default:
             throw new Error('Invalid SQLite metrics reader request');
         }
         port.postMessage({ kind: 'result', id: request.id, value } satisfies SqliteWorkerResponse);
       } catch (error) {
-        port.postMessage({
-          kind: 'error',
-          id: request.id,
-          message: errorMessage(error),
-          category: error instanceof StatisticsQueryValidationError ? 'invalid_request' : 'unavailable',
-        } satisfies SqliteWorkerResponse);
+        port.postMessage(readerErrorResponse(request.id, error));
       }
     });
   });

@@ -38,6 +38,7 @@ const {
   const mockAppState = {
     workflows: new Map<string, WorkflowSummaryDto>(),
     pendingGates: new Map<string, HumanGateRequestDto>(),
+    pendingWorkflowEscalations: new Map(),
     selectedWorkflowId: null as string | null,
   };
   return {

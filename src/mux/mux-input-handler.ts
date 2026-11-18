@@ -8,17 +8,41 @@
  * Ctrl-A toggles between modes (following screen/tmux convention).
  * Pressing Ctrl-A in PTY mode enters command mode; pressing it again
  * returns to PTY mode.
+ *
+ * Pickers and panels take the keyboard while open. The escalation picker
+ * opens only on Ctrl-E (an arriving escalation never opens it), and its
+ * decision keys, like `y` on the whitelist and approve-all confirmations,
+ * count only once armed; see escalation-picker-state.ts for the rules.
  */
 
 import { readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
+import { performance } from 'node:perf_hooks';
 import { expandTilde } from '../types/argument-roles.js';
 import { PASTE_START, PASTE_END } from './paste-interceptor.js';
-import type { InputMode, MuxAction } from './types.js';
+import type { InputMode, MuxAction, PendingRef } from './types.js';
 import type { SessionSnapshot } from '../pty/session-scanner.js';
 import type { PersonaSnapshot } from './persona-scanner.js';
 import type { ProviderProfileSnapshot } from './provider-profile-snapshot.js';
 import { hasSelectableProfiles } from './provider-profile-snapshot.js';
+import type { WhitelistScope } from '../trusted-process/approval-whitelist.js';
+import {
+  bulkApprovalKey,
+  decisionArmedAt,
+  ESCALATION_ARMING_DELAY_MS,
+  openEscalationPicker,
+  reconcileEscalationUi,
+  refocusEscalationPicker,
+  whitelistConfirmView,
+  type BulkApproveGroup,
+  type BulkApproveState,
+  type DisplayedBulkApproval,
+  type DisplayedEscalation,
+  type EscalationPickerState,
+  type EscalationUiTransition,
+} from './escalation-picker-state.js';
+
+export type { BulkApproveGroup, BulkApproveState, EscalationPickerState } from './escalation-picker-state.js';
 
 export type PickerPhase = 'menu' | 'browse';
 
@@ -68,19 +92,17 @@ export interface ProviderPickerState {
   pending: PendingSpawnSelection;
 }
 
-export interface EscalationPickerState {
-  /**
-   * The display number of the currently focused escalation tab.
-   * This is NOT an array index -- it's the monotonic displayNumber from
-   * PendingEscalation, which survives additions and removals.
-   */
-  focusedDisplayNumber: number;
-
-  /**
-   * The mode the user was in before the picker opened.
-   * Used to restore when the picker is dismissed with Esc.
-   */
-  previousMode: 'pty' | 'command';
+/**
+ * Multi-line command output (`/sessions`, bulk resolve results) shown in a
+ * dismissible bottom panel. Lines are display-sanitized by the renderer.
+ */
+export interface MessagePanelState {
+  readonly title: string;
+  readonly lines: readonly string[];
+  /** First visible line; the renderer clamps it to what fits. */
+  scrollOffset: number;
+  /** The mode to restore when the panel is dismissed. */
+  readonly previousMode: 'pty' | 'command';
 }
 
 export interface MuxInputHandler {
@@ -136,20 +158,69 @@ export interface MuxInputHandler {
   /** Current escalation picker state (null when not in escalation picker mode). */
   readonly escalationPickerState: EscalationPickerState | null;
 
-  /** Whether the escalation picker was dismissed by the user. */
-  readonly escalationDismissed: boolean;
-
-  /** The highest display number when the picker was last dismissed. */
-  readonly escalationDismissedAtNumber: number;
-
-  /** Enter escalation picker mode. */
-  enterEscalationPickerMode(focusedDisplayNumber: number, previousMode: 'pty' | 'command'): void;
+  /**
+   * Open the escalation picker on `focus` (the user pressed Ctrl-E). It
+   * opens disarmed: decision keys count only after the arming delay. Nothing
+   * opens it on its own; an arrival only rings, badges and banners.
+   */
+  enterEscalationPickerMode(focus: PendingRef, previousMode: 'pty' | 'command'): void;
 
   /** Exit escalation picker mode (return to previous mode). */
   exitEscalationPickerMode(): void;
 
-  /** Dismiss (Esc) the escalation picker, suppressing auto-open until new escalation. */
-  dismissEscalationPicker(highestPendingNumber: number, targetMode?: 'pty' | 'command'): void;
+  /** Dismiss (Esc) the escalation picker, returning to `targetMode` or the mode it was opened from. */
+  dismissEscalationPicker(targetMode?: 'pty' | 'command'): void;
+
+  /**
+   * Move the picker's focus to `focus` (navigation). A different escalation
+   * re-arms the picker, starts an open detail view at the top and cancels a
+   * whitelist confirmation.
+   */
+  focusEscalation(focus: PendingRef): void;
+
+  /**
+   * Apply a change to the pending escalations (`pending` sorted by display
+   * number): closes the picker when nothing is left, moves and re-arms its
+   * focus when the focused one went away, and cancels the approve-all screen
+   * when the set it listed changed. Never opens anything and never changes
+   * any other mode. See `reconcileEscalationUi`.
+   */
+  reconcileEscalations(pending: readonly PendingRef[]): EscalationUiTransition;
+
+  /** Switch the escalation picker between the summary and the full-detail view. */
+  toggleEscalationDetailView(): void;
+
+  /** Scroll the escalation detail view by `delta` lines (never below 0; the renderer clamps it to the content). */
+  scrollEscalationDetailView(delta: number): void;
+
+  /** Current approve-all confirmation state (null when that screen is not open). */
+  readonly bulkApproveState: BulkApproveState | null;
+
+  /**
+   * Open the approve-all confirmation screen for exactly `reviewed` (every
+   * pending escalation, `/approve all` or, with `whitelist`, `/approve+ all`;
+   * with `group`, the members of one whitelist-pattern group, `/approve
+   * group N`). It opens disarmed; `y` approves the listed set once every
+   * line has been on screen and the arming delay has passed.
+   */
+  enterBulkApproveConfirm(
+    reviewed: readonly PendingRef[],
+    whitelist: boolean,
+    previousMode: 'pty' | 'command',
+    group?: BulkApproveGroup,
+  ): void;
+
+  /** Close the approve-all confirmation screen and return to the mode it was opened from. */
+  exitBulkApproveConfirm(): void;
+
+  /** Current message panel state (null when the panel is not open). */
+  readonly messagePanelState: MessagePanelState | null;
+
+  /** Show multi-line output in the message panel, remembering the mode to restore on dismiss. */
+  enterMessagePanel(title: string, lines: readonly string[], previousMode: 'pty' | 'command'): void;
+
+  /** Close the message panel and return to the mode it was opened from. */
+  exitMessagePanel(): void;
 
   /**
    * Processes a key event from terminal-kit.
@@ -185,6 +256,39 @@ const HOME = 'HOME';
 const END = 'END';
 const CTRL_E = 'CTRL_E';
 const SHIFT_TAB = 'SHIFT_TAB';
+const PAGE_UP = 'PAGE_UP';
+const PAGE_DOWN = 'PAGE_DOWN';
+
+/** Lines scrolled by PageUp/PageDown in the message panel. */
+const MESSAGE_PANEL_PAGE_LINES = 5;
+
+/** Lines scrolled by PageUp/PageDown in the escalation detail view and the approve-all list. */
+const DETAIL_VIEW_PAGE_LINES = 10;
+
+/**
+ * Scroll change for a key in the escalation detail view or the approve-all
+ * list, or null when the key does not scroll. End jumps far past the
+ * bottom; the renderer clamps the offset to the content, which only it can
+ * measure.
+ */
+function scrollDelta(key: string, scrollOffset: number): number | null {
+  switch (key) {
+    case UP:
+      return -1;
+    case DOWN:
+      return 1;
+    case PAGE_UP:
+      return -DETAIL_VIEW_PAGE_LINES;
+    case PAGE_DOWN:
+      return DETAIL_VIEW_PAGE_LINES;
+    case HOME:
+      return -scrollOffset;
+    case END:
+      return Number.MAX_SAFE_INTEGER - scrollOffset;
+    default:
+      return null;
+  }
+}
 
 /** Scroll amount (in lines) for arrow-key and mouse-wheel scrolling. */
 export const SCROLL_LINES = 3;
@@ -264,10 +368,39 @@ function longestCommonPrefix(strings: string[]): string {
 
 export interface MuxInputHandlerOptions {
   initialMode?: InputMode;
+  /**
+   * Monotonic clock in milliseconds for the arming delay. Default
+   * `performance.now`; tests inject a fake one. The renderer must use the
+   * same clock (its `displayedEscalation.since` is compared with it).
+   */
+  now?: () => number;
+  /** Arming delay in milliseconds. Default {@link ESCALATION_ARMING_DELAY_MS}. */
+  armingDelayMs?: number;
+  /**
+   * What the escalation picker last drew in full; the app wires it to the
+   * renderer's `displayedEscalation`. `a` approves and `w`/`W` whitelist
+   * only the escalation drawn in full (summary or detail view) for at least
+   * the arming delay: when the terminal is too small for the dialog the
+   * renderer draws a notice instead, and approving, or whitelisting a
+   * pattern, that the user never saw is swallowed. `y` on a whitelist
+   * confirmation needs that confirmation, with the pattern it whitelists,
+   * on screen. Denying needs no display. Omitted: the focused escalation
+   * counts as drawn, in its current view, since forever, with both patterns.
+   */
+  displayedEscalation?: () => DisplayedEscalation | null;
+  /**
+   * What the approve-all screen last drew; the app wires it to the
+   * renderer's `displayedBulkApproval`. `y` approves only when every line of
+   * the listed set has been on screen for at least the arming delay.
+   * Omitted: the whole list counts as seen since forever.
+   */
+  displayedBulkApproval?: () => DisplayedBulkApproval | null;
 }
 
 export function createMuxInputHandler(options?: MuxInputHandlerOptions): MuxInputHandler {
   let _mode: InputMode = options?.initialMode ?? 'pty';
+  const clock = options?.now ?? ((): number => performance.now());
+  const armingDelayMs = options?.armingDelayMs ?? ESCALATION_ARMING_DELAY_MS;
   let _inputBuffer = '';
   let _cursorPos = 0;
   let _pickerState: PickerState | null = null;
@@ -275,8 +408,30 @@ export function createMuxInputHandler(options?: MuxInputHandlerOptions): MuxInpu
   let _personaPickerState: PersonaPickerState | null = null;
   let _providerPickerState: ProviderPickerState | null = null;
   let _escalationPickerState: EscalationPickerState | null = null;
-  let _escalationDismissed = false;
-  let _escalationDismissedAtNumber = 0;
+  let _bulkApproveState: BulkApproveState | null = null;
+  let _messagePanelState: MessagePanelState | null = null;
+
+  const displayedEscalation =
+    options?.displayedEscalation ??
+    ((): DisplayedEscalation | null => {
+      const eps = _escalationPickerState;
+      if (!eps) return null;
+      return {
+        displayNumber: eps.focusedDisplayNumber,
+        escalationId: eps.focusedEscalationId,
+        view: eps.whitelistConfirm ? whitelistConfirmView(eps.whitelistConfirm) : eps.detailView ? 'detail' : 'summary',
+        since: Number.NEGATIVE_INFINITY,
+        canWhitelist: true,
+        canWhitelistDirectory: true,
+      };
+    });
+  const displayedBulkApproval =
+    options?.displayedBulkApproval ??
+    ((): DisplayedBulkApproval | null => {
+      const bulk = _bulkApproveState;
+      if (!bulk) return null;
+      return { setKey: bulkApprovalKey(bulk.reviewed, bulk.whitelist), seenAllSince: Number.NEGATIVE_INFINITY };
+    });
 
   let _cachedPersonas: PersonaSnapshot[] = [];
   let _cachedProfiles: ProviderProfileSnapshot[] = [];
@@ -478,7 +633,11 @@ export function createMuxInputHandler(options?: MuxInputHandlerOptions): MuxInpu
 
     if (key === ENTER) {
       const selected = pps.personas[pps.selectedIndex];
-      if (!selected.compiled) {
+      // A stale policy no longer matches the persona's constitution, and a
+      // malformed agent model or resource budget fails validation; the
+      // session would refuse either, so neither is more selectable than an
+      // uncompiled persona.
+      if (!selected.compiled || selected.stale || selected.invalidOverrides !== undefined) {
         return { kind: 'none' };
       }
       // Transition to workspace browse phase with persona context
@@ -754,10 +913,95 @@ export function createMuxInputHandler(options?: MuxInputHandlerOptions): MuxInpu
     return handleBrowseKey(key);
   }
 
-  function enterEscalationPickerMode(focusedDisplayNumber: number, previousMode: 'pty' | 'command'): void {
+  function enterEscalationPickerMode(focus: PendingRef, previousMode: 'pty' | 'command'): void {
     _mode = 'escalation-picker';
-    _escalationPickerState = { focusedDisplayNumber, previousMode };
-    _escalationDismissed = false;
+    _escalationPickerState = openEscalationPicker(focus, previousMode, clock(), armingDelayMs);
+  }
+
+  function focusEscalation(focus: PendingRef): void {
+    if (!_escalationPickerState) return;
+    _escalationPickerState = refocusEscalationPicker(_escalationPickerState, focus, clock(), armingDelayMs);
+  }
+
+  function reconcileEscalations(pending: readonly PendingRef[]): EscalationUiTransition {
+    const transition = reconcileEscalationUi(
+      { mode: _mode, picker: _escalationPickerState, bulk: _bulkApproveState },
+      pending,
+      clock(),
+      armingDelayMs,
+    );
+    _mode = transition.next.mode;
+    _escalationPickerState = transition.next.picker;
+    _bulkApproveState = transition.next.bulk;
+    return transition;
+  }
+
+  function enterBulkApproveConfirm(
+    reviewed: readonly PendingRef[],
+    whitelist: boolean,
+    previousMode: 'pty' | 'command',
+    group?: BulkApproveGroup,
+  ): void {
+    _mode = 'escalation-approve-all';
+    _bulkApproveState = {
+      reviewed: [...reviewed],
+      ...(group ? { group } : {}),
+      whitelist,
+      previousMode,
+      scrollOffset: 0,
+      armedAt: clock() + armingDelayMs,
+    };
+  }
+
+  function exitBulkApproveConfirm(): void {
+    // Already closed (a change to the pending set cancels it): nothing to restore.
+    if (!_bulkApproveState) return;
+    _mode = _bulkApproveState.previousMode;
+    _bulkApproveState = null;
+  }
+
+  function toggleEscalationDetailView(): void {
+    const eps = _escalationPickerState;
+    if (!eps) return;
+    eps.detailView = eps.detailView ? null : { scrollOffset: 0 };
+  }
+
+  function scrollEscalationDetailView(delta: number): void {
+    const view = _escalationPickerState?.detailView;
+    if (!view) return;
+    view.scrollOffset = Math.max(0, view.scrollOffset + delta);
+  }
+
+  function enterMessagePanel(title: string, lines: readonly string[], previousMode: 'pty' | 'command'): void {
+    _mode = 'message-panel';
+    _messagePanelState = { title, lines: [...lines], scrollOffset: 0, previousMode };
+  }
+
+  function exitMessagePanel(): void {
+    const prev = _messagePanelState?.previousMode ?? 'pty';
+    _mode = prev;
+    _messagePanelState = null;
+  }
+
+  function handleMessagePanelKey(key: string): MuxAction {
+    const panel = _messagePanelState;
+    if (!panel) return { kind: 'none' };
+
+    if (key === ESCAPE || key === ENTER || key === CTRL_C || key === 'q') {
+      return { kind: 'message-panel-dismiss' };
+    }
+
+    // Scrolling only moves the window; the renderer clamps the top end
+    // because only it knows how many rows the panel has.
+    if (key === UP || key === DOWN || key === PAGE_UP || key === PAGE_DOWN) {
+      const step = key === UP || key === PAGE_UP ? -1 : 1;
+      const lines = key === PAGE_UP || key === PAGE_DOWN ? MESSAGE_PANEL_PAGE_LINES : 1;
+      const maxOffset = Math.max(0, panel.lines.length - 1);
+      panel.scrollOffset = Math.min(maxOffset, Math.max(0, panel.scrollOffset + step * lines));
+      return { kind: 'redraw-picker' };
+    }
+
+    return { kind: 'none' };
   }
 
   function exitEscalationPickerMode(): void {
@@ -766,18 +1010,81 @@ export function createMuxInputHandler(options?: MuxInputHandlerOptions): MuxInpu
     _escalationPickerState = null;
   }
 
-  function dismissEscalationPicker(highestPendingNumber: number, targetMode?: 'pty' | 'command'): void {
-    _escalationDismissed = true;
-    _escalationDismissedAtNumber = highestPendingNumber;
+  function dismissEscalationPicker(targetMode?: 'pty' | 'command'): void {
     exitEscalationPickerMode();
     if (targetMode) {
       _mode = targetMode;
     }
   }
 
+  /**
+   * Restarts the arming window of an armed-input screen. Every key there
+   * other than a decision that counts does this, the ones that navigate,
+   * view or scroll included, so a decision counts only after a full delay
+   * in which no other key came: text typed into the picker by mistake
+   * ("va...", a Tab, an arrow before an `a`), a held key or a double tap
+   * decides nothing.
+   */
+  function restartArming(state: { armedAt: number }): void {
+    state.armedAt = clock() + armingDelayMs;
+  }
+
+  /**
+   * A key that was not accepted on an armed-input screen: swallowed (never
+   * forwarded to the PTY) and the arming window starts again
+   * (`restartArming`). The redraw shows the "wait" hint.
+   */
+  function rearm(state: { armedAt: number }): MuxAction {
+    restartArming(state);
+    return { kind: 'redraw-picker' };
+  }
+
+  function resolveFocused(
+    eps: EscalationPickerState,
+    decision: 'approved' | 'denied',
+    whitelist: false | WhitelistScope,
+  ): MuxAction {
+    return {
+      kind: 'escalation-resolve',
+      displayNumber: eps.focusedDisplayNumber,
+      escalationId: eps.focusedEscalationId,
+      decision,
+      whitelist,
+    };
+  }
+
+  /**
+   * The focused escalation as the renderer last drew it, when that is the
+   * escalation the picker is focused on; otherwise null.
+   */
+  function drawnFocus(eps: EscalationPickerState): DisplayedEscalation | null {
+    const shown = displayedEscalation();
+    if (!shown) return null;
+    if (shown.displayNumber !== eps.focusedDisplayNumber || shown.escalationId !== eps.focusedEscalationId) {
+      return null;
+    }
+    return shown;
+  }
+
+  /**
+   * Escalation picker keys. Dismissing (Esc, Ctrl-C, Ctrl-A), navigating
+   * and viewing decide nothing and always work, armed or not; like every
+   * key other than a decision that counts, navigating and viewing restart
+   * the arming window (moving to another escalation also re-arms through
+   * `focusEscalation`). Decision keys count only once the picker is armed:
+   * `d` (deny) and `D` (deny all) then act at once; `a` (approve), `w`
+   * (open the confirmation of the exact whitelist pattern) and `W` (open the
+   * confirmation of the directory-wide one, when the escalation offers it)
+   * also need the escalation drawn in full for the whole arming delay.
+   * Every other key, and a decision key that does not count yet, is
+   * swallowed and restarts the arming window. There is no approve-all key:
+   * bulk approval goes through the `/approve all` confirmation screen.
+   */
   function handleEscalationPickerKey(key: string): MuxAction {
     const eps = _escalationPickerState;
     if (!eps) return { kind: 'none' };
+
+    if (eps.whitelistConfirm) return handleWhitelistConfirmKey(eps, eps.whitelistConfirm, key);
 
     if (key === ESCAPE || key === CTRL_C) {
       return { kind: 'escalation-dismiss' };
@@ -787,49 +1094,125 @@ export function createMuxInputHandler(options?: MuxInputHandlerOptions): MuxInpu
       return { kind: 'escalation-dismiss', targetMode: 'command' };
     }
 
-    // Tab navigation: LEFT/SHIFT_TAB = prev, RIGHT/TAB = next
+    // Tab navigation: LEFT/SHIFT_TAB = prev, RIGHT/TAB = next. Restarts the
+    // window even when the focus does not move (a single escalation), so a
+    // Tab or an arrow right before `a` does not approve.
     if (key === RIGHT || key === TAB) {
+      restartArming(eps);
       return { kind: 'escalation-navigate', direction: 'next' };
     }
     if (key === LEFT || key === SHIFT_TAB) {
+      restartArming(eps);
       return { kind: 'escalation-navigate', direction: 'prev' };
     }
 
-    // Single-key resolve actions
-    if (key === 'a') {
-      return {
-        kind: 'escalation-resolve',
-        displayNumber: eps.focusedDisplayNumber,
-        decision: 'approved',
-        whitelist: false,
-      };
+    // Detail view: 'v' toggles it, the arrow, page and Home/End keys scroll
+    // it. Viewing never decides anything, so these work while disarmed; they
+    // restart the window, so "va..." typed into the picker approves nothing.
+    if (key === 'v') {
+      toggleEscalationDetailView();
+      return rearm(eps);
     }
-    if (key === 'd') {
-      return {
-        kind: 'escalation-resolve',
-        displayNumber: eps.focusedDisplayNumber,
-        decision: 'denied',
-        whitelist: false,
-      };
-    }
-    if (key === 'w') {
-      return {
-        kind: 'escalation-resolve',
-        displayNumber: eps.focusedDisplayNumber,
-        decision: 'approved',
-        whitelist: true,
-      };
+    if (eps.detailView) {
+      const delta = scrollDelta(key, eps.detailView.scrollOffset);
+      if (delta !== null) {
+        scrollEscalationDetailView(delta);
+        return rearm(eps);
+      }
     }
 
-    // Batch resolve (shift keys)
-    if (key === 'A') {
-      return { kind: 'escalation-resolve-all', decision: 'approved', whitelist: false };
+    const now = clock();
+    if (now >= eps.armedAt) {
+      if (key === 'd') return resolveFocused(eps, 'denied', false);
+      if (key === 'D') return { kind: 'escalation-deny-all' };
+      // Approving needs the request on screen in full, for the whole delay:
+      // the "too small" notice or a request drawn a moment ago does not count.
+      const shown = drawnFocus(eps);
+      const shownLongEnough = shown !== null && now >= decisionArmedAt(eps.armedAt, shown.since, armingDelayMs);
+      if (key === 'a' && shown && shownLongEnough) return resolveFocused(eps, 'approved', false);
+      // Show the pattern in full first; `y` there approves and whitelists it.
+      if (key === 'w' && shown && shownLongEnough && shown.canWhitelist) {
+        eps.whitelistConfirm = 'exact';
+        return rearm(eps);
+      }
+      if (key === 'W' && shown && shownLongEnough && shown.canWhitelistDirectory) {
+        eps.whitelistConfirm = 'directory';
+        return rearm(eps);
+      }
     }
-    if (key === 'D') {
-      return { kind: 'escalation-resolve-all', decision: 'denied', whitelist: false };
+    return rearm(eps);
+  }
+
+  /**
+   * Keys on a whitelist confirmation (`scope`: which pattern it shows):
+   * `y` approves the focused escalation and whitelists that pattern, once
+   * armed and with this confirmation (and so the complete pattern) on
+   * screen; `n`, Esc and Ctrl-C go back to the escalation and restart the
+   * window; Ctrl-A dismisses the picker to command mode. Anything else is
+   * swallowed and re-arms.
+   */
+  function handleWhitelistConfirmKey(eps: EscalationPickerState, scope: WhitelistScope, key: string): MuxAction {
+    if (key === 'n' || key === ESCAPE || key === CTRL_C) {
+      eps.whitelistConfirm = false;
+      return rearm(eps);
+    }
+    if (key === CTRL_A) {
+      return { kind: 'escalation-dismiss', targetMode: 'command' };
+    }
+    if (key === 'y') {
+      const now = clock();
+      const shown = drawnFocus(eps);
+      const offered = scope === 'directory' ? shown?.canWhitelistDirectory : shown?.canWhitelist;
+      if (
+        shown?.view === whitelistConfirmView(scope) &&
+        offered === true &&
+        now >= decisionArmedAt(eps.armedAt, shown.since, armingDelayMs)
+      ) {
+        return resolveFocused(eps, 'approved', scope);
+      }
+    }
+    return rearm(eps);
+  }
+
+  /**
+   * Keys on the approve-all confirmation. `y` approves exactly the listed
+   * escalations, once armed and once every line of the list has been on
+   * screen for the arming delay. `n`, Esc, Ctrl-C and Ctrl-A cancel; the
+   * arrow, page and Home/End keys scroll and restart the window. Anything
+   * else is swallowed and re-arms.
+   */
+  function handleBulkApproveKey(key: string): MuxAction {
+    const bulk = _bulkApproveState;
+    if (!bulk) return { kind: 'none' };
+
+    if (key === 'n' || key === ESCAPE || key === CTRL_C || key === CTRL_A) {
+      return { kind: 'escalation-approve-all-cancel' };
     }
 
-    return { kind: 'none' };
+    const delta = scrollDelta(key, bulk.scrollOffset);
+    if (delta !== null) {
+      bulk.scrollOffset = Math.max(0, bulk.scrollOffset + delta);
+      return rearm(bulk);
+    }
+
+    if (key === 'y') {
+      const now = clock();
+      const shown = displayedBulkApproval();
+      if (
+        now >= bulk.armedAt &&
+        shown?.setKey === bulkApprovalKey(bulk.reviewed, bulk.whitelist) &&
+        shown.seenAllSince !== null &&
+        now >= shown.seenAllSince + armingDelayMs
+      ) {
+        return {
+          kind: 'escalation-approve-reviewed',
+          reviewed: bulk.reviewed,
+          whitelist: bulk.whitelist,
+          ...(bulk.group ? { groupKey: bulk.group.key } : {}),
+        };
+      }
+    }
+    return rearm(bulk);
   }
 
   function handlePtyKey(key: string, rawCode?: Buffer | number): MuxAction {
@@ -1008,15 +1391,23 @@ export function createMuxInputHandler(options?: MuxInputHandlerOptions): MuxInpu
     enterEscalationPickerMode,
     exitEscalationPickerMode,
     dismissEscalationPicker,
+    focusEscalation,
+    reconcileEscalations,
+    toggleEscalationDetailView,
+    scrollEscalationDetailView,
+    enterBulkApproveConfirm,
+    exitBulkApproveConfirm,
+    enterMessagePanel,
+    exitMessagePanel,
 
     get escalationPickerState() {
       return _escalationPickerState;
     },
-    get escalationDismissed() {
-      return _escalationDismissed;
+    get bulkApproveState() {
+      return _bulkApproveState;
     },
-    get escalationDismissedAtNumber() {
-      return _escalationDismissedAtNumber;
+    get messagePanelState() {
+      return _messagePanelState;
     },
 
     handleKey(key: string, rawCode?: Buffer | number): MuxAction {
@@ -1038,11 +1429,26 @@ export function createMuxInputHandler(options?: MuxInputHandlerOptions): MuxInpu
       if (_mode === 'escalation-picker') {
         return handleEscalationPickerKey(key);
       }
+      if (_mode === 'escalation-approve-all') {
+        return handleBulkApproveKey(key);
+      }
+      if (_mode === 'message-panel') {
+        return handleMessagePanelKey(key);
+      }
       return handleCommandKey(key);
     },
 
     handlePaste(text: string): MuxAction {
       if (!text) return { kind: 'none' };
+
+      // A paste into the picker or the approve-all screen is input that was
+      // not meant for it: swallowed, and the arming window starts again.
+      if (_mode === 'escalation-picker' && _escalationPickerState) {
+        return rearm(_escalationPickerState);
+      }
+      if (_mode === 'escalation-approve-all' && _bulkApproveState) {
+        return rearm(_bulkApproveState);
+      }
 
       if (_mode === 'pty') {
         return { kind: 'write-pty', data: PASTE_START + text + PASTE_END };

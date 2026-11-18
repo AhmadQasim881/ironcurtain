@@ -305,7 +305,7 @@ function runnerFixture() {
   };
 }
 
-function reportExecutor(fixture: ReturnType<typeof runnerFixture>, value: ReturnType<typeof report>, exitCode = 0) {
+function reportExecutor(fixture: ReturnType<typeof runnerFixture>, value: VitestReportFixture, exitCode = 0) {
   return outputExecutor((path) => {
     const boundReport = structuredClone(value);
     for (const result of boundReport.testResults) {
@@ -337,7 +337,24 @@ function outputExecutor(
   return vi.fn(executor);
 }
 
-function report(testCount = 1) {
+/**
+ * A Vitest JSON report as the runner parses it. Loosely typed: cases corrupt
+ * individual fields (a missing aggregate, an assertion without a title).
+ */
+interface VitestReportFixture {
+  numTotalTests?: number;
+  numPassedTests: number;
+  numFailedTests: number;
+  numPendingTests: number;
+  numTodoTests: number;
+  numFailedTestSuites: number;
+  numPendingTestSuites: number;
+  success: boolean;
+  snapshot: { failure: boolean; unchecked: number; unmatched: number };
+  testResults: { name: string; status: string; assertionResults: { status: string; title?: string }[] }[];
+}
+
+function report(testCount = 1): VitestReportFixture {
   return {
     numTotalTests: testCount,
     numPassedTests: testCount,

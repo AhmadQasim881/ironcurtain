@@ -4,10 +4,10 @@ import {
   parseDockerResourceError,
   probeDockerResources,
   isImagePresent,
+  type ConfiguredDockerEnvelope,
   type ExecFileFn,
   type HostResources,
 } from '../src/docker/resource-limits.js';
-import type { ResolvedDockerResourcesConfig } from '../src/config/user-config.js';
 
 const HOST_2VCPU_4GB: HostResources = { cpus: 2, memoryMb: 4096 };
 const HOST_8VCPU_16GB: HostResources = { cpus: 8, memoryMb: 16384 };
@@ -15,7 +15,7 @@ const HOST_1VCPU_1GB: HostResources = { cpus: 1, memoryMb: 1024 };
 
 describe('clampDockerResources', () => {
   it('passes through values that fit', () => {
-    const cfg: ResolvedDockerResourcesConfig = { memoryMb: 4096, cpus: 4 };
+    const cfg: ConfiguredDockerEnvelope = { memoryMb: 4096, cpus: 4 };
     const result = clampDockerResources(cfg, HOST_8VCPU_16GB);
     expect(result.effective.cpus).toBe(4);
     expect(result.effective.memoryMb).toBe(4096);
@@ -24,7 +24,7 @@ describe('clampDockerResources', () => {
 
   it('clamps cpus to hostCpus - 1 on a small host (Bishop Fox scenario)', () => {
     // The reported failure: hardcoded 4 cpus on a 2-vCPU VM.
-    const cfg: ResolvedDockerResourcesConfig = { memoryMb: 8192, cpus: 4 };
+    const cfg: ConfiguredDockerEnvelope = { memoryMb: 8192, cpus: 4 };
     const result = clampDockerResources(cfg, HOST_2VCPU_4GB);
     expect(result.effective.cpus).toBe(1); // 2 - 1
     expect(result.effective.memoryMb).toBe(3072); // floor(4096 * 0.75)
@@ -32,14 +32,14 @@ describe('clampDockerResources', () => {
   });
 
   it('clamps memory to floor(hostMb * 0.75) when configured exceeds host', () => {
-    const cfg: ResolvedDockerResourcesConfig = { memoryMb: 8192, cpus: 1 };
+    const cfg: ConfiguredDockerEnvelope = { memoryMb: 8192, cpus: 1 };
     const result = clampDockerResources(cfg, HOST_2VCPU_4GB);
     expect(result.effective.memoryMb).toBe(3072);
     expect(result.clamped).toBe(true);
   });
 
   it('null cpus produces undefined (no flag) and is never clamped', () => {
-    const cfg: ResolvedDockerResourcesConfig = { memoryMb: 2048, cpus: null };
+    const cfg: ConfiguredDockerEnvelope = { memoryMb: 2048, cpus: null };
     const result = clampDockerResources(cfg, HOST_2VCPU_4GB);
     expect(result.effective.cpus).toBeUndefined();
     expect(result.effective.memoryMb).toBe(2048);
@@ -47,7 +47,7 @@ describe('clampDockerResources', () => {
   });
 
   it('null memoryMb produces undefined (no flag) and is never clamped', () => {
-    const cfg: ResolvedDockerResourcesConfig = { memoryMb: null, cpus: 1 };
+    const cfg: ConfiguredDockerEnvelope = { memoryMb: null, cpus: 1 };
     const result = clampDockerResources(cfg, HOST_2VCPU_4GB);
     expect(result.effective.memoryMb).toBeUndefined();
     expect(result.effective.cpus).toBe(1);
@@ -55,7 +55,7 @@ describe('clampDockerResources', () => {
   });
 
   it('both null = no flags emitted', () => {
-    const cfg: ResolvedDockerResourcesConfig = { memoryMb: null, cpus: null };
+    const cfg: ConfiguredDockerEnvelope = { memoryMb: null, cpus: null };
     const result = clampDockerResources(cfg, HOST_8VCPU_16GB);
     expect(result.effective.cpus).toBeUndefined();
     expect(result.effective.memoryMb).toBeUndefined();
@@ -65,33 +65,33 @@ describe('clampDockerResources', () => {
   it('single-core host: cpu ceiling falls back to Docker minimum', () => {
     // A 1-cpu host can't give a container "hostCpus - 1 = 0" -- it has
     // to fall back to Docker's documented minimum (0.01).
-    const cfg: ResolvedDockerResourcesConfig = { memoryMb: 256, cpus: 2 };
+    const cfg: ConfiguredDockerEnvelope = { memoryMb: 256, cpus: 2 };
     const result = clampDockerResources(cfg, HOST_1VCPU_1GB);
     expect(result.effective.cpus).toBe(0.01);
     expect(result.clamped).toBe(true);
   });
 
   it('clamps cpu values below 0.01 up to Docker minimum', () => {
-    const cfg: ResolvedDockerResourcesConfig = { memoryMb: 1024, cpus: 0.001 };
+    const cfg: ConfiguredDockerEnvelope = { memoryMb: 1024, cpus: 0.001 };
     const result = clampDockerResources(cfg, HOST_8VCPU_16GB);
     expect(result.effective.cpus).toBe(0.01);
   });
 
   it('clamps memory values below 6 MB up to Docker minimum', () => {
-    const cfg: ResolvedDockerResourcesConfig = { memoryMb: 4, cpus: 1 };
+    const cfg: ConfiguredDockerEnvelope = { memoryMb: 4, cpus: 1 };
     const result = clampDockerResources(cfg, HOST_8VCPU_16GB);
     expect(result.effective.memoryMb).toBe(6);
   });
 
   it('reports requested and host snapshots back to the caller', () => {
-    const cfg: ResolvedDockerResourcesConfig = { memoryMb: 8192, cpus: 4 };
+    const cfg: ConfiguredDockerEnvelope = { memoryMb: 8192, cpus: 4 };
     const result = clampDockerResources(cfg, HOST_2VCPU_4GB);
     expect(result.requested).toEqual(cfg);
     expect(result.host).toEqual(HOST_2VCPU_4GB);
   });
 
   it('fractional cpus are preserved when they fit', () => {
-    const cfg: ResolvedDockerResourcesConfig = { memoryMb: 2048, cpus: 1.5 };
+    const cfg: ConfiguredDockerEnvelope = { memoryMb: 2048, cpus: 1.5 };
     const result = clampDockerResources(cfg, HOST_8VCPU_16GB);
     expect(result.effective.cpus).toBe(1.5);
     expect(result.clamped).toBe(false);

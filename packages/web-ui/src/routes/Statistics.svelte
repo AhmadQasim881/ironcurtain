@@ -34,6 +34,8 @@
     createStatisticsRequestLimiter,
     findMeasure,
     localTimeZone,
+    statisticsErrorMessage,
+    statisticsGroupNoun,
     statisticsIdentityDimensions,
     type StatisticsIdentityMode,
   } from '$lib/components/features/statistics/statistics-helpers.js';
@@ -45,6 +47,18 @@
   const MAX_VISIBLE_TREND_SERIES = 4;
   const MAX_RETURNED_TREND_SERIES = 8;
   const initialTrendDomain = calendarDayDomain(Date.now(), 30, timeZone);
+  const GROUPING_OPTIONS: readonly { readonly mode: StatisticsIdentityMode; readonly label: string }[] = [
+    { mode: 'routed', label: 'Routed model' },
+    { mode: 'served', label: 'Served model' },
+    { mode: 'persona', label: 'Persona' },
+    { mode: 'workflow', label: 'Workflow' },
+  ];
+  const GROUPING_BADGES: Readonly<Record<StatisticsIdentityMode, string>> = {
+    routed: 'Routed identity',
+    served: 'Served identity',
+    persona: 'By persona',
+    workflow: 'By workflow run',
+  };
 
   let rangeDays = $state<7 | 30 | 90>(30);
   let identityMode = $state<StatisticsIdentityMode>('routed');
@@ -268,7 +282,7 @@
       visibleTrendSeries = new Set(orderedObservedSeriesKeys(nextRail, nextTrend).slice(0, MAX_VISIBLE_TREND_SERIES));
     } catch (reason) {
       if (reason === STALE || !isCurrent(generation)) return;
-      error = reason instanceof Error ? reason.message : String(reason);
+      error = statisticsErrorMessage(reason);
     } finally {
       if (isCurrent(generation)) loading = false;
     }
@@ -337,7 +351,7 @@
       selectedDistribution = nextDistribution;
     } catch (reason) {
       if (reason === STALE || !current()) return;
-      selectedError = reason instanceof Error ? reason.message : String(reason);
+      selectedError = statisticsErrorMessage(reason);
     } finally {
       if (current()) selectedLoading = false;
     }
@@ -372,19 +386,15 @@
       {/each}
     </fieldset>
     <fieldset>
-      <legend>Model identity</legend>
-      <button
-        type="button"
-        class:active={identityMode === 'routed'}
-        aria-pressed={identityMode === 'routed'}
-        onclick={() => (identityMode = 'routed')}>Routed model</button
-      >
-      <button
-        type="button"
-        class:active={identityMode === 'served'}
-        aria-pressed={identityMode === 'served'}
-        onclick={() => (identityMode = 'served')}>Served model</button
-      >
+      <legend>Group by</legend>
+      {#each GROUPING_OPTIONS as option (option.mode)}
+        <button
+          type="button"
+          class:active={identityMode === option.mode}
+          aria-pressed={identityMode === option.mode}
+          onclick={() => (identityMode = option.mode)}>{option.label}</button
+        >
+      {/each}
     </fieldset>
   </nav>
 
@@ -442,14 +452,14 @@
           <p class="eyebrow">Longitudinal view</p>
           <h2 id="trend-heading">Speed over time</h2>
           <p>
-            Daily median with the middle 50% shaded for the busiest provider/model groups. Missing points mean no
-            eligible effective-speed sample was observed.
+            Daily median with the middle 50% shaded for the busiest {statisticsGroupNoun(loadedIdentityMode)} groups. Missing
+            points mean no eligible effective-speed sample was observed.
           </p>
         </div>
-        <span>{loadedIdentityMode === 'served' ? 'Served identity' : 'Routed identity'}</span>
+        <span>{GROUPING_BADGES[loadedIdentityMode]}</span>
       </header>
       {#if trendSeriesOptions.length > 0}
-        <div class="series-filters" aria-label="Visible provider and model series">
+        <div class="series-filters" aria-label={`Visible ${statisticsGroupNoun(loadedIdentityMode)} series`}>
           {#each trendSeriesOptions as option (option.key)}
             {@const active = activeSeriesKeys.has(option.key)}
             <button

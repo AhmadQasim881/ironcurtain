@@ -6,11 +6,24 @@
  * output) so callers can inspect the decomposition before writing — so a dry-run
  * response is NOT content-free, and MCP clients that log tool output will capture
  * that fact text.
+ *
+ * Secret values in the blob are removed by the engine before extraction (so neither
+ * the LLM, the stored source segments nor the facts see them); tags and `source`
+ * that contain one are rejected. Seed importance above MAX_AGENT_IMPORTANCE is
+ * stored as the cap.
+ *
+ * Every chunk of the blob is a paid LLM call on the user's key, outside IronCurtain's
+ * session budgets, so the content is capped at MAX_INGEST_CONTENT_BYTES and `source`
+ * (stored on every fact) at MAX_SOURCE_LENGTH before anything else runs, dry runs
+ * included; an ingest keeps at most MAX_FACTS_PER_INGEST facts, and its result says
+ * when part of the content was left out.
  */
 
-import type { MemoryEngine, IngestOptions } from '../engine.js';
+import type { CallControls, MemoryEngine, IngestOptions } from '../engine.js';
 import type { IngestResult } from '../types.js';
-import { validateTags } from './validation.js';
+import { assertIngestSize, assertValidAsOf, capImportance, validateTags } from './validation.js';
+import { assertNoSecret } from '../utils/secrets.js';
+import { MAX_FACTS_PER_INGEST, MAX_INGEST_CHUNKS } from '../storage/extraction.js';
 
 export type IngestMode = 'conversation' | 'document';
 export type OnExtractionFailure = 'degrade' | 'skip' | 'error';
@@ -31,8 +44,9 @@ export interface IngestInput {
 
 /**
  * Normalize `as_of` (epoch ms number, numeric string, OR ISO 8601 string) to an
- * INTEGER epoch ms. Rejects non-finite / negative results; truncates any fractional
- * ms so the value round-trips through the SQLite `INTEGER` timestamp columns.
+ * INTEGER epoch ms. Rejects non-finite / negative results and times more than
+ * MAX_AS_OF_FUTURE_SKEW_MS (5 minutes) in the future; truncates any fractional ms so
+ * the value round-trips through the SQLite `INTEGER` timestamp columns.
  */
 function normalizeAsOf(value: unknown): number | undefined {
   if (value === undefined) return undefined;
@@ -50,10 +64,9 @@ function normalizeAsOf(value: unknown): number | undefined {
     throw new Error('as_of must be an epoch-ms number or an ISO 8601 string');
   }
 
-  if (!Number.isFinite(ms) || ms < 0) {
-    throw new Error('as_of must resolve to a non-negative epoch-ms timestamp');
-  }
-  return Math.floor(ms);
+  const asOf = Math.floor(ms);
+  assertValidAsOf(asOf);
+  return asOf;
 }
 
 /**
@@ -79,10 +92,16 @@ export function validateIngestInput(args: Record<string, unknown>): IngestInput 
   if (source !== undefined && typeof source !== 'string') {
     throw new Error('source must be a string');
   }
+  // Size first: nothing else (and no LLM call) looks at an oversized blob.
+  assertIngestSize(content, source);
+  // `source` is the caller's own label for the blob, stored on every fact. It is not
+  // provenance: who wrote the facts is recorded from the host-set writer.
+  if (source !== undefined) assertNoSecret(source, 'source');
 
   const mode = optEnum(args.mode, INGEST_MODES, "mode must be 'conversation' or 'document'") ?? 'conversation';
 
   const tags = validateTags(args.tags);
+  for (const tag of tags ?? []) assertNoSecret(tag, 'a tag');
 
   const importance = args.importance;
   if (importance !== undefined) {
@@ -110,7 +129,7 @@ export function validateIngestInput(args: Record<string, unknown>): IngestInput 
     source,
     mode,
     tags,
-    importance,
+    importance: capImportance(importance),
     dry_run: dryRun ?? false,
     on_extraction_failure: onExtractionFailure,
     as_of: asOf,
@@ -143,7 +162,33 @@ function renderDryRunPreview(result: IngestResult): string {
   return [header, ...lines].join('\n') + warning;
 }
 
+/**
+ * Note appended when the ingest did not turn all of its content into facts (the fact
+ * cap was reached, or the content ran past the chunk cap), so a caller does not take a
+ * partial decomposition for the whole document.
+ */
+function truncationNote(result: IngestResult): string {
+  if (!result.truncated) return '';
+  const dropped = result.dropped_chunks ?? 0;
+  const chunks = dropped > 0 ? ` ${dropped} of ${result.chunks ?? dropped} chunk(s) were not extracted.` : '';
+  return (
+    ` Truncated: one ingest keeps at most ${MAX_FACTS_PER_INGEST} facts and ${MAX_INGEST_CHUNKS} chunks, so part of ` +
+    `the content was left out.${chunks} Ingest the rest separately.`
+  );
+}
+
+/** Note appended when secret values were removed from the blob before extraction. */
+function redactionNote(result: IngestResult): string {
+  const count = result.redacted_secrets ?? 0;
+  if (count === 0) return '';
+  return ` ${count} secret value${count === 1 ? ' was' : 's were'} removed from the content before extraction.`;
+}
+
 export function formatIngestResult(result: IngestResult, dryRun: boolean): string {
+  return formatIngestOutcome(result, dryRun) + truncationNote(result) + redactionNote(result);
+}
+
+function formatIngestOutcome(result: IngestResult, dryRun: boolean): string {
   if (result.skipped) {
     return 'Extraction failed and on_extraction_failure=skip — nothing written.';
   }
@@ -177,7 +222,11 @@ export function formatIngestResult(result: IngestResult, dryRun: boolean): strin
   return base;
 }
 
-export async function handleIngest(engine: MemoryEngine, args: Record<string, unknown>): Promise<string> {
+export async function handleIngest(
+  engine: MemoryEngine,
+  args: Record<string, unknown>,
+  controls?: CallControls,
+): Promise<string> {
   const input = validateIngestInput(args);
   const opts: IngestOptions = {
     source: input.source,
@@ -188,6 +237,6 @@ export async function handleIngest(engine: MemoryEngine, args: Record<string, un
     as_of: input.as_of,
     on_extraction_failure: input.on_extraction_failure,
   };
-  const result = await engine.ingest(input.content, opts);
+  const result = await engine.ingest(input.content, opts, controls);
   return formatIngestResult(result, input.dry_run);
 }

@@ -12,3 +12,8 @@ export function parseTags(json: string | null | undefined): string[] {
     return [];
   }
 }
+
+/** Union of tag lists in first-seen order, without duplicates. */
+export function unionTags(...lists: string[][]): string[] {
+  return [...new Set(lists.flat())];
+}

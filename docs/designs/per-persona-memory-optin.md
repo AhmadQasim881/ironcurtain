@@ -1,10 +1,31 @@
 # Per-Persona / Per-Job Memory Opt-In
 
-Status: implemented (PR #215)
-Last updated: 2026-04-28
+**Status (2026-11-14):** Implemented (PR #215). Sessions that borrow a workflow's shared container run without memory (WP-68); the per-persona memory backends of section 11 are designed but not built.
+
+Last updated: 2026-11-12
 
 ## Revision history
 
+- **2026-11-12 (WP-95)**: The Memory submenu of `ironcurtain config` (§6.4)
+  also toggles `memory.offlineModels` (the memory server never downloads its
+  models; see `memory-mcp-server-v2.md` §9, "Model Provenance and Storage"),
+  and `memoryHint` appends `, offline models` when it is on.
+- **2026-11-11 (WP-68)**: Corrected the shared-container claims. The §5
+  site F change ("mint the relay if any persona opts in") never took effect:
+  the workflow's default infrastructure factory builds the bundle's servers
+  from `mcp-servers.json`, which has no `memory` entry, so shared-container
+  bundles never ran a memory server, while the sessions borrowing them
+  still received the memory prompt and the CLAUDE.md protocol telling the
+  agent to call `memory.context` first (audit finding MEM-9). Closing the
+  gap that way would also have been unsafe: one bundle-wide memory server
+  would give every persona in the scope one persona's database. Now
+  shared-container bundles run no memory server (the orchestrator no longer
+  requests it and the default factory refuses it), the gate has a
+  `borrowedBundle` input that closes it for every session on a borrowed
+  bundle, and the orchestrator tells the user which memory-enabled personas
+  run without memory. Updated §1.2, §4, §5 site F, §7, §9.4, §10 and §11.
+  Per-persona memory in shared containers is follow-up work (§11,
+  "Per-persona memory in shared-container workflows").
 - **2026-04-28**: Resolved import-cycle and orchestrator-deps blockers from
   clean-implementer review. Split the loader-aware helper into a new
   `src/persona/memory-gate.ts` module to break a `memory/ → persona/ → memory/`
@@ -73,6 +94,44 @@ the per-state coordinator's policy hot-swap is gated by the
 `mintedServersByBundle` check at `orchestrator.ts:746-758`. Net result:
 in shared-container mode today, **memory is not actually spawned as a
 relay**, regardless of `memory.enabled`.
+
+**Outcome (2026-11-11, WP-68).** Adding `memory` to the scope's required
+set (the original §5 site F plan) did not spawn anything: the default
+infrastructure factory filters the servers of `loadConfig()`, which come
+from `mcp-servers.json` and have no `memory` entry, and nothing else adds
+one to the bundle. Borrowing sessions still computed `memoryEnabled` from
+the persona alone, so every state of a memory-enabled persona was told to
+call `memory.context` before anything else, and got an error from a tool
+that did not exist.
+
+Spawning one memory server per bundle would not be a fix either. All
+personas whose states share a `containerScope` borrow the bundle's single
+coordinator, and the memory server is a trusted server (no annotations
+or compiled rules; since WP-67 only a per-tool trusted-server policy that
+escalates bulk forgets and large ingests), so whichever persona's state
+ran would read and write the database the server was started with. A scope is one container, but
+memory is per persona.
+
+So shared-container bundles run **no** memory server, and no session that
+borrows one advertises it:
+
+- `getRequiredServersForScope` never adds `memory`, and the default
+  infrastructure factory removes a `memory` entry even if the required
+  set or the server configuration names it (`withoutMemoryServer` in
+  `src/workflow/orchestrator.ts`).
+- `isMemoryEnabledFor` takes `borrowedBundle`; `buildSessionConfig` sets
+  it whenever `SessionOptions.workflow.infrastructure` is present, so the
+  persona prompt, the CLAUDE.md seed (which `createDockerSession` builds
+  from the same decision) and the server bolt-on all see memory as off.
+- When a bundle is minted, the orchestrator writes one line to the
+  workflow tab and stderr naming the personas in that scope that have
+  memory enabled and therefore run without it.
+
+Workflows without `sharedContainer: true` (each Docker state builds its
+own bundle from its session config) and builtin workflows keep per-persona
+memory exactly as standalone sessions do. Memory for personas in shared
+containers needs one isolated backend per persona; see §11, "Per-persona
+memory in shared-container workflows".
 
 ### 1.3 Architectural smell: `ALWAYS_INCLUDED_SERVERS`
 
@@ -228,6 +287,11 @@ export interface MemoryGateInputs {
   readonly job?: JobDefinition;
   /** Resolved user config (always present at the call sites). */
   readonly userConfig: ResolvedUserConfig;
+  /**
+   * True when the session borrows a workflow shared-container bundle
+   * (added 2026-11-11; see §1.2). Such a bundle runs no memory server.
+   */
+  readonly borrowedBundle?: boolean;
 }
 
 /**
@@ -235,16 +299,18 @@ export interface MemoryGateInputs {
  *
  * Precedence (most restrictive wins):
  *   1. Global kill switch: userConfig.memory.enabled === false → off.
- *   2. Scope: no persona AND no job → off (default sessions are stateless).
- *   3. Per-persona: persona.memory.enabled === false → off.
- *   4. Per-job:     job.memory.enabled === false → off.
- *   5. Otherwise: on.
+ *   2. Borrowed workflow shared-container bundle → off.
+ *   3. Scope: no persona AND no job → off (default sessions are stateless).
+ *   4. Per-persona: persona.memory.enabled === false → off.
+ *   5. Per-job:     job.memory.enabled === false → off.
+ *   6. Otherwise: on.
  *
  * This is the SINGLE point where these signals are combined. All four
- * runtime sites and the orchestrator's relay-derivation site call it.
+ * runtime sites and the orchestrator's memory report call it.
  */
 export function isMemoryEnabledFor(inputs: MemoryGateInputs): boolean {
   if (inputs.userConfig.memory.enabled === false) return false;
+  if (inputs.borrowedBundle === true) return false;
   if (!inputs.persona && !inputs.job) return false;
   if (inputs.persona?.memory?.enabled === false) return false;
   if (inputs.job?.memory?.enabled === false) return false;
@@ -252,12 +318,19 @@ export function isMemoryEnabledFor(inputs: MemoryGateInputs): boolean {
 }
 ```
 
+`buildSessionConfig` passes `borrowedBundle: true` whenever
+`SessionOptions.workflow.infrastructure` is set. The two Docker CLAUDE.md
+sites (C and D) take the boolean `buildSessionConfig` returns, so they
+inherit the closed gate without a second check.
+
 ### 4.2 Loader-friendly variant for the orchestrator
 
-The orchestrator only has persona _names_ in scope at relay-derivation
-time, not loaded definitions. To avoid scattering `loadPersona` calls,
-expose a thin loader-aware wrapper. **It must live on the `persona/`
-side of the boundary** — placing it next to `isMemoryEnabledFor` in
+The orchestrator only has persona _names_ in scope when it mints a
+shared-container bundle (where it reports the memory-enabled personas that
+run without memory; §5 site F), not loaded definitions. To avoid
+scattering `loadPersona` calls, expose a thin loader-aware wrapper.
+**It must live on the `persona/` side of the boundary** — placing it
+next to `isMemoryEnabledFor` in
 `src/memory/memory-policy.ts` would require a runtime
 `memory/memory-policy.ts → persona/resolve.ts` import, which closes the
 `memory/ → persona/ → memory/` cycle described in §4.1.
@@ -273,8 +346,8 @@ import { createPersonaName, type PersonaDefinition } from './types.js';
 
 /**
  * Convenience: loads the persona definition by name and runs the gate.
- * Returns false if the persona file cannot be read (fail closed — the
- * orchestrator should not spawn a relay for a persona it cannot load).
+ * Returns false if the persona file cannot be read (fail closed — memory
+ * is never reported as on for a persona it cannot load).
  *
  * Lives in `src/persona/` (not `src/memory/`) to avoid a
  * `memory/ → persona/ → memory/` import cycle.
@@ -505,6 +578,12 @@ design time):
 | 4   | `src/web-ui/dispatch/session-dispatch.ts:134`       | Web UI session start. Has `persona: string \| undefined`; same pattern as the Signal callsite.                                                                                     |
 | 5   | `src/web-ui/__tests__/json-rpc-dispatch.test.ts:51` | Test mock (`vi.fn().mockReturnValue(false)`). Update the mock to accept the new second argument; the existing `mockReturnValue(false)` works regardless of args.                   |
 
+> **As implemented (WP-96).** Passing `{ job }` alone (row 2) ignored the persona the job runs as: the
+> session's memory gate looks at both (`isMemoryEnabledFor({ persona, job })`), so a job whose persona
+> opted out ran without a memory server but was still asked to auto-save. The daemon now passes
+> `{ job, persona: job.persona }` (the raw persona name is loaded fail-closed). The auto-save prompt itself
+> asks for one `memory.ingest` call in document mode (see `memory-ingest-tool.md` §10).
+
 For sessions that have outlived their `SessionOptions` and only have a
 `SessionMetadata` snapshot (`src/session/session-metadata.ts`), reload
 the persona/job from disk using the metadata's `personaName` /
@@ -512,7 +591,10 @@ the persona/job from disk using the metadata's `personaName` /
 fallback — they all run at session-creation time, where the original
 options are still in scope.
 
-### Site F — `src/workflow/orchestrator.ts:700-715` (relay derivation)
+### Site F — `src/workflow/orchestrator.ts:700-715` (relay derivation; revised 2026-11-11)
+
+The first two blocks are the original 2026-04 design, kept for the record;
+read the "Superseded" note after them for what the code does now.
 
 **Old:**
 
@@ -558,12 +640,49 @@ private getRequiredServersForScope(instance, scope) {
 }
 ```
 
-This closes the relay-spawning gap. The bundle is now minted with
-`memory` if any persona in the scope wants it; the per-state policy
-swap (`cyclePolicy`) does not need to add memory because it does not
-add servers (it only ever uses the minted-server set), and the bolt-on
-in `buildSessionConfig` will set `sessionConfig.mcpServers[MEMORY_SERVER_NAME]`
-for each state that opts in.
+~~This closes the relay-spawning gap.~~ **Superseded (2026-11-11, WP-68).**
+The block above put `memory` into the required set, but the default
+infrastructure factory builds the bundle from `loadConfig().mcpServers`,
+which has no `memory` entry, so no memory server was ever spawned; and
+the bolt-on in `buildSessionConfig` only edits the borrowing session's own
+config, which a borrowed bundle never reads. The sessions still advertised
+memory. A single bundle-wide memory server would have been wrong anyway:
+every persona in the scope would share the database it was started with
+(§1.2). The code now does the opposite:
+
+```ts
+// src/workflow/orchestrator.ts
+private getRequiredServersForScope(instance, scope) {
+  const union = new Set<string>();
+  for (const persona of this.getPersonasForScope(instance, scope)) {
+    const { compiledPolicy } = loadPersonaPolicyArtifacts(this.getPolicyDir(instance, persona));
+    for (const server of extractRequiredServers(compiledPolicy)) union.add(server);
+  }
+  return union; // never `memory`
+}
+
+// Called from ensureBundleForScope next to the line above: one notice per
+// minted bundle, on the workflow tab and stderr.
+private reportUnavailableMemory(instance, scope) {
+  const personas = this.getPersonasForScope(instance, scope).filter((persona) =>
+    isMemoryEnabledForPersonaName(persona, this.deps.userConfig),
+  );
+  if (personas.length === 0) return;
+  // "memory is enabled for persona(s) a, b, but shared-container workflows
+  //  do not run the memory server: their states in scope "primary" run
+  //  without memory"
+}
+
+// In the default infrastructure factory, after filterMcpServersByPolicy:
+// warn and drop a `memory` entry if one is present.
+config.mcpServers = withoutMemoryServer(servers);
+```
+
+and `buildSessionConfig` closes the gate for borrowed bundles
+(`borrowedBundle`, §4.1), which keeps the persona prompt, the CLAUDE.md
+seed and the bolt-on consistent with the bundle. `cyclePolicy` is
+unchanged: memory was never in a compiled policy, so the minted-server
+check never involved it.
 
 #### Orchestrator dependency wiring
 
@@ -597,6 +716,9 @@ export interface WorkflowOrchestratorDeps {
 
 The orchestrator reads `this.deps.userConfig` (the existing class
 already stores `deps`); no separate field on the class is required.
+(Since 2026-11-11 the dependency feeds the memory report instead of
+relay derivation, and container snapshots read it too; the doc comment
+in the code says so.)
 
 **Production callers that construct `WorkflowOrchestrator` (4 sites; verified by grep):**
 
@@ -873,7 +995,9 @@ if (field === 'enabled') {
 }
 ```
 
-Update `memoryHint` (line 865) to surface both fields:
+Update `memoryHint` (line 865) to surface both fields (WP-95 later added an
+"Offline models" option for `memory.offlineModels` to this submenu, and an
+`, offline models` suffix to the hint):
 
 ```ts
 function memoryHint(resolved: ResolvedUserConfig, pending: UserConfig): string {
@@ -919,12 +1043,24 @@ fields.
   memory globally. This is the kill switch.
 - **Default case (everything absent)**: identical behavior to today.
 
-The only behavior change for default-shape configs is the **closing of
-the workflow shared-container relay-spawning gap** (§1.2). Previously
-in shared-container mode, `memory.enabled: true` did _not_ actually
-spawn the relay; now it will. Calling this out in release notes is
-recommended because workflow runs on shared containers will start
-seeing memory tools where they didn't before.
+This section originally promised one more change for default-shape
+configs: that shared-container workflows would start spawning the memory
+relay. That never happened (§1.2), and it is no longer the plan. What
+changed on 2026-11-11 (WP-68) instead:
+
+- **Shared-container workflows** (`sharedContainer: true`): still no
+  memory, as in practice before, but the agents are no longer told to use
+  it. The persona prompt omits the memory protocol and CLAUDE.md is no
+  longer seeded with "call `memory.context` first" (a stale one is
+  removed), so states stop opening with a failing call to a missing tool.
+  When a bundle is minted, the workflow tab (and stderr) names the personas
+  in that scope that have memory enabled and run without it.
+- **Workflows without `sharedContainer`** and **builtin workflows**: no
+  change; each state's session spawns its own memory server for its
+  persona, as a standalone session does.
+
+Release notes should say that shared-container workflows do not provide
+persona memory yet.
 
 There is no schema-version bump; both `PersonaDefinition` and
 `JobDefinition` extensions are additive optional fields, and Zod (for
@@ -1022,17 +1158,42 @@ Build the test deps via the shared `createDeps` helper at
 `test/workflow/test-helpers.ts:253`, overriding `userConfig` per case
 to drive the memory-gate decision.
 
-- Workflow with one persona in scope that has `memory.enabled: false`:
-  required servers does NOT include `memory`.
-- Workflow with one persona in scope (default config): required
-  servers includes `memory`.
-- Workflow with two personas in scope, one opting out and one not:
-  required servers includes `memory` (any-persona-wants-it semantics).
-- Workflow with all personas opting out: required servers does NOT
-  include `memory`.
-- Workflow with `userConfig.memory.enabled === false` (kill switch):
-  required servers does NOT include `memory`, regardless of per-persona
-  state.
+The cases below are the 2026-11-11 (WP-68) set; the original plan
+expected `memory` in the required set whenever a persona opted in, and
+two of its tests pinned that.
+
+- Whatever the personas in a scope want, the required set never includes
+  `memory`: one persona with memory on (default config); two personas
+  with memory on; one opting out and one not; all opting out; the global
+  kill switch off.
+- The `[memory]` workflow-tab notice names exactly the personas whose own
+  setting enables memory (both, one, or none in the cases above), and
+  nothing for the `global` persona, even when a persona directory of that
+  name exists (the session factory runs `global` states without a persona).
+
+**`test/workflow/orchestrator-shared-container-memory.test.ts`** (new)
+runs a two-persona shared-container workflow end to end through the
+orchestrator's real default infrastructure factory (only
+`createDockerInfrastructure` is stubbed), the production session factory,
+the real `createSession` and CLAUDE.md sync (only `DockerAgentSession` is
+scripted). It asserts that the bundle is built with exactly the
+policy-referenced servers and no memory server (so no trusted server, no
+`MEMORY_DB_PATH`), and that each persona's session gets its persona prompt
+without any memory tool mention, no CLAUDE.md and no memory server. A
+second case runs the same two personas without `sharedContainer` and
+asserts the gate stays open there: each state's own bundle gets the
+trusted memory server on that persona's database and namespace, and each
+session is told to use it. A third case gives the factory a configured
+`memory` server and a required set naming it, and asserts the bundle
+still has none.
+
+Session level: `test/session-memory-gate.test.ts` checks that
+`buildSessionConfig` closes the gate on a borrowed bundle and keeps it
+open for a workflow state that borrows none, and
+`test/docker-session-factory.test.ts` checks that a memory-enabled persona
+state on a borrowed bundle only removes CLAUDE.md (a stale memory protocol,
+a planted link or FIFO) and never seeds it; the no-follow replacement cases
+run on the standalone path, where memory still seeds it.
 
 ### 9.5 CLI smoke tests
 
@@ -1050,10 +1211,10 @@ new prompt step using `@clack/prompts` mocks. Assert that:
 | File                                            | What to update                                                                                                                                                                                                                                                                                      |
 | ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `CLAUDE.md` (top level)                         | Add a brief note in "Configuration" or "Onboarding a New MCP Server" section pointing at the memory opt-in: "Memory is enabled per-persona / per-job; toggle during creation or via `ironcurtain persona edit` / `daemon edit-job`. Global kill switch is `ironcurtain config → Memory → Enabled`." |
-| `src/trusted-process/CLAUDE.md`                 | No change required — trusted process does not gate memory.                                                                                                                                                                                                                                          |
-| `docs/designs/memory-mcp-server.md` (if exists) | Add a "Per-persona / per-job opt-in (2026)" section linking to this doc.                                                                                                                                                                                                                            |
+| `src/trusted-process/CLAUDE.md`                 | No change required by this design. (Since WP-67 the trusted process gates memory per tool: bulk forgets and large ingests escalate to a human; see memory-mcp-server-v2.md, Policy Treatment.)                                                                                                      |
+| `docs/designs/archive/memory-mcp-server.md` (if exists) | Add a "Per-persona / per-job opt-in (2026)" section linking to this doc.                                                                                                                                                                                                                            |
 | `docs/designs/per-persona-memory-optin.md`      | This document.                                                                                                                                                                                                                                                                                      |
-| Release notes                                   | Call out the workflow-shared-container behavior change (§7): default-shape configs in shared-container mode will start spawning the memory relay where they previously did not.                                                                                                                     |
+| Release notes                                   | Call out the workflow shared-container behavior (§7, revised 2026-11-11): shared-container workflows run without persona memory, their agents are no longer told to call memory tools, and the workflow tab names the affected personas.                                                            |
 
 `grep -rn "memory.enabled" docs/` to find any other prose references
 that need updating.
@@ -1098,7 +1259,36 @@ that need updating.
    persona's memory opt-out causes the relay to be omitted?** Useful
    for debugging "why is memory not present" in shared-container
    workflows. Cheap to add. **Recommend yes**, via the existing
-   diagnostic event channel.
+   diagnostic event channel. _Partly done (2026-11-11):_ shared-container
+   bundles never run memory, so the orchestrator now names the
+   memory-enabled personas that run without it, once per minted bundle, on
+   the workflow tab and stderr. A structured event is still open.
+
+7. **Per-persona memory in shared-container workflows (follow-up to
+   WP-68).** Bundles run no memory server today (§1.2). Providing one
+   needs an isolated backend per persona, never one server per bundle:
+   - **Persona-bound backends.** Start one memory relay per
+     memory-enabled persona in the scope, each with that persona's
+     `MEMORY_DB_PATH` and `MEMORY_NAMESPACE`, under internal names. The
+     coordinator routes `memory.*` calls to the relay of the persona
+     installed by the last `loadPolicy`, and trusts (bypasses policy for)
+     that relay only; with no persona loaded, or one without memory, the
+     calls are denied. `buildTrustedServerSet` must verify every such
+     relay. The routing changes under the same policy mutex as the policy
+     swap, so it inherits the guarantees `cyclePolicy` already gives:
+     fan-out lanes share a persona, and a swap waits for other personas'
+     turns to end.
+   - **Swap on `cyclePolicy`.** Alternatively restart a single memory
+     relay with the next persona's database when the policy swaps. Simpler
+     routing, but a restart per persona change and a window where a
+     still-running turn could reach the new database unless the swap
+     drains it first.
+   - Either way the bundle must expose which personas it can serve, so
+     `buildSessionConfig` opens the gate only for those (replacing the
+     blanket `borrowedBundle` rule). Any per-session value the memory
+     server takes from its environment (such as a planned writer session
+     id for provenance) needs another channel, because a bundle-lived relay
+     outlives the sessions that use it.
 
 ### 11.1 Resolved during review (2026-04-28)
 

@@ -218,6 +218,8 @@ describe('frozen-manifest binding', () => {
     // gate. The production construction seam must never reach for it.
     const source = readFileSync(resolve('src/docker/docker-workload-egress.ts'), 'utf8');
     expect(source).not.toContain('allowUnfrozenManifest');
+    // Nor may it move the manifest out of the package root that the code ships in.
+    expect(source).not.toContain('manifestPackageRoot');
   });
 });
 
@@ -425,6 +427,7 @@ function workload(networkAccess: 'offline' | 'images' | 'packages'): ResolvedDoc
     resources: {
       memoryMb: 4096,
       cpus: 2,
+      daemonShare: 0.5,
       pids: { desired: 512, required: false },
       diskMb: null,
     },

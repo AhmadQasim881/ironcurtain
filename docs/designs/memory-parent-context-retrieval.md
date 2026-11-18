@@ -1,6 +1,7 @@
 # Design: Parent-context retention for `memory_ingest` — "index fine, return coarse"
 
-**Status:** Design v3 (back-compat-free simplification) — no implementation
+**Status (2026-11-14):** Implemented: segments and `memory_expand` (`packages/memory-mcp-server/src/tools/expand.ts`); see the "As implemented" notes.
+
 **Package:** `packages/memory-mcp-server/`
 **Extends:** [`memory-ingest-tool.md`](./memory-ingest-tool.md) (the ingest tool this changes)
 **Motivated by:** the contract-decomposition loss surfaced in
@@ -269,6 +270,20 @@ passes a `segmentId`.
 
 ## 4. Schema is canonical — no in-place migration
 
+> **Superseded (WP-94).** Rebuilding a stale database emptied every persona's memory on the
+> first start after a schema bump, recoverable only by hand from the backup. `storage/database.ts`
+> now upgrades in place: `MIGRATIONS` is an ordered list of additive, idempotent steps (v3 → v4
+> adds `segments` and `memories.segment_id` with `ALTER TABLE`; v4 → v5 adds and backfills
+> `segments.content_hash`), run after a `VACUUM INTO` backup and inside `BEGIN IMMEDIATE`, where
+> the stamp is read again so that of several servers opening one stale database only one
+> upgrades it (the others delete their redundant backups). Only a database older than v3,
+> unstamped with the legacy shape, with an unparseable stamp, or half-created is still backed
+> up and rebuilt; a newer stamp still fails closed. The open also refuses a database whose
+> stored vectors come from another embedding model or have another size (an empty database is
+> switched to the configured model). `memory-mcp-server backups` lists the copies kept next to
+> a database and `memory-mcp-server restore <copy>` restores one (saving the current database
+> first). The rest of this section describes the v4 design as it was built.
+
 **Product directive:** we do **not** care about backwards compatibility; the system must work
 correctly out of the box. That removes the entire reason v2 carried a migration runner. The
 `segments` table and the `memories.segment_id` column are simply part of the canonical schema a
@@ -432,8 +447,10 @@ if expand === 'none': packToBudget(factUnits, budget) as today.   // unchanged p
      - expand === 'parent'  → every group with a non-null segment_id (size ≥1)
      - expand === 'auto'    → only groups whose size is ≥2 (a SHARED parent)
    (no expandable segment → packToBudget(factUnits, budget); identical to 'none'.)
-3. Fetch the selected segments by id in one query (getSegmentsByIds(db, ns, ids)).
-4. For each expanded segment, SPLIT-AND-RANK to a passage via rankSegmentPassages (§5.3.1):
+3. Fetch the selected segments by id in one query (getSegmentsByIds(db, ns, ids); as
+   implemented, getLiveSegmentsByIds: only segments a live memory still references, §6.4).
+4. For each expanded segment, SPLIT-AND-RANK to a passage via rankSegmentPassages (§5.3.1)
+   (as implemented, lazily: one segment at a time, stopping at the cap of step 5, §6.4):
      - split segment.content into coherent passages (paragraph/turn/sentence boundaries,
        each capped ~300–400 tokens);
      - embed each passage and rank by cosine similarity to queryEmbedding;
@@ -652,8 +669,9 @@ for each chunk-group g with g.facts.length > 0:
     `segmentId`;
   - else compare `fact_count` of the two segments and keep the higher; ties keep the existing
     (stable, order-independent given equal richness).
-  - **The merge path must read both segments' `fact_count`.** `updateMemoryContent`
-    (`engine-impl.ts`) is content-only and does not touch `segment_id`, so this needs a small new
+  - **The merge path must read both segments' `fact_count`.** The merge write itself
+    (`updateMemoryContent`, now `mergeMemoryMetadata`, which keeps the stored text because a
+    store-time merge requires the same text) does not touch `segment_id`, so this needs a small new
     query `updateMemorySegmentIfRicher(db, ns, survivorId, incomingSegmentId)` that looks up both
     `fact_count`s and conditionally rewrites `memories.segment_id` (mirrors the A1
     `updateMemoryTimestampsOnMerge` shape — runs only when `incomingSegmentId` is set, so non-ingest
@@ -671,6 +689,25 @@ for each chunk-group g with g.facts.length > 0:
   - `skip`: nothing written (unchanged).
 - **`maybeRunMaintenance`** still fires inside `storeImmediate` as today; segments are inert to
   maintenance (not in `memories`, so decay/consolidation/compaction never touch them).
+
+> **As implemented (WP-93): segments are written lazily.** `ingestBlob` gives each non-empty
+> chunk-group a pending segment (`PendingSegment`, with a pre-generated id) and passes it to
+> `storeImmediate` (an engine-internal option; the public `StoreOptions` has no segment field). The
+> segment row is written by the first fact that links to it, in the same transaction as that fact
+> (`materializeSegment`): a new fact's insert, or a merge whose survivor adopts it as the richer
+> parent (`adoptRicherPendingSegment`, which compares the pending segment's `fact_count` and deletes
+> the parent the survivor leaves once no live memory references it). A chunk whose facts all merge
+> into memories that keep their own parents therefore writes no segment, and a segment row never
+> exists without a live memory pointing at it, so the maintenance sweep (§6.3) cannot remove one an
+> ingest is still filling. A segment that was written and is gone by the time a later fact of the
+> same chunk links to it (a forget purged it, or its facts were merged away and it was swept) is not
+> written again; that fact is stored without a source. A fact that merges into a memory which keeps
+> its own parent still makes the chunk one of that memory's sources (§6.3): recorded at once when
+> the chunk's row exists, otherwise noted on the pending segment (`sharedWith`) and recorded when the
+> row is written. If such a memory is gone by then (a forget ran while the ingest went on), the row
+> is not written at all, since it states that memory's text. At the end, the ingest deletes any of
+> its segments that lost every live fact meanwhile, and `segments_created` counts the segments it
+> leaves. Maintenance is no longer inert to segments: each pass ends with the orphan sweep (§6.3).
 
 ### 6.3 Segment lifecycle vs. forget / decay / compaction
 
@@ -691,6 +728,50 @@ CASCADE`, deleting facts never deletes segments and deleting a segment is only e
 - **Decay/compaction** don't delete rows, so segment links survive; an expanded recall of a
   decayed fact still has its parent (though a decayed fact rarely surfaces, since its vector is
   removed).
+- **Consolidation** (`storage/consolidation.ts`) deletes the row it folds into a survivor. A
+  duplicate passes its segment to the survivor by the same adopt-or-richer rule
+  (`updateMemorySegmentIfRicher`). A contradiction whose newer text replaces the survivor's also
+  replaces the survivor's `segment_id` and `source` with the new row's, since the old segment
+  describes the superseded text; when the survivor keeps its (newer) text, it keeps its segment.
+
+> **As implemented (WP-93): a segment lives only as long as a LIVE memory references it.** The
+> rules above kept a forgotten fact's text on disk: the segment is the raw chunk, the forgotten
+> fact's text included, so `memory_expand` returned it and a default `'auto'` recall expanded it
+> back through the fact's siblings. Re-ingesting a document also left one orphan segment per ingest
+> (the tie rule keeps the existing parent). Now (`storage/queries.ts`):
+>
+> - **Forget a fact:** its source segments are deleted with it, in the same transaction
+>   (`forgetMemoryRows` → `purgeSegments`), even when siblings still reference them. The text cannot
+>   be cut out of a chunk (facts are paraphrases, not spans), so the whole source goes; the siblings
+>   are unlinked first (the foreign key has no `ON DELETE` action) and keep their own text, losing
+>   only the source context.
+> - **A fact several chunks state:** a memory links to one segment, but the same fact can be
+>   extracted from several chunks (an edited document ingested again: the tie rule above keeps the
+>   first parent while the new chunk is written for its other facts; or two documents stating it,
+>   merged by consolidation). Every merge records the chunks the survivor does not link to in its
+>   `metadata.source_segments` (`addSourceSegments`: the store-time merge of an ingested fact, which
+>   also records the parent a survivor leaves for a richer one while other facts keep it, and
+>   consolidation's duplicate, replace and archive merges), and forgetting the memory deletes those
+>   too. Before, forgetting such a fact left its text in the other chunk, and `memory_expand` and
+>   recall expansion returned it.
+> - **Segments with no live fact** (every fact forgotten, merged away, decayed or compacted) are
+>   treated as gone at once: recall expansion and `memory_expand` fetch segments with
+>   `getLiveSegmentsByIds`, so `memory_expand` reports `found: false`. They are deleted by the change
+>   that released them where it can (an ingest merge that repoints a survivor to a richer parent
+>   deletes the parent it left), and otherwise by the maintenance sweep that ends every maintenance
+>   pass (`deleteSegmentsWithoutLiveFacts`), which unlinks the decayed and compacted memories that
+>   still point at them first. A segment that a live memory references is never swept.
+> - **Ingest writes a segment only when a fact links to it** (§6.2).
+
+### 6.4 Re-expansion over live segments only (WP-93)
+
+Recall expansion (§5.3 step 3) and `memory_expand` (§9.4) fetch segments through
+`getLiveSegmentsByIds`, which returns a segment only while a live memory of its namespace
+references it. Recall expansion then chooses passages lazily (§5.3 steps 4–5): it splits, embeds
+and ranks one segment at a time, in segment-best-rank order, and stops once `max_expand_passages`
+passages are accepted (a passage dropped by overlap-dedup does not use a slot). The chosen passages
+are exactly those of the eager version, which embedded every candidate segment's passages before
+applying the cap (about 0.5 s of embedding per 6000-token segment).
 
 ---
 
@@ -782,6 +863,16 @@ These additive fields are what enable the agentic follow-up loop (§5.5): an age
 headlines reads `expanded_segment_ids` (or, for a non-expanded headline, the per-unit `segment_id`
 in `raw`) and calls `memory_expand` (§9.4) on the one it cares about.
 
+> **As implemented (WP-96).** The handle is in the text in every format, so the loop no longer needs
+> `raw` or structured output: `list` lines and briefing lines of a fact that has a segment end with a
+> `[src:<segment id>]` marker, and `summary` / `answer` output (which a model rewrites) ends with a
+> sources line of the markers of the facts behind it (`utils/source-markers.ts`). `RecallResult` and
+> the tool's `structuredContent` also carry `source_segment_ids` (every returned fact's segment, not
+> only the expanded ones). `memory_expand` accepts the bare id, `src:<id>` or the whole marker. Inside
+> IronCurtain the relay and the coordinator now forward a backend's `structuredContent`, and Code Mode
+> hands it to the agent for the memory server (documented by `help.help('memory')`); a reader sees a
+> segment only through a fact it may see (WP-96 review quarantine).
+
 The v1 `expand_budget_fraction` option is **removed** (§5.4): passage return makes the two-tier
 segment sub-budget unnecessary; `max_expand_passages` replaces it as the single, simpler knob.
 
@@ -790,6 +881,8 @@ segment sub-budget unnecessary; `max_expand_passages` replaces it as the single,
 `StoreOptions` (`engine.ts:20-30`) gains `segmentId?: string` (optional; only `ingest` sets it).
 `InsertMemoryParams` (`queries.ts:11-25`) gains `segmentId?: string`, bound as `NULL` when absent.
 Both are additive and optional — the `store`/`memory_store` contract is unchanged.
+(As implemented, WP-93: the segment reaches `storeImmediate` as an engine-internal pending segment
+written on first use, §6.2; the public `StoreOptions` has no segment field.)
 
 ### 9.3 New queries (`queries.ts`)
 
@@ -800,7 +893,11 @@ Both are additive and optional — the `store`/`memory_store` contract is unchan
 - `updateMemorySegmentIfRicher(db, namespace, survivorId, incomingSegmentId)` — the A4 merge
   repoint (§6.2): adopts `incomingSegmentId` when the survivor has no parent, else keeps whichever
   of the two segments has the higher `fact_count`. Runs only when `incomingSegmentId` is set.
-- (deferred §6.3) `deleteOrphanSegments(db, namespace): number`.
+- (deferred §6.3) `deleteOrphanSegments(db, namespace): number`. As implemented (WP-93):
+  `deleteSegmentsWithoutLiveFacts(db, namespace, segmentIds?)` (the maintenance sweep, or a scoped
+  clean-up), `purgeSegments` (forget), `getLiveSegmentsByIds` (expansion), the lazy-write pair
+  `materializeSegment` / `adoptRicherPendingSegment` (§6.2, §6.3), and `addSourceSegments` /
+  `readSourceSegments` (a merged memory's other source segments, §6.3).
 
 ### 9.4 `recall` tool schema + new `memory_expand` tool
 
@@ -823,6 +920,29 @@ id. The `query` path's split→embed→rank is the **shared `rankSegmentPassages
 `retrieval/expansion.ts`) — the same one recall expansion (§5.3) uses (it takes the top 1 per
 segment); `memory_expand` ranks all passages of the one segment. (DRY: one split/rank implementation,
 not two.)
+
+As implemented (WP-93), `memory_expand` fetches the segment with `getLiveSegmentsByIds` and reports
+`found: false` for a segment no live memory references any more (its facts were forgotten, merged
+away, decayed or compacted), exactly as for an unknown id (§6.3).
+
+> **As implemented (WP-130): a bounded result that says what it is.** `memory_expand` takes an
+> optional `max_passages` (1–20, validated like `max_expand_passages`, default 3) and returns at
+> most that many passages either way. With a `query`, every passage of the segment is still ranked
+> (`rankPassages`, the helper behind `rankSegmentPassages`), and the best come first; without one,
+> the segment's first passages come in source order: the "whole segment up to a cap" above.
+> `ExpandResult.total_passages` is the segment's passage count, and the tool's text ends with a
+> line after the notes frame such as `[passages 1-3 of 20 of this source, in source order; ...]`
+> (which also says how to get other passages) or `[passages 1-3 of 3: the whole source, ...]`,
+> so a partial read never passes for the whole source. A blank `query` counts as none. Before,
+> the query path returned every passage (up to ~6,000 tokens of a full chunk, in ranked rather
+> than source order), and the tool description promised the whole source when the query was
+> omitted, which returned three passages without saying so.
+>
+> All seven tools are now registered with `registerTool`, together rather than piecemeal: the
+> same Zod input shapes, plus a title, tool annotations (read-only: `memory_context`,
+> `memory_expand`, `memory_inspect`; destructive: `memory_store`, `memory_ingest`,
+> `memory_forget`; none open-world) and, for `memory_recall`, an output schema of its
+> `structuredContent`. The server reports the version in the package's `package.json`.
 
 ### 9.5 What existing callers see
 
@@ -966,9 +1086,11 @@ fix the evidenced loss; corrected here).
 2. **Phase 2 (optional, deferred, §7):** contextualized embedding behind
    `MEMORY_INGEST_CONTEXTUALIZE_EMBEDDING` (default off). Improves _retrieval_ of detail-bearing
    facts; requires a corpus rebuild. Phase 1 already fixes _return_ of un-decomposed clauses.
-3. **Phase 3 (optional, deferred, §6.3/§8):** orphan-segment collection in maintenance;
+3. **Phase 3 (optional, deferred, §6.3/§8):** orphan-segment collection in maintenance (done in
+   WP-93, together with deleting a forgotten fact's source, §6.3);
    **ingest-time passage pre-split** (precompute + persist passages/embeddings if the recall-time
-   passage embed proves hot); a possible exhaustive reference mode.
+   passage embed proves hot; WP-93 made recall embed only the segments it shows, §6.4); a possible
+   exhaustive reference mode.
 
 ### Explicit non-goals
 

@@ -108,9 +108,12 @@ async def call_recall_raw(
     raw_text = extract_text(result)
 
     try:
-        memories = json.loads(raw_text)
+        parsed = json.loads(raw_text)
     except (json.JSONDecodeError, TypeError):
         return raw_text, []
+    # Raw recalls arrive as {"notice": ..., "memories": [...]}: the notice frames the
+    # memories as notes from earlier sessions. Older servers returned the bare list.
+    memories = parsed.get("memories", []) if isinstance(parsed, dict) else parsed
 
     # Reconstruct readable context for the reader LLM
     # Pull session date from tags (where it's stored) rather than created_at

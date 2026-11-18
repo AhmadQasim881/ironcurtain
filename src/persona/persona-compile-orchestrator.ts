@@ -2,52 +2,74 @@ import { resolveHostModelApiKey } from '../config/model-provider.js';
 /**
  * src/persona/persona-compile-orchestrator.ts
  *
- * The long-running persona-compile orchestrator (Phase 1b, §4.3).
+ * The long-running persona-compile orchestrator for the daemon's web UI
+ * (Phase 1b, §4.3).
  *
  * Owns:
  *  - the per-persona in-memory `active` Map (live snapshot, fast UX path) and a
  *    bounded `recent` LRU (~50) of TERMINAL records keyed by operationId;
  *  - a daemon-wide concurrency gate `globalLimit = pLimit(2)` + a queue cap;
- *  - an O_EXCL filesystem lock per persona generated dir (cross-process
- *    serialization of same-persona compiles) with stale-lock reclaim;
  *  - credential preflight (derive the env var from the policy + prefilter model
  *    ids and verify it is present);
- *  - a wall-clock cap that fires the abort signal;
  *  - daemon-startup stale-lock recovery (synthetic failed events).
  *
- * This module is the ONLY runtime invocation site of `compilePersonaPolicy`,
- * reached EXCLUSIVELY via `await import('./compile-persona-policy.js')`. It
- * carries ONLY type-only pipeline imports; the value edge stays behind the
- * dynamic import + the sanctioned seam. Enforced by the Phase-0 ESLint
+ * The compile itself runs through `runPersonaCompile`
+ * (persona-compile-service.ts), the one path every persona compile takes,
+ * CLI compiles included: it holds the cross-process FS lock, runs the
+ * broad-policy validator, arms the wall-clock cap and writes the audit record.
+ * This module takes that lock synchronously in `startCompile` (so a duplicate
+ * is refused before it queues) and hands it to `runPersonaCompile`.
+ *
+ * Carries ONLY type-only pipeline imports. Enforced by the Phase-0 ESLint
  * no-restricted-imports rule + test/pipeline-import-boundary.test.ts.
  *
  * @see docs/designs/web-ui-policy-persona-management.md §4.3, §6
  */
 
 import { randomUUID } from 'node:crypto';
-import { openSync, closeSync, writeSync, readFileSync, unlinkSync, existsSync, readdirSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { existsSync, readdirSync } from 'node:fs';
 import pLimit from 'p-limit';
 
-import { getPersonaGeneratedDir, getPersonaWorkspaceDir, getPersonasDir, loadPersona } from './resolve.js';
+import { getPersonasDir } from './resolve.js';
 import { createPersonaName, type PersonaName } from './types.js';
 import { EventBusProgressReporter } from './event-bus-progress-reporter.js';
 import type { EventBusProgressReporterContext } from './event-bus-progress-reporter.js';
-import { makeBroadPolicyValidator, BroadPolicyRejectedError } from './broad-policy-validator.js';
-import { computeRuleDelta } from './rule-delta.js';
-import { policyMutationAuditLog } from './policy-mutation-audit.js';
+import {
+  acquirePersonaCompileLock,
+  classifyPersonaCompileError,
+  DEFAULT_COMPILE_WALL_CLOCK_CAP_MS,
+  getPersonaCompileLockPath,
+  isPersonaCompileLockStale,
+  PersonaCompileError,
+  readPersonaCompileLock,
+  reclaimStalePersonaCompileLock,
+  runPersonaCompile,
+  type PersonaCompileImpl,
+  type PersonaCompileLock,
+} from './persona-compile-service.js';
 // NOTE: EventBusProgressReporter carries ONLY type-only pipeline imports, so a
 // static VALUE import of it does not violate the import boundary (the boundary
 // forbids reaching pipeline-runner.ts / pipeline-shared.ts VALUES).
 import { loadUserConfig } from '../config/user-config.js';
 import { parseModelId, PROVIDER_ENV_VARS } from '../config/model-provider.js';
-import type { ErrorCode, PersonaCompileOperationDto, PersonaCompileResultDto } from '../web-ui/web-ui-types.js';
+import type {
+  ErrorCode,
+  FailedServerDto,
+  PersonaCompileOperationDto,
+  PersonaCompileResultDto,
+} from '../web-ui/web-ui-types.js';
 import type { WebEventBus } from '../web-ui/web-event-bus.js';
-// Type-only pipeline imports — no runtime edge. The VALUE edge to the pipeline
-// lives only behind `await import('./compile-persona-policy.js')` below.
+// Type-only pipeline imports — no runtime edge.
 import type { CompilationPhase } from '../pipeline/pipeline-shared.js';
-import type { CompilePersonaOptions } from './compile-persona-policy.js';
-import type { CompiledPolicyFile } from '../pipeline/types.js';
+import type { FailedServer } from '../pipeline/types.js';
+
+/**
+ * The typed compile error, under the name the WS dispatch and older callers
+ * use. It is the same class as {@link PersonaCompileError}, so `instanceof`
+ * matches errors thrown by the compile service (e.g. a lock held by a CLI
+ * compile) too.
+ */
+export { PersonaCompileError as CompileOrchestratorError } from './persona-compile-service.js';
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -59,34 +81,6 @@ const GLOBAL_CONCURRENCY = 2;
 const QUEUE_CAP = 10;
 /** Bounded LRU size for terminal records. */
 const RECENT_CAP = 50;
-/** Wall-clock cap (ms) before the compile is aborted. */
-const WALL_CLOCK_CAP_MS = 20 * 60 * 1000;
-
-const LOCK_FILE = '.compile.lock';
-
-/** Shape of the JSON written into the FS lock file. */
-interface LockFileContent {
-  readonly operationId: string;
-  readonly startedAt: string;
-  readonly pid: number;
-}
-
-/**
- * An error carrying a typed {@link ErrorCode} so the dispatch layer can map it
- * to a `ResponseFrame` error without importing this module's internals. Mirrors
- * the `RpcError` shape but lives here so the orchestrator does not depend on the
- * web-ui dispatch error class.
- */
-export class CompileOrchestratorError extends Error {
-  constructor(
-    readonly code: ErrorCode,
-    message: string,
-    readonly data?: unknown,
-  ) {
-    super(message);
-    this.name = 'CompileOrchestratorError';
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Operation record store
@@ -108,7 +102,7 @@ interface OperationRecord {
 /** Test-injectable dependency seam. */
 export interface OrchestratorDeps {
   /** Concrete compile implementation; defaults to the dynamic-import seam. */
-  readonly compileImpl?: (name: PersonaName, opts: CompilePersonaOptions) => Promise<CompiledPolicyFile>;
+  readonly compileImpl?: PersonaCompileImpl;
   /** Override the wall-clock cap (ms). */
   readonly wallClockCapMs?: number;
   /** Override the queue cap. */
@@ -131,7 +125,7 @@ export class PersonaCompileOrchestrator {
 
   constructor(deps: OrchestratorDeps = {}) {
     this.deps = deps;
-    this.wallClockCapMs = deps.wallClockCapMs ?? WALL_CLOCK_CAP_MS;
+    this.wallClockCapMs = deps.wallClockCapMs ?? DEFAULT_COMPILE_WALL_CLOCK_CAP_MS;
     this.queueCap = deps.queueCap ?? QUEUE_CAP;
   }
 
@@ -170,8 +164,9 @@ export class PersonaCompileOrchestrator {
    * mints the operationId / emits `persona.compile.started`, then detaches the
    * actual compile inside the global concurrency gate. Returns the ack.
    *
-   * @throws {CompileOrchestratorError} with a typed code on a synchronous
-   *   rejection (in-progress, queue-full, credentials-missing).
+   * @throws {PersonaCompileError} with a typed code on a synchronous
+   *   rejection (in-progress — in this daemon or in another process such as a
+   *   CLI compile —, queue-full, credentials-missing).
    */
   startCompile(
     name: PersonaName,
@@ -183,22 +178,23 @@ export class PersonaCompileOrchestrator {
     //    single synchronous critical section so a just-settled op is not here.
     const live = this.active.get(name);
     if (live) {
-      throw new CompileOrchestratorError('COMPILE_IN_PROGRESS', `A compile for persona "${name}" is already running.`, {
+      throw new PersonaCompileError('COMPILE_IN_PROGRESS', `A compile for persona "${name}" is already running.`, {
         operationId: live.operationId,
       });
     }
 
-    // 2) O_EXCL FS lock (cross-process correctness). Stale locks are reclaimed.
+    // 2) The cross-process FS lock (shared with CLI compiles). Stale locks are
+    //    reclaimed.
     const operationId = randomUUID();
     const startedAt = new Date().toISOString();
-    this.acquireLockOrThrow(name, operationId, startedAt);
+    const lock = acquirePersonaCompileLock(name, operationId, { staleAfterMs: this.wallClockCapMs });
 
     // 3) Credential preflight (both models). Runs AFTER the dispatch gate, so a
     //    read-only client never reaches here. On miss, release the lock.
     try {
       this.credentialPreflight();
     } catch (err) {
-      this.releaseLock(name);
+      lock.release();
       throw err;
     }
 
@@ -206,8 +202,8 @@ export class PersonaCompileOrchestrator {
     //    the cap, reject. Otherwise enqueue.
     const willQueue = this.globalLimit.activeCount >= GLOBAL_CONCURRENCY;
     if (willQueue && this.queueDepth >= this.queueCap) {
-      this.releaseLock(name);
-      throw new CompileOrchestratorError('COMPILE_QUEUE_FULL', 'Too many persona compiles are queued.');
+      lock.release();
+      throw new PersonaCompileError('COMPILE_QUEUE_FULL', 'Too many persona compiles are queued.');
     }
 
     // 5) Insert active record, emit started.
@@ -230,7 +226,7 @@ export class PersonaCompileOrchestrator {
     void this.globalLimit(async () => {
       if (willQueue) this.queueDepth = Math.max(0, this.queueDepth - 1);
       record.queuePosition = undefined;
-      await this.runCompile(record, eventBus);
+      await this.runCompile(record, lock, eventBus);
     });
 
     return { accepted: true, name, operationId, ...(willQueue ? { queued: true } : {}) };
@@ -240,32 +236,11 @@ export class PersonaCompileOrchestrator {
   // Detached compile body
   // -------------------------------------------------------------------------
 
-  private async runCompile(record: OperationRecord, eventBus: WebEventBus): Promise<void> {
+  private async runCompile(record: OperationRecord, lock: PersonaCompileLock, eventBus: WebEventBus): Promise<void> {
     const { name, operationId } = record;
-    const abort = new AbortController();
-    const timer = setTimeout(() => abort.abort(new Error('wall-clock cap exceeded')), this.wallClockCapMs);
-    // Don't keep the process alive solely for the cap timer.
-    if (typeof timer.unref === 'function') timer.unref();
-
     record.phase = 'running';
 
     try {
-      // Persona-bound inputs for the broad-policy validator + ruleDelta. The
-      // workspace dir is the containment authority for path checks; the opt-in
-      // flag is read from persona.json (NEVER inferred from the constitution).
-      const workspaceDir = getPersonaWorkspaceDir(name);
-      let allowBroadPolicy = false;
-      try {
-        allowBroadPolicy = loadPersona(name).allowBroadPolicy ?? false;
-      } catch {
-        // Persona missing/unreadable — leave allowBroadPolicy false (most
-        // restrictive). The compile itself will fail downstream with a clearer
-        // error if the persona truly does not exist.
-      }
-      const validateCompiled = makeBroadPolicyValidator(workspaceDir, allowBroadPolicy);
-      const previousPolicy = readPreviousCompiledPolicy(name);
-
-      const compileImpl = this.deps.compileImpl ?? defaultCompileImpl;
       const reporterFactory = (serverName: string) => {
         const ctx: EventBusProgressReporterContext = {
           operationId,
@@ -283,41 +258,37 @@ export class PersonaCompileOrchestrator {
         return new EventBusProgressReporter(ctx);
       };
 
-      const policy = await compileImpl(name, {
-        reporterFactory,
-        signal: abort.signal,
-        quiet: true,
-        operationId,
+      // Lock, broad-policy validator, wall-clock cap and audit record: the
+      // shared compile path. No live MCP for list resolution over the WS.
+      const { policy, ruleDelta } = await runPersonaCompile(name, record.actor, {
+        lock,
         allowMcpLists: false,
-        validateCompiled,
+        reporterFactory,
+        quiet: true,
+        wallClockCapMs: this.wallClockCapMs,
+        ...(this.deps.compileImpl ? { compileImpl: this.deps.compileImpl } : {}),
       });
 
-      // ruleDelta is omitted on the first compile (no previous policy to diff).
-      const ruleDelta = previousPolicy ? computeRuleDelta(previousPolicy, policy, workspaceDir) : undefined;
+      // A partial failure still writes the policy (so it ends in `done`), but
+      // the failed servers have no rules: carry them on the result and event so
+      // the UI does not report an unqualified success.
+      const failedServers = toFailedServerDtos(policy.failedServers);
       record.result = {
         success: true,
         ruleCount: policy.rules.length,
         ...(ruleDelta ? { ruleDelta } : {}),
+        ...(failedServers.length > 0 ? { failedServers } : {}),
       };
-
-      // Audit the successful compile at the service layer (covers WS/CLI/cron).
-      policyMutationAuditLog.append(record.actor, 'compilePersonaPolicy', name, {
-        constitutionHash: policy.constitutionHash,
-        ruleCountDelta: policy.rules.length - (previousPolicy?.rules.length ?? 0),
-        broadened: !!ruleDelta && (ruleDelta.broadenedDomains.length > 0 || ruleDelta.outOfWorkspacePaths.length > 0),
-        operationId,
-      });
     } catch (err) {
-      record.error = classifyError(err);
+      record.error = classifyPersonaCompileError(err);
     } finally {
-      clearTimeout(timer);
       // ONE synchronous critical section: move active->recent, release lock.
       // No `await` between these ops so getCompile/listCompiles always find the
       // op in exactly one place.
       record.endedAt = new Date().toISOString();
       record.phase = record.error ? 'failed' : 'done';
       this.active.delete(name);
-      this.releaseLock(name);
+      lock.release();
       this.pushRecent(record);
 
       if (record.error) {
@@ -359,16 +330,15 @@ export class PersonaCompileOrchestrator {
       } catch {
         continue; // tmp dirs / trash / invalid slugs
       }
-      const lockPath = resolve(getPersonaGeneratedDir(name), LOCK_FILE);
-      if (!existsSync(lockPath)) continue;
-      const content = readLockFile(lockPath);
+      if (!existsSync(getPersonaCompileLockPath(name))) continue;
+      const content = readPersonaCompileLock(name);
       if (!content) {
         // Unparseable lock — treat as stale and remove.
-        safeUnlink(lockPath);
+        reclaimStalePersonaCompileLock(name, null);
         continue;
       }
-      if (this.isLockStale(content)) {
-        safeUnlink(lockPath);
+      if (isPersonaCompileLockStale(content, this.wallClockCapMs)) {
+        reclaimStalePersonaCompileLock(name, content);
         eventBus.emit('persona.compile.failed', {
           name,
           operationId: content.operationId,
@@ -380,61 +350,26 @@ export class PersonaCompileOrchestrator {
   }
 
   // -------------------------------------------------------------------------
-  // FS lock
-  // -------------------------------------------------------------------------
-
-  private acquireLockOrThrow(name: PersonaName, operationId: string, startedAt: string): void {
-    const lockPath = resolve(getPersonaGeneratedDir(name), LOCK_FILE);
-    const payload: LockFileContent = { operationId, startedAt, pid: process.pid };
-    try {
-      writeLockExclusive(lockPath, payload);
-      return;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-    }
-
-    // Lock exists — reclaim if stale, else COMPILE_IN_PROGRESS.
-    const existing = readLockFile(lockPath);
-    if (existing && !this.isLockStale(existing)) {
-      throw new CompileOrchestratorError('COMPILE_IN_PROGRESS', `A compile for persona "${name}" is already running.`, {
-        operationId: existing.operationId,
-      });
-    }
-    // Stale (or unparseable) — remove and retry once.
-    safeUnlink(lockPath);
-    writeLockExclusive(lockPath, payload);
-  }
-
-  private releaseLock(name: PersonaName): void {
-    safeUnlink(resolve(getPersonaGeneratedDir(name), LOCK_FILE));
-  }
-
-  private isLockStale(content: LockFileContent): boolean {
-    // Dead pid => stale.
-    if (!isPidAlive(content.pid)) return true;
-    // Past the wall-clock cap => stale.
-    const started = Date.parse(content.startedAt);
-    if (Number.isNaN(started)) return true;
-    return Date.now() - started > this.wallClockCapMs;
-  }
-
-  // -------------------------------------------------------------------------
   // Credential preflight
   // -------------------------------------------------------------------------
 
   private credentialPreflight(): void {
     const config = loadUserConfig({ readOnly: true });
     const missing = new Set<string>();
+    // A separate verifier model (scenarios and judge) uses the policy role's
+    // host profile, like the policy model.
+    const verifier = config.policyVerifierModelId;
     for (const [role, modelId] of [
       ['policy', config.policyModelId],
       ['prefilter', config.prefilterModelId],
+      ...(verifier !== undefined ? ([['policy', verifier]] as const) : []),
     ] as const) {
       const { provider } = parseModelId(modelId);
       const key = resolveHostModelApiKey(modelId, config, role);
       if (!key) missing.add(config.hostModelProfiles?.[role] ?? PROVIDER_ENV_VARS[provider]);
     }
     if (missing.size > 0) {
-      throw new CompileOrchestratorError(
+      throw new PersonaCompileError(
         'CREDENTIALS_MISSING',
         `Missing credential(s) on the daemon host: ${[...missing].join(', ')}.`,
       );
@@ -461,16 +396,6 @@ export class PersonaCompileOrchestrator {
 // Module helpers
 // ---------------------------------------------------------------------------
 
-/**
- * The default compile implementation: the dynamic-import seam to the sanctioned
- * pipeline-value module. Keeping it a free function (not a static import at the
- * top of the file) is what keeps the import-boundary green.
- */
-async function defaultCompileImpl(name: PersonaName, opts: CompilePersonaOptions): Promise<CompiledPolicyFile> {
-  const { compilePersonaPolicy } = await import('./compile-persona-policy.js');
-  return compilePersonaPolicy(name, opts);
-}
-
 function toDto(rec: OperationRecord): PersonaCompileOperationDto {
   return {
     operationId: rec.operationId,
@@ -487,95 +412,12 @@ function toDto(rec: OperationRecord): PersonaCompileOperationDto {
 }
 
 /**
- * Classifies a thrown compile error into a typed `{ code, message }`. Credential
- * / MCP-list / broad-policy / orchestrator errors carry their codes; everything
- * else maps to INTERNAL_ERROR with an operator-safe message.
+ * Maps a compiled policy's `failedServers` to wire DTOs. Typed against the
+ * pipeline contract, so a pipeline failure phase the DTO cannot carry is a
+ * compile error here rather than a silently dropped failure.
  */
-/**
- * Reads the persona's previous `compiled-policy.json` for ruleDelta computation.
- * Returns undefined when absent/unparseable (the first compile, or a corrupted
- * prior artifact) so the caller omits the delta.
- */
-function readPreviousCompiledPolicy(name: PersonaName): CompiledPolicyFile | undefined {
-  const path = resolve(getPersonaGeneratedDir(name), 'compiled-policy.json');
-  if (!existsSync(path)) return undefined;
-  try {
-    return JSON.parse(readFileSync(path, 'utf-8')) as CompiledPolicyFile;
-  } catch {
-    return undefined;
-  }
-}
-
-function classifyError(err: unknown): { code: ErrorCode; message: string } {
-  if (err instanceof CompileOrchestratorError) {
-    return { code: err.code, message: err.message };
-  }
-  // Broad-policy validator rejection (constitution-injection defense). Surfaced
-  // terminally as BROAD_POLICY_REJECTED on the failed event.
-  if (err instanceof BroadPolicyRejectedError) {
-    return { code: err.code, message: err.message };
-  }
-  // Discriminant string from the pipeline (McpListsDisallowedError) — detected
-  // without importing the thrower's module (layering rule).
-  const code = typeof err === 'object' && err !== null ? (err as { code?: unknown }).code : undefined;
-  if (code === 'MCP_LISTS_DISALLOWED') {
-    return { code: 'LIST_REQUIRES_MCP', message: 'A dynamic list requires live MCP access, which is disabled.' };
-  }
-  const message = err instanceof Error ? err.message : String(err);
-  // AI SDK missing-key surfaces as a LoadAPIKeyError; map to CREDENTIALS_MISSING.
-  if (err instanceof Error && (err.name === 'LoadAPIKeyError' || /api key/i.test(message))) {
-    return { code: 'CREDENTIALS_MISSING', message: 'Missing model credentials on the daemon host.' };
-  }
-  return { code: 'INTERNAL_ERROR', message: 'Persona compilation failed.' };
-}
-
-/** Writes the lock file with O_EXCL (`wx`): fails with EEXIST if it exists. */
-function writeLockExclusive(lockPath: string, payload: LockFileContent): void {
-  // 'wx' => O_CREAT | O_EXCL | O_WRONLY. The generated dir already exists for
-  // any compiled persona; if not, createPersona made it.
-  const fd = openSync(lockPath, 'wx');
-  try {
-    writeSync(fd, JSON.stringify(payload));
-  } finally {
-    closeSync(fd);
-  }
-}
-
-function readLockFile(lockPath: string): LockFileContent | null {
-  try {
-    const raw = readFileSync(lockPath, 'utf-8');
-    const parsed = JSON.parse(raw) as Partial<LockFileContent>;
-    if (
-      typeof parsed.operationId === 'string' &&
-      typeof parsed.pid === 'number' &&
-      typeof parsed.startedAt === 'string'
-    ) {
-      return { operationId: parsed.operationId, pid: parsed.pid, startedAt: parsed.startedAt };
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-function safeUnlink(path: string): void {
-  try {
-    unlinkSync(path);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-  }
-}
-
-/** True iff a process with `pid` exists (signal 0 probe). */
-function isPidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    // ESRCH => no such process. EPERM => exists but not ours (still alive).
-    return (err as NodeJS.ErrnoException).code === 'EPERM';
-  }
+function toFailedServerDtos(failed: readonly FailedServer[] | undefined): FailedServerDto[] {
+  return (failed ?? []).map((f) => ({ serverName: f.serverName, phase: f.phase, reason: f.reason }));
 }
 
 // ---------------------------------------------------------------------------

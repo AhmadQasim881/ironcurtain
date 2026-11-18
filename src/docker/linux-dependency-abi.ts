@@ -1,4 +1,14 @@
-/** Linux-only node_modules identity and native-load qualification. */
+/**
+ * Linux-only node_modules identity and native-load qualification.
+ *
+ * Not yet wired: nothing outside its test calls this module. It is the tested
+ * foundation for an ABI-keyed Linux dependency volume (manifest, volume name
+ * and in-container `isolated-vm`/`node-pty` load probe). Its intended consumer
+ * is the IronCurtain-in-IronCurtain harness, which must run Linux-built
+ * dependencies instead of a macOS `node_modules` and is reserved, not
+ * scheduled (docs/designs/ironcurtain-in-ironcurtain-hermetic-slice.md), and
+ * later native Linux nested-runtime work.
+ */
 
 import { isAbsolute, posix } from 'node:path';
 import { z } from 'zod';

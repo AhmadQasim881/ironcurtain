@@ -20,6 +20,26 @@ const DOCKER_WORKLOAD_MEMORY_MIN_MB = 512;
 const DOCKER_WORKLOAD_MEMORY_MAX_MB = 1024 * 1024;
 const DOCKER_WORKLOAD_CPU_MIN = 0.25;
 const DOCKER_WORKLOAD_CPU_MAX = 1024;
+/**
+ * Bounds and default of the bundle's aggregate PID budget. Nested Docker uses
+ * the numeric `dockerResources.pidsLimit` (default 4096) as that budget, the
+ * same way it uses `dockerResources.memoryMb` and `cpus`; the minimum is the
+ * old fixed total, which still covers every reserve the partition charges.
+ */
+export const DOCKER_WORKLOAD_PIDS_MIN = 512;
+export const DOCKER_WORKLOAD_PIDS_MAX = 1_048_576;
+export const DOCKER_WORKLOAD_DEFAULT_PIDS = 4096;
+/**
+ * Share of the session's CPU, memory and PIDs the nested daemon receives on
+ * Docker Desktop (`dockerWorkload.resources.daemonShare`). The default gives
+ * it half: it runs dockerd, BuildKit and every inner container, while the
+ * agent mostly waits on model I/O. The agent always keeps its minimum floor.
+ */
+export const DOCKER_WORKLOAD_DAEMON_SHARE_MIN = 0.1;
+export const DOCKER_WORKLOAD_DAEMON_SHARE_MAX = 0.9;
+export const DOCKER_WORKLOAD_DEFAULT_DAEMON_SHARE = 0.5;
+
+const daemonShareSchema = z.number().min(DOCKER_WORKLOAD_DAEMON_SHARE_MIN).max(DOCKER_WORKLOAD_DAEMON_SHARE_MAX);
 
 const legacyRequestedResourcesSchema = z
   .object({
@@ -39,6 +59,8 @@ const legacyRequestedResourcesSchema = z
       .max(16 * 1024 * 1024)
       .nullable()
       .optional(),
+    /** The one supported resource choice; the other fields are legacy and transformed away. */
+    daemonShare: daemonShareSchema.optional(),
   })
   .strict()
   .optional();
@@ -116,7 +138,8 @@ export const dockerWorkloadRequestedSchema = z
       context.addIssue({
         code: 'custom',
         path: ['resources', 'pids', 'desired'],
-        message: 'custom nested-Docker PID targets are no longer supported by user configuration',
+        message:
+          'custom nested-Docker PID targets are no longer set here; nested Docker uses dockerResources.pidsLimit as its aggregate PID budget',
       });
     }
     if (request.resources?.pids?.required === true) {
@@ -144,13 +167,22 @@ export const dockerWorkloadRequestedSchema = z
           : request.enabled === true
             ? 'images'
             : undefined);
+    const daemonShare = request.resources?.daemonShare;
     return {
       ...(request.enabled === undefined ? {} : { enabled: request.enabled }),
       ...(networkAccess === undefined ? {} : { networkAccess }),
+      ...(daemonShare === undefined ? {} : { resources: { daemonShare } }),
     };
   });
 
 export type DockerWorkloadRequestedConfig = z.infer<typeof dockerWorkloadRequestedSchema>;
+
+/**
+ * A `dockerWorkload` request as written, legacy fields included: what
+ * {@link dockerWorkloadRequestedSchema} accepts before normalizing it to
+ * {@link DockerWorkloadRequestedConfig}.
+ */
+export type DockerWorkloadRequestedInput = z.input<typeof dockerWorkloadRequestedSchema>;
 
 /** Complete bounded configuration recorded directly in admission and session evidence. */
 export const resolvedDockerWorkloadConfigSchema = z.discriminatedUnion('enabled', [
@@ -167,6 +199,7 @@ export const resolvedDockerWorkloadConfigSchema = z.discriminatedUnion('enabled'
         .object({
           memoryMb: z.number().int().min(DOCKER_WORKLOAD_MEMORY_MIN_MB).max(DOCKER_WORKLOAD_MEMORY_MAX_MB),
           cpus: z.number().min(DOCKER_WORKLOAD_CPU_MIN).max(DOCKER_WORKLOAD_CPU_MAX),
+          daemonShare: daemonShareSchema,
           pids: z
             .object({ desired: z.number().int().min(16).max(1_048_576), required: z.boolean() })
             .strict()
@@ -187,10 +220,18 @@ export const resolvedDockerWorkloadConfigSchema = z.discriminatedUnion('enabled'
 
 export type ResolvedDockerWorkloadConfig = z.infer<typeof resolvedDockerWorkloadConfigSchema>;
 
-/** Feature-off is a one-field value carrying no per-session provisioned authority. */
+/**
+ * Validates a request (legacy fields included) and resolves it. Feature-off is
+ * a one-field value carrying no per-session provisioned authority.
+ *
+ * `resourceDefaults` are the numeric ordinary `dockerResources` values: they
+ * become the bundle's aggregate envelope (memory, CPU and PID budget), clamped
+ * into the nested bounds. Unlimited (`null`, passed as undefined) values fall
+ * back to safe nested defaults.
+ */
 export function resolveDockerWorkloadConfig(
-  request: DockerWorkloadRequestedConfig | undefined,
-  resourceDefaults?: { readonly memoryMb?: number; readonly cpus?: number },
+  request: DockerWorkloadRequestedInput | undefined,
+  resourceDefaults?: { readonly memoryMb?: number; readonly cpus?: number; readonly pidsLimit?: number },
 ): ResolvedDockerWorkloadConfig {
   const validated = dockerWorkloadRequestedSchema.parse(request ?? {});
   if (validated.enabled !== true) return { enabled: false };
@@ -206,19 +247,35 @@ export function resolveDockerWorkloadConfig(
     DOCKER_WORKLOAD_CPU_MAX,
     2,
   );
+  const inheritedPids = Math.floor(
+    clampInheritedResourceDefault(
+      resourceDefaults?.pidsLimit,
+      DOCKER_WORKLOAD_PIDS_MIN,
+      DOCKER_WORKLOAD_PIDS_MAX,
+      DOCKER_WORKLOAD_DEFAULT_PIDS,
+    ),
+  );
   return {
     enabled: true,
     networkAccess: validated.networkAccess ?? 'images',
-    // The currently admitted developer slice uses an observed-only disk
-    // ceiling guarded by the host watchdog on both backends. Keep that
-    // implementation detail out of the ordinary opt-in: `{ enabled: true }`
-    // must resolve without requiring hidden risk-policy fields.
+    // The admitted developer slice has no hard disk quota. Its disk ceiling
+    // is observed: the detached host watchdog measures the storage the bundle
+    // actually grows (an Apple VM's rootfs image blocks; on Docker Desktop the
+    // daemon volume's Engine-reported size plus a free-space floor on the VM
+    // disk) and revokes the bundle past the frozen thresholds. Admission
+    // refuses a runtime the frozen policy gives no such coverage, so this flag
+    // never stands for an unmeasured preview. Keep that implementation detail
+    // out of the ordinary opt-in: `{ enabled: true }` must resolve without
+    // requiring hidden risk-policy fields.
     acceptObservedDiskRisk: true,
     resources: {
       memoryMb: inheritedMemoryMb,
       cpus: inheritedCpus,
+      daemonShare: validated.resources?.daemonShare ?? DOCKER_WORKLOAD_DEFAULT_DAEMON_SHARE,
+      // The aggregate PID budget partitioned across the bundle's outer
+      // containers. Not required: Apple guest PIDs stay advisory.
       pids: {
-        desired: 512,
+        desired: inheritedPids,
         required: false,
       },
       diskMb: null,
@@ -245,6 +302,23 @@ export function formatDockerWorkloadStatus(config: ResolvedDockerWorkloadConfig 
 }
 
 /**
+ * How to get ordinary sessions back, appended to every admission refusal.
+ * `dockerWorkload.enabled` is global: while it is true every Docker agent
+ * session (batch, PTY, workflow, cron) goes through admission, so one refusal
+ * stops all of them until the feature is turned off.
+ */
+export const DOCKER_WORKLOAD_DISABLE_HINT =
+  'To run ordinary Docker sessions without nested Docker, set dockerWorkload.enabled to false (ironcurtain config > Docker Agent > Nested Docker, or Settings in the web UI).';
+
+/** An admission refusal carrying {@link DOCKER_WORKLOAD_DISABLE_HINT}. */
+function admissionRefusal(message: string, cause?: unknown): Error {
+  return new Error(
+    `${message.replace(/\.$/u, '')}. ${DOCKER_WORKLOAD_DISABLE_HINT}`,
+    cause === undefined ? undefined : { cause },
+  );
+}
+
+/**
  * Admit only a supported developer slice. The caller resolves `auto` first,
  * then invokes this guard before any feature-attributable runtime, image,
  * proxy, lease, or filesystem provisioning. Docker Desktop is admitted on macOS
@@ -252,7 +326,8 @@ export function formatDockerWorkloadStatus(config: ResolvedDockerWorkloadConfig 
  * preflight. Apple Container performs its platform/version checks there too.
  * Operational artifacts are verified
  * later by their owning seams; this guard deliberately contains no
- * release/commit bookkeeping.
+ * release/commit bookkeeping. Every refusal ends with
+ * {@link DOCKER_WORKLOAD_DISABLE_HINT}.
  */
 export function assertDockerWorkloadVariantAdmitted(
   config: ResolvedDockerWorkloadConfig | undefined,
@@ -262,12 +337,12 @@ export function assertDockerWorkloadVariantAdmitted(
 ): void {
   if (config?.enabled !== true) return;
   if (config.resources.pids.required || config.resources.diskMb !== null || !config.acceptObservedDiskRisk) {
-    throw new Error(
+    throw admissionRefusal(
       'secure nested Docker does not admit the requested resource policy; no image, relay, daemon, or lease action was performed',
     );
   }
   if (resolvedRuntimeKind === 'docker' && hostPlatform !== 'darwin' && !isWsl2Host(hostPlatform, hostRelease)) {
-    throw new Error(
+    throw admissionRefusal(
       `secure nested Docker with the Docker runtime is supported on macOS and WSL2 with Docker Desktop, not this ${hostPlatform} host; no image, relay, daemon, or lease action was performed`,
     );
   }
@@ -275,17 +350,22 @@ export function assertDockerWorkloadVariantAdmitted(
     try {
       assertNestedDaemonIdentity(resolveContainerIdentity(true));
     } catch (error) {
-      throw new Error(
+      throw admissionRefusal(
         'Nested Docker on WSL requires a non-root coordinator UID and GID. Run IronCurtain as your regular WSL user; sudo remains available inside agent containers.',
-        { cause: error },
+        error,
       );
     }
   }
 }
 
-/** Read-only runtime preflight required after the supported variant is selected. */
+/**
+ * Read-only runtime preflight required after the supported variant is selected.
+ * `networkAccess` selects the engine requirement: online modes need an engine
+ * that enforces isolated relay networks; omitted means the stricter online check.
+ */
 export async function assertAdmittedDockerWorkloadRuntimeAvailable(
   resolvedRuntimeKind: 'docker' | 'apple-container',
+  networkAccess?: DockerWorkloadNetworkAccess,
 ): Promise<DockerWorkloadEnvironment> {
   const { defaultExecFile } = await import('../docker/docker-manager.js');
   const dockerEndpoint = resolvedRuntimeKind === 'docker' ? await resolveDockerEndpoint(defaultExecFile) : undefined;
@@ -297,13 +377,19 @@ export async function assertAdmittedDockerWorkloadRuntimeAvailable(
       : await (await import('../docker/apple-container-manager.js')).checkAppleContainerAvailable();
   if (!availability.available) {
     const runtimeName = resolvedRuntimeKind === 'docker' ? 'Docker' : 'Apple';
-    throw new Error(
+    throw admissionRefusal(
       `secure nested Docker ${runtimeName} runtime is unavailable: ${availability.reason}` +
         (availability.detailedMessage ? ` (${availability.detailedMessage})` : ''),
     );
   }
+  let environment: DockerWorkloadEnvironment;
+  try {
+    environment = resolveDockerWorkloadEnvironment(resolvedRuntimeKind, availability.server, undefined, networkAccess);
+  } catch (error) {
+    throw admissionRefusal(error instanceof Error ? error.message : String(error), error);
+  }
   return {
-    ...resolveDockerWorkloadEnvironment(resolvedRuntimeKind, availability.server),
+    ...environment,
     ...(dockerEndpoint === undefined ? {} : { dockerEndpoint }),
   };
 }

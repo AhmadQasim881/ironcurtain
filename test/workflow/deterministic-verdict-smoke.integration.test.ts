@@ -1,3 +1,5 @@
+import { testUserConfig } from '../helpers/user-config.js';
+import { USER_CONFIG_DEFAULTS } from '../../src/config/user-config.js';
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -18,6 +20,7 @@ import {
 } from '../../src/workflow/orchestrator.js';
 import type { SessionOptions } from '../../src/session/types.js';
 import { approvedResponse, createDeps, MockSession, waitForCompletion } from './test-helpers.js';
+import type { AgentId } from '../../src/docker/agent-adapter.js';
 
 const IMAGE = 'ironcurtain-claude-code:latest';
 
@@ -49,13 +52,10 @@ function buildDockerSessionConfig(
     constitutionPath: join(generatedDir, 'constitution.md'),
     agentModelId: 'anthropic:claude-sonnet-4-6',
     escalationTimeoutSeconds: 300,
-    userConfig: {
+    userConfig: testUserConfig({
       agentModelId: 'anthropic:claude-sonnet-4-6',
       policyModelId: 'anthropic:claude-sonnet-4-6',
       anthropicApiKey: 'test-fake-key-no-network',
-      googleApiKey: '',
-      openaiApiKey: '',
-      escalationTimeoutSeconds: 300,
       resourceBudget: {
         maxTotalTokens: 1_000_000,
         maxSteps: 200,
@@ -63,29 +63,12 @@ function buildDockerSessionConfig(
         maxEstimatedCostUsd: 5.0,
         warnThresholdPercent: 80,
       },
-      autoCompact: {
-        enabled: false,
-        thresholdTokens: 80_000,
-        keepRecentMessages: 10,
-        summaryModelId: 'anthropic:claude-haiku-4-5',
-      },
-      autoApprove: { enabled: false, modelId: 'anthropic:claude-haiku-4-5' },
       auditRedaction: { enabled: false },
-      memory: { enabled: false, llmBaseUrl: undefined, llmApiKey: undefined },
-      packageInstall: {
-        enabled: true,
-        quarantineDays: 2,
-        allowedPackages: ['numpy', 'ajv'],
-        deniedPackages: [],
-      },
-      serverCredentials: {},
-      dockerResources: { memoryMb: null, cpus: null },
-      // Pin the runtime per matrix lane. Without this it defaults to 'auto',
-      // which on a machine with the `container` CLI would resolve the "docker"
-      // lane to apple-container too.
+      packageInstall: { enabled: true, quarantineDays: 2, allowedPackages: ['numpy', 'ajv'], deniedPackages: [] },
+      dockerResources: { ...USER_CONFIG_DEFAULTS.dockerResources, memoryMb: null, cpus: null },
       containerRuntime: runtimeKind,
-    },
-  } as unknown as IronCurtainConfig;
+    }),
+  };
 }
 
 function defineSmokeSuite(runtimeKind: ContainerRuntimeKind): void {
@@ -156,7 +139,7 @@ function defineSmokeSuite(runtimeKind: ContainerRuntimeKind): void {
         mkdirSync(escalationDir, { recursive: true });
         const bundle = await createDockerInfrastructure(
           config,
-          { kind: 'docker', agent: 'claude-code' },
+          { kind: 'docker', agent: 'claude-code' as AgentId },
           bundleDir,
           input.workspacePath,
           escalationDir,
@@ -166,6 +149,7 @@ function defineSmokeSuite(runtimeKind: ContainerRuntimeKind): void {
           input.resolvedSkills,
           undefined,
           input.workflowScriptsDir,
+          { workflowRunDir: input.workflowRunDir },
         );
         liveBundles.add(bundle);
         return bundle;

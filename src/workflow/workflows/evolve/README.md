@@ -28,17 +28,18 @@ If the workspace is empty, `preflight` falls back to inferring everything from t
 
 After a one-time setup, the orchestrator drives rounds. Each round is a linear pipeline that turns sampled history into one scored, recorded candidate.
 
-| Phase        | State(s)          | Role                                                                                                     | Output                   |
-| ------------ | ----------------- | -------------------------------------------------------------------------------------------------------- | ------------------------ |
-| Setup        | `provision`       | Install the experiment's deps into the persistent venv (idempotent)                                      | provisioned venv         |
-| Setup        | `preflight`       | Infer the run spec, initialize the run, author the cognition seed                                        | run spec, cognition seed |
-| Loop control | `orchestrator`    | Round-boundary controller — enforce the budget and stop conditions; route continue / complete / escalate | —                        |
-| Round        | `sample`          | Sample parent nodes (UCB1 / greedy / random / MAP-Elites) and retrieve relevant cognition                | sampled parents          |
-| Round        | `researcher`      | Evolve one candidate from the sampled parents and retrieved lessons                                      | candidate program        |
-| Round        | `evaluate`        | Run your evaluator on the candidate                                                                      | JSON metrics             |
-| Round        | `analyzer`        | Distill the outcome into a transferable lesson for future rounds                                         | round lesson             |
-| Round        | `analysis_record` | Commit the round (candidate + score + lesson + parents) to the experiment database                       | recorded node            |
-| Wrap-up      | `final_summary`   | Summarize the best candidates and what was learned                                                       | run summary              |
+| Phase        | State(s)          | Role                                                                                      | Output                   |
+| ------------ | ----------------- | ----------------------------------------------------------------------------------------- | ------------------------ |
+| Setup        | `provision`       | Install the experiment's deps into the persistent venv (idempotent)                       | provisioned venv         |
+| Setup        | `preflight`       | Infer the run spec, initialize the run, author the cognition seed                         | run spec, cognition seed |
+| Loop control | `orchestrator`    | Round-boundary controller — start the next round, resume a blocked one, or escalate       | —                        |
+| Round        | `sample`          | Sample parent nodes (UCB1 / greedy / random / MAP-Elites) and retrieve relevant cognition | sampled parents          |
+| Round        | `researcher`      | Evolve one candidate from the sampled parents and retrieved lessons                       | candidate program        |
+| Round        | `evaluate`        | Run your evaluator on the candidate                                                       | JSON metrics             |
+| Round        | `analyzer`        | Distill the outcome into a transferable lesson for future rounds                          | round lesson             |
+| Round        | `analysis_record` | Commit the round (candidate + score + lesson + parents) to the experiment database        | recorded node            |
+| Loop control | `stop_check`      | Deterministic stop: end the search once target, patience or `max_rounds` is met           | stop / continue          |
+| Wrap-up      | `final_summary`   | Summarize the best candidates and what was learned                                        | run summary              |
 
 ## Human gates
 
@@ -51,7 +52,9 @@ Four gates pause for your decision; each accepts **APPROVE** (continue), **FORCE
 
 ## The round loop
 
-The real budget is `run_spec.budget.max_rounds`, inferred at preflight from your experiment brief and enforced by the **orchestrator** — not the `maxRounds: 200` setting, which is only a safety backstop against a wedged pipeline. After each recorded round the orchestrator re-checks the budget and stop conditions and routes to continue, `complete`, or escalate, so the search ends cleanly instead of running forever.
+The real budget is `run_spec.budget.max_rounds`, inferred at preflight from your experiment brief, together with the target and patience stops. After every recorded round the deterministic **`stop_check`** state recomputes the stop signals from the experiment database and ends the search when one fires — the orchestrator agent cannot talk the run past it, and the `maxRounds: 200` setting is only a safety backstop against a wedged pipeline. Asking for more rounds at `final_review` (FORCE_REVISION) runs one more round per request.
+
+To cap what a whole run may spend across every round, lane and resume, add `settings.workflowBudget` (`maxTotalTokens`, `maxEstimatedCostUsd`, `maxWallClockSeconds`) to the workflow definition. The ceiling is checked before each state; reaching it stops the run as `aborted` with its checkpoint kept, so raising the limit in the run's `definition.json` and resuming continues it.
 
 ## At a glance
 
@@ -59,8 +62,8 @@ The real budget is `run_spec.budget.max_rounds`, inferred at preflight from your
 - **Model:** `anthropic:claude-sonnet-4-6`
 - **Persona:** `global` for every agent state
 - **Input:** an experiment directory via `--workspace` (evaluator + objective; optional seed/deps/cognition)
-- **Budget:** `max_rounds` inferred at preflight; `maxRounds: 200` is a backstop only
+- **Budget:** `max_rounds` inferred at preflight and enforced by `stop_check`; `maxRounds: 200` is a backstop only; optional whole-run ceiling via `settings.workflowBudget`
 - **Run state:** `.evolve_runs/` (experiment DB, cognition store) and `.workflow/` in the workspace
-- **Terminal states:** `done` (budget reached, approved) · `failed` (unrecoverable) · `aborted` (stopped at a gate)
+- **Terminal states:** `done` (budget reached, approved) · `failed` (unrecoverable) · `aborted` (stopped at a gate, or by the run ceiling — resumable)
 
 > Tip: the search is only as good as `evaluator.py`. A noisy or too-lenient fitness function makes every candidate look equally good and the loop learns nothing — invest in a scorer that cleanly separates better from worse before kicking off a long run. For the framework behind the loop (cognition store, experiment database, sampling strategies) see [`scripts/README.md`](scripts/README.md).

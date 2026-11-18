@@ -11,7 +11,12 @@
 import { resolve, dirname } from 'node:path';
 import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import type { CompiledPolicyFile, ToolAnnotationsFile } from '../../src/pipeline/types.js';
+import type {
+  CompiledPolicyFile,
+  StoredServerAnnotations,
+  StoredToolAnnotation,
+  StoredToolAnnotationsFile,
+} from '../../src/pipeline/types.js';
 import { getUserConfigPath } from '../../src/config/paths.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -239,13 +244,81 @@ export const testCompiledPolicy: CompiledPolicyFile = {
   ],
 };
 
+/** A property of a tool input schema: a JSON Schema type name, or a full property schema. */
+type PropertySchema = 'string' | 'number' | 'boolean' | 'array' | 'object' | Record<string, unknown>;
+
 /**
- * Tool annotations for the filesystem, git, GitHub, and fetch MCP servers.
- * Filesystem: matches the stable tool set from @modelcontextprotocol/server-filesystem.
+ * A tool input schema in the JSON Schema shape MCP servers list and
+ * `annotate-tools` stores with every annotation
+ * (`StoredToolAnnotation.inputSchema`). Each fixture schema declares exactly
+ * the arguments its annotation classifies (test/test-policy-fixture.test.ts
+ * checks this).
+ */
+export function objectSchema(
+  properties: Record<string, PropertySchema>,
+  required: readonly string[] = [],
+): Record<string, unknown> {
+  return {
+    type: 'object',
+    properties: Object.fromEntries(
+      Object.entries(properties).map(([name, schema]) => [
+        name,
+        typeof schema === 'string' ? { type: schema } : schema,
+      ]),
+    ),
+    ...(required.length > 0 ? { required: [...required] } : {}),
+  };
+}
+
+/**
+ * The input schema of a tool whose server declares exactly the arguments
+ * the annotation classifies (`args`), as it does while the annotation is
+ * current. For test-local annotations whose subject is not the schema itself.
+ */
+export function argsSchema(args: Readonly<Record<string, unknown>>): Record<string, unknown> {
+  return objectSchema(Object.fromEntries(Object.keys(args).map((name) => [name, {}])));
+}
+
+/** A stored annotation whose input schema {@link withInputSchemas} may fill in. */
+export type FixtureToolAnnotation = Omit<StoredToolAnnotation, 'inputSchema'> & {
+  inputSchema?: Record<string, unknown>;
+};
+
+/** Annotations in the stored format, with input schemas optional per tool. */
+export interface FixtureToolAnnotationsFile extends Omit<StoredToolAnnotationsFile, 'servers'> {
+  servers: Record<string, Omit<StoredServerAnnotations, 'tools'> & { tools: FixtureToolAnnotation[] }>;
+}
+
+/**
+ * Completes test-local annotations into the stored format that the policy
+ * engine, coordinator and session load (`StoredToolAnnotationsFile`): a tool
+ * written without an `inputSchema` gets {@link argsSchema} of its `args`.
+ */
+export function withInputSchemas(file: FixtureToolAnnotationsFile): StoredToolAnnotationsFile {
+  return {
+    ...file,
+    servers: Object.fromEntries(
+      Object.entries(file.servers).map(([serverName, server]) => [
+        serverName,
+        {
+          ...server,
+          tools: server.tools.map((tool) => ({ ...tool, inputSchema: tool.inputSchema ?? argsSchema(tool.args) })),
+        },
+      ]),
+    ),
+  };
+}
+
+/**
+ * Tool annotations for the filesystem, git, GitHub, Google Workspace and
+ * fetch MCP servers, in the stored (on-disk) format the policy engine and
+ * coordinator load, input schemas included.
+ * Filesystem: matches the stable tool set of @modelcontextprotocol/server-filesystem,
+ * with its argument names, types, enums and required lists.
  * Git: covers the tools referenced by handwritten git scenarios.
  * GitHub: covers read-only and mutation tools for policy engine tests.
  */
-export const testToolAnnotations: ToolAnnotationsFile = {
+export const testToolAnnotations: StoredToolAnnotationsFile = {
   generatedAt: 'test-fixture',
   servers: {
     filesystem: {
@@ -255,98 +328,101 @@ export const testToolAnnotations: ToolAnnotationsFile = {
           toolName: 'read_file',
           serverName: 'filesystem',
           comment: 'Reads file contents.',
-
+          inputSchema: objectSchema({ path: 'string', tail: 'number', head: 'number' }, ['path']),
           args: { path: ['read-path'], tail: ['none'], head: ['none'] },
         },
         {
           toolName: 'read_text_file',
           serverName: 'filesystem',
           comment: 'Reads text file contents.',
-
+          inputSchema: objectSchema({ path: 'string', tail: 'number', head: 'number' }, ['path']),
           args: { path: ['read-path'], tail: ['none'], head: ['none'] },
         },
         {
           toolName: 'read_media_file',
           serverName: 'filesystem',
           comment: 'Reads image/audio file as base64.',
-
+          inputSchema: objectSchema({ path: 'string' }, ['path']),
           args: { path: ['read-path'] },
         },
         {
           toolName: 'read_multiple_files',
           serverName: 'filesystem',
           comment: 'Reads multiple files at once.',
-
+          inputSchema: objectSchema({ paths: { type: 'array', items: { type: 'string' } } }, ['paths']),
           args: { paths: ['read-path'] },
         },
         {
           toolName: 'write_file',
           serverName: 'filesystem',
           comment: 'Creates or overwrites a file.',
-
+          inputSchema: objectSchema({ path: 'string', content: 'string' }, ['path', 'content']),
           args: { path: ['write-path'], content: ['none'] },
         },
         {
           toolName: 'edit_file',
           serverName: 'filesystem',
           comment: 'Makes targeted edits to a file.',
-
+          inputSchema: objectSchema({ path: 'string', edits: 'array', dryRun: 'boolean' }, ['path', 'edits']),
           args: { path: ['read-path', 'write-path'], edits: ['none'], dryRun: ['none'] },
         },
         {
           toolName: 'create_directory',
           serverName: 'filesystem',
           comment: 'Creates a directory.',
-
+          inputSchema: objectSchema({ path: 'string' }, ['path']),
           args: { path: ['write-path'] },
         },
         {
           toolName: 'list_directory',
           serverName: 'filesystem',
           comment: 'Lists directory contents.',
-
+          inputSchema: objectSchema({ path: 'string' }, ['path']),
           args: { path: ['read-path'] },
         },
         {
           toolName: 'list_directory_with_sizes',
           serverName: 'filesystem',
           comment: 'Lists directory contents with sizes.',
-
+          inputSchema: objectSchema({ path: 'string', sortBy: { type: 'string', enum: ['name', 'size'] } }, ['path']),
           args: { path: ['read-path'], sortBy: ['none'] },
         },
         {
           toolName: 'directory_tree',
           serverName: 'filesystem',
           comment: 'Recursive directory tree view.',
-
+          inputSchema: objectSchema({ path: 'string', excludePatterns: 'array' }, ['path']),
           args: { path: ['read-path'], excludePatterns: ['none'] },
         },
         {
           toolName: 'move_file',
           serverName: 'filesystem',
           comment: 'Moves or renames a file/directory.',
-
+          inputSchema: objectSchema({ source: 'string', destination: 'string' }, ['source', 'destination']),
           args: { source: ['read-path', 'delete-path'], destination: ['write-path'] },
         },
         {
           toolName: 'search_files',
           serverName: 'filesystem',
           comment: 'Searches for files matching a pattern.',
-
+          inputSchema: objectSchema({ path: 'string', pattern: 'string', excludePatterns: 'array' }, [
+            'path',
+            'pattern',
+          ]),
           args: { path: ['read-path'], pattern: ['none'], excludePatterns: ['none'] },
         },
         {
           toolName: 'get_file_info',
           serverName: 'filesystem',
           comment: 'Gets file metadata.',
-
+          inputSchema: objectSchema({ path: 'string' }, ['path']),
           args: { path: ['read-path'] },
         },
         {
           toolName: 'list_allowed_directories',
           serverName: 'filesystem',
           comment: 'Lists allowed directories (no side effects).',
-
+          inputSchema: objectSchema({}),
           args: {},
         },
       ],
@@ -359,21 +435,21 @@ export const testToolAnnotations: ToolAnnotationsFile = {
           toolName: 'git_status',
           serverName: 'git',
           comment: 'Shows working tree status.',
-
+          inputSchema: objectSchema({ path: 'string' }),
           args: { path: ['read-path'] },
         },
         {
           toolName: 'git_log',
           serverName: 'git',
           comment: 'Shows commit history.',
-
+          inputSchema: objectSchema({ path: 'string' }),
           args: { path: ['read-path'] },
         },
         {
           toolName: 'git_diff',
           serverName: 'git',
           comment: 'Shows changes between commits or working tree.',
-
+          inputSchema: objectSchema({ path: 'string' }),
           args: { path: ['read-path'] },
         },
         // Local write operations: path is write-path so sandbox containment auto-allows
@@ -381,14 +457,14 @@ export const testToolAnnotations: ToolAnnotationsFile = {
           toolName: 'git_add',
           serverName: 'git',
           comment: 'Stages files for commit.',
-
+          inputSchema: objectSchema({ path: 'string', files: 'array' }),
           args: { path: ['write-path'], files: ['none'] },
         },
         {
           toolName: 'git_commit',
           serverName: 'git',
           comment: 'Creates a new commit.',
-
+          inputSchema: objectSchema({ path: 'string', message: 'string' }, ['message']),
           args: { path: ['write-path'], message: ['commit-message'] },
         },
         // Remote operations: path is none (repo locator), remote is git-remote-url
@@ -397,21 +473,21 @@ export const testToolAnnotations: ToolAnnotationsFile = {
           toolName: 'git_push',
           serverName: 'git',
           comment: 'Pushes commits to remote.',
-
+          inputSchema: objectSchema({ path: 'string', remote: 'string', branch: 'string' }),
           args: { path: ['none'], remote: ['git-remote-url'], branch: ['branch-name'] },
         },
         {
           toolName: 'git_pull',
           serverName: 'git',
           comment: 'Pulls changes from remote.',
-
+          inputSchema: objectSchema({ path: 'string', remote: 'string', branch: 'string' }),
           args: { path: ['none'], remote: ['git-remote-url'], branch: ['branch-name'] },
         },
         {
           toolName: 'git_fetch',
           serverName: 'git',
           comment: 'Fetches from remote without merging.',
-
+          inputSchema: objectSchema({ path: 'string', remote: 'string' }),
           args: { path: ['none'], remote: ['git-remote-url'] },
         },
         // History-rewriting operations: path has write-history (not sandbox-safe)
@@ -420,21 +496,21 @@ export const testToolAnnotations: ToolAnnotationsFile = {
           toolName: 'git_reset',
           serverName: 'git',
           comment: 'Resets HEAD to a commit.',
-
+          inputSchema: objectSchema({ path: 'string', mode: 'string' }),
           args: { path: ['read-path', 'write-history'], mode: ['none'] },
         },
         {
           toolName: 'git_rebase',
           serverName: 'git',
           comment: 'Reapplies commits on top of another branch.',
-
+          inputSchema: objectSchema({ path: 'string', branch: 'string' }),
           args: { path: ['read-path', 'write-history'], branch: ['branch-name'] },
         },
         {
           toolName: 'git_merge',
           serverName: 'git',
           comment: 'Merges branches.',
-
+          inputSchema: objectSchema({ path: 'string', branch: 'string' }),
           args: { path: ['read-path', 'write-history'], branch: ['branch-name'] },
         },
         // Branch management: path has both write-history and delete-history
@@ -442,7 +518,7 @@ export const testToolAnnotations: ToolAnnotationsFile = {
           toolName: 'git_branch',
           serverName: 'git',
           comment: 'Creates, lists, or deletes branches.',
-
+          inputSchema: objectSchema({ path: 'string', name: 'string', delete: 'boolean' }),
           args: { path: ['read-path', 'write-history', 'delete-history'], name: ['branch-name'], delete: ['none'] },
         },
       ],
@@ -454,35 +530,46 @@ export const testToolAnnotations: ToolAnnotationsFile = {
           toolName: 'list_issues',
           serverName: 'github',
           comment: 'Lists issues in a repository.',
-
+          inputSchema: objectSchema({ owner: 'string', repo: 'string' }, ['owner', 'repo']),
           args: { owner: ['github-owner'], repo: ['github-repo'] },
         },
         {
           toolName: 'get_issue',
           serverName: 'github',
           comment: 'Gets a single issue.',
-
+          inputSchema: objectSchema({ owner: 'string', repo: 'string', issue_number: 'number' }, [
+            'owner',
+            'repo',
+            'issue_number',
+          ]),
           args: { owner: ['github-owner'], repo: ['github-repo'], issue_number: ['none'] },
         },
         {
           toolName: 'search_code',
           serverName: 'github',
           comment: 'Searches code across repositories.',
-
+          inputSchema: objectSchema({ q: 'string' }, ['q']),
           args: { q: ['none'] },
         },
         {
           toolName: 'create_issue',
           serverName: 'github',
           comment: 'Creates an issue in a repository.',
-
+          inputSchema: objectSchema({ owner: 'string', repo: 'string', title: 'string', body: 'string' }, [
+            'owner',
+            'repo',
+            'title',
+          ]),
           args: { owner: ['github-owner'], repo: ['github-repo'], title: ['none'], body: ['none'] },
         },
         {
           toolName: 'create_pull_request',
           serverName: 'github',
           comment: 'Creates a pull request.',
-
+          inputSchema: objectSchema(
+            { owner: 'string', repo: 'string', title: 'string', head: 'string', base: 'string' },
+            ['owner', 'repo', 'title', 'head', 'base'],
+          ),
           args: {
             owner: ['github-owner'],
             repo: ['github-repo'],
@@ -495,7 +582,11 @@ export const testToolAnnotations: ToolAnnotationsFile = {
           toolName: 'merge_pull_request',
           serverName: 'github',
           comment: 'Merges a pull request.',
-
+          inputSchema: objectSchema({ owner: 'string', repo: 'string', pull_number: 'number' }, [
+            'owner',
+            'repo',
+            'pull_number',
+          ]),
           args: { owner: ['github-owner'], repo: ['github-repo'], pull_number: ['none'] },
         },
       ],
@@ -508,35 +599,35 @@ export const testToolAnnotations: ToolAnnotationsFile = {
           toolName: 'gmail_search_messages',
           serverName: 'google-workspace',
           comment: 'Searches Gmail messages matching a query.',
-
+          inputSchema: objectSchema({ query: 'string', maxResults: 'number' }, ['query']),
           args: { query: ['none'], maxResults: ['none'] },
         },
         {
           toolName: 'gmail_get_message',
           serverName: 'google-workspace',
           comment: 'Gets a single Gmail message.',
-
+          inputSchema: objectSchema({ messageId: 'string' }, ['messageId']),
           args: { messageId: ['none'] },
         },
         {
           toolName: 'calendar_list_events',
           serverName: 'google-workspace',
           comment: 'Lists calendar events.',
-
+          inputSchema: objectSchema({ calendarId: 'string', maxResults: 'number' }),
           args: { calendarId: ['none'], maxResults: ['none'] },
         },
         {
           toolName: 'drive_list_files',
           serverName: 'google-workspace',
           comment: 'Lists Drive files.',
-
+          inputSchema: objectSchema({ query: 'string', maxResults: 'number' }),
           args: { query: ['none'], maxResults: ['none'] },
         },
         {
           toolName: 'drive_read_file',
           serverName: 'google-workspace',
           comment: 'Reads a Drive file.',
-
+          inputSchema: objectSchema({ fileId: 'string' }, ['fileId']),
           args: { fileId: ['none'] },
         },
         // Mutation operations
@@ -544,21 +635,25 @@ export const testToolAnnotations: ToolAnnotationsFile = {
           toolName: 'gmail_send_message',
           serverName: 'google-workspace',
           comment: 'Sends an email via Gmail.',
-
+          inputSchema: objectSchema({ to: 'string', subject: 'string', body: 'string' }, ['to', 'subject', 'body']),
           args: { to: ['email-address'], subject: ['none'], body: ['email-body'] },
         },
         {
           toolName: 'gmail_draft_message',
           serverName: 'google-workspace',
           comment: 'Creates a Gmail draft.',
-
+          inputSchema: objectSchema({ to: 'string', subject: 'string', body: 'string' }, ['to', 'subject', 'body']),
           args: { to: ['email-address'], subject: ['none'], body: ['email-body'] },
         },
         {
           toolName: 'calendar_create_event',
           serverName: 'google-workspace',
           comment: 'Creates a calendar event.',
-
+          inputSchema: objectSchema({ summary: 'string', start: 'string', end: 'string', attendees: 'array' }, [
+            'summary',
+            'start',
+            'end',
+          ]),
           args: {
             summary: ['none'],
             start: ['none'],
@@ -570,21 +665,21 @@ export const testToolAnnotations: ToolAnnotationsFile = {
           toolName: 'drive_share_file',
           serverName: 'google-workspace',
           comment: 'Shares a Drive file with another user.',
-
+          inputSchema: objectSchema({ fileId: 'string', email: 'string', role: 'string' }, ['fileId', 'email', 'role']),
           args: { fileId: ['none'], email: ['email-address'], role: ['share-permission'] },
         },
         {
           toolName: 'gmail_delete_message',
           serverName: 'google-workspace',
           comment: 'Permanently deletes a Gmail message.',
-
+          inputSchema: objectSchema({ messageId: 'string' }, ['messageId']),
           args: { messageId: ['none'] },
         },
         {
           toolName: 'gmail_batch_modify_labels',
           serverName: 'google-workspace',
           comment: 'Batch modifies labels on multiple messages.',
-
+          inputSchema: objectSchema({ messageIds: 'array', addLabels: 'array', removeLabels: 'array' }, ['messageIds']),
           args: { messageIds: ['none'], addLabels: ['none'], removeLabels: ['none'] },
         },
       ],
@@ -596,7 +691,16 @@ export const testToolAnnotations: ToolAnnotationsFile = {
           toolName: 'http_fetch',
           serverName: 'fetch',
           comment: 'Fetches web content via HTTP GET.',
-
+          inputSchema: objectSchema(
+            {
+              url: 'string',
+              headers: 'object',
+              max_length: 'number',
+              format: { type: 'string', enum: ['markdown', 'text', 'html'] },
+              timeout: 'number',
+            },
+            ['url'],
+          ),
           args: { url: ['fetch-url'], headers: ['none'], max_length: ['none'], format: ['none'], timeout: ['none'] },
         },
       ],

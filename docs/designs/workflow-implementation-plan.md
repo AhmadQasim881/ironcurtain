@@ -1,5 +1,7 @@
 # Workflow System: Module Decomposition & Implementation Plan
 
+**Status (2026-11-14):** Implemented: the modules it plans shipped in `src/workflow/`; kept as a design record.
+
 This document specifies the module boundaries, public interfaces, dependency
 graph, test strategies, and implementation phases for the multi-agent workflow
 system described in `workflow-implementation-final.md`.

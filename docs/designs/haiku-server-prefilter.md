@@ -1,10 +1,13 @@
 # Design: Haiku Server Pre-Filter for Policy Compilation
 
+**Status (2026-11-14):** Implemented (`src/pipeline/server-prefilter.ts`).
+
 ## Overview
 
 The policy compilation pipeline (`compile-policy`) runs a full compile-verify-repair cycle for every MCP server that has tool annotations. When the input text (user constitution, task description, or persona definition) has no specific guidance for a server, this cycle produces rules equivalent to default-deny -- an expensive no-op. This design adds a cheap pre-filter step that uses Haiku to determine whether each server can be skipped before invoking the expensive compilation model (Opus/Sonnet).
 
 The pre-filter asks Haiku a single yes/no question per server. The question is mode-aware:
+
 - **Constitution mode**: "Does this user guidance specifically allow any of this server's tools?"
 - **Task-policy mode**: "Would accomplishing this task require any of this server's tools?"
 
@@ -23,7 +26,8 @@ If the answer is no, the server is skipped with a clear log message, and default
 ### 2. Caller provides pre-filter text, not read from disk
 
 **Decision**: The pre-filter function takes its input text as a parameter. Each caller decides what to pass:
-- `compile.ts` (constitution mode): passes user constitution text only (via `loadUserConstitutionText()`), excluding base principles
+
+- `compile.ts` (constitution mode): passes user constitution text only, excluding base principles, unless a user base override exists (via `loadPrefilterConstitutionText()`, see decision 3)
 - `compileTaskPolicy()`: passes the task description (same as `constitutionInput`)
 - Persona compilation: passes the persona constitution (same as `constitutionInput`)
 
@@ -33,15 +37,16 @@ If the answer is no, the server is skipped with a clear log message, and default
 
 ### 3. For constitution mode, only the user constitution is evaluated (not base principles)
 
-**Decision**: In constitution mode, the pre-filter receives only the user constitution text (from `~/.ironcurtain/constitution-user.md` or the bundled `constitution-user-base.md`), not the combined `base + user` text.
+**Decision**: In constitution mode, the pre-filter receives only the user constitution text (from `~/.ironcurtain/constitution-user.md` or the bundled `constitution-user-base.md`), not the combined `base + user` text — as long as the package base is in use. When the user overrides the base with `~/.ironcurtain/constitution.md`, the pre-filter receives the full combined text the compiler gets. `loadPrefilterConstitutionText()` in `src/config/paths.ts` makes this choice.
 
-**Rationale**: The base constitution (`constitution.md`) contains three universal principles -- least privilege, no destruction, human oversight. These apply to every server equally and never produce server-specific allow rules on their own. Including them would add noise and could mislead Haiku into thinking "human oversight" means something should be allowed via escalate rules.
+**Rationale**: The bundled base constitution (`src/config/constitution.md`) contains three universal principles -- least privilege, no destruction, human oversight. These apply to every server equally and never produce server-specific allow rules on their own. Including them would add noise and could mislead Haiku into thinking "human oversight" means something should be allowed via escalate rules. A user base override, however, replaces those principles with arbitrary text that can grant server-specific permissions; hiding it from the pre-filter would let Haiku skip a server the compiler would have given rules to.
 
 **Alternative considered**: Pass the full combined constitution. Rejected because it conflates universal structural principles (which the engine enforces independently) with user-specific guidance (which drives compiled rules).
 
 ### 4. Mode-aware prompt framing
 
 **Decision**: The Haiku prompt is framed differently depending on `constitutionKind`:
+
 - **Constitution**: "Does this guidance specifically allow any of this server's tools?"
 - **Task-policy**: "Would accomplishing this task require any of this server's tools?"
 
@@ -79,11 +84,13 @@ The schema, function signature, and fail-open behavior are identical across mode
 
 **Alternative considered**: Fail the pipeline on pre-filter error. Rejected because a Haiku outage should not block policy compilation.
 
-### 9. No caching of skip decisions
+### 9. Skip decisions are cached per server
 
-**Decision**: The pre-filter result is not persisted to disk or cached between runs.
+**Decision**: Each decision the model makes is stored in `<outputDir>/servers/<name>/prefilter-decision.json` with the hash of its inputs (`computePrefilterHash` in `server-prefilter.ts`): the trimmed pre-filter text, the server name and its tool annotations, the compilation mode, the system prompt and response schema the model is given, the pre-filter model id (`PipelineModels.prefilterModelId`, from `prefilterModelId` in the user config) and a cache epoch. A later run with the same inputs reuses the decision without a model call; any change asks the model again. Fail-open decisions after an error are never stored. `compile-policy --force` (`PipelineRunConfig.force`) ignores the stored decisions and stores fresh ones. A damaged file counts as a miss.
 
-**Rationale**: Haiku is cheap (~$0.001 per call). Adding a cache layer introduces invalidation complexity for negligible savings. The existing per-server compilation cache (content-hash based) already handles the expensive compilation caching.
+**Rationale**: The cost of a call is negligible, but its nondeterminism is not: before the cache, every recompile asked again, even when every server was served from the per-server compile cache, and a decision that flipped to `skip: true` on an unchanged rerun dropped that server's rules from the merged policy (its tools default-denied) until the next run. With the cache an unchanged rerun makes no pre-filter call and cannot change the skip set. The cost is that a wrong decision is also stable until an input changes; `--force` re-evaluates it.
+
+**Previously**: decisions were not persisted (the original rationale was that Haiku is cheap and invalidation adds complexity).
 
 ### 10. Skipped servers emit zero rules (no synthetic rules)
 
@@ -123,12 +130,12 @@ The schema, function signature, and fail-open behavior are identical across mode
 import { z } from 'zod';
 
 const serverRelevanceSchema = z.object({
-  skip: z.boolean().describe(
-    'true if the input text contains no specific guidance that would require or allow any of this server\'s tools. When in doubt, set to false.'
-  ),
-  reason: z.string().describe(
-    'Brief explanation of why the server is or is not relevant to the input text'
-  ),
+  skip: z
+    .boolean()
+    .describe(
+      "true if the input text contains no specific guidance that would require or allow any of this server's tools. When in doubt, set to false.",
+    ),
+  reason: z.string().describe('Brief explanation of why the server is or is not relevant to the input text'),
 });
 
 type ServerRelevanceResult = z.infer<typeof serverRelevanceSchema>;
@@ -244,12 +251,11 @@ function buildPrefilterPrompt(
   tools: ReadonlyArray<ToolAnnotation>,
   kind: ConstitutionKind,
 ): string {
-  const toolList = tools
-    .map((t) => `- ${t.toolName}: ${t.comment}`)
-    .join('\n');
+  const toolList = tools.map((t) => `- ${t.toolName}: ${t.comment}`).join('\n');
 
-  const taskFraming = kind === 'constitution'
-    ? `Based ONLY on the user guidance below, determine whether ANY of this server's tools would be specifically allowed or granted special permissions.
+  const taskFraming =
+    kind === 'constitution'
+      ? `Based ONLY on the user guidance below, determine whether ANY of this server's tools would be specifically allowed or granted special permissions.
 
 The user guidance is relevant to this server if it:
 - Mentions the server by name
@@ -261,7 +267,7 @@ The user guidance is NOT relevant if it:
 - Only contains general principles that don't translate to specific allow rules for this server's tools
 
 If the user guidance contains no specific permissions for this server, the server can be safely skipped — a default-deny policy will handle all its tools.`
-    : `Based ONLY on the task description below, determine whether accomplishing this task would require ANY of this server's tools.
+      : `Based ONLY on the task description below, determine whether accomplishing this task would require ANY of this server's tools.
 
 The task is relevant to this server if it:
 - Describes work that directly requires this server's capabilities (e.g., "analyze CSV files" requires filesystem tools, "check open PRs" requires GitHub tools)
@@ -345,10 +351,7 @@ export async function createPipelineModels(logPath: string): Promise<PipelineMod
   };
 }
 
-async function createPrefilterModel(
-  userConfig: UserConfig,
-  logPath: string,
-): Promise<LanguageModel> {
+async function createPrefilterModel(userConfig: UserConfig, logPath: string): Promise<LanguageModel> {
   const baseLlm = await createLanguageModel('anthropic:claude-haiku-4-5', userConfig);
   const logContext: LlmLogContext = { stepName: 'prefilter' };
   return wrapLanguageModel({
@@ -446,11 +449,11 @@ Provides pre-filter text appropriate to the source:
 // In the PipelineRunConfig construction
 {
   // ... existing fields ...
-  prefilterText: constitutionArg ? config.constitutionText : loadUserConstitutionText(),
+  prefilterText: constitutionArg ? config.constitutionText : loadPrefilterConstitutionText(config.constitutionText),
 }
 ```
 
-When `--constitution` is specified, the override file's full text is used as pre-filter input (it IS the user's guidance). In normal mode, only the user constitution portion is used (excluding base principles).
+When `--constitution` is specified, the override file's full text is used as pre-filter input (it IS the user's guidance). In normal mode, only the user constitution portion is used (excluding base principles), unless `~/.ironcurtain/constitution.md` overrides the base, in which case the full combined text is used.
 
 ### File: `src/cron/compile-task-policy.ts` (modified)
 
@@ -460,7 +463,7 @@ Provides the task description as `prefilterText`:
 return runner.run({
   constitutionInput: taskDescription,
   constitutionKind: 'task-policy',
-  prefilterText: taskDescription,  // NEW
+  prefilterText: taskDescription, // NEW
   // ... rest unchanged ...
 });
 ```
@@ -473,7 +476,7 @@ Provides the persona constitution as `prefilterText`:
 return runner.run({
   constitutionInput: personaConstitution,
   constitutionKind: 'constitution', // or whatever kind persona uses
-  prefilterText: personaConstitution,  // NEW
+  prefilterText: personaConstitution, // NEW
   // ... rest unchanged ...
 });
 ```
@@ -484,8 +487,9 @@ return runner.run({
 compile.ts (CLI)                    compileTaskPolicy()         compilePersonaPolicy()
   |                                   |                           |
   | prefilterText =                   | prefilterText =           | prefilterText =
-  |   loadUserConstitutionText()      |   taskDescription         |   personaConstitution
-  |   (undefined if --constitution)   |                           |
+  |   loadPrefilterConstitutionText() |   taskDescription         |   personaConstitution
+  |   (override text if               |                           |
+  |    --constitution)                |                           |
   +-----------------------------------+---------------------------+
                                       |
                                       v
@@ -532,7 +536,7 @@ When servers are skipped:
 
 Handwritten scenarios (in `handwritten-scenarios.ts`) exist for filesystem and git servers to catch default-deny regressions. If the pre-filter skips these servers, those scenarios are never verified.
 
-This is acceptable because: if the pre-filter skips a server, the compiled policy has no rules for it. Handwritten scenarios test that *compiled rules* produce the correct decisions. With no compiled rules, the policy engine's structural default-deny is the only behavior, and it's tested independently in `policy-engine.test.ts`. The handwritten scenarios would either pass trivially (for escalate/deny expectations) or fail pointlessly (for allow expectations that can't work without compiled rules).
+This is acceptable because: if the pre-filter skips a server, the compiled policy has no rules for it. Handwritten scenarios test that _compiled rules_ produce the correct decisions. With no compiled rules, the policy engine's structural default-deny is the only behavior, and it's tested independently in `policy-engine.test.ts`. The handwritten scenarios would either pass trivially (for escalate/deny expectations) or fail pointlessly (for allow expectations that can't work without compiled rules).
 
 ## Error Handling
 
@@ -586,6 +590,7 @@ The pre-filter short-circuits and skips all servers without any LLM calls.
 ## Concurrency
 
 `prefilterServers()` runs all per-server Haiku calls concurrently via `Promise.all`. Given that:
+
 - Haiku has high rate limits
 - Each call is tiny (~256 output tokens)
 - There are typically 3-5 servers
@@ -602,6 +607,7 @@ No concurrency cap is needed. If server count grows significantly in the future,
 4. **Empty text short-circuit**: `prefilterServers()` with empty string returns `skip: true` for all servers without invoking the model.
 5. **Error handling**: `checkServerRelevance()` with a throwing model returns `{ skip: false }`.
 6. **`generateObjectWithRepair` integration**: Mock model returns valid JSON, verify `{ output }` destructuring works correctly.
+7. **Decision cache** (decision 9): an unchanged rerun makes no model call and returns the stored decisions; a change of text, tools, mode or model asks again; fail-open decisions are not stored; `refresh` asks again; a damaged file is a miss (`test/server-prefilter.test.ts`). Runner level: an unchanged rerun with an LLM that fails every call makes zero calls and keeps the skip set (`test/pipeline-incremental.test.ts`).
 
 ### Unit tests for pipeline-runner integration
 
@@ -614,7 +620,7 @@ No concurrency cap is needed. If server count grows significantly in the future,
 
 ### Caller-level tests
 
-1. **`compile.ts`**: `prefilterText` is always set — to the user constitution text in normal mode, or to the full override text when `--constitution` is specified.
+1. **`compile.ts`**: `prefilterText` is always set — to the user constitution text in normal mode (the full combined text when `~/.ironcurtain/constitution.md` overrides the base), or to the full override text when `--constitution` is specified.
 2. **`compileTaskPolicy()`**: `prefilterText` is set to the task description.
 3. **Persona compilation**: `prefilterText` is set to the persona constitution.
 

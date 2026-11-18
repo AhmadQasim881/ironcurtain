@@ -302,6 +302,39 @@ describe('OAuthTokenProvider', () => {
       }
     });
 
+    it('keeps and returns a newer token another process stored while the refresh was in flight', async () => {
+      saveOAuthToken('google', makeExpiredToken());
+      const storedMeanwhile = makeToken({
+        accessToken: 'ya29.stored-by-other-process',
+        expiresAt: Date.now() + 2 * 3600 * 1000,
+      });
+
+      // The token endpoint answers only after another process finished its own
+      // refresh and stored a token that outlives ours.
+      const server = createServer((req, res) => {
+        req.resume();
+        req.on('end', () => {
+          saveOAuthToken('google', storedMeanwhile);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ access_token: 'ya29.ours', expires_in: 3600 }));
+        });
+      });
+      const tokenUrl = await new Promise<string>((resolveUrl) => {
+        server.listen(0, '127.0.0.1', () => {
+          const addr = server.address();
+          if (typeof addr === 'object' && addr !== null) resolveUrl(`http://127.0.0.1:${addr.port}/token`);
+        });
+      });
+      try {
+        const tp = new OAuthTokenProvider(makeProvider(tokenUrl), TEST_CLIENT_CREDENTIALS);
+
+        await expect(tp.getValidAccessToken()).resolves.toBe('ya29.stored-by-other-process');
+        expect(loadOAuthToken('google')).toEqual(storedMeanwhile);
+      } finally {
+        server.close();
+      }
+    });
+
     // ---------------------------------------------------------------------
     // Deduplication
     // ---------------------------------------------------------------------

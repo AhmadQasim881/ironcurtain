@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import type { MemoryEngine } from '../src/engine.js';
 import type { IngestResult } from '../src/types.js';
 import { validateIngestInput, handleIngest, formatIngestResult } from '../src/tools/ingest.js';
+import { MAX_INGEST_CONTENT_BYTES, MAX_SOURCE_LENGTH } from '../src/tools/validation.js';
 
 function createMockEngine(ingestResult: IngestResult): MemoryEngine {
   return {
@@ -121,6 +122,30 @@ describe('validateIngestInput', () => {
     it('leaves as_of undefined when omitted', () => {
       expect(validateIngestInput({ content: 'x' }).as_of).toBeUndefined();
     });
+
+    // A far-future as_of sorted first in every "recent" view, never decayed, and a value
+    // beyond the Date range (1e20) made memory_context throw 'Invalid time value'.
+    it('rejects an as_of in 2100, as an ISO string, an epoch number or a numeric string', () => {
+      const year2100 = Date.parse('2100-01-01T00:00:00.000Z');
+      expect(() => validateIngestInput({ content: 'x', as_of: '2100-01-01T00:00:00Z' })).toThrow(
+        'as_of must not be more than 5 minutes in the future',
+      );
+      expect(() => validateIngestInput({ content: 'x', as_of: year2100 })).toThrow('5 minutes in the future');
+      expect(() => validateIngestInput({ content: 'x', as_of: String(year2100) })).toThrow('5 minutes in the future');
+      expect(() => validateIngestInput({ content: 'x', as_of: 1e20 })).toThrow('5 minutes in the future');
+    });
+
+    it('accepts an as_of up to 5 minutes ahead (clock skew) and rejects one just beyond', () => {
+      const now = Date.now();
+      expect(validateIngestInput({ content: 'x', as_of: now + 4 * 60 * 1000 }).as_of).toBe(now + 4 * 60 * 1000);
+      expect(() => validateIngestInput({ content: 'x', as_of: now + 6 * 60 * 1000 })).toThrow('5 minutes');
+    });
+
+    it('surfaces the rejection from the handler without calling the engine', async () => {
+      const engine = createMockEngine({ created: 0, merged: 0, memory_ids: [], facts: [] });
+      await expect(handleIngest(engine, { content: 'x', as_of: '2100-01-01' })).rejects.toThrow('as_of');
+      expect(engine.ingest).not.toHaveBeenCalled();
+    });
   });
 
   it('validates tags and importance', () => {
@@ -151,21 +176,73 @@ describe('handleIngest routing', () => {
       as_of: '2023-01-15T00:00:00.000Z',
     });
 
-    expect(engine.ingest).toHaveBeenCalledWith('blob', {
-      source: undefined,
-      mode: 'document',
-      tags: ['seed'],
-      importance: 0.6,
-      dry_run: false,
-      as_of: Date.parse('2023-01-15T00:00:00.000Z'),
-      on_extraction_failure: 'degrade',
-    });
+    expect(engine.ingest).toHaveBeenCalledWith(
+      'blob',
+      {
+        source: undefined,
+        mode: 'document',
+        tags: ['seed'],
+        importance: 0.6,
+        dry_run: false,
+        as_of: Date.parse('2023-01-15T00:00:00.000Z'),
+        on_extraction_failure: 'degrade',
+      },
+      undefined,
+    );
     expect(text).toContain('Ingested 3 atomic fact');
     expect(text).toContain('2 new memories, 1 merged');
   });
 });
 
+describe('ingest size limits', () => {
+  it('rejects content over 200 KB (in UTF-8 bytes) and accepts it at the limit', () => {
+    expect(() => validateIngestInput({ content: 'x'.repeat(MAX_INGEST_CONTENT_BYTES + 1) })).toThrow(
+      /content exceeds the maximum of 204800 bytes/,
+    );
+    expect(() => validateIngestInput({ content: 'é'.repeat(MAX_INGEST_CONTENT_BYTES / 2 + 1) })).toThrow(
+      /exceeds the maximum/,
+    );
+    expect(validateIngestInput({ content: 'x'.repeat(MAX_INGEST_CONTENT_BYTES) }).content).toHaveLength(
+      MAX_INGEST_CONTENT_BYTES,
+    );
+  });
+
+  it('rejects a source label over 256 characters', () => {
+    expect(() => validateIngestInput({ content: 'x', source: 's'.repeat(MAX_SOURCE_LENGTH + 1) })).toThrow(
+      'source exceeds maximum length of 256 characters',
+    );
+    expect(validateIngestInput({ content: 'x', source: 's'.repeat(MAX_SOURCE_LENGTH) }).source).toHaveLength(256);
+  });
+});
+
 describe('formatIngestResult', () => {
+  it('says when the fact cap left part of the content out', () => {
+    const text = formatIngestResult(
+      {
+        created: 200,
+        merged: 0,
+        memory_ids: [],
+        facts: Array.from({ length: 200 }, (_, i) => ({ fact: `f${i}` })),
+        chunks: 9,
+        truncated: true,
+        dropped_chunks: 4,
+      },
+      false,
+    );
+    expect(text).toContain('Truncated: one ingest keeps at most 200 facts and 50 chunks');
+    expect(text).toContain('4 of 9 chunk(s) were not extracted.');
+    expect(text).toContain('Ingest the rest separately.');
+  });
+
+  it('flags a truncated dry-run preview too', () => {
+    const text = formatIngestResult(
+      { created: 0, merged: 0, memory_ids: [], facts: [{ fact: 'f' }], truncated: true },
+      true,
+    );
+    expect(text).toContain('Dry run');
+    expect(text).toContain('Truncated:');
+  });
+
   it('renders a normal result reporting created and merged separately (A7)', () => {
     const text = formatIngestResult(
       {

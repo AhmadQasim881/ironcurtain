@@ -1,6 +1,7 @@
 # Design: PTY Support and Escalation Listener for Docker Agent Mode
 
-**Status:** Proposed
+**Status (2026-11-14):** Implemented: `ironcurtain start --pty` and `ironcurtain escalation-listener` (`src/docker/pty-session.ts`, `src/escalation/`). The keystroke reconstruction of section 9.1 was never built; trusted user input comes from the mux and the web UI trusted-input bar (`src/escalation/trusted-input.ts`). `ironcurtain mux` is the recommended interface.
+
 **Date:** 2026-02-27
 **Author:** IronCurtain Engineering
 
@@ -246,8 +247,17 @@ interface EscalationFileRequest {
   toolName: string;
   arguments: Record<string, unknown>;
   reason: string;
+  context?: Record<string, string>;
+  whitelistCandidates?: { description: string; patternKey?: string }[];
+  humanOnly?: true;
+  /** TRUSTED: the human's last message (for a PTY session, only what the trusted-input bar wrote). */
+  lastTrustedUserMessage?: { text: string; sentAt?: string };
+  /** UNTRUSTED: the agent's execute_code justification; display only. */
+  agentJustification?: string;
 }
 ```
+
+The reviewer-context fields are bounded by the pipeline (`src/trusted-process/escalation-context.ts`) and validated again by the watcher (`withValidReviewFields`): a field of the wrong shape is dropped, never shown. The pipeline never writes `taskSummary` (the session, or the workflow orchestrator, attaches the task after reading the request), so the watcher drops one found in a request file: text from the file is never shown under the trusted `Task:` label. Front-ends label the human's message as the human's own text and show the agent's justification apart, escaped, as untrusted.
 
 ### Response File Format
 
@@ -262,14 +272,16 @@ interface EscalationFileResponse {
 All file writes in the escalation protocol **must** use write-to-temp-then-rename to prevent partial reads:
 
 ```typescript
-import { writeFileSync, renameSync } from 'node:fs';
-
+// src/escalation/escalation-watcher.ts, over src/util/atomic-write.ts
 function atomicWriteJsonSync(filePath: string, data: unknown): void {
-  const tmpPath = `${filePath}.tmp`;
-  writeFileSync(tmpPath, JSON.stringify(data, null, 2));
-  renameSync(tmpPath, filePath);  // atomic on same filesystem (POSIX)
+  // Temp file `<file>.<pid>.<uuid>.tmp`, created exclusively ('wx') in the
+  // target's directory, renamed into place (atomic on the same filesystem),
+  // removed again on failure. The directory is never created.
+  atomicWriteTextSync(filePath, JSON.stringify(data, null, 2), { createParentDirs: false });
 }
 ```
+
+The temp name is unique per write: two writers of the same file (two UIs answering one escalation, a session and a mux writing `user-context.json`) never share a temp file, so neither can rename a torn mix of both into place.
 
 This applies to:
 - Proxy writing `request-{id}.json`
@@ -345,7 +357,7 @@ Currently, escalation handling logic is duplicated across three sites:
 
 1. **`DockerAgentSession`** (`src/docker/docker-agent-session.ts`): `pollEscalationDirectory()`, `checkEscalationExpiry()`, `resolveEscalation()`.
 2. **`CliTransport`** (`src/session/cli-transport.ts`): `handleEscalationCommand()`, `writeEscalationBanner()`, `createEscalationHandler()`.
-3. **`SignalBotDaemon`** (`src/signal/signal-bot-daemon.ts`): `handleEscalationReply()`, `setPendingEscalation()`, `clearPendingEscalation()`.
+3. **`SignalBotDaemon`** (`src/signal/signal-bot-daemon.ts`): `handleEscalationReply()`, `setPendingEscalation()`, `clearPendingEscalation()` (since replaced by `surfaceEscalation()` / `expireEscalation()`, which send a banner with a per-escalation reply code; see `signal-transport.md`).
 
 The escalation listener would be a fourth consumer. To avoid further duplication, we extract a shared module.
 
@@ -373,13 +385,14 @@ export interface EscalationWatcher {
   start(): void;
   /** Stop polling. */
   stop(): void;
-  /** Returns the currently pending escalation, if any. */
-  getPending(): EscalationRequest | undefined;
+  /** Every escalation surfaced and not yet resolved or expired, oldest first. */
+  getPending(): readonly EscalationRequest[];
   /**
-   * Resolves a pending escalation by writing the response file.
+   * Resolves a pending escalation by writing the response file. Returns
+   * false when the proxy had already timed it out (the response was late).
    * @throws {Error} if no escalation with this ID is pending
    */
-  resolve(escalationId: string, decision: 'approved' | 'denied'): void;
+  resolve(escalationId: string, decision: 'approved' | 'denied', options?: { whitelistSelection?: number }): boolean;
 }
 
 /**
@@ -394,6 +407,23 @@ export function createEscalationWatcher(
   },
 ): EscalationWatcher;
 ```
+
+**Several pending escalations per session.** One session can have several
+escalations waiting at once: the coordinator releases its call mutex while a
+call waits for a decision, so parallel tool calls (an agent's parallel tool
+use, parallel subagents, the builtin agent's parallel `execute_code` calls)
+each write their own `request-<id>.json` with its own deadline. The watcher
+therefore keeps a map of pending requests: every poll surfaces every request
+file not seen before (one `onEscalation` each), oldest first by the
+`createdAt` the trusted process writes into the request file (the file's
+modification time when it has none), and checks each surfaced request for
+expiry on its own (`onEscalationExpired` with its id). A malformed request
+file, or one whose content names another escalation than its file name, does
+not hide the others. Consumers that number escalations (the listener state,
+the mux) already key them by display number; `Session.getPendingEscalations()`
+and `ManagedSession.pendingEscalations` hold all of a session's pending
+escalations, and the CLI transport numbers its banners and refuses an
+unnumbered `/approve` while more than one is pending.
 
 ### Migration Path
 
@@ -439,12 +469,18 @@ We use `ink` (React for the terminal) for the TUI. Rationale:
 |                                                                  |
 |  [1] Session #1 (a1b2c3d4)                                      |
 |      Tool:    filesystem/write_file                              |
-|      Path:    /home/user/Documents/report.md                     |
+|      Args:    path: "/home/user/Documents/report.md"             |
+|               content: "# Report\n\nDraft..."                    |
 |      Reason:  Write outside sandbox directory                    |
+|      /approve+ 1: Allow filesystem/write_file write-path /home/...|
+|      /approve+dir 1: Allow filesystem/write_file write-path wi...|
 |                                                                  |
 |  [2] Session #2 (e5f6g7h8)                                      |
 |      Tool:    github/create_pull_request                         |
-|      Repo:    owner/repo                                         |
+|      Args:    owner: "owner"                                     |
+|               repo: "repo"                                       |
+|               title: "Fix login"                                 |
+|               draft: false                                       |
 |      Reason:  GitHub mutation requires approval                  |
 |                                                                  |
 +------------------------------------------------------------------+
@@ -458,6 +494,12 @@ We use `ink` (React for the terminal) for the TUI. Rationale:
 |  > /approve 1                                                    |
 +------------------------------------------------------------------+
 ```
+
+#### Untrusted text and complete arguments
+
+Everything on the dashboard that originates from the agent -- server and tool names, every argument, the reason, context values, whitelist descriptions, session labels and error messages -- is written to the user's real terminal. `buildDashboard` (exported for tests) passes each such field through `toDisplayText` from `src/terminal/display-sanitize.ts`, which renders control characters, C1 controls, bidi overrides, invisible format characters and the other default-ignorable code points (variation selectors, Hangul fillers) as visible `\u...` escapes, so no argument can move the cursor, overwrite the `Tool:` line, write the clipboard (OSC 52) or make the terminal type a reply. chalk does not interpret markup, so nothing else is needed on this path.
+
+Arguments are shown completely: one line per argument, every value as JSON (strings quoted, objects and arrays serialized), so non-string and fourth-and-later arguments appear and a string's boundaries are unambiguous. A single value longer than 240 code points is cut with an explicit `...[+N chars]` marker rather than silently, because the dashboard is redrawn from the top of a fixed screen; the approver sees that content was omitted and can deny.
 
 ### State Management
 
@@ -497,11 +539,20 @@ interface ListenerState {
 | Command | Description |
 |---------|-------------|
 | `/approve N` | Approve escalation with display number N |
+| `/approve+ N` | Approve escalation N and whitelist its exact pattern, the first candidate (a human-only escalation is approved once, never whitelisted) |
+| `/approve+dir N` | Approve escalation N and whitelist its directory-wide pattern (paths widened to their directories, recursively). When the escalation offers none (no path, a refused directory such as the home directory, a human-only escalation), nothing is resolved and the message says so. `/approve+dir all` is refused |
 | `/deny N` | Deny escalation with display number N |
-| `/approve all` | Approve all pending escalations |
+| `/approve all`, `/approve+ all` | Approve nothing yet: list every pending escalation (tool, every argument, reason, and for `/approve+ all` the exact pattern) and print the command, with a code for exactly that set, that approves them |
+| `/approve all <code>`, `/approve+ all <code>` | Approve the listed set, if it is still exactly what is pending; a stale or wrong code is refused and the current set is listed again. Human-only escalations stay pending |
+| `/approve group N`, `/approve+ group N` | Approve nothing yet: list every pending escalation that shares #N's exact whitelist pattern, the one `/approve+` selects (`src/escalation/escalation-groups.ts`; a shared directory-wide pattern forms no group), headed by the pattern, and print the command, with a code for exactly that group, that approves them. Refused when #N is human-only, has no keyed pattern, or is alone in its group; `/approve+dir group N` is refused (directory-wide whitelisting is chosen one escalation at a time) |
+| `/approve group N <code>`, `/approve+ group N <code>` | Approve each member of the listed group once (`+`: also whitelist each one's exact pattern in its session), if the group is still exactly what was listed; otherwise refused, and the current group is listed again |
 | `/deny all` | Deny all pending escalations |
 | `/sessions` | List active sessions with details |
 | `/quit` | Exit the escalation listener |
+
+The code (`bulkApprovalCode` in `listener-command.ts`) is the first six hex digits of a SHA-256 over the pending set (display number, session and escalation id of each) and the variant, so anything that arrives, expires or is resolved after the list was printed voids it, and approving in bulk never covers an escalation the user was not shown (see `docs/designs/mux-escalation-picker-ui.md` section 5.5). The group code (`groupApprovalCode`) is computed the same way over the group's members and its pattern key.
+
+The dashboard shows each escalation's reviewer context: `Task:` and `You said:` (the human's own text, cut to 300 characters) and, apart, `Agent says (untrusted, written by the agent):` with the justification escaped. An escalation that shares its pattern with others says so and names the `/approve group N` command.
 
 The display number `N` in `/approve N` and `/deny N` refers to the escalation display number shown in the "Pending Escalations" section, not the session number. This avoids ambiguity when a single session has multiple escalations (rare but possible with concurrent tool calls).
 
@@ -550,7 +601,7 @@ No flags needed. The listener:
 5. Accepts commands via the input prompt.
 6. On `/quit`, stops all watchers and exits.
 
-**Single-instance enforcement**: On startup, the listener attempts to create a lock file at `~/.ironcurtain/escalation-listener.lock` containing its PID. If the file exists and the PID is alive, it prints an error and exits. The lock file is deleted on clean exit and detected as stale on crash (PID check).
+**Single-instance enforcement**: On startup, the listener takes `~/.ironcurtain/escalation-listener.lock` (`src/escalation/listener-lock.ts`), a `docker-workload/process-lock` record: its pid, OS process-start identity and a random token, written under a unique name and published with an atomic hard link. If a live listener holds it, the new one prints an error and exits. A crashed listener's lock is reclaimed by exactly one starting listener, also when its pid has since been reused by another process (the process-start identity differs). The listener releases the lock on `/quit`, on SIGHUP (its terminal was closed) and SIGTERM, and on any other exit; release removes only the lock it published. It does not watch sessions owned by a live mux (or the web UI daemon), which show their escalations themselves.
 
 ### Updated `cli.ts`
 
@@ -810,7 +861,7 @@ The PTY does not bypass the policy engine. Claude Code inside the container stil
 
 ### Lock File Security
 
-The escalation listener lock file (`~/.ironcurtain/escalation-listener.lock`) should be created with `0600` permissions. The PID inside is validated with `process.kill(pid, 0)` which only succeeds if the calling process has permission to signal the target (same user), preventing PID-spoofing attacks from other users on a shared system.
+The escalation listener lock file (`~/.ironcurtain/escalation-listener.lock`) is created with `0600` permissions. Its owner is adjudicated by pid plus OS process-start identity (`/proc/<pid>/stat` start time and the boot id on Linux, `ps -o lstart` on macOS), never by `process.kill(pid, 0)` alone, so a reused pid is not mistaken for the listener; an owner whose identity cannot be read counts as alive (the lock is not stolen).
 
 ## 11. New Type Definitions
 

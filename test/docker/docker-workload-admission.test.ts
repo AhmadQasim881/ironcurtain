@@ -73,6 +73,8 @@ afterEach(() => {
   Object.defineProperty(process, 'platform', hostPlatformDescriptor);
 });
 
+const CLAUDE_CODE = 'claude-code' as AgentId;
+
 function admittedAppleConfig() {
   return resolveDockerWorkloadConfig({ enabled: true });
 }
@@ -91,7 +93,7 @@ describe('secure nested Docker resolved-variant admission', () => {
         vi.spyOn(process, 'getuid').mockReturnValue(uid);
         vi.spyOn(process, 'getgid').mockReturnValue(gid);
         await expect(
-          ensureDockerImage('claude-code', {
+          ensureDockerImage(CLAUDE_CODE, {
             containerRuntime: 'docker',
             dockerWorkload: resolveDockerWorkloadConfig({ enabled: true, networkAccess }),
           } as ResolvedUserConfig),
@@ -141,7 +143,7 @@ describe('secure nested Docker resolved-variant admission', () => {
     });
     const { ensureDockerImage } = await import('../../src/docker/docker-infrastructure.js');
     await expect(
-      ensureDockerImage('claude-code', {
+      ensureDockerImage(CLAUDE_CODE, {
         containerRuntime: 'auto',
         dockerWorkload: admittedAppleConfig(),
       } as ResolvedUserConfig),
@@ -155,7 +157,7 @@ describe('secure nested Docker resolved-variant admission', () => {
   it('preserves feature-off adapter-before-runtime error ordering', async () => {
     const { ensureDockerImage } = await import('../../src/docker/docker-infrastructure.js');
     await expect(
-      ensureDockerImage('claude-code', {
+      ensureDockerImage(CLAUDE_CODE, {
         containerRuntime: 'auto',
         dockerWorkload: { enabled: false },
       } as ResolvedUserConfig),
@@ -175,7 +177,7 @@ describe('secure nested Docker resolved-variant admission', () => {
     });
     const { ensureDockerImage } = await import('../../src/docker/docker-infrastructure.js');
     await expect(
-      ensureDockerImage('claude-code', {
+      ensureDockerImage(CLAUDE_CODE, {
         containerRuntime: 'apple-container',
         dockerWorkload: admittedAppleConfig(),
       } as ResolvedUserConfig),
@@ -194,10 +196,13 @@ describe('secure nested Docker resolved-variant admission', () => {
       const relayImage = 'ironcurtain-fixed-relay:latest';
       const immutableImageId = `sha256:${'a'.repeat(64)}`;
       const relayImageId = `sha256:${'b'.repeat(64)}`;
+      // Build-hash labels by tag: agent and base images are built under their
+      // build tags and the logical alias is then pointed at the build.
       const buildHashes = new Map<string, string>();
-      const getImageLabel = vi
-        .fn<(reference: string, label: string) => Promise<string | undefined>>()
-        .mockResolvedValue(undefined);
+      const getImageLabel = vi.fn(async (reference: string, label: string) =>
+        label === 'ironcurtain.build-hash' ? buildHashes.get(reference) : undefined,
+      );
+      const agentBuildTag = /^ironcurtain-claude-code:build-[0-9a-f]{16}$/u;
       const buildImage = vi.fn(
         async (tag: string, _dockerfile: string, _context: string, labels?: Record<string, string>) => {
           const buildHash = labels?.['ironcurtain.build-hash'];
@@ -216,10 +221,10 @@ describe('secure nested Docker resolved-variant admission', () => {
           };
         const buildHash = buildHashes.get(reference);
         if (buildHash === undefined) return undefined;
-        if (reference === image) {
+        if (reference === image || agentBuildTag.test(reference)) {
           return {
             id: immutableImageId,
-            repoTags: [image],
+            repoTags: [reference],
             labels: { 'ironcurtain.build-hash': buildHash },
             created: '2026-08-31T00:00:00.000Z',
           };
@@ -235,10 +240,24 @@ describe('secure nested Docker resolved-variant admission', () => {
             created: '2026-08-31T00:00:00.000Z',
           };
         }
+        if (reference === 'ironcurtain-nested-daemon:latest') {
+          return {
+            id: `sha256:${'d'.repeat(64)}`,
+            repoTags: [reference],
+            labels: {
+              'ironcurtain.build-hash': buildHash,
+              'com.ironcurtain.docker-workload.image-role': 'nested-daemon',
+            },
+            created: '2026-08-31T00:00:00.000Z',
+          };
+        }
         return undefined;
       });
       const saveImageArchive = vi.fn();
-      const tagImage = vi.fn();
+      const tagImage = vi.fn(async (source: string, target: string) => {
+        const buildHash = buildHashes.get(source);
+        if (buildHash !== undefined) buildHashes.set(target, buildHash);
+      });
       const loadImageArchive = vi.fn();
       const listImages = vi.fn();
       const removeImage = vi.fn();
@@ -256,7 +275,7 @@ describe('secure nested Docker resolved-variant admission', () => {
       resolveRuntimeKind.mockResolvedValue('docker');
       const { ensureDockerImage } = await import('../../src/docker/docker-infrastructure.js');
 
-      const resolution = await ensureDockerImage('claude-code', {
+      const resolution = await ensureDockerImage(CLAUDE_CODE, {
         containerRuntime: 'docker',
         dockerWorkload: resolveDockerWorkloadConfig({ enabled: true, networkAccess }),
       } as ResolvedUserConfig);
@@ -273,7 +292,9 @@ describe('secure nested Docker resolved-variant admission', () => {
       expect(getImageLabel.mock.calls.some(([reference]) => reference === relayImage)).toBe(expectsRelay);
       expect(inspectImage.mock.calls.some(([reference]) => reference === relayImage)).toBe(expectsRelay);
       expect(saveImageArchive).not.toHaveBeenCalled();
-      expect(tagImage).not.toHaveBeenCalled();
+      // Only the build-tag alias moves: no Apple capture reference is minted.
+      expect(tagImage.mock.calls.every(([, target]) => !target.startsWith('ironcurtain-capture-'))).toBe(true);
+      expect(tagImage).toHaveBeenCalledWith(expect.stringMatching(agentBuildTag), image);
       expect(loadImageArchive).not.toHaveBeenCalled();
       expect(listImages).not.toHaveBeenCalled();
       expect(removeImage).not.toHaveBeenCalled();
@@ -397,6 +418,93 @@ describe('secure nested Docker admission — prepareDockerInfrastructure', () =>
 
     expect(config.activeProviderProfile).toBeUndefined();
     expect(registerBuiltinAdapters).not.toHaveBeenCalled();
+    expect(readdirSync(home)).toEqual([]);
+  });
+});
+
+describe('ordinary Linux Docker sessions run by root (DINF-23)', () => {
+  let home: string;
+  let previousHome: string | undefined;
+  const detectCredential = vi.fn();
+
+  beforeEach(() => {
+    Object.defineProperty(process, 'platform', { ...hostPlatformDescriptor, value: 'linux' });
+    resolveRuntimeKind.mockResolvedValue('docker');
+    registerBuiltinAdapters.mockResolvedValue(undefined);
+    getAgent.mockImplementation(() => ({
+      getImage: async () => 'ironcurtain-claude-code:latest',
+      detectCredential,
+    }));
+    previousHome = process.env.IRONCURTAIN_HOME;
+    home = mkdtempSync(join(tmpdir(), 'root-guard-'));
+    process.env.IRONCURTAIN_HOME = home;
+  });
+
+  afterEach(() => {
+    if (previousHome === undefined) delete process.env.IRONCURTAIN_HOME;
+    else process.env.IRONCURTAIN_HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('refuses before any image build or container runtime work', async () => {
+    vi.spyOn(process, 'getuid').mockReturnValue(0);
+    vi.spyOn(process, 'getgid').mockReturnValue(0);
+    const { ensureDockerImage } = await import('../../src/docker/docker-infrastructure.js');
+    const { ROOT_HOST_IDENTITY_MESSAGE } = await import('../../src/docker/container-identity.js');
+
+    await expect(
+      ensureDockerImage(CLAUDE_CODE, {
+        containerRuntime: 'docker',
+        dockerWorkload: { enabled: false },
+      } as ResolvedUserConfig),
+    ).rejects.toThrow(ROOT_HOST_IDENTITY_MESSAGE);
+
+    // No runtime handle exists, so no build, pull or create can have run.
+    expect(createContainerRuntime).not.toHaveBeenCalled();
+  });
+
+  it('lets a regular user through to runtime work (the guard, not the runtime, stopped root)', async () => {
+    vi.spyOn(process, 'getuid').mockReturnValue(1000);
+    vi.spyOn(process, 'getgid').mockReturnValue(1000);
+    const { ensureDockerImage } = await import('../../src/docker/docker-infrastructure.js');
+
+    await expect(
+      ensureDockerImage(CLAUDE_CODE, {
+        containerRuntime: 'docker',
+        dockerWorkload: { enabled: false },
+      } as ResolvedUserConfig),
+    ).rejects.toThrow(/runtime creation must not run/u);
+    expect(createContainerRuntime).toHaveBeenCalledOnce();
+  });
+
+  it('refuses session preparation before credentials, proxies or containers', async () => {
+    vi.spyOn(process, 'getuid').mockReturnValue(0);
+    vi.spyOn(process, 'getgid').mockReturnValue(1000);
+    const { prepareDockerInfrastructure } = await import('../../src/docker/docker-infrastructure.js');
+    const { ROOT_HOST_IDENTITY_MESSAGE } = await import('../../src/docker/container-identity.js');
+    const config = {
+      auditLogPath: join(home, 'audit.jsonl'),
+      userConfig: {
+        modelProviders: { default: 'native', profiles: { native: { type: 'native' } } },
+        containerRuntime: 'docker',
+        dockerWorkload: { enabled: false },
+      },
+    } as unknown as IronCurtainConfig;
+
+    await expect(
+      prepareDockerInfrastructure(
+        config,
+        { kind: 'docker', agent: 'claude-code' as AgentId },
+        join(home, 'bundle'),
+        join(home, 'workspace'),
+        join(home, 'escalations'),
+        'bundle-root-001' as BundleId,
+      ),
+    ).rejects.toThrow(ROOT_HOST_IDENTITY_MESSAGE);
+
+    expect(detectCredential).not.toHaveBeenCalled();
+    expect(createContainerRuntime).not.toHaveBeenCalled();
+    expect(checkDockerAvailable).not.toHaveBeenCalled();
     expect(readdirSync(home)).toEqual([]);
   });
 });

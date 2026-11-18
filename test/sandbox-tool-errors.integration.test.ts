@@ -36,15 +36,18 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { isDispatchingAuditEntry } from '../src/types/audit.js';
 import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { Sandbox } from '../src/sandbox/index.js';
 import type { IronCurtainConfig } from '../src/config/types.js';
-import type { CompiledPolicyFile, ToolAnnotationsFile } from '../src/pipeline/types.js';
+import type { CompiledPolicyFile, StoredToolAnnotationsFile } from '../src/pipeline/types.js';
 import { testCompiledPolicy, testToolAnnotations, REAL_TMP } from './fixtures/test-policy.js';
 import { isIsolatedVmAvailable } from './helpers/isolated-vm-available.js';
+import { packagedFilesystemServer } from './helpers/filesystem-server.js';
+import { testUserConfig } from './helpers/user-config.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(__dirname, '..');
@@ -93,19 +96,25 @@ function probeSnippet(body: string): string {
 function writeTestArtifacts(
   dir: string,
   compiledPolicy: CompiledPolicyFile,
-  toolAnnotations: ToolAnnotationsFile,
+  toolAnnotations: StoredToolAnnotationsFile,
 ): void {
   mkdirSync(dir, { recursive: true });
   writeFileSync(resolve(dir, 'compiled-policy.json'), JSON.stringify(compiledPolicy));
   writeFileSync(resolve(dir, 'tool-annotations.json'), JSON.stringify(toolAnnotations));
 }
 
-/** Reads the audit log as an array of parsed entries (empty if missing). */
+/**
+ * Reads the audit log's outcome records (empty if missing). The write-ahead
+ * `dispatching` record that precedes each dispatched call is skipped.
+ */
 function readAudit(path: string): Array<Record<string, unknown>> {
   if (!existsSync(path)) return [];
   const raw = readFileSync(path, 'utf-8').trim();
   if (!raw) return [];
-  return raw.split('\n').map((line) => JSON.parse(line) as Record<string, unknown>);
+  return raw
+    .split('\n')
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .filter((entry) => !isDispatchingAuditEntry(entry));
 }
 
 describe.skipIf(!isIsolatedVmAvailable())('Code Mode surfaces backend tool errors as thrown exceptions', () => {
@@ -117,8 +126,7 @@ describe.skipIf(!isIsolatedVmAvailable())('Code Mode surfaces backend tool error
     mcpServers: {
       filesystem: {
         description: 'Read, write, search, and manage files and directories',
-        command: 'npx',
-        args: ['-y', '@modelcontextprotocol/server-filesystem', SANDBOX_DIR],
+        ...packagedFilesystemServer(SANDBOX_DIR),
         sandbox: false,
       },
     },
@@ -132,30 +140,7 @@ describe.skipIf(!isIsolatedVmAvailable())('Code Mode surfaces backend tool error
     constitutionPath: resolve(projectRoot, 'src/config/constitution.md'),
     agentModelId: 'anthropic:claude-sonnet-4-6',
     escalationTimeoutSeconds: 300,
-    userConfig: {
-      agentModelId: 'anthropic:claude-sonnet-4-6',
-      policyModelId: 'anthropic:claude-sonnet-4-6',
-      anthropicApiKey: '',
-      googleApiKey: '',
-      openaiApiKey: '',
-      escalationTimeoutSeconds: 300,
-      resourceBudget: {
-        maxTotalTokens: 1_000_000,
-        maxSteps: 200,
-        maxSessionSeconds: 1800,
-        maxEstimatedCostUsd: 5.0,
-        warnThresholdPercent: 80,
-      },
-      autoCompact: {
-        enabled: false,
-        thresholdTokens: 80_000,
-        keepRecentMessages: 10,
-        summaryModelId: 'anthropic:claude-haiku-4-5',
-      },
-      autoApprove: { enabled: false, modelId: 'anthropic:claude-haiku-4-5' },
-      auditRedaction: { enabled: true },
-      serverCredentials: {},
-    },
+    userConfig: testUserConfig(),
   };
 
   // One sandbox + one filesystem MCP subprocess for all probes. Each

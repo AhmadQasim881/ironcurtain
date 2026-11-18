@@ -1,6 +1,8 @@
 # Evolve Native Workflow — Search-Quality Slice (mid-run cognition promotion + multi-parent sampling + selectable samplers)
 
-Status: **Design — revised; ready to implement.** The M1 seed mechanism (§6.3) has been **empirically verified** (the `runpy` preamble reproducibly seeds the engine's single global `random` with the engine byte-untouched; `random`/`island`/`ucb1` all reproduce same-seed and diverge diff-seed on identical inputs). The central mechanism is sound; this revision corrects the test/gate spec (§11), the §4.5 promotion-branch placement, the §5.3 `--n 1` override, and the multi-parent/rename blast-radius details.
+**Status (2026-11-14):** Implemented (PR #315): mid-run cognition promotion, multi-parent sampling and selectable samplers.
+
+Original status (design phase): **Design — revised; ready to implement.** The M1 seed mechanism (§6.3) has been **empirically verified** (the `runpy` preamble reproducibly seeds the engine's single global `random` with the engine byte-untouched; `random`/`island`/`ucb1` all reproduce same-seed and diverge diff-seed on identical inputs). The central mechanism is sound; this revision corrects the test/gate spec (§11), the §4.5 promotion-branch placement, the §5.3 `--n 1` override, and the multi-parent/rename blast-radius details.
 
 Audience: IronCurtain workflow + docker-infrastructure engineer extending the merged `evolve` workflow package (all six prior increments — single/multi-round hub, human-surface gates, generic experiment harness, correctness slice — are on `master`).
 

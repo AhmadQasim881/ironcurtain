@@ -14,4 +14,5 @@ export const ERROR_PREFIX_ESCALATION_REQUIRED = 'ESCALATION REQUIRED:';
 export const ERROR_PREFIX_ESCALATION_DENIED = 'ESCALATION DENIED:';
 export const ERROR_PREFIX_CIRCUIT_BREAKER = 'CIRCUIT BREAKER:';
 export const ERROR_PREFIX_UNKNOWN_ARGS = 'Unknown argument(s):';
+export const ERROR_PREFIX_UNANNOTATED_ARGS = 'Unannotated argument(s):';
 export const ERROR_PREFIX_MISSING_ANNOTATION = 'Missing annotation for tool:';

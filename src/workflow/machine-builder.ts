@@ -15,8 +15,9 @@ import type {
 import type { AgentConversationId } from '../session/types.js';
 import { guardImplementations } from './guards.js';
 import { stripStatusBlock } from './status-parser.js';
-import { isAgentInvocationError } from './errors.js';
+import { isAgentInvocationError, isResumableWorkflowStop } from './errors.js';
 import { laneScopeEvolveCurrentPath, templateLaneCommand } from './lane-template.js';
+import { toDisplayText } from '../terminal/display-sanitize.js';
 
 // ---------------------------------------------------------------------------
 // Invoke input/result types
@@ -29,6 +30,14 @@ export interface AgentInvokeInput {
   readonly stateId: string;
   readonly stateConfig: AgentStateDefinition;
   readonly context: WorkflowContext;
+  /**
+   * True only when the orchestrator's resume replay re-runs this state from
+   * its start: the run was stopped while the state was executing, so an
+   * earlier attempt may already have done part of the work (written files,
+   * pushed a branch, posted a comment). The agent prompt then carries a
+   * resume notice (`buildAgentCommand`). The machine never sets it.
+   */
+  readonly resumeReplay?: boolean;
 }
 
 /** Result returned by an agent service promise. */
@@ -45,17 +54,25 @@ export interface AgentInvokeResult {
    */
   readonly agentConversationId: AgentConversationId;
   readonly artifacts: Record<string, string>;
-  /** SHA-256 of output artifacts, computed by the orchestrator. */
+  /**
+   * SHA-256 of output artifacts, computed by the orchestrator only for a state
+   * with an `isStalled` transition (the guard below is its sole reader); empty
+   * otherwise, which `isStalled` never treats as a stall.
+   */
   readonly outputHash: string;
-  /** Latest non-empty substantive response body, with status fences removed. */
+  /**
+   * What the state hands to the next one: the `handoff` of its
+   * `workflow_commit` when it gave one, otherwise the latest non-empty
+   * substantive response body, with status fences removed.
+   */
   readonly responseText: string;
   /**
-   * Cumulative workflow-level output-token count at the moment this
-   * agent finished. Copied onto `ctx.totalTokens` by the XState
-   * `updateContextFromAgentResult` assign action. Sourced from the
-   * orchestrator's token-stream bus subscription, which sums every
-   * `message_end.outputTokens` seen for sessions belonging to this
-   * workflow run.
+   * Run-wide total tokens (input, cache and output, over every session of
+   * the run) at the moment this agent finished. Copied onto
+   * `ctx.totalTokens` by the XState `updateContextFromAgentResult` assign
+   * action. Sourced from the orchestrator's `WorkflowUsageMeter`
+   * (workflow-usage.ts), which counts the run's LLM exchanges on the metrics
+   * bus and its builtin sessions' AI SDK usage.
    */
   readonly totalTokens: number;
 }
@@ -66,6 +83,8 @@ export interface DeterministicInvokeInput {
   readonly commands: readonly (readonly string[])[];
   readonly context: WorkflowContext;
   readonly container?: boolean;
+  /** The state's `host: true` acknowledgement; the host runner refuses to run without it. */
+  readonly host?: boolean;
   readonly containerScope?: string;
   readonly timeoutMs?: number;
   readonly resultFile?: string;
@@ -142,6 +161,61 @@ export interface FanOutInvokeResult extends DeterministicInvokeResult {
 }
 
 // ---------------------------------------------------------------------------
+// Invoke input builders
+// ---------------------------------------------------------------------------
+//
+// The single source of the invoke inputs for executable states. The machine's
+// `invoke.input` callbacks and the orchestrator's resume replay
+// (`replayInvokeForRestoredState`, which runs a restored state's service by
+// hand because XState does not re-enter it) both call these, so a replayed
+// state receives exactly what a normal entry would — in particular the
+// lane-templated argv and result path of a deterministic state.
+
+/** Invoke input for a (non-fan-out) agent state. */
+export function buildAgentInvokeInput(
+  stateId: string,
+  config: AgentStateDefinition,
+  context: WorkflowContext,
+): AgentInvokeInput {
+  return { stateId, stateConfig: config, context };
+}
+
+/**
+ * Invoke input for a (non-fan-out) deterministic state. The `run` argv and
+ * the `resultFile` path are lane-templated against `context`: `{laneDir}`,
+ * `{laneRelDir}`, `{laneId}` and friends resolve to the active lane, or to
+ * the default `current/` directory and lane id 0 when no lane is active
+ * (see lane-template.ts). The state's `host: true` acknowledgement is carried
+ * through unchanged: the host runner refuses a host state without it, on a
+ * normal entry and on a resume replay alike.
+ */
+export function buildDeterministicInvokeInput(
+  stateId: string,
+  config: DeterministicStateDefinition,
+  context: WorkflowContext,
+): DeterministicInvokeInput {
+  return {
+    stateId,
+    commands: config.run.map((command) => templateLaneCommand(command, context)),
+    context,
+    container: config.container ?? false,
+    host: config.host,
+    containerScope: config.containerScope,
+    timeoutMs: config.timeoutMs,
+    resultFile: config.resultFile ? laneScopeEvolveCurrentPath(config.resultFile, context) : undefined,
+  };
+}
+
+/** Invoke input for a fan-out parent state (agent- or deterministic-typed). */
+export function buildFanOutInvokeInput(
+  stateId: string,
+  config: ExecutableStateDefinition,
+  context: WorkflowContext,
+): FanOutInvokeInput {
+  return { stateId, stateConfig: config, context };
+}
+
+// ---------------------------------------------------------------------------
 // Build result
 // ---------------------------------------------------------------------------
 
@@ -170,6 +244,34 @@ function extractInvokeResult(event: { output?: unknown }): AgentInvokeResult | u
     return output;
   }
   return undefined;
+}
+
+/**
+ * Cap on the rendered verdict in the `no transition matched` diagnostic. The
+ * verdict is untrusted — a deterministic verdict comes from a result file the
+ * container writes (up to 1 MiB), a guard-only agent's verdict is free-form —
+ * and the diagnostic lands in `lastError`, stderr, the tab, the checkpoint
+ * and the gate summary.
+ */
+const MAX_UNMATCHED_VERDICT_DISPLAY_CHARS = 200;
+
+/**
+ * Human-readable verdict of a settled invoke, for the `no transition matched`
+ * diagnostic: the agent's `output.verdict`, a deterministic / fan-out result's
+ * `verdict`, or — for a guard-only deterministic result that carries no
+ * verdict at all — its pass/fail bit, which is what `isPassed` routed on.
+ * The verdict is JSON-quoted, then rendered with `toDisplayText` so control,
+ * bidi and invisible characters show as escapes and the length is bounded.
+ */
+function describeInvokeVerdict(output: unknown): string {
+  const agentResult = extractInvokeResult({ output });
+  const detResult = output as DeterministicInvokeResult | undefined;
+  const verdict: unknown = agentResult ? agentResult.output.verdict : detResult?.verdict;
+  if (typeof verdict === 'string') {
+    return toDisplayText(JSON.stringify(verdict), { maxLength: MAX_UNMATCHED_VERDICT_DISPLAY_CHARS });
+  }
+  if (agentResult) return 'none';
+  return `none, passed=${detResult?.passed === true}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +373,44 @@ function findErrorTarget(
 }
 
 /**
+ * The terminal a resumable stop lands on: an upstream failure (quota
+ * exhaustion, transient upstream stall) or the run reaching its
+ * `settings.workflowBudget` ceiling. Unlike {@link findErrorTarget} this NEVER
+ * picks a human gate. The orchestrator stamps `quotaExhausted` /
+ * `transientFailure` / `workflowBudgetExhausted` on the instance before the
+ * service rejects, and `handleWorkflowComplete` reads those stamps to force an
+ * abort-preserving terminal phase that keeps the checkpoint resumable. If the run paused at
+ * a gate instead, a human could APPROVE past the turn that never ran, the
+ * stamps would never clear, and a later successful completion would still
+ * be reported as `aborted` (non-zero exit, checkpoint kept, container
+ * snapshot retained). Routing straight to a terminal keeps the documented
+ * "halt immediately, preserve the checkpoint" contract true.
+ *
+ * Preference order is `findErrorTarget`'s with gates removed — `aborted` /
+ * `failed` by name, then any terminal — so workflows whose error target is
+ * already a terminal see no change. `fallback` covers an unvalidated
+ * definition with no terminal at all.
+ */
+function findUpstreamFailureTarget(definition: WorkflowDefinition, fallback: string): string {
+  for (const [id, state] of Object.entries(definition.states)) {
+    if (state.type === 'terminal' && (id === 'aborted' || id === 'failed')) return id;
+  }
+  for (const [id, state] of Object.entries(definition.states)) {
+    if (state.type === 'terminal') return id;
+  }
+  return fallback;
+}
+
+/**
+ * Name of the parameter-less guard that recognises a resumable stop (an
+ * upstream failure or a spend-ceiling stop, see `isResumableWorkflowStop`) on
+ * an `xstate.error.actor.*` event (see {@link buildOnErrorTransitions}).
+ * Double-underscore prefix marks it as builder-internal, like
+ * `__matchesWhen`; it is not a `REGISTERED_GUARDS` entry authors can reference.
+ */
+const RESUMABLE_STOP_GUARD = '__isResumableStop';
+
+/**
  * XState-level action entry. Either a bare action name (for parameter-less
  * actions) or an object with `type` + `params` for parameterized actions.
  */
@@ -299,15 +439,37 @@ function compileAction(action: WorkflowTransitionAction): XStateActionEntry {
   return { type: 'resetVisitCounts', params: { stateIds: action.stateIds } };
 }
 
-// Shared onDone-transition builder for agent and deterministic states: both map a
-// `when:` clause to the __matchesWhen guard, else a bare `guard:`, and run a
-// per-state-type context-update action. Only the update action differs.
+// Shared onDone-transition builder for agent, deterministic and fan-out states:
+// all map a `when:` clause to the __matchesWhen guard, else a bare `guard:`,
+// and run a per-state-type context-update action. Only the update action
+// differs. Two safety properties are added on top of the author's list:
+//
+// - SELF-TARGETS GET `reenter: true`. XState v5 transitions are internal by
+//   default, so a transition back onto the same state neither exits nor
+//   re-enters it: the already-settled invoke is NOT restarted and the entry
+//   action (`incrementVisitCount`) does not run — the state would sit on its
+//   finished invoke forever with no error, gate or terminal. `reenter: true`
+//   makes the self-loop exit and re-enter, which restarts the service with the
+//   updated context and bumps the visit count. A transition to another state
+//   already exits the source, so the flag is only set where it changes
+//   behaviour.
+//
+// - AN IMPLICIT FALLBACK TO THE ERROR TARGET when no author transition is
+//   unconditional. Otherwise a settled invoke whose output matches no guard /
+//   `when` clause (a deterministic verdict outside the table, a guard that is
+//   simply false) drops the done event and hangs the state in the same way.
+//   The fallback records `lastError` via `storeNoTransitionMatched` so the
+//   outcome is visible at the error target (gate summary / failed phase).
+//   `validateTransitionFallbacks` rejects such definitions up front; this is
+//   the defence in depth for definitions that bypass validation.
 function buildOnDoneTransitions(
+  stateId: string,
   transitions: readonly AgentTransitionDefinition[],
   updateAction: string,
+  fallbackTarget: string,
   mapTarget: (transition: AgentTransitionDefinition) => string = (transition) => transition.to,
 ): readonly object[] {
-  return transitions.map((t) => {
+  const compiled: object[] = transitions.map((t) => {
     let guard: string | { type: string; params: { when: Readonly<Record<string, WhenValue>> } } | undefined;
     if (t.when) {
       guard = { type: '__matchesWhen', params: { when: t.when } };
@@ -315,17 +477,65 @@ function buildOnDoneTransitions(
       guard = t.guard;
     }
 
+    const target = mapTarget(t);
     return {
-      target: mapTarget(t),
+      target,
+      ...(target === stateId ? { reenter: true } : {}),
       ...(guard ? { guard } : {}),
       actions: collectTransitionActions(t, updateAction),
     };
   });
+
+  const hasUnconditional = transitions.some((t) => !t.guard && !t.when);
+  if (!hasUnconditional) {
+    compiled.push({ target: fallbackTarget, actions: ['storeNoTransitionMatched'] });
+  }
+  return compiled;
+}
+
+/**
+ * `onError` for an executable state. A resumable stop (quota exhaustion,
+ * transient upstream stall or the spend ceiling, see `isResumableWorkflowStop`)
+ * goes to `upstreamFailureTarget` — always a terminal, see
+ * {@link findUpstreamFailureTarget} — while every other rejection follows the
+ * state's regular error target, which may be a human gate. Both branches run
+ * the same actions so `lastError` (and, for agent states, the conversation id)
+ * is recorded either way. Collapses to a single transition when both targets
+ * coincide (child round machines force every error onto `errored`).
+ */
+function buildOnErrorTransitions(
+  errorTarget: string,
+  upstreamFailureTarget: string,
+  actions: readonly string[],
+): object | readonly object[] {
+  if (upstreamFailureTarget === errorTarget) {
+    return { target: errorTarget, actions: [...actions] };
+  }
+  return [
+    { guard: RESUMABLE_STOP_GUARD, target: upstreamFailureTarget, actions: [...actions] },
+    { target: errorTarget, actions: [...actions] },
+  ];
 }
 
 interface ExecutableStateBuildOptions {
   readonly mapTransitionTarget?: (transition: AgentTransitionDefinition) => string;
   readonly onErrorTarget?: string;
+}
+
+/**
+ * Resolves the two error destinations of an executable state. A forced
+ * `onErrorTarget` (child round machines) wins for both; otherwise the regular
+ * target comes from {@link findErrorTarget} and the upstream-failure target
+ * from {@link findUpstreamFailureTarget}.
+ */
+function resolveErrorTargets(
+  config: AgentStateDefinition | DeterministicStateDefinition,
+  definition: WorkflowDefinition,
+  options: ExecutableStateBuildOptions,
+): { readonly errorTarget: string; readonly upstreamFailureTarget: string } {
+  const errorTarget = options.onErrorTarget ?? findErrorTarget(config, definition);
+  const upstreamFailureTarget = options.onErrorTarget ?? findUpstreamFailureTarget(definition, errorTarget);
+  return { errorTarget, upstreamFailureTarget };
 }
 
 function buildAgentState(
@@ -334,21 +544,24 @@ function buildAgentState(
   definition: WorkflowDefinition,
   options: ExecutableStateBuildOptions = {},
 ): object {
+  const { errorTarget, upstreamFailureTarget } = resolveErrorTargets(config, definition, options);
   return {
     entry: [{ type: 'incrementVisitCount', params: { stateId } }],
     invoke: {
       id: stateId,
       src: 'agentService',
-      input: ({ context }: { context: WorkflowContext }) => ({
+      input: ({ context }: { context: WorkflowContext }) => buildAgentInvokeInput(stateId, config, context),
+      onDone: buildOnDoneTransitions(
         stateId,
-        stateConfig: config,
-        context,
-      }),
-      onDone: buildOnDoneTransitions(config.transitions, 'updateContextFromAgentResult', options.mapTransitionTarget),
-      onError: {
-        target: options.onErrorTarget ?? findErrorTarget(config, definition),
-        actions: ['storeError', 'updateContextFromAgentInvocationError'],
-      },
+        config.transitions,
+        'updateContextFromAgentResult',
+        errorTarget,
+        options.mapTransitionTarget,
+      ),
+      onError: buildOnErrorTransitions(errorTarget, upstreamFailureTarget, [
+        'storeError',
+        'updateContextFromAgentInvocationError',
+      ]),
     },
   };
 }
@@ -359,9 +572,12 @@ function buildDeterministicState(
   definition: WorkflowDefinition,
   options: ExecutableStateBuildOptions = {},
 ): object {
+  const { errorTarget, upstreamFailureTarget } = resolveErrorTargets(config, definition, options);
   const onDoneTransitions = buildOnDoneTransitions(
+    stateId,
     config.transitions,
     'updateContextFromDeterministicResult',
+    errorTarget,
     options.mapTransitionTarget,
   );
 
@@ -369,20 +585,9 @@ function buildDeterministicState(
     invoke: {
       id: stateId,
       src: 'deterministicService',
-      input: ({ context }: { context: WorkflowContext }) => ({
-        stateId,
-        commands: config.run.map((command) => templateLaneCommand(command, context)),
-        context,
-        container: config.container ?? false,
-        containerScope: config.containerScope,
-        timeoutMs: config.timeoutMs,
-        resultFile: config.resultFile ? laneScopeEvolveCurrentPath(config.resultFile, context) : undefined,
-      }),
+      input: ({ context }: { context: WorkflowContext }) => buildDeterministicInvokeInput(stateId, config, context),
       onDone: onDoneTransitions,
-      onError: {
-        target: options.onErrorTarget ?? findErrorTarget(config, definition),
-        actions: ['storeError'],
-      },
+      onError: buildOnErrorTransitions(errorTarget, upstreamFailureTarget, ['storeError']),
     },
   };
 }
@@ -394,23 +599,20 @@ function buildDeterministicState(
  * body, not in the parent's state value, so the parent's `snapshot.value` stays
  * the string `"workers"` (single-active-state spine, §6.4). `onDone` runs
  * `updateContextFromFanOutResult` (promote the joined context) then follows the
- * verdict-matched edge; `onError` routes to the definition's error target.
+ * verdict-matched edge; `onError` routes to the definition's error target —
+ * except for a lane's resumable upstream failure, which `runFanOutSegment`
+ * re-throws at the barrier so it lands on the abort-preserving terminal
+ * (see {@link buildOnErrorTransitions}).
  */
 function buildFanOutState(stateId: string, config: ExecutableStateDefinition, definition: WorkflowDefinition): object {
+  const { errorTarget, upstreamFailureTarget } = resolveErrorTargets(config, definition, {});
   return {
     invoke: {
       id: stateId,
       src: 'fanOutService',
-      input: ({ context }: { context: WorkflowContext }) => ({
-        stateId,
-        stateConfig: config,
-        context,
-      }),
-      onDone: buildOnDoneTransitions(config.transitions, 'updateContextFromFanOutResult'),
-      onError: {
-        target: findErrorTarget(config, definition),
-        actions: ['storeError'],
-      },
+      input: ({ context }: { context: WorkflowContext }) => buildFanOutInvokeInput(stateId, config, context),
+      onDone: buildOnDoneTransitions(stateId, config.transitions, 'updateContextFromFanOutResult', errorTarget),
+      onError: buildOnErrorTransitions(errorTarget, upstreamFailureTarget, ['storeError']),
     },
   };
 }
@@ -583,7 +785,11 @@ export function buildWorkflowMachine(
   // Per-state maxVisits map, built at machine-construction time and
   // closed over by the `isStateVisitLimitReached` guard below. Only
   // agent states can declare `maxVisits`; states without it are absent
-  // from the map and the guard returns false for them.
+  // from the map and the guard returns false for them. The cap is read
+  // ONLY by that guard on the state's own transitions, and only for a
+  // plain agent state (a fan-out parent counts no visits and its result
+  // is not an agent result), so lint WF016 flags a `maxVisits` that no
+  // such transition can ever check.
   const maxVisitsByState = new Map<string, number>();
 
   // For child round machines, every executable member's error path is forced
@@ -734,6 +940,15 @@ export function buildWorkflowMachine(
     return true;
   };
 
+  // Recognises a resumable stop on an `xstate.error.actor.*` event so
+  // `onError` can send it to the abort-preserving terminal instead of a human
+  // gate (see buildOnErrorTransitions). Reads the rejection reason directly;
+  // the agent service wraps it in AgentInvocationError, which the predicate
+  // unwraps.
+  xstateGuards[RESUMABLE_STOP_GUARD] = ({ event }) => {
+    return isResumableWorkflowStop((event as { error?: unknown }).error);
+  };
+
   const machine = setup({
     types: {
       context: {} as WorkflowContext,
@@ -775,11 +990,10 @@ export function buildWorkflowMachine(
             ...context.agentConversationsByState,
             [stateId]: result.agentConversationId,
           },
-          // Sourced from `instance.outputTokens` in the orchestrator,
-          // which subscribes to the token-stream bus and accumulates
-          // `message_end.outputTokens` across every session this workflow
-          // has spawned. The orchestrator always supplies a numeric
-          // cumulative value — the field is required on AgentInvokeResult.
+          // The run-wide total from the orchestrator's usage meter (every
+          // session this workflow has spawned, across resumes). The
+          // orchestrator always supplies a numeric cumulative value — the
+          // field is required on AgentInvokeResult.
           totalTokens: result.totalTokens,
           previousAgentOutput: truncateAgentOutput(stripStatusBlock(result.responseText)),
           previousAgentNotes: output.notes ? truncateAgentOutput(output.notes) : null,
@@ -856,7 +1070,22 @@ export function buildWorkflowMachine(
         }
         // Write directly to stderr to bypass any console hijacking
         // (logger.setup() redirects console.error to a log file).
-        process.stderr.write(`[workflow] storeError action: ${message}\n`);
+        process.stderr.write(`${toDisplayText(`[workflow] storeError action: ${message}`, { maxLength: 4096 })}\n`);
+        return { lastError: message };
+      }),
+      /**
+       * Runs on the implicit fallback transition `buildOnDoneTransitions`
+       * appends when a state has no unconditional transition: the invoke
+       * settled but no author transition matched its output. Records the
+       * offending verdict in `lastError` so the error target (gate summary
+       * or `failed` phase) shows why the state did not route, instead of
+       * the silent permanent hang XState's default (drop the event) gives.
+       */
+      storeNoTransitionMatched: assign(({ event }) => {
+        const doneEvent = event as unknown as { type: string; output?: unknown };
+        const stateId = doneEvent.type.replace('xstate.done.actor.', '');
+        const message = `no transition matched (verdict ${describeInvokeVerdict(doneEvent.output)})`;
+        process.stderr.write(`${toDisplayText(`[workflow] state "${stateId}": ${message}`, { maxLength: 4096 })}\n`);
         return { lastError: message };
       }),
       /**

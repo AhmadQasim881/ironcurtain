@@ -100,8 +100,6 @@
         "docs.oracle.com",
         "cppreference.com",
         "devdocs.io",
-        "readthedocs.io",
-        "*.readthedocs.io",
         "godoc.org",
         "pkg.go.dev",
         "hackage.haskell.org",

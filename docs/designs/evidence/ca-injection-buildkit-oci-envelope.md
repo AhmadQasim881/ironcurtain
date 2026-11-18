@@ -1,7 +1,8 @@
 # BuildKit OCI envelope capture for CA injection
 
+**Status (2026-11-14):** Historical: redacted compatibility evidence, not lifecycle qualification.
+
 **Date:** 2026-08-22
-**Status:** redacted compatibility evidence; not lifecycle qualification
 **Scope:** Apple Container, Docker 29.2.1 embedded BuildKit, pinned runc 1.3.4
 
 ## Result

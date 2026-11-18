@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { writeFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import {
   type ConfigTestEnv,
   setupConfigEnv,
@@ -12,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   select: vi.fn(),
   confirm: vi.fn(),
   text: vi.fn(),
+  password: vi.fn(),
   autocomplete: vi.fn(),
   intro: vi.fn(),
   outro: vi.fn(),
@@ -24,6 +27,7 @@ vi.mock('@clack/prompts', () => ({
   select: (...args: unknown[]) => mocks.select(...args),
   confirm: (...args: unknown[]) => mocks.confirm(...args),
   text: (...args: unknown[]) => mocks.text(...args),
+  password: (...args: unknown[]) => mocks.password(...args),
   autocomplete: (...args: unknown[]) => mocks.autocomplete(...args),
   intro: (...args: unknown[]) => mocks.intro(...args),
   outro: (...args: unknown[]) => mocks.outro(...args),
@@ -32,6 +36,22 @@ vi.mock('@clack/prompts', () => ({
   isCancel: (...args: unknown[]) => mocks.isCancel(...args),
   log: mocks.log,
 }));
+
+// Nested Docker can only be enabled on a supported host. Run the real host
+// check against a simulated host so these flows do not depend on the runner
+// (macOS by default; individual tests switch to native Linux).
+const simulatedHost = vi.hoisted(() => {
+  const current: { platform: NodeJS.Platform; release: string } = { platform: 'darwin', release: '25.0.0' };
+  return { current };
+});
+vi.mock('../src/docker-workload/environment.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/docker-workload/environment.js')>();
+  return {
+    ...actual,
+    unsupportedNestedDockerHostReason: (host?: Parameters<typeof actual.unsupportedNestedDockerHostReason>[0]) =>
+      actual.unsupportedNestedDockerHostReason(host ?? simulatedHost.current),
+  };
+});
 
 // Stub the network fetch in the catalog leaf so interactive-flow tests never hit
 // openrouter.ai. A plain (non-vi.fn) function is immune to clear/restoreAllMocks.
@@ -54,17 +74,21 @@ import {
   formatCost,
   buildSlugOptions,
   slugPromptMode,
+  credentialPromptsFor,
 } from '../src/config/config-command.js';
 import type { ModelCatalogResult, ModelCatalogSource } from '../src/config/openrouter-catalog.js';
 import type { ResolvedUserConfig, UserConfig } from '../src/config/user-config.js';
 import { USER_CONFIG_DEFAULTS, loadUserConfig, maskApiKey } from '../src/config/user-config.js';
+import { defaultSandboxPolicy } from '../src/config/sandbox-policy.js';
 import { DOCKER_WORKLOAD_PACKAGE_NETWORK_WARNING, resolveDockerWorkloadConfig } from '../src/docker-workload/config.js';
+import { testUserConfig } from './helpers/user-config.js';
 
 describe('config-command', () => {
   let env: ConfigTestEnv;
   let savedIsTTY: boolean | undefined;
 
   beforeEach(() => {
+    simulatedHost.current = { platform: 'darwin', release: '25.0.0' };
     env = setupConfigEnv('configcmd');
     savedIsTTY = process.stdin.isTTY;
     Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
@@ -106,6 +130,53 @@ describe('config-command', () => {
     expect(onDisk.policyModelId).toBe('anthropic:claude-sonnet-4-6');
   });
 
+  it('prompts for the credentials a server in ~/.ironcurtain/mcp-servers.json declares', async () => {
+    seedConfig(env.testHome, {});
+    writeFileSync(
+      resolve(env.testHome, 'mcp-servers.json'),
+      JSON.stringify({ notes: { command: '/opt/notes/server', args: [], env: { NOTES_TOKEN: '', MODE: 'fast' } } }),
+      { mode: 0o600 },
+    );
+
+    // Script: Server Credentials -> notes -> (prompted for NOTES_TOKEN) -> Back -> Save -> confirm
+    mocks.select
+      .mockResolvedValueOnce('credentials')
+      .mockResolvedValueOnce('notes')
+      .mockResolvedValueOnce('back')
+      .mockResolvedValueOnce('save');
+    mocks.password.mockResolvedValueOnce('notes-secret');
+    mocks.confirm.mockResolvedValueOnce(true);
+
+    await runConfigCommand();
+
+    const serverMenu = mocks.select.mock.calls
+      .map((call) => call[0] as { message?: string; options?: { value: string }[] })
+      .find((call) => call.message === 'Server Credentials');
+    expect(serverMenu?.options?.map((option) => option.value)).toContain('notes');
+    // A secret prompt, masked like every credential prompt; MODE (a set,
+    // non-credential value) is not asked for.
+    expect(mocks.password).toHaveBeenCalledTimes(1);
+    expect(mocks.password).toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'NOTES_TOKEN (for the notes server):' }),
+    );
+    expect(mocks.text).not.toHaveBeenCalled();
+    const onDisk = readConfig(env.testHome);
+    expect(onDisk.serverCredentials).toEqual({ notes: { NOTES_TOKEN: 'notes-secret' } });
+  });
+
+  it('derives the prompts from declared -e and env slots, with the known hints', () => {
+    expect(credentialPromptsFor('github', undefined).map((hint) => hint.envVar)).toEqual([
+      'GITHUB_PERSONAL_ACCESS_TOKEN',
+    ]);
+    const prompts = credentialPromptsFor('notion', {
+      command: 'docker',
+      args: ['run', '-e', 'NOTION_TOKEN', 'img'],
+      env: { REGION: 'eu' },
+    });
+    expect(prompts).toEqual([{ envVar: 'NOTION_TOKEN', description: 'for the notion server' }]);
+    expect(credentialPromptsFor('plain', { command: 'npx', args: [] })).toEqual([]);
+  });
+
   it('nullable budget field set to null', async () => {
     seedConfig(env.testHome, {
       agentModelId: 'anthropic:claude-sonnet-4-6',
@@ -130,6 +201,57 @@ describe('config-command', () => {
     const onDisk = readConfig(env.testHome);
     const budget = onDisk.resourceBudget as Record<string, unknown>;
     expect(budget.maxSteps).toBeNull();
+  });
+
+  it('labels the token and cost caps with their container-mode scope', async () => {
+    seedConfig(env.testHome, {
+      agentModelId: 'anthropic:claude-sonnet-4-6',
+      policyModelId: 'anthropic:claude-sonnet-4-6',
+      resourceBudget: { ...USER_CONFIG_DEFAULTS.resourceBudget, maxTotalTokens: null },
+    });
+
+    mocks.select
+      .mockResolvedValueOnce('resources') // main menu: Resources
+      .mockResolvedValueOnce('back') // Resource sub: Back
+      .mockResolvedValueOnce('cancel'); // main menu: Cancel
+
+    await runConfigCommand();
+
+    const limitsMenu = mocks.select.mock.calls
+      .map((call) => call[0] as { message?: string; options?: { value: string; hint?: string }[] })
+      .find((call) => call.message === 'Resource Limits');
+    const hint = (value: string) => limitsMenu?.options?.find((option) => option.value === value)?.hint;
+    expect(hint('maxEstimatedCostUsd')).toBe(
+      '$5.00 (container mode: list-price estimate per agent container, enforced at the proxy)',
+    );
+    // No caveat on a disabled cap.
+    expect(hint('maxTotalTokens')).toBe('disabled');
+  });
+
+  it('edits the container pids ceiling and rejects values too small to run an agent', async () => {
+    seedConfig(env.testHome, {
+      agentModelId: 'anthropic:claude-sonnet-4-6',
+      policyModelId: 'anthropic:claude-sonnet-4-6',
+    });
+
+    mocks.select
+      .mockResolvedValueOnce('dockerAgent') // main menu: Docker Agent
+      .mockResolvedValueOnce('dockerResources') // Docker Agent: Container resources
+      .mockResolvedValueOnce('pidsLimit') // resources: Process ceiling
+      .mockResolvedValueOnce('set') // 3-way: set value
+      .mockResolvedValueOnce('back') // resources: Back
+      .mockResolvedValueOnce('back') // Docker Agent: Back
+      .mockResolvedValueOnce('save'); // main menu: Save
+    mocks.text.mockResolvedValueOnce('2048');
+    mocks.confirm.mockResolvedValueOnce(true);
+
+    await runConfigCommand();
+
+    expect(readConfig(env.testHome).dockerResources).toMatchObject({ pidsLimit: 2048 });
+    const prompt = mocks.text.mock.calls[0][0] as { validate: (value: string) => string | undefined };
+    expect(prompt.validate('8')).toMatch(/at least 16/);
+    expect(prompt.validate('64.5')).toMatch(/integer/);
+    expect(prompt.validate('16')).toBeUndefined();
   });
 
   it('cancel discards all changes', async () => {
@@ -174,6 +296,162 @@ describe('config-command', () => {
     expect(mocks.outro).toHaveBeenCalledWith('No changes to save.');
   });
 
+  it('sets the OS sandbox policy from the Security section', async () => {
+    seedConfig(env.testHome, {
+      agentModelId: 'anthropic:claude-sonnet-4-6',
+      policyModelId: 'anthropic:claude-sonnet-4-6',
+      escalationTimeoutSeconds: 300,
+    });
+    const savedPolicy = { iron: process.env.IRONCURTAIN_SANDBOX_POLICY, plain: process.env.SANDBOX_POLICY };
+    delete process.env.IRONCURTAIN_SANDBOX_POLICY;
+    delete process.env.SANDBOX_POLICY;
+    try {
+      // Script: Security -> OS sandbox policy -> Warn -> Back -> Save -> confirm
+      mocks.select
+        .mockResolvedValueOnce('security')
+        .mockResolvedValueOnce('sandboxPolicy')
+        .mockResolvedValueOnce('warn')
+        .mockResolvedValueOnce('back')
+        .mockResolvedValueOnce('save');
+      mocks.confirm.mockResolvedValueOnce(true);
+
+      await runConfigCommand();
+
+      // Before the change the menu shows the platform default.
+      const securityMenu = mocks.select.mock.calls[1][0] as { options: { value: string; hint?: string }[] };
+      expect(securityMenu.options.find((o) => o.value === 'sandboxPolicy')?.hint).toBe(defaultSandboxPolicy());
+      const policyPrompt = mocks.select.mock.calls[2][0] as { options: { value: string }[] };
+      expect(policyPrompt.options.map((o) => o.value)).toEqual(['enforce', 'warn']);
+      const onDisk = readConfig(env.testHome) as Record<string, unknown>;
+      expect(onDisk.sandboxPolicy).toBe('warn');
+    } finally {
+      if (savedPolicy.iron !== undefined) process.env.IRONCURTAIN_SANDBOX_POLICY = savedPolicy.iron;
+      if (savedPolicy.plain !== undefined) process.env.SANDBOX_POLICY = savedPolicy.plain;
+    }
+  });
+
+  it('sets how stale compiled policies are handled from the Security section', async () => {
+    seedConfig(env.testHome, {
+      agentModelId: 'anthropic:claude-sonnet-4-6',
+      policyModelId: 'anthropic:claude-sonnet-4-6',
+      escalationTimeoutSeconds: 300,
+    });
+    // Script: Security -> Stale compiled policies -> Refuse -> Back -> Save -> confirm
+    mocks.select
+      .mockResolvedValueOnce('security')
+      .mockResolvedValueOnce('policyOnStale')
+      .mockResolvedValueOnce('refuse')
+      .mockResolvedValueOnce('back')
+      .mockResolvedValueOnce('save');
+    mocks.confirm.mockResolvedValueOnce(true);
+
+    await runConfigCommand();
+
+    const mainMenu = mocks.select.mock.calls[0][0] as { options: { value: string; label: string }[] };
+    expect(mainMenu.options.find((o) => o.value === 'security')?.label).toContain('stale policies: warn');
+    const securityMenu = mocks.select.mock.calls[1][0] as { options: { value: string; hint?: string }[] };
+    expect(securityMenu.options.find((o) => o.value === 'policyOnStale')?.hint).toBe('warn');
+    const prompt = mocks.select.mock.calls[2][0] as { options: { value: string }[] };
+    expect(prompt.options.map((o) => o.value)).toEqual(['warn', 'refuse']);
+    const onDisk = readConfig(env.testHome) as Record<string, unknown>;
+    expect(onDisk.policy).toEqual({ onStale: 'refuse' });
+  });
+
+  it('sets the LLM interaction log mode from the Security section', async () => {
+    seedConfig(env.testHome, {});
+    // Script: Security -> LLM interaction log -> Full -> Back -> Save -> confirm
+    mocks.select
+      .mockResolvedValueOnce('security')
+      .mockResolvedValueOnce('llmInteractionLog')
+      .mockResolvedValueOnce('full')
+      .mockResolvedValueOnce('back')
+      .mockResolvedValueOnce('save');
+    mocks.confirm.mockResolvedValueOnce(true);
+
+    await runConfigCommand();
+
+    const securityMenu = mocks.select.mock.calls[1][0] as { options: { value: string; hint?: string }[] };
+    expect(securityMenu.options.find((o) => o.value === 'llmInteractionLog')?.hint).toBe('metadata');
+    const modePrompt = mocks.select.mock.calls[2][0] as { options: { value: string }[]; initialValue: string };
+    expect(modePrompt.options.map((o) => o.value)).toEqual(['off', 'metadata', 'full']);
+    expect(modePrompt.initialValue).toBe('metadata');
+    expect((readConfig(env.testHome) as Record<string, unknown>).observability).toEqual({ llmInteractionLog: 'full' });
+  });
+
+  it('saves the chosen OS sandbox policy even when an env override already forces that value', async () => {
+    // config.json says "warn"; the environment temporarily forces "enforce".
+    // Choosing "enforce" must still be written to the file, otherwise
+    // unsetting the variable would silently bring "warn" back.
+    seedConfig(env.testHome, {
+      agentModelId: 'anthropic:claude-sonnet-4-6',
+      policyModelId: 'anthropic:claude-sonnet-4-6',
+      escalationTimeoutSeconds: 300,
+      sandboxPolicy: 'warn',
+    });
+    const savedPolicy = { iron: process.env.IRONCURTAIN_SANDBOX_POLICY, plain: process.env.SANDBOX_POLICY };
+    delete process.env.SANDBOX_POLICY;
+    process.env.IRONCURTAIN_SANDBOX_POLICY = 'enforce';
+    try {
+      // Script: Security -> OS sandbox policy -> Enforce -> Back -> Save -> confirm
+      mocks.select
+        .mockResolvedValueOnce('security')
+        .mockResolvedValueOnce('sandboxPolicy')
+        .mockResolvedValueOnce('enforce')
+        .mockResolvedValueOnce('back')
+        .mockResolvedValueOnce('save');
+      mocks.confirm.mockResolvedValueOnce(true);
+
+      await runConfigCommand();
+
+      // The menus show the saved value and name the override.
+      const mainMenu = mocks.select.mock.calls[0][0] as { options: { value: string; label: string }[] };
+      expect(mainMenu.options.find((o) => o.value === 'security')?.label).toContain(
+        'OS sandbox: warn (overridden by IRONCURTAIN_SANDBOX_POLICY=enforce)',
+      );
+      const securityMenu = mocks.select.mock.calls[1][0] as { options: { value: string; hint?: string }[] };
+      expect(securityMenu.options.find((o) => o.value === 'sandboxPolicy')?.hint).toBe(
+        'warn (overridden by IRONCURTAIN_SANDBOX_POLICY=enforce)',
+      );
+      expect(mocks.log.warn).toHaveBeenCalledWith(expect.stringContaining('IRONCURTAIN_SANDBOX_POLICY=enforce'));
+      expect(mocks.outro).not.toHaveBeenCalledWith('No changes to save.');
+      expect((readConfig(env.testHome) as Record<string, unknown>).sandboxPolicy).toBe('enforce');
+    } finally {
+      if (savedPolicy.iron === undefined) delete process.env.IRONCURTAIN_SANDBOX_POLICY;
+      else process.env.IRONCURTAIN_SANDBOX_POLICY = savedPolicy.iron;
+      if (savedPolicy.plain !== undefined) process.env.SANDBOX_POLICY = savedPolicy.plain;
+    }
+  });
+
+  it('enables taint escalation from the Security section, keeping any per-tool classes', async () => {
+    seedConfig(env.testHome, {
+      agentModelId: 'anthropic:claude-sonnet-4-6',
+      policyModelId: 'anthropic:claude-sonnet-4-6',
+      escalationTimeoutSeconds: 300,
+      taintEscalation: { tools: { 'slack/post_message': 'sink' } },
+    });
+
+    // Script: Security -> Taint escalation -> yes -> Back -> Save -> confirm
+    mocks.select
+      .mockResolvedValueOnce('security')
+      .mockResolvedValueOnce('taintEscalation')
+      .mockResolvedValueOnce('back')
+      .mockResolvedValueOnce('save');
+    mocks.confirm.mockResolvedValueOnce(true).mockResolvedValueOnce(true);
+
+    await runConfigCommand();
+
+    // Off by default, and shown as such before the change.
+    const mainMenu = mocks.select.mock.calls[0][0] as { options: { value: string; label: string }[] };
+    expect(mainMenu.options.find((o) => o.value === 'security')?.label).toContain('taint escalation: off');
+    const securityMenu = mocks.select.mock.calls[1][0] as { options: { value: string; hint?: string }[] };
+    expect(securityMenu.options.find((o) => o.value === 'taintEscalation')?.hint).toBe('off');
+    expect(readConfig(env.testHome).taintEscalation).toEqual({
+      enabled: true,
+      tools: { 'slack/post_message': 'sink' },
+    });
+    expect(loadUserConfig({ readOnly: true }).taintEscalation?.enabled).toBe(true);
+  });
+
   it('Web Search section appears in main menu', async () => {
     seedConfig(env.testHome, {
       agentModelId: 'anthropic:claude-sonnet-4-6',
@@ -215,7 +493,7 @@ describe('config-command', () => {
       .mockResolvedValueOnce('brave') // Provider: brave
       .mockResolvedValueOnce('back') // Web Search: Back
       .mockResolvedValueOnce('save'); // main menu: Save
-    mocks.text.mockResolvedValueOnce('test-brave-key-123'); // API key
+    mocks.password.mockResolvedValueOnce('test-brave-key-123'); // API key (masked prompt)
     mocks.confirm.mockResolvedValueOnce(true); // confirm save
 
     await runConfigCommand();
@@ -225,6 +503,8 @@ describe('config-command', () => {
     const ws = onDisk.webSearch as Record<string, unknown>;
     expect(ws.provider).toBe('brave');
     expect(ws.brave).toEqual({ apiKey: 'test-brave-key-123' });
+    // The key is typed into a masked prompt, never an echoing text prompt.
+    expect(mocks.text).not.toHaveBeenCalled();
   });
 
   it('Model Providers section appears in main menu', async () => {
@@ -248,6 +528,28 @@ describe('config-command', () => {
     const firstCall = mocks.select.mock.calls[0][0] as { options: { value: string }[] };
     expect(firstCall.options.some((o) => o.value === 'modelProviders')).toBe(true);
     expect(mocks.outro).toHaveBeenCalledWith('No changes to save.');
+  });
+
+  it('opts in to the outbound content checks and their LLM check from the Security section', async () => {
+    seedConfig(env.testHome, {});
+    // Script: Security -> content checks (yes) -> LLM check (yes) -> Back -> Save -> confirm
+    mocks.select
+      .mockResolvedValueOnce('security')
+      .mockResolvedValueOnce('contentAssessmentEnabled')
+      .mockResolvedValueOnce('contentAssessmentLlm')
+      .mockResolvedValueOnce('back')
+      .mockResolvedValueOnce('save');
+    mocks.confirm.mockResolvedValueOnce(true).mockResolvedValueOnce(true).mockResolvedValueOnce(true);
+
+    await runConfigCommand();
+
+    // Both checks start off.
+    const securityMenu = mocks.select.mock.calls[1][0] as { options: { value: string; hint?: string }[] };
+    expect(securityMenu.options.find((o) => o.value === 'contentAssessmentEnabled')?.hint).toBe('off');
+    expect(securityMenu.options.find((o) => o.value === 'contentAssessmentLlm')?.hint).toBe('off');
+    const mainMenu = mocks.select.mock.calls[0][0] as { options: { value: string; label: string }[] };
+    expect(mainMenu.options.find((o) => o.value === 'security')?.label).toContain('content checks: off');
+    expect(readConfig(env.testHome).contentAssessment).toMatchObject({ enabled: true, llmCheck: true });
   });
 
   it('can explicitly opt out of default-on LLM statistics', async () => {
@@ -283,9 +585,8 @@ describe('config-command', () => {
       .mockResolvedValueOnce('openrouter') // Model Providers: Add profile
       .mockResolvedValueOnce('back') // Model Providers: Back
       .mockResolvedValueOnce('save'); // main menu: Save
-    mocks.text
-      .mockResolvedValueOnce('glm-5.2') // profile name
-      .mockResolvedValueOnce('sk-or-v1-testkey-abcdef'); // api key
+    mocks.text.mockResolvedValueOnce('glm-5.2'); // profile name
+    mocks.password.mockResolvedValueOnce('sk-or-v1-testkey-abcdef'); // api key (masked prompt)
     mocks.confirm.mockResolvedValueOnce(true); // confirm save
 
     await runConfigCommand();
@@ -352,16 +653,18 @@ describe('config-command', () => {
         .mockResolvedValueOnce('back')
         .mockResolvedValueOnce('back')
         .mockResolvedValueOnce('save');
-      mocks.text.mockResolvedValueOnce('');
+      mocks.password.mockResolvedValueOnce('');
       mocks.confirm.mockResolvedValueOnce(true);
 
       await runConfigCommand();
 
-      expect(mocks.text).toHaveBeenCalledWith(
+      // A masked prompt has no placeholder, so the hint is part of the message.
+      expect(mocks.password).toHaveBeenCalledWith(
         expect.objectContaining({
-          placeholder: `leave blank to clear the stored key and use ${credentialEnv} env`,
+          message: expect.stringContaining(`leave blank to clear the stored key and use ${credentialEnv} env`),
         }),
       );
+      expect(mocks.text).not.toHaveBeenCalled();
       const stored = readConfig(env.testHome).modelProviders as { profiles: Record<string, { apiKey?: string }> };
       expect(stored.profiles.gateway.apiKey).toBeUndefined();
       expect(loadUserConfig().modelProviders.profiles.gateway).toMatchObject({ apiKey: 'dummy-environment-key' });
@@ -369,6 +672,102 @@ describe('config-command', () => {
       if (saved === undefined) delete process.env[credentialEnv];
       else process.env[credentialEnv] = saved;
     }
+  });
+
+  it('collects server credentials with masked prompts; only the variable name is echoed', async () => {
+    seedConfig(env.testHome, {});
+    // Guided flow (github), then the generic flow (fetch has no hints): add one credential.
+    mocks.select
+      .mockResolvedValueOnce('credentials') // main menu: Server Credentials
+      .mockResolvedValueOnce('github') // server
+      .mockResolvedValueOnce('fetch') // server (generic flow)
+      .mockResolvedValueOnce('add') // Credentials for fetch: Add credential
+      .mockResolvedValueOnce('back') // server list: Back
+      .mockResolvedValueOnce('save'); // main menu: Save
+    mocks.password
+      .mockResolvedValueOnce('ghp_dummy_token_value') // GITHUB_PERSONAL_ACCESS_TOKEN
+      .mockResolvedValueOnce('dummy-fetch-secret'); // value for the generic credential
+    mocks.text.mockResolvedValueOnce('FETCH_API_KEY'); // generic: variable name
+    mocks.confirm.mockResolvedValueOnce(true);
+
+    await runConfigCommand();
+
+    expect(readConfig(env.testHome).serverCredentials).toEqual({
+      github: { GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_dummy_token_value' },
+      fetch: { FETCH_API_KEY: 'dummy-fetch-secret' },
+    });
+    expect(mocks.password).toHaveBeenCalledTimes(2);
+    expect(mocks.text).toHaveBeenCalledTimes(1);
+    expect(mocks.text).toHaveBeenCalledWith(expect.objectContaining({ message: 'Environment variable name:' }));
+  });
+
+  it('keeps a stored server credential when its masked prompt is left blank', async () => {
+    seedConfig(env.testHome, { serverCredentials: { github: { GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_stored_value' } } });
+    mocks.select
+      .mockResolvedValueOnce('credentials')
+      .mockResolvedValueOnce('github')
+      .mockResolvedValueOnce('back')
+      .mockResolvedValueOnce('save');
+    mocks.password.mockResolvedValueOnce('');
+
+    await runConfigCommand();
+
+    expect(mocks.password).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringContaining('leave blank to keep the current value') }),
+    );
+    expect(readConfig(env.testHome).serverCredentials).toEqual({
+      github: { GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_stored_value' },
+    });
+  });
+
+  it('warns when a host role bound to OpenRouter would send it a bare, unmapped model ID', async () => {
+    seedConfig(env.testHome, {
+      agentModelId: 'openai:gpt-5',
+      modelProviders: { profiles: { router: { type: 'openrouter', apiKey: 'sk-or-v1-dummy-key-abcdef' } } },
+    });
+    mocks.select
+      .mockResolvedValueOnce('modelProviders')
+      .mockResolvedValueOnce('hostModels')
+      .mockResolvedValueOnce('agent') // role
+      .mockResolvedValueOnce('router') // bind it to the OpenRouter profile
+      .mockResolvedValueOnce('summary') // role (anthropic:claude-haiku-4-5 maps through the default map)
+      .mockResolvedValueOnce('router')
+      .mockResolvedValueOnce('back') // host model profiles: Back
+      .mockResolvedValueOnce('back') // Model Providers: Back
+      .mockResolvedValueOnce('save');
+    mocks.confirm.mockResolvedValueOnce(true);
+
+    await runConfigCommand();
+
+    const warnings = mocks.log.warn.mock.calls.map((call) => String(call[0]));
+    expect(warnings.some((w) => w.includes('Host role "agent"') && w.includes('"gpt-5"'))).toBe(true);
+    expect(warnings.some((w) => w.includes('Host role "summary"'))).toBe(false);
+    expect(readConfig(env.testHome).hostModelProfiles).toEqual({ agent: 'router', summary: 'router' });
+  });
+
+  it('judges the outbound content check role by its pending model when binding it to a gateway', async () => {
+    seedConfig(env.testHome, {
+      modelProviders: { profiles: { router: { type: 'openrouter', apiKey: 'sk-or-v1-dummy-key-abcdef' } } },
+    });
+    mocks.select
+      .mockResolvedValueOnce('security')
+      .mockResolvedValueOnce('contentAssessmentModel')
+      .mockResolvedValueOnce('openai:gpt-4o-mini') // the check's model (pending, not saved)
+      .mockResolvedValueOnce('back') // Security: Back
+      .mockResolvedValueOnce('modelProviders')
+      .mockResolvedValueOnce('hostModels')
+      .mockResolvedValueOnce('contentAssessment') // role
+      .mockResolvedValueOnce('router') // bind it to the OpenRouter profile
+      .mockResolvedValueOnce('back') // host model profiles: Back
+      .mockResolvedValueOnce('back') // Model Providers: Back
+      .mockResolvedValueOnce('cancel'); // discard: only the bind-time warning is printed
+
+    await runConfigCommand();
+
+    const warnings = mocks.log.warn.mock.calls.map((call) => String(call[0]));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('Host role "contentAssessment" (profile "router")');
+    expect(warnings[0]).toContain('"gpt-4o-mini"');
   });
 
   it('deleting the default-pointed profile re-points default to native (F10)', async () => {
@@ -488,6 +887,67 @@ describe('config-command', () => {
     expect(pendingNote?.[0]).toBe('  dockerWorkload.enabled: off -> on');
   });
 
+  it('refuses to enable nested Docker on native Linux with a clear message', async () => {
+    simulatedHost.current = { platform: 'linux', release: '7.0.0-42-generic' };
+    seedConfig(env.testHome, {
+      agentModelId: 'anthropic:claude-sonnet-4-6',
+      policyModelId: 'anthropic:claude-sonnet-4-6',
+    });
+
+    mocks.select
+      .mockResolvedValueOnce('dockerAgent')
+      .mockResolvedValueOnce('nestedDocker')
+      .mockResolvedValueOnce('enabled')
+      .mockResolvedValueOnce('back')
+      .mockResolvedValueOnce('back')
+      .mockResolvedValueOnce('save');
+
+    await runConfigCommand();
+
+    expect(mocks.log.error).toHaveBeenCalledWith(
+      'Nested Docker is not yet supported on native Linux (Docker Engine or Docker Desktop for Linux). It requires macOS with Docker Desktop or Apple Container, or Windows with WSL2 and Docker Desktop. Nested Docker stays off.',
+    );
+    // Refused before the enable prompt; nothing to save.
+    expect(mocks.confirm).not.toHaveBeenCalled();
+    expect(mocks.outro).toHaveBeenCalledWith('No changes to save.');
+    expect(readConfig(env.testHome).dockerWorkload).toBeUndefined();
+    type MenuOption = { value: string; hint?: string };
+    const nestedMenu = mocks.select.mock.calls
+      .map((call) => call[0] as { message?: string; options?: MenuOption[] })
+      .find((call) => call.message === 'Nested Docker');
+    expect(nestedMenu?.options?.find((option) => option.value === 'enabled')?.hint).toBe(
+      'off (not supported on this host)',
+    );
+  });
+
+  it('lets native Linux turn an already-enabled nested Docker off and warns that it breaks sessions', async () => {
+    simulatedHost.current = { platform: 'linux', release: '7.0.0-42-generic' };
+    seedConfig(env.testHome, {
+      agentModelId: 'anthropic:claude-sonnet-4-6',
+      policyModelId: 'anthropic:claude-sonnet-4-6',
+      dockerWorkload: { enabled: true, networkAccess: 'images' },
+    });
+
+    mocks.select
+      .mockResolvedValueOnce('dockerAgent')
+      .mockResolvedValueOnce('nestedDocker')
+      .mockResolvedValueOnce('enabled')
+      .mockResolvedValueOnce('back')
+      .mockResolvedValueOnce('back')
+      .mockResolvedValueOnce('save');
+    mocks.confirm
+      .mockResolvedValueOnce(false) // turn nested Docker off
+      .mockResolvedValueOnce(true); // save changes
+
+    await runConfigCommand();
+
+    expect(mocks.log.warn).toHaveBeenCalledWith(
+      expect.stringContaining('every Docker agent session on this host fails'),
+    );
+    expect(mocks.log.error).not.toHaveBeenCalled();
+    expect(readConfig(env.testHome).dockerWorkload).toMatchObject({ enabled: false });
+  });
+
   it('persists offline as the network-access choice', async () => {
     seedConfig(env.testHome, {
       agentModelId: 'anthropic:claude-sonnet-4-6',
@@ -549,35 +1009,13 @@ describe('config-command', () => {
 });
 
 describe('computeDiff', () => {
-  const resolved: ResolvedUserConfig = {
-    agentModelId: 'anthropic:claude-sonnet-4-6',
-    policyModelId: 'anthropic:claude-sonnet-4-6',
-    anthropicApiKey: '',
-    googleApiKey: '',
-    openaiApiKey: '',
-    escalationTimeoutSeconds: 300,
-    resourceBudget: {
-      maxTotalTokens: 1_000_000,
-      maxSteps: 200,
-      maxSessionSeconds: 1800,
-      maxEstimatedCostUsd: 5.0,
-      warnThresholdPercent: 80,
-    },
+  // Defaults with auto-compaction and statistics on (as loaded), plus one OpenRouter profile.
+  const resolved: ResolvedUserConfig = testUserConfig({
     autoCompact: {
       enabled: true,
       thresholdTokens: 160_000,
       keepRecentMessages: 10,
       summaryModelId: 'anthropic:claude-haiku-4-5',
-    },
-    autoApprove: {
-      enabled: false,
-      modelId: 'anthropic:claude-haiku-4-5',
-    },
-    webSearch: {
-      provider: null,
-      brave: null,
-      tavily: null,
-      serpapi: null,
     },
     modelProviders: {
       default: 'native',
@@ -590,15 +1028,15 @@ describe('computeDiff', () => {
             { match: '*sonnet*', model: 'z-ai/glm-5.2' },
             { match: '*opus*', model: 'z-ai/glm-5.2' },
           ],
+          usesDefaultMap: false,
           perAgent: { 'claude-code': undefined, goose: 'z-ai/glm-5.2', codex: undefined },
           providerPreference: { order: ['z-ai'] },
           sessionAffinity: true,
         },
       },
     },
-    serverCredentials: {},
     statistics: { enabled: true, retentionDays: 90 },
-  };
+  });
 
   it('returns empty array when no changes', () => {
     expect(computeDiff(resolved, {})).toEqual([]);
@@ -612,12 +1050,48 @@ describe('computeDiff', () => {
     expect(diffs).toEqual([['agentModelId', { from: 'anthropic:claude-sonnet-4-6', to: 'anthropic:claude-opus-4-6' }]]);
   });
 
+  it('detects turning agent sudo off', () => {
+    const withSudo = { ...resolved, agentSudo: true } as ResolvedUserConfig;
+    expect(computeDiff(withSudo, { agentSudo: false })).toEqual([['agentSudo', { from: true, to: false }]]);
+    expect(computeDiff(withSudo, { agentSudo: true })).toEqual([]);
+  });
+
   it('detects nested changes', () => {
     const pending: UserConfig = {
       resourceBudget: { maxSteps: null },
     };
     const diffs = computeDiff(resolved, pending);
     expect(diffs).toEqual([['resourceBudget.maxSteps', { from: 200, to: null }]]);
+  });
+
+  it('detects an OS sandbox policy change', () => {
+    const withPolicy = { ...resolved, sandboxPolicy: 'enforce' } as ResolvedUserConfig;
+    expect(computeDiff(withPolicy, { sandboxPolicy: 'warn' })).toEqual([
+      ['sandboxPolicy', { from: 'enforce', to: 'warn' }],
+    ]);
+    expect(computeDiff(withPolicy, { sandboxPolicy: 'enforce' })).toEqual([]);
+  });
+
+  it('detects a stale-policy handling change', () => {
+    const withPolicy = { ...resolved, policy: { onStale: 'warn' } } as ResolvedUserConfig;
+    expect(computeDiff(withPolicy, { policy: { onStale: 'refuse' } })).toEqual([
+      ['policy.onStale', { from: 'warn', to: 'refuse' }],
+    ]);
+    expect(computeDiff(withPolicy, { policy: { onStale: 'warn' } })).toEqual([]);
+  });
+
+  it('detects an LLM interaction log mode change', () => {
+    const withMode = { ...resolved, observability: { llmInteractionLog: 'metadata' } } as ResolvedUserConfig;
+    expect(computeDiff(withMode, { observability: { llmInteractionLog: 'off' } })).toEqual([
+      ['observability.llmInteractionLog', { from: 'metadata', to: 'off' }],
+    ]);
+    expect(computeDiff(withMode, { observability: { llmInteractionLog: 'metadata' } })).toEqual([]);
+  });
+
+  it('reports the outbound content check opt-in against the default-off resolved value', () => {
+    expect(computeDiff(resolved, { contentAssessment: { enabled: true } })).toEqual([
+      ['contentAssessment.enabled', { from: false, to: true }],
+    ]);
   });
 
   it('reports statistics opt-out against the default-on resolved value', () => {

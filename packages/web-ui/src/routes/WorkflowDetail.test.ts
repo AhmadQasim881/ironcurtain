@@ -8,6 +8,7 @@ import type {
   MessageLogEntry,
   MessageLogResponseDto,
   WorkflowBudgetDto,
+  WorkflowEscalationDto,
 } from '$lib/types.js';
 import { tick } from 'svelte';
 import { RpcError } from '$lib/ws-client.js';
@@ -33,19 +34,29 @@ const {
   mockGetWorkflowFileTree,
   mockGetWorkflowFileContent,
   mockGetWorkflowArtifacts,
+  mockGetWorkflowArtifactFile,
   mockGetWorkflowMessageLog,
+  mockGetWorkflowMessageLogEntry,
+  mockResolveWorkflowEscalation,
   mockAppState,
 } = vi.hoisted(() => ({
   mockGetWorkflowBudget: vi.fn<(id: string) => Promise<WorkflowBudgetDto>>(),
   mockGetWorkflowDetail: vi.fn<(id: string) => Promise<WorkflowDetailDto>>(),
-  mockResolveWorkflowGate: vi.fn<(id: string, event: string, prompt?: string) => Promise<void>>(),
+  mockResolveWorkflowGate: vi.fn<(id: string, gateId: string, event: string, prompt?: string) => Promise<void>>(),
   mockGetWorkflowFileTree: vi.fn(),
   mockGetWorkflowFileContent: vi.fn(),
   mockGetWorkflowArtifacts: vi.fn(),
+  mockGetWorkflowArtifactFile: vi.fn(),
   mockGetWorkflowMessageLog:
     vi.fn<(id: string, opts?: { before?: string; limit?: number }) => Promise<MessageLogResponseDto>>(),
+  mockGetWorkflowMessageLogEntry: vi.fn(),
+  mockResolveWorkflowEscalation:
+    vi.fn<(id: string, escalationId: string, decision: string, whitelistSelection?: number) => Promise<void>>(),
   mockAppState: {
+    workflowReviewErrors: new Map<string, string>(),
+    refreshErrors: {} as Record<string, string>,
     pendingGates: new Map<string, HumanGateRequestDto>(),
+    pendingWorkflowEscalations: new Map<string, WorkflowEscalationDto>(),
   },
 }));
 
@@ -55,12 +66,25 @@ vi.mock('$lib/stores.svelte.js', () => ({
   connectionGeneration: { value: 0 },
   getWorkflowDetail: (...args: unknown[]) => mockGetWorkflowDetail(...(args as [string])),
   resolveWorkflowGate: (...args: unknown[]) =>
-    mockResolveWorkflowGate(...(args as [string, string, string | undefined])),
+    mockResolveWorkflowGate(...(args as [string, string, string, string | undefined])),
+  // Mirrors the store: the detail's gate replaces every entry for that workflow.
+  syncWorkflowGateFromDetail: (workflowId: string, detail: WorkflowDetailDto) => {
+    const next = new Map<string, HumanGateRequestDto>();
+    for (const [gateId, gate] of mockAppState.pendingGates) {
+      if (gate.workflowId !== workflowId) next.set(gateId, gate);
+    }
+    if (detail.phase === 'waiting_human' && detail.gate) next.set(detail.gate.gateId, detail.gate);
+    mockAppState.pendingGates = next;
+  },
+  resolveWorkflowEscalation: (...args: unknown[]) =>
+    mockResolveWorkflowEscalation(...(args as [string, string, string, number | undefined])),
   getWorkflowFileTree: (...args: unknown[]) => mockGetWorkflowFileTree(...args),
   getWorkflowFileContent: (...args: unknown[]) => mockGetWorkflowFileContent(...args),
   getWorkflowArtifacts: (...args: unknown[]) => mockGetWorkflowArtifacts(...args),
+  getWorkflowArtifactFile: (...args: unknown[]) => mockGetWorkflowArtifactFile(...args),
   getWorkflowMessageLog: (...args: unknown[]) =>
     mockGetWorkflowMessageLog(...(args as [string, { before?: string; limit?: number } | undefined])),
+  getWorkflowMessageLogEntry: (...args: unknown[]) => mockGetWorkflowMessageLogEntry(...args),
   getWorkflowReadme: () => Promise.resolve({ content: '# Readme' }),
 }));
 
@@ -168,6 +192,7 @@ function makeProps(overrides: Record<string, unknown> = {}) {
 describe('WorkflowDetail', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    vi.spyOn(document, 'hasFocus').mockReturnValue(true);
     // `restoreAllMocks` does not reset the call history of the hoisted
     // `vi.fn()` instances; explicitly clear so per-test assertions on
     // call counts (e.g. message-log fetch counts) start from zero.
@@ -178,8 +203,12 @@ describe('WorkflowDetail', () => {
     mockGetWorkflowFileTree.mockReset();
     mockGetWorkflowFileContent.mockReset();
     mockGetWorkflowArtifacts.mockReset();
+    mockGetWorkflowArtifactFile.mockReset();
+    mockGetWorkflowMessageLogEntry.mockReset();
     mockGetWorkflowMessageLog.mockReset();
     mockAppState.pendingGates = new Map();
+    mockAppState.pendingWorkflowEscalations = new Map();
+    mockResolveWorkflowEscalation.mockReset();
     mockGetWorkflowDetail.mockResolvedValue(makeDetail());
     // WorkspaceBrowser's FileTree calls fetchFileTree on mount
     mockGetWorkflowFileTree.mockResolvedValue({ entries: [] });
@@ -260,6 +289,71 @@ describe('WorkflowDetail', () => {
       expect(screen.getByText('/tmp/wf-workspace')).toBeTruthy();
       expect(screen.getByText('Automated code review workflow')).toBeTruthy();
     });
+  });
+
+  it('shows run-wide tokens with their breakdown, marking a partial total as a lower bound', async () => {
+    mockGetWorkflowDetail.mockResolvedValue(
+      makeDetail({
+        usage: {
+          inputTokens: 52_000,
+          cacheReadTokens: 40_000,
+          cacheWriteTokens: 2_000,
+          outputTokens: 3_000,
+          totalTokens: 55_000,
+          estimatedCostUsd: 1.2,
+          activeSeconds: 300,
+          observedExchanges: 9,
+          incompleteExchanges: 1,
+          unmeasuredExchanges: 0,
+          meteredSessions: 2,
+          reportedSessions: 0,
+          untrackedSessions: 0,
+          lowerBound: true,
+          tokenTrackingStatus: 'partial',
+        },
+      }),
+    );
+    render(WorkflowDetail, { props: makeProps() });
+
+    await vi.waitFor(() => {
+      expect(screen.getByTestId('workflow-total-tokens').textContent).toBe(`≥${(55_000).toLocaleString()}`);
+    });
+    const breakdown = screen.getByTestId('workflow-token-breakdown').textContent ?? '';
+    expect(breakdown).toContain(`${(52_000).toLocaleString()} in (${(42_000).toLocaleString()} cache)`);
+    expect(breakdown).toContain(`${(3_000).toLocaleString()} out`);
+    expect(breakdown).toContain('partial: 1 of 9 exchanges incomplete');
+  });
+
+  it('says run tokens are unavailable instead of 0 when LLM statistics are off', async () => {
+    mockGetWorkflowDetail.mockResolvedValue(
+      makeDetail({
+        totalTokens: 0,
+        context: { ...makeDetail().context, totalTokens: 0 },
+        usage: {
+          inputTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          outputTokens: 0,
+          totalTokens: 0,
+          estimatedCostUsd: 0.4,
+          activeSeconds: 30,
+          observedExchanges: 0,
+          incompleteExchanges: 0,
+          unmeasuredExchanges: 0,
+          meteredSessions: 0,
+          reportedSessions: 0,
+          untrackedSessions: 1,
+          lowerBound: false,
+          tokenTrackingStatus: 'unavailable',
+        },
+      }),
+    );
+    render(WorkflowDetail, { props: makeProps() });
+
+    await vi.waitFor(() => {
+      expect(screen.getByTestId('workflow-total-tokens').textContent).toBe('Unavailable');
+    });
+    expect(screen.getByTestId('workflow-token-breakdown').textContent).toContain('LLM statistics are off');
   });
 
   it('shows "--" for empty description', async () => {
@@ -557,7 +651,7 @@ describe('WorkflowDetail', () => {
     renderWithGate();
 
     await vi.waitFor(() => {
-      expect(screen.getByText('Approve')).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Approve' }).getAttribute('aria-disabled')).toBe('false');
     });
 
     await fireEvent.click(screen.getByText('Approve'));
@@ -572,7 +666,7 @@ describe('WorkflowDetail', () => {
     renderWithGate();
 
     await vi.waitFor(() => {
-      expect(screen.getByText('Approve')).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Approve' }).getAttribute('aria-disabled')).toBe('false');
     });
 
     await fireEvent.click(screen.getByText('Approve'));
@@ -609,7 +703,7 @@ describe('WorkflowDetail', () => {
 
   it('seeds gate into appState.pendingGates when detail has a gate', async () => {
     const gate = makeGate({ gateId: 'gate-seed-1', stateName: 'review' });
-    mockGetWorkflowDetail.mockResolvedValue(makeDetail({ gate }));
+    mockGetWorkflowDetail.mockResolvedValue(makeDetail({ gate, phase: 'waiting_human' }));
 
     render(WorkflowDetail, { props: makeProps() });
 
@@ -619,6 +713,49 @@ describe('WorkflowDetail', () => {
     });
 
     expect(mockAppState.pendingGates.get('gate-seed-1')?.stateName).toBe('review');
+  });
+
+  it('replaces a stale gate for the workflow with the one the detail reports', async () => {
+    // A gate dismissed while the client was disconnected (its gate_dismissed
+    // event was missed) must not survive beside the live one, or the panel
+    // could show the stale summary while the click resolves the live gate.
+    mockAppState.pendingGates = new Map([['gate-stale', makeGate({ gateId: 'gate-stale', stateName: 'old_review' })]]);
+    const gate = makeGate({ gateId: 'gate-live', stateName: 'review' });
+    mockGetWorkflowDetail.mockResolvedValue(makeDetail({ gate, phase: 'waiting_human' }));
+
+    render(WorkflowDetail, { props: makeProps() });
+
+    await vi.waitFor(() => {
+      expect(mockAppState.pendingGates.has('gate-live')).toBe(true);
+    });
+    expect(mockAppState.pendingGates.has('gate-stale')).toBe(false);
+  });
+
+  // The store's getWorkflowDetail rebuilds the workflow's entries from each
+  // detail (stores-escalation-refresh.test.ts); the view shows what it holds.
+  it("shows the store's pending tool-call escalations of this workflow only", async () => {
+    const escalation: WorkflowEscalationDto = {
+      escalationId: 'esc-live',
+      workflowId: 'wf-1',
+      stateId: 'implement',
+      serverName: 'filesystem',
+      toolName: 'write_file',
+      arguments: { path: '/outside/f.txt' },
+      reason: 'Writes outside the workspace require approval.',
+      receivedAt: '2026-01-15T10:06:00Z',
+    };
+    mockAppState.pendingWorkflowEscalations = new Map([
+      ['esc-live', escalation],
+      ['esc-other', { ...escalation, escalationId: 'esc-other', workflowId: 'wf-2', toolName: 'delete_file' }],
+    ]);
+    mockGetWorkflowDetail.mockResolvedValue(makeDetail({ escalations: [escalation] }));
+
+    render(WorkflowDetail, { props: makeProps() });
+
+    await vi.waitFor(() => {
+      expect(screen.getAllByTestId('workflow-escalation')).toHaveLength(1);
+    });
+    expect(screen.getByTestId('workflow-escalation').textContent).toContain('write_file');
   });
 
   // ── Multiple transition messages: one expanded, one collapsed ──
@@ -712,16 +849,86 @@ describe('WorkflowDetail', () => {
     renderWithGate();
 
     await vi.waitFor(() => {
-      expect(screen.getByText('Approve')).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Approve' }).getAttribute('aria-disabled')).toBe('false');
     });
 
     await fireEvent.click(screen.getByText('Approve'));
 
     await vi.waitFor(() => {
-      expect(mockResolveWorkflowGate).toHaveBeenCalledWith('wf-1', 'APPROVE', undefined);
+      // The decision is bound to the gate the panel displayed.
+      expect(mockResolveWorkflowGate).toHaveBeenCalledWith('wf-1', 'gate-1', 'APPROVE', undefined);
     });
 
     expect(screen.queryByText(/Failed to resolve gate/)).toBeNull();
+  });
+
+  // ── A new raise gets a fresh review panel ──────────────────────
+  //
+  // The displayed gate can switch from one raise to another without the panel
+  // unmounting in between: the reconnect rebuild, the re-read after a stale
+  // refusal, and a gate_raised that evicts a raise whose dismissal was missed
+  // all replace the workflow's gate in one step. Nothing the user saw or
+  // started for the earlier raise may carry over to the new one.
+
+  it('does not show artifact content cached for an earlier raise of the same gate', async () => {
+    const summary = makeSummary({ phase: 'waiting_human' });
+    const visit1 = makeGate({ gateId: 'wf-1-review-1-aaaa', presentedArtifacts: ['plan'] });
+    const visit2 = makeGate({ gateId: 'wf-1-review-2-bbbb', presentedArtifacts: ['plan'] });
+    mockGetWorkflowDetail.mockResolvedValue(makeDetail({ phase: 'waiting_human', gate: visit1 }));
+    // WP-32: the listing carries names and sizes; each file's content is its own fetch.
+    mockGetWorkflowArtifacts.mockResolvedValue({ files: [{ path: 'plan.txt', size: 19 }], truncated: false });
+    mockGetWorkflowArtifactFile.mockResolvedValue({ content: 'plan from visit one', language: 'text' });
+
+    const artifactsTab = () => screen.getByRole('button', { name: /^Artifacts/ });
+    const view = render(WorkflowDetail, { props: makeProps({ summary, gate: visit1 }) });
+    await vi.waitFor(() => {
+      expect(artifactsTab()).toBeTruthy();
+    });
+    await fireEvent.click(artifactsTab());
+    await vi.waitFor(() => {
+      expect(screen.getByText('plan from visit one')).toBeTruthy();
+    });
+
+    mockGetWorkflowArtifacts.mockResolvedValue({ files: [{ path: 'plan.txt', size: 19 }], truncated: false });
+    mockGetWorkflowArtifactFile.mockResolvedValue({ content: 'plan from visit two', language: 'text' });
+    mockGetWorkflowDetail.mockResolvedValue(makeDetail({ phase: 'waiting_human', gate: visit2 }));
+    await view.rerender(makeProps({ summary, gate: visit2 }));
+    await tick();
+
+    // The earlier raise's artifact is gone and the panel starts over on the summary.
+    expect(screen.queryByText('plan from visit one')).toBeNull();
+    await fireEvent.click(artifactsTab());
+    await vi.waitFor(() => {
+      expect(screen.getByText('plan from visit two')).toBeTruthy();
+    });
+    expect(screen.queryByText('plan from visit one')).toBeNull();
+    expect(mockGetWorkflowArtifacts).toHaveBeenCalledTimes(2);
+    expect(mockGetWorkflowArtifactFile).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not carry an abort confirmation over to a new raise', async () => {
+    mockResolveWorkflowGate.mockResolvedValue(undefined);
+    const summary = makeSummary({ phase: 'waiting_human' });
+    const visit1 = makeGate({ gateId: 'wf-1-review-1-aaaa', acceptedEvents: ['APPROVE', 'ABORT'] });
+    const visit2 = makeGate({ gateId: 'wf-1-review-2-bbbb', acceptedEvents: ['APPROVE', 'ABORT'] });
+    mockGetWorkflowDetail.mockResolvedValue(makeDetail({ phase: 'waiting_human', gate: visit1 }));
+
+    const view = render(WorkflowDetail, { props: makeProps({ summary, gate: visit1 }) });
+    await vi.waitFor(() => {
+      expect(screen.getByText('Abort Workflow')).toBeTruthy();
+    });
+    await fireEvent.click(screen.getByText('Abort Workflow'));
+    expect(screen.getByText('Confirm Abort')).toBeTruthy();
+
+    mockGetWorkflowDetail.mockResolvedValue(makeDetail({ phase: 'waiting_human', gate: visit2 }));
+    await view.rerender(makeProps({ summary, gate: visit2 }));
+    await tick();
+
+    // The confirmation was given while the first raise was shown; the new
+    // raise starts with its own buttons and no pending confirmation.
+    expect(screen.queryByText('Confirm Abort')).toBeNull();
+    expect(screen.getByText('Abort Workflow')).toBeTruthy();
+    expect(mockResolveWorkflowGate).not.toHaveBeenCalled();
   });
 
   // ── Error callout (failed / interrupted with error) ───────────────

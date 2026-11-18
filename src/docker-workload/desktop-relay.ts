@@ -3,6 +3,7 @@ import { lstatSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 import type { ExecFileFn } from '../docker/docker-manager.js';
 import type { LedgeredOuterCreateAuthority } from './infrastructure.js';
+import { inheritedEnv } from '../trusted-process/child-env.js';
 
 const IMAGE_ID = /^sha256:[a-f0-9]{64}$/;
 const RESOURCE_NAME = /^ic-[a-z0-9][a-z0-9_.-]{0,62}$/;
@@ -12,6 +13,7 @@ const IPV4_GATEWAY_MODE = 'com.docker.network.bridge.gateway_mode_ipv4';
 const IPV6_GATEWAY_MODE = 'com.docker.network.bridge.gateway_mode_ipv6';
 const ENABLE_IPV4 = 'com.docker.network.enable_ipv4';
 const RELAY_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+export const FIXED_RELAY_AUTHORIZATION_ENV = 'IRONCURTAIN_FIXED_RELAY_PROXY_AUTHORIZATION';
 export const DESKTOP_RELAY_HOST_GATEWAY_ALIAS = 'host.docker.internal';
 export const DESKTOP_RELAY_UPLINK_NETWORK = 'bridge';
 export const FIXED_RELAY_UNIX_TARGET = '/run/ironcurtain-upstream.sock';
@@ -290,6 +292,10 @@ export function buildDesktopRelayCreateArgs(
     config.upstream.kind === 'unix' ? `${config.upstream.runtimeUid}:${config.upstream.runtimeGid}` : '65532:65532',
     '--env',
     `PATH=${RELAY_PATH}`,
+    // Docker copies the value from its private process environment. Passing
+    // NAME=value here would disclose it in the host CLI's command line.
+    '--env',
+    FIXED_RELAY_AUTHORIZATION_ENV,
     '--workdir',
     '/',
     '--memory',
@@ -327,8 +333,6 @@ export function buildDesktopRelayCreateArgs(
     DESKTOP_RELAY_PROFILE.maxDuration,
     '--dial-timeout',
     DESKTOP_RELAY_PROFILE.dialTimeout,
-    '--proxy-authorization',
-    config.requiredProxyAuthorization,
   ];
 }
 
@@ -382,10 +386,11 @@ export function assertDesktopRelayContainerInspect(
     throw new Error('relay fixed command/config drift');
   }
   if (
-    JSON.stringify(stringArray(containerConfig.Env)) !== JSON.stringify([`PATH=${RELAY_PATH}`]) ||
+    JSON.stringify(stringArray(containerConfig.Env)) !==
+      JSON.stringify([`PATH=${RELAY_PATH}`, `${FIXED_RELAY_AUTHORIZATION_ENV}=${config.requiredProxyAuthorization}`]) ||
     containerConfig.WorkingDir !== '/'
   ) {
-    throw new Error('relay fixed non-secret environment/working-directory drift');
+    throw new Error('relay fixed environment/working-directory drift');
   }
   const labels = objectAt(containerConfig, 'Labels');
   if (labels[RELAY_LABEL] !== 'fixed-relay' || labels[BUNDLE_LABEL] !== config.bundleId) {
@@ -683,6 +688,7 @@ async function createRelayContainer(
       const container = await exec('docker', buildDesktopRelayCreateArgs(config, labels), {
         timeout: 30_000,
         maxBuffer: 10 * 1024 * 1024,
+        env: { ...inheritedEnv(), [FIXED_RELAY_AUTHORIZATION_ENV]: config.requiredProxyAuthorization },
       });
       const containerId = assertRawId(container.stdout.trim(), 'container');
       rawContainerId = containerId;

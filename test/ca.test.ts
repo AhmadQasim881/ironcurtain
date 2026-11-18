@@ -19,10 +19,25 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { createServer as createTlsServer } from 'node:tls';
+import { createServer as createNetServer } from 'node:net';
+import {
+  checkServerIdentity,
+  connect as tlsConnect,
+  createServer as createTlsServer,
+  TLSSocket,
+  type PeerCertificate,
+  type SecureContext,
+} from 'node:tls';
 import { pathToFileURL } from 'node:url';
 import forge from 'node-forge';
-import { createLeafSecureContextCache, loadOrCreateCA, randomSerialNumber } from '../src/docker/ca.js';
+import {
+  createLeafSecureContextCache,
+  isLeafHostname,
+  LEAF_SECURE_CONTEXT_CACHE_MAX_ENTRIES,
+  leafSecureContextCacheSize,
+  loadOrCreateCA,
+  randomSerialNumber,
+} from '../src/docker/ca.js';
 import { acquireProcessLock } from '../src/docker-workload/process-lock.js';
 
 describe('loadOrCreateCA', () => {
@@ -267,6 +282,99 @@ describe('loadOrCreateCA', () => {
     expect(cache('api.example.com')).toBe(cache('api.example.com'));
     expect(cache('api.example.com')).not.toBe(cache('other.example.com'));
   });
+
+  it('shares leaf contexts and one natively signed leaf key pair across every proxy of a CA generation', async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'ca-test-'));
+    const authority = loadOrCreateCA(join(tempDir, 'ca'));
+    const firstProxy = createLeafSecureContextCache(authority);
+    const secondProxy = createLeafSecureContextCache(authority);
+    expect(secondProxy('api.shared.example')).toBe(firstProxy('api.shared.example'));
+
+    const root = forge.pki.certificateFromPem(authority.certPem);
+    const first = await peerCertificate(firstProxy, 'api.shared.example', join(tempDir, 'a.sock'));
+    const second = await peerCertificate(secondProxy, 'other.shared.example', join(tempDir, 'b.sock'));
+    // Signed with node:crypto over the forge-built TBSCertificate; still a valid CA signature.
+    expect(root.verify(first)).toBe(true);
+    expect(root.verify(second)).toBe(true);
+    expect(first.subject.getField('CN')?.value).toBe('api.shared.example');
+    expect(first.serialNumber).not.toBe(second.serialNumber);
+    expect(forge.pki.publicKeyToPem(first.publicKey)).toBe(forge.pki.publicKeyToPem(second.publicKey));
+
+    // Another CA generation gets its own key pair.
+    const otherAuthority = loadOrCreateCA(join(tempDir, 'other-ca'));
+    const other = await peerCertificate(
+      createLeafSecureContextCache(otherAuthority),
+      'api.shared.example',
+      join(tempDir, 'c.sock'),
+    );
+    expect(forge.pki.publicKeyToPem(other.publicKey)).not.toBe(forge.pki.publicKeyToPem(first.publicKey));
+    expect(forge.pki.certificateFromPem(otherAuthority.certPem).verify(other)).toBe(true);
+  });
+
+  it('bounds the process-wide leaf cache and evicts the least recently used host', () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'ca-test-'));
+    const cache = createLeafSecureContextCache(loadOrCreateCA(join(tempDir, 'ca')));
+    const touched = cache('touched.lru.example');
+    const evicted = cache('evicted.lru.example');
+    for (let i = 0; i < 200; i++) cache(`fill-${i}.lru.example`);
+    expect(cache('touched.lru.example')).toBe(touched);
+    for (let i = 200; i < LEAF_SECURE_CONTEXT_CACHE_MAX_ENTRIES; i++) cache(`fill-${i}.lru.example`);
+
+    expect(leafSecureContextCacheSize()).toBe(LEAF_SECURE_CONTEXT_CACHE_MAX_ENTRIES);
+    expect(cache('touched.lru.example')).toBe(touched);
+    expect(cache('evicted.lru.example')).not.toBe(evicted);
+    expect(leafSecureContextCacheSize()).toBe(LEAF_SECURE_CONTEXT_CACHE_MAX_ENTRIES);
+  });
+
+  it.each([
+    '',
+    'API.EXAMPLE.COM',
+    'a..example.com',
+    '-lead.example.com',
+    'trail-.example.com',
+    'api.example.com:443',
+    '[::1]',
+    'a b.example.com',
+    `${'a'.repeat(64)}.example.com`,
+    `${'a.'.repeat(127)}aa`,
+  ])('refuses to issue a leaf for %j', (hostname) => {
+    tempDir = mkdtempSync(join(tmpdir(), 'ca-test-'));
+    const cache = createLeafSecureContextCache(loadOrCreateCA(join(tempDir, 'ca')));
+    expect(isLeafHostname(hostname)).toBe(false);
+    expect(() => cache(hostname)).toThrow(/invalid hostname/);
+  });
+
+  it.each(['api.anthropic.com', 'xn--bcher-kva.example', '_acme-challenge.example.com', '127.0.0.1', 'localhost'])(
+    'accepts %j as a leaf hostname',
+    (hostname) => {
+      expect(isLeafHostname(hostname)).toBe(true);
+    },
+  );
+
+  it.each([
+    ['2001:db8::5', 'IP Address:2001:DB8:0:0:0:0:0:5'],
+    ['127.0.0.1', 'IP Address:127.0.0.1'],
+    ['api.example.com', 'DNS:api.example.com'],
+  ])('certifies the admitted host %j as %j', async (host, subjectAltName) => {
+    // An IP-literal CONNECT host (a provider configured by address) is
+    // certified as an address: that is what a client connecting by address verifies.
+    tempDir = mkdtempSync(join(tmpdir(), 'ca-test-'));
+    const cache = createLeafSecureContextCache(loadOrCreateCA(join(tempDir, 'ca')));
+    const peer = await servedCertificate(cache(host), join(tempDir, 'leaf.sock'));
+    expect(peer.subjectaltname).toBe(subjectAltName);
+    expect(checkServerIdentity(host, peer)).toBeUndefined();
+  });
+
+  it.each(['1.2.3', '0x7f.1', '2001:DB8::5', '2001:db8:0::5', '::1%eth0'])(
+    'refuses to issue a leaf for the non-canonical IP literal %j',
+    (hostname) => {
+      // The proxy only ever passes the canonical address it admitted, so any
+      // other spelling is refused rather than becoming a second cache entry.
+      tempDir = mkdtempSync(join(tmpdir(), 'ca-test-'));
+      const cache = createLeafSecureContextCache(loadOrCreateCA(join(tempDir, 'ca')));
+      expect(() => cache(hostname)).toThrow(/invalid hostname/);
+    },
+  );
 
   it('serves a strict-v2 leaf accepted by Python strict OpenSSL verification', async () => {
     tempDir = mkdtempSync(join(tmpdir(), 'ca-test-'));
@@ -721,6 +829,60 @@ function writeCurrentGenerationFixture(caDir: string, generation: string, certPe
 
 function sha256(contents: Buffer): string {
   return createHash('sha256').update(contents).digest('hex');
+}
+
+/** The certificate a TLS server holding `context` presents to a ClientHello without SNI. */
+async function servedCertificate(context: SecureContext, socketPath: string): Promise<PeerCertificate> {
+  const server = createNetServer((raw) => {
+    const socket = new TLSSocket(raw, { isServer: true, secureContext: context });
+    socket.on('error', () => {});
+    socket.once('secure', () => socket.end());
+  });
+  await new Promise<void>((resolvePromise, rejectPromise) => {
+    server.once('error', rejectPromise);
+    server.listen(socketPath, resolvePromise);
+  });
+  try {
+    return await new Promise<PeerCertificate>((resolvePromise, rejectPromise) => {
+      const socket = tlsConnect({ path: socketPath, servername: '', rejectUnauthorized: false }, () => {
+        const peer = socket.getPeerCertificate();
+        socket.destroy();
+        resolvePromise(peer);
+      });
+      socket.once('error', rejectPromise);
+    });
+  } finally {
+    await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
+  }
+}
+
+/** The leaf certificate `cache` serves for `hostname`, read back over a real TLS handshake. */
+async function peerCertificate(
+  cache: (hostname: string) => SecureContext,
+  hostname: string,
+  socketPath: string,
+): Promise<forge.pki.Certificate> {
+  const server = createTlsServer(
+    { SNICallback: (servername, callback) => callback(null, cache(servername)) },
+    (socket) => socket.end(),
+  );
+  await new Promise<void>((resolvePromise, rejectPromise) => {
+    server.once('error', rejectPromise);
+    server.listen(socketPath, resolvePromise);
+  });
+  try {
+    const der = await new Promise<Buffer>((resolvePromise, rejectPromise) => {
+      const socket = tlsConnect({ path: socketPath, servername: hostname, rejectUnauthorized: false }, () => {
+        const raw = socket.getPeerCertificate().raw;
+        socket.destroy();
+        resolvePromise(raw);
+      });
+      socket.once('error', rejectPromise);
+    });
+    return forge.pki.certificateFromAsn1(forge.asn1.fromDer(der.toString('binary')));
+  } finally {
+    await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
+  }
 }
 
 function authorityKeyIdentifierHex(certificate: forge.pki.Certificate): string | undefined {

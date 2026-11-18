@@ -11,9 +11,13 @@
  *   - Default-shape cron job: memory present + cron memory prompt prepended.
  *   - Default session (no scope): memory off regardless of global flag.
  *   - Global kill switch overrides per-persona "on".
+ *   - Borrowed workflow shared-container bundle: memory off (the bundle
+ *     runs no memory server), so neither prompt nor CLAUDE.md mentions it.
+ *   - Workflow state with no borrowed bundle: per-persona memory as in a
+ *     standalone session.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import * as loggerModule from '../src/logger.js';
@@ -24,9 +28,23 @@ import { buildDockerClaudeMd } from '../src/docker/claude-md-seed.js';
 import { MEMORY_SERVER_NAME } from '../src/memory/memory-annotations.js';
 import { createSessionId } from '../src/session/types.js';
 import type { IronCurtainConfig } from '../src/config/types.js';
+import type { DockerInfrastructure } from '../src/docker/docker-infrastructure.js';
 import type { JobDefinition, JobId } from '../src/cron/types.js';
 import type { PersonaDefinition } from '../src/persona/types.js';
+import type { WorkflowId } from '../src/workflow/types.js';
 import { isMemoryEnabledFor } from '../src/memory/memory-policy.js';
+import { writePersonaPolicy } from './fixtures/scoped-policy.js';
+import { renamePersona } from '../src/persona/persona-service.js';
+import { createPersonaName } from '../src/persona/types.js';
+
+// A memory server with the review quarantine, whatever this checkout's
+// workspace build is, unless a test says otherwise: cron and workflow sessions
+// refuse one without it (FU-05, test/memory-annotations.test.ts).
+const installedMemoryServer = vi.hoisted(() => ({ hasReviewQuarantine: true }));
+vi.mock('../src/memory/memory-server-exports.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/memory/memory-server-exports.js')>()),
+  memoryServerHasReviewQuarantine: () => installedMemoryServer.hasReviewQuarantine,
+}));
 
 // Tests touch the user filesystem (persona dirs, job dirs) under a
 // dedicated tmp home; pid suffix isolates parallel runs.
@@ -97,22 +115,21 @@ function createTestPersonaOnDisk(name: string, opts: { memoryOptOut?: boolean } 
 
   // Minimal compiled-policy.json that references `filesystem` so
   // `filterMcpServersByPolicy` keeps it. Memory is bolted on after the
-  // filter, so it doesn't need to appear here.
-  writeFileSync(
-    resolve(generatedDir, 'compiled-policy.json'),
-    JSON.stringify({
-      rules: [
-        {
-          name: 'allow-fs',
-          description: 'test',
-          principle: 'test',
-          if: { server: ['filesystem'] },
-          then: 'allow',
-          reason: 'test',
-        },
-      ],
-    }),
-  );
+  // filter, so it doesn't need to appear here. The rule escalates: an
+  // unconditioned `allow` would grant broad access, which `resolvePersona`
+  // refuses for a persona without the broad-policy opt-in.
+  writePersonaPolicy(personaDir, {
+    rules: [
+      {
+        name: 'escalate-fs',
+        description: 'test',
+        principle: 'test',
+        if: { server: ['filesystem'] },
+        then: 'escalate',
+        reason: 'test',
+      },
+    ],
+  });
 }
 
 /**
@@ -151,6 +168,7 @@ afterEach(() => {
   loggerModule.teardown();
   delete process.env['IRONCURTAIN_HOME'];
   rmSync(TEST_HOME, { recursive: true, force: true });
+  installedMemoryServer.hasReviewQuarantine = true;
 });
 
 // ---------------------------------------------------------------------------
@@ -195,6 +213,43 @@ describe('buildSessionConfig memory gate', () => {
     expect(claudeMd).toContain('memory.context');
   });
 
+  it('hands the memory server its LLM key as its own credential, never in its config', () => {
+    // The server config is serialized into the memory relay's
+    // MCP_SERVERS_CONFIG; credentials travel only in that relay's
+    // SERVER_CREDENTIALS, which it scrubs before spawning the server.
+    createTestPersonaOnDisk('default-persona');
+    const config = createTestConfig(true);
+    const sessionId = createSessionId();
+
+    const result = buildSessionConfig(config, sessionId, sessionId, { persona: 'default-persona' });
+
+    const memoryServer = result.config.mcpServers[MEMORY_SERVER_NAME];
+    expect(memoryServer.env?.MEMORY_LLM_API_KEY).toBeUndefined();
+    expect(JSON.stringify(memoryServer)).not.toContain('test-api-key');
+    expect(result.config.userConfig.serverCredentials[MEMORY_SERVER_NAME]).toEqual({
+      MEMORY_LLM_API_KEY: 'test-api-key',
+    });
+    // No other server is handed the key, and the caller's config is untouched.
+    expect(Object.keys(result.config.userConfig.serverCredentials)).toEqual([MEMORY_SERVER_NAME]);
+    expect(config.userConfig.serverCredentials).toBeUndefined();
+  });
+
+  it("keeps the user's stored credentials alongside the memory server's key", () => {
+    createTestPersonaOnDisk('default-persona');
+    const stored = { github: { GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_stored' }, memory: { EXTRA: 'kept' } };
+    const config = createTestConfig(true);
+    const withStored = { ...config, userConfig: { ...config.userConfig, serverCredentials: stored } };
+    const sessionId = createSessionId();
+
+    const result = buildSessionConfig(withStored, sessionId, sessionId, { persona: 'default-persona' });
+
+    expect(result.config.userConfig.serverCredentials).toEqual({
+      github: { GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_stored' },
+      memory: { EXTRA: 'kept', MEMORY_LLM_API_KEY: 'test-api-key' },
+    });
+    expect(stored.memory).toEqual({ EXTRA: 'kept' });
+  });
+
   it('includes memory server and prepended cron prompt for a default-shape job', () => {
     const job = createTestJobOnDisk('default-job');
     const config = createTestConfig(true);
@@ -219,6 +274,178 @@ describe('buildSessionConfig memory gate', () => {
     // No persona augmentation either — `systemPromptAugmentation` is whatever
     // the caller passed in (undefined here).
     expect(result.systemPromptAugmentation).toBeUndefined();
+  });
+
+  it('closes the gate for a default-shape persona on a borrowed workflow bundle', () => {
+    // Workflow shared-container mode: the bundle's MCP servers were fixed by
+    // the workflow's infrastructure factory, which never starts a memory
+    // server, so the session must not add one or advertise the tool.
+    createTestPersonaOnDisk('default-persona');
+    const config = createTestConfig(true);
+    const sessionId = createSessionId();
+    const bundleDir = resolve(TEST_HOME, 'bundle');
+    mkdirSync(bundleDir, { recursive: true });
+    const bundle = {
+      bundleId: 'memory-gate-bundle',
+      bundleDir,
+      escalationDir: resolve(bundleDir, 'escalations'),
+      auditLogPath: resolve(bundleDir, 'audit.jsonl'),
+      restageSkills: () => {},
+    } as unknown as DockerInfrastructure;
+
+    const result = buildSessionConfig(config, sessionId, sessionId, {
+      persona: 'default-persona',
+      workflow: { infrastructure: bundle },
+    });
+
+    expect(result.memoryEnabled).toBe(false);
+    expect(result.config.mcpServers[MEMORY_SERVER_NAME]).toBeUndefined();
+    const credentials = result.config.userConfig.serverCredentials as Record<string, unknown> | undefined;
+    expect(credentials?.[MEMORY_SERVER_NAME]).toBeUndefined();
+    // The persona prompt is still emitted; only the memory protocol is gone.
+    expect(result.systemPromptAugmentation).toContain('## Persona: default-persona');
+    expect(result.systemPromptAugmentation).not.toContain('memory.context');
+    expect(result.systemPromptAugmentation).not.toContain('memory_context');
+    // createDockerSession seeds CLAUDE.md from the same decision.
+    expect(
+      buildDockerClaudeMd({ personaName: 'default-persona', memoryEnabled: result.memoryEnabled }),
+    ).toBeUndefined();
+  });
+
+  it('keeps per-persona memory for a workflow state that borrows no bundle', () => {
+    // Per-state-container Docker workflows (no `sharedContainer`) and builtin
+    // workflows pass a workflow record without `infrastructure`: the session
+    // builds its own servers, so it gets its persona's memory server and
+    // database exactly as a standalone session does.
+    createTestPersonaOnDisk('default-persona');
+    const config = createTestConfig(true);
+    const sessionId = createSessionId();
+
+    const result = buildSessionConfig(config, sessionId, sessionId, {
+      persona: 'default-persona',
+      workflow: { workflowRunId: 'wf-memory-gate' as WorkflowId, stateId: 'work', personaId: 'default-persona' },
+    });
+
+    expect(result.memoryEnabled).toBe(true);
+    const memoryServer = result.config.mcpServers[MEMORY_SERVER_NAME];
+    expect(memoryServer.env?.MEMORY_DB_PATH).toBe(resolve(TEST_HOME, 'personas', 'default-persona', 'memory.db'));
+    expect(memoryServer.env?.MEMORY_NAMESPACE).toBe('default-persona');
+    expect(result.systemPromptAugmentation).toContain('memory.context');
+    expect(buildDockerClaudeMd({ personaName: 'default-persona', memoryEnabled: result.memoryEnabled })).toContain(
+      'memory.context',
+    );
+  });
+
+  it('a renamed persona keeps the namespace its memories were stored under, in its own moved database', () => {
+    // `persona rename` moves memory.db with the persona and records the old
+    // name as persona.json `memoryNamespace`, so the memories stay visible.
+    createTestPersonaOnDisk('before');
+    renamePersona(createPersonaName('before'), 'after', 'test');
+    // The rename moved the policy aside (it named the old workspace): recompile.
+    writePersonaPolicy(resolve(TEST_HOME, 'personas', 'after'), {
+      rules: [
+        {
+          name: 'escalate-fs',
+          description: 't',
+          principle: 't',
+          if: { server: ['filesystem'] },
+          then: 'escalate',
+          reason: 't',
+        },
+      ],
+    });
+    const config = createTestConfig(true);
+    const sessionId = createSessionId();
+
+    const result = buildSessionConfig(config, sessionId, sessionId, { persona: 'after' });
+
+    const memoryServer = result.config.mcpServers[MEMORY_SERVER_NAME];
+    expect(memoryServer.env?.MEMORY_DB_PATH).toBe(resolve(TEST_HOME, 'personas', 'after', 'memory.db'));
+    expect(memoryServer.env?.MEMORY_NAMESPACE).toBe('before');
+  });
+
+  // Every memory records who wrote it (WP-67). The kind and the session id come
+  // from the session, never from the agent, so an unattended cron or workflow
+  // run cannot pass its notes off as written in a session a person drove.
+  it('tells the memory server which kind of session writes, and its id', () => {
+    createTestPersonaOnDisk('default-persona');
+    const job = createTestJobOnDisk('writer-job');
+    const config = createTestConfig(true);
+
+    const interactiveId = createSessionId();
+    const interactive = buildSessionConfig(config, interactiveId, interactiveId, { persona: 'default-persona' });
+    const cronId = createSessionId();
+    const cron = buildSessionConfig(config, cronId, cronId, { jobId: job.id });
+    const cronAsPersonaId = createSessionId();
+    const cronAsPersona = buildSessionConfig(config, cronAsPersonaId, cronAsPersonaId, {
+      persona: 'default-persona',
+      jobId: job.id,
+    });
+    const workflowId = createSessionId();
+    const workflow = buildSessionConfig(config, workflowId, workflowId, {
+      persona: 'default-persona',
+      workflow: { workflowRunId: 'wf-writer' as WorkflowId, stateId: 'work', personaId: 'default-persona' },
+    });
+
+    const writerEnv = (result: ReturnType<typeof buildSessionConfig>) => {
+      const env = result.config.mcpServers[MEMORY_SERVER_NAME].env;
+      return { kind: env?.MEMORY_WRITER_KIND, session: env?.MEMORY_SESSION_ID, scope: env?.MEMORY_WRITER_SCOPE };
+    };
+    // What an unattended session writes waits for review under its scope: the
+    // job (its later runs see it) or the workflow run (its later states do).
+    expect(writerEnv(interactive)).toEqual({ kind: 'interactive', session: interactiveId, scope: undefined });
+    expect(writerEnv(cron)).toEqual({ kind: 'cron', session: cronId, scope: 'job:writer-job' });
+    // A cron job running as a persona writes into the persona's memory, as cron.
+    expect(writerEnv(cronAsPersona)).toEqual({ kind: 'cron', session: cronAsPersonaId, scope: 'job:writer-job' });
+    expect(writerEnv(workflow)).toEqual({ kind: 'workflow', session: workflowId, scope: 'workflow:wf-writer' });
+  });
+
+  // FU-05: a memory server from before the review quarantine ignores the
+  // scope and would show what the run writes to interactive sessions.
+  it('refuses memory to cron and workflow sessions when the memory server predates the review quarantine', () => {
+    installedMemoryServer.hasReviewQuarantine = false;
+    createTestPersonaOnDisk('default-persona');
+    const job = createTestJobOnDisk('writer-job');
+    const config = createTestConfig(true);
+
+    const cronId = createSessionId();
+    expect(() => buildSessionConfig(config, cronId, cronId, { jobId: job.id })).toThrow(
+      'predates the review quarantine',
+    );
+    const workflowId = createSessionId();
+    expect(() =>
+      buildSessionConfig(config, workflowId, workflowId, {
+        persona: 'default-persona',
+        workflow: { workflowRunId: 'wf-writer' as WorkflowId, stateId: 'work', personaId: 'default-persona' },
+      }),
+    ).toThrow('predates the review quarantine');
+
+    // A session a person drives keeps its memory.
+    const interactiveId = createSessionId();
+    const interactive = buildSessionConfig(config, interactiveId, interactiveId, { persona: 'default-persona' });
+    expect(interactive.config.mcpServers[MEMORY_SERVER_NAME].env?.MEMORY_WRITER_KIND).toBe('interactive');
+  });
+
+  // WP-95: models live in the IronCurtain home, verified against their pins;
+  // memory.offlineModels keeps the server from downloading any.
+  it('points the memory server at ~/.ironcurtain/models, offline when memory.offlineModels is on', () => {
+    createTestPersonaOnDisk('default-persona');
+    const config = createTestConfig(true);
+    const onlineId = createSessionId();
+    const online = buildSessionConfig(config, onlineId, onlineId, { persona: 'default-persona' });
+    const offlineConfig: IronCurtainConfig = {
+      ...config,
+      userConfig: { ...config.userConfig, memory: { ...config.userConfig.memory, offlineModels: true } },
+    };
+    const offlineId = createSessionId();
+    const offline = buildSessionConfig(offlineConfig, offlineId, offlineId, { persona: 'default-persona' });
+
+    const onlineEnv = online.config.mcpServers[MEMORY_SERVER_NAME].env;
+    expect(onlineEnv?.MEMORY_MODELS_DIR).toBe(resolve(TEST_HOME, 'models'));
+    expect(onlineEnv?.MEMORY_MODELS_OFFLINE).toBeUndefined();
+    const offlineEnv = offline.config.mcpServers[MEMORY_SERVER_NAME].env;
+    expect(offlineEnv?.MEMORY_MODELS_DIR).toBe(resolve(TEST_HOME, 'models'));
+    expect(offlineEnv?.MEMORY_MODELS_OFFLINE).toBe('true');
   });
 
   it('global kill switch overrides per-persona "on"', () => {

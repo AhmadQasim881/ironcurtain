@@ -1,7 +1,8 @@
 # CA Injection Through the BuildKit runc PATH Seam
 
+**Status (2026-11-14):** Historical: redacted feasibility evidence, not production qualification.
+
 **Date:** 2026-08-22
-**Status:** redacted feasibility evidence; not production qualification
 **Scope:** Apple Container, Docker 29.2.1 embedded BuildKit, pinned runc 1.3.4
 
 ## Purpose

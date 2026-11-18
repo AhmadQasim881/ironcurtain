@@ -142,7 +142,11 @@ describe('Settings', () => {
       screen.getByText(/Generic destinations, recognized credential fields, request bodies, and uploads/),
     ).toBeTruthy();
     expect(screen.getByText(/Changes apply to new agent sessions/)).toBeTruthy();
-    expect(screen.getByText(/macOS with Docker Desktop or, on Apple silicon, Apple Container installed/)).toBeTruthy();
+    expect(
+      screen.getByText(
+        /macOS with Docker Desktop or, on Apple silicon, Apple Container, or Windows with WSL2 and Docker Desktop\. Native Linux Docker Engine is not yet supported/,
+      ),
+    ).toBeTruthy();
     expect((screen.getByTestId('save-runtime-settings') as HTMLButtonElement).disabled).toBe(true);
     expect(screen.queryByText(/backend/i)).toBeNull();
   });
@@ -174,6 +178,22 @@ describe('Settings', () => {
       }),
     );
     expect(screen.getByTestId('runtime-settings-saved')).toBeTruthy();
+  });
+
+  it('shows the daemon refusal when its host cannot run nested Docker', async () => {
+    const refusal =
+      'Nested Docker is not yet supported on native Linux (Docker Engine or Docker Desktop for Linux). It requires macOS with Docker Desktop or Apple Container, or Windows with WSL2 and Docker Desktop. Nothing was saved; on this host nested Docker can only be turned off.';
+    mockSetDockerWorkload.mockRejectedValue(Object.assign(new Error(refusal), { code: 'INVALID_PARAMS' }));
+    render(Settings);
+    await vi.waitFor(() => expect(screen.getByTestId('docker-workload-enabled')).toBeTruthy());
+
+    await fireEvent.click(screen.getByTestId('docker-workload-enabled'));
+    await fireEvent.click(screen.getByTestId('save-runtime-settings'));
+
+    await vi.waitFor(() => expect(screen.getByTestId('runtime-settings-error')).toBeTruthy());
+    expect(screen.getByTestId('runtime-settings-error').textContent).toContain('INVALID_PARAMS');
+    expect(screen.getByTestId('runtime-settings-error').textContent).toContain(refusal);
+    expect(screen.queryByTestId('runtime-settings-saved')).toBeNull();
   });
 
   it('allows network access to be set to offline', async () => {

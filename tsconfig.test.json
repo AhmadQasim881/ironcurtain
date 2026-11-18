@@ -1,0 +1,13 @@
+{
+  // Type-checks the test suite, which vitest runs with its types stripped:
+  // tests, examples and the vitest config, with every source they import.
+  // `npm run typecheck:tests`. rootDir widens from src/ so files outside it
+  // may be part of the program; nothing is emitted.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "noEmit": true
+  },
+  "include": ["src/**/*", "test/**/*", "examples/**/*", "vitest.config.ts"],
+  "exclude": ["node_modules", "dist"]
+}

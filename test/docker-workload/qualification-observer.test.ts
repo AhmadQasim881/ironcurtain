@@ -71,7 +71,7 @@ function fixture(runtimeKind: 'docker' | 'apple-container' = 'docker') {
   const create = () => createQualificationObserverContainer({ runtime, leasePath, generation, config });
   const cleanup = () => {
     const lease = loadDockerWorkloadLease(leasePath);
-    if (lease.schemaVersion !== 2) throw new Error('expected current lease');
+    if (lease.schemaVersion === 1) throw new Error('expected current lease');
     const policy = lease.bindings.watchdogPolicy;
     let nowMs = Date.now();
     return performSerializedDockerWorkloadCleanup({

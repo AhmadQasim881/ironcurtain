@@ -1,9 +1,10 @@
 /** Docker client/daemon compatibility requirements and observed live versions. */
 
 import { z } from 'zod';
-import { loadImmutableHostJson } from '../hardened-fs.js';
+import { loadPackageAssetJson } from '../hardened-fs.js';
 import type { ContainerRuntime } from '../docker/types.js';
 import { compareDockerApiVersions } from '../docker/docker-api-version.js';
+import { getIronCurtainPackageRoot } from '../docker/docker-workload-paths.js';
 
 export const CLIENT_TOOLCHAIN_SCHEMA_VERSION = 2;
 export const MAX_CLIENT_TOOLCHAIN_MANIFEST_BYTES = 64 * 1024;
@@ -106,15 +107,21 @@ export interface ClientToolchainPreflight {
   };
 }
 
-/** Select the shared compatibility requirements for the resolved execution architecture. */
+/**
+ * Select the shared compatibility requirements for the resolved execution
+ * architecture. The manifest ships in the package and is read under the
+ * package-asset rules below `packageRoot`, which only tests override.
+ */
 export function loadClientToolchainManifest(
   path: string,
   architecture: DockerToolchainArchitecture,
+  packageRoot: string = getIronCurtainPackageRoot(),
 ): LoadedClientToolchainManifest {
-  const loaded = loadImmutableHostJson(path, {
+  const loaded = loadPackageAssetJson(path, {
     label: 'client toolchain manifest',
     schema: clientToolchainManifestSchema,
     maxBytes: MAX_CLIENT_TOOLCHAIN_MANIFEST_BYTES,
+    packageRoot,
   });
   return {
     path: loaded.path,

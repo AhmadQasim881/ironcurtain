@@ -2,28 +2,44 @@ import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { Worker, type WorkerOptions } from 'node:worker_threads';
 
+import {
+  STATISTICS_IDENTIFIER_MAX_LENGTH,
+  STATISTICS_IDENTIFIER_PATTERN,
+  StatisticsLimitError,
+} from '../query-contract.js';
 import type { LlmExchangeCompleted } from '../types.js';
+import { createRateLimitedLog, projectLogSink, type LlmMetricsLogSink, type RateLimitedLog } from './health-log.js';
 import {
   LlmMetricsRepositoryUnavailableError,
   type LlmDeleteBeforeOptions,
   type LlmDeleteBeforeResult,
   type LlmDimensionCount,
   type LlmExchangeScanQuery,
+  type LlmMetricsReadRepository,
   type LlmMetricsRepository,
   type LlmMetricsRepositoryHealth,
+  type LlmMetricsRepositoryState,
   type LlmMetricsReaderState,
+  type LlmSessionTotalsQuery,
+  type LlmSessionUsageTotalsResult,
+  type LlmStatisticsAggregateQuery,
   type LlmStatisticsDimension,
+  type LlmStatisticsDistributionQuery,
+  type LlmStatisticsDistributionResult,
+  type LlmStatisticsPartition,
   type StoredLlmExchange,
 } from './repository.js';
 import type {
   SqliteDeleteChunkResult,
   SqliteDeleteLeaseResult,
+  SqliteInsertResult,
   SqliteReaderWorkerData,
   SqliteReaderWorkerRequest,
   SqliteWriterWorkerData,
   SqliteWorkerRequest,
   SqliteWorkerResponse,
 } from './sqlite-worker.js';
+import { isPermanentStorageError, type LlmMetricsStorageErrorCode } from './storage-errors.js';
 
 const DEFAULT_MAX_QUEUED_RECORDS = 2_000;
 const DEFAULT_MAX_QUEUED_BYTES = 8 * 1024 * 1024;
@@ -32,9 +48,22 @@ const DEFAULT_BATCH_SIZE = 64;
 const DEFAULT_FLUSH_INTERVAL_MS = 100;
 const DEFAULT_CHECKPOINT_INTERVAL_MS = 5_000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 10_000;
-const DEFAULT_FLUSH_TIMEOUT_MS = 10_000;
+const DEFAULT_WRITE_TIMEOUT_MS = 10_000;
 const DEFAULT_CLOSE_TIMEOUT_MS = 2_000;
 const DEFAULT_READ_TIMEOUT_MS = 10_000;
+const DEFAULT_RESTART_DELAY_MS = 1_000;
+const DEFAULT_MAX_RESTART_DELAY_MS = 5 * 60 * 1_000;
+const DEFAULT_BUSY_RETRY_DELAY_MS = 500;
+/** Keeps exponential backoff arithmetic finite; the configured maximum bounds the delay itself. */
+const MAX_RESTART_BACKOFF_EXPONENT = 30;
+/** A busy batch's requeue delay doubles per attempt, up to 16 times its base. */
+const MAX_BUSY_RETRY_BACKOFF_EXPONENT = 4;
+/** Write attempts per record, across busy requeues and writers lost mid-batch, before it is dropped. */
+const MAX_RECORD_WRITE_ATTEMPTS = 5;
+const HEALTH_LOG_INTERVAL_MS = 60_000;
+const MAX_INVALID_REASONS = 32;
+const MAX_INVALID_REASON_LENGTH = 120;
+const OTHER_INVALID_REASON = 'other';
 const DEFAULT_DELETE_CHUNK_SIZE = 250;
 const DEFAULT_DELETE_MAX_ROWS = 10_000;
 const DEFAULT_DELETE_MAX_DURATION_MS = 5_000;
@@ -72,11 +101,31 @@ interface PendingRequest {
 interface QueuedExchange {
   readonly exchange: LlmExchangeCompleted;
   readonly bytes: number;
+  /** Failed write attempts so far: busy batches and batches lost with their worker. */
+  readonly attempts: number;
+}
+
+/** A batch sent to the writer. Exactly one outcome settles it: written, requeued, or dropped. */
+interface InFlightBatch {
+  readonly items: readonly QueuedExchange[];
+  readonly bytes: number;
+  settled: boolean;
 }
 
 interface ActiveDelete {
   callerSettled: boolean;
   outstandingRequests: number;
+}
+
+/** A writer request the worker answered with an error, with the worker's storage classification. */
+class WriterRequestError extends Error {
+  constructor(
+    message: string,
+    readonly code: LlmMetricsStorageErrorCode | undefined,
+  ) {
+    super(message);
+    this.name = 'WriterRequestError';
+  }
 }
 
 export interface SqliteLlmMetricsRepositoryOptions {
@@ -89,9 +138,20 @@ export interface SqliteLlmMetricsRepositoryOptions {
   readonly flushIntervalMs?: number;
   readonly checkpointIntervalMs?: number;
   readonly startupTimeoutMs?: number;
-  readonly flushTimeoutMs?: number;
+  /**
+   * Deadline for each writer request: one insert batch, checkpoint, or
+   * maintenance step. A worker that misses it is treated as wedged and replaced.
+   */
+  readonly writeTimeoutMs?: number;
   readonly readTimeoutMs?: number;
   readonly closeTimeoutMs?: number;
+  /** First writer restart delay; it doubles per consecutive failure up to `maxRestartDelayMs`. */
+  readonly restartDelayMs?: number;
+  readonly maxRestartDelayMs?: number;
+  /** First requeue delay for a batch that met SQLITE_BUSY; it doubles per attempt. */
+  readonly busyRetryDelayMs?: number;
+  /** Health log test seam; production logs through the project logger. */
+  readonly logSink?: LlmMetricsLogSink;
   /** Writer test seam; production callers should use the default worker implementation. */
   readonly workerFactory?: WorkerFactory;
   /** Reader test seam; production callers should use the default worker implementation. */
@@ -139,10 +199,11 @@ function workerUrl(): URL {
  * silently drifting from the flags production actually uses.
  */
 export function defaultWorkerFactory(url: URL, options: WorkerOptions): Worker {
-  // The entry shim loads .ts sources via native type stripping, which is
-  // flag-gated before Node 22.18 and a silent no-op afterwards. The worker
-  // must be self-contained: tsx's loader hooks do not take effect inside
-  // worker threads on Node 22, so inheriting the parent's loaders is unsafe.
+  // The entry shim loads .ts sources via native type stripping; the flag is
+  // a no-op on the supported Node lines (24, 26), which strip types by
+  // default. The explicit execArgv also keeps the worker self-contained: it
+  // never inherits the parent's tsx loader hooks, which a worker cannot rely
+  // on, so the shim registers its own remap hook.
   if (url.pathname.endsWith('.mjs')) {
     return new Worker(url, { ...options, execArgv: ['--experimental-strip-types'] });
   }
@@ -155,6 +216,37 @@ function estimateBytes(exchange: LlmExchangeCompleted): number {
   } catch {
     return Number.POSITIVE_INFINITY;
   }
+}
+
+function isCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+interface ParsedInsertResult {
+  readonly inserted: number;
+  readonly duplicates: number;
+  readonly rejected: ReadonlyMap<string, number>;
+  readonly rejectedTotal: number;
+}
+
+/** The worker is trusted code, but its answers still cross a message boundary: check their shape and arithmetic. */
+function parseInsertResult(value: unknown, batchSize: number): ParsedInsertResult {
+  const invalid = (): never => {
+    throw new Error('Invalid insert response from LLM metrics worker');
+  };
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return invalid();
+  const { inserted, duplicates, rejected } = value as Partial<Record<keyof SqliteInsertResult, unknown>>;
+  if (!isCount(inserted) || !isCount(duplicates)) return invalid();
+  if (typeof rejected !== 'object' || rejected === null || Array.isArray(rejected)) return invalid();
+  const reasons = new Map<string, number>();
+  let rejectedTotal = 0;
+  for (const [reason, count] of Object.entries(rejected)) {
+    if (!isCount(count) || count === 0) return invalid();
+    reasons.set(reason, count);
+    rejectedTotal += count;
+  }
+  if (inserted + duplicates + rejectedTotal !== batchSize) return invalid();
+  return { inserted, duplicates, rejected: reasons, rejectedTotal };
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
@@ -174,9 +266,95 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string)
   });
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Read methods shared by the full repository and the reader-only handle. */
+async function readSnapshotMaxSequence(reader: SqliteReadWorkerClient): Promise<number> {
+  const value = await reader.request({ kind: 'snapshotMaxSequence' });
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error('Invalid snapshot response from LLM metrics worker');
+  }
+  return value;
+}
+
+async function readScan(
+  reader: SqliteReadWorkerClient,
+  query: LlmExchangeScanQuery,
+): Promise<readonly StoredLlmExchange[]> {
+  const value = await reader.request({ kind: 'scan', query });
+  if (!Array.isArray(value)) throw new Error('Invalid scan response from LLM metrics worker');
+  return value as readonly StoredLlmExchange[];
+}
+
+async function readDimensionValues(
+  reader: SqliteReadWorkerClient,
+  dimension: LlmStatisticsDimension,
+  query: Omit<LlmExchangeScanQuery, 'cursor'>,
+): Promise<readonly LlmDimensionCount[]> {
+  const value = await reader.request({ kind: 'dimensionValues', dimension, query });
+  if (!Array.isArray(value)) throw new Error('Invalid dimension response from LLM metrics worker');
+  return value as readonly LlmDimensionCount[];
+}
+
+async function readAggregate(
+  reader: SqliteReadWorkerClient,
+  query: LlmStatisticsAggregateQuery,
+): Promise<readonly LlmStatisticsPartition[]> {
+  const value = await reader.request({ kind: 'aggregate', query });
+  if (
+    !Array.isArray(value) ||
+    !value.every(
+      (partition: unknown) =>
+        isRecord(partition) &&
+        Array.isArray(partition.dimensions) &&
+        Array.isArray(partition.measures) &&
+        partition.measures.length === query.measures.length &&
+        typeof partition.eligibleCount === 'number',
+    )
+  ) {
+    throw new Error('Invalid aggregate response from LLM metrics worker');
+  }
+  return value as readonly LlmStatisticsPartition[];
+}
+
+async function readDistribution(
+  reader: SqliteReadWorkerClient,
+  query: LlmStatisticsDistributionQuery,
+): Promise<LlmStatisticsDistributionResult> {
+  const value: unknown = await reader.request({ kind: 'distribution', query });
+  if (!isRecord(value) || !Array.isArray(value.bins) || typeof value.sampleCount !== 'number') {
+    throw new Error('Invalid distribution response from LLM metrics worker');
+  }
+  return value as unknown as LlmStatisticsDistributionResult;
+}
+
+async function readSessionTotals(
+  reader: SqliteReadWorkerClient,
+  query: LlmSessionTotalsQuery,
+): Promise<LlmSessionUsageTotalsResult> {
+  const value: unknown = await reader.request({ kind: 'sessionTotals', query });
+  if (!isRecord(value) || typeof value.exchanges !== 'number' || typeof value.tokenTotalsLowerBound !== 'boolean') {
+    throw new Error('Invalid session totals response from LLM metrics worker');
+  }
+  return value as unknown as LlmSessionUsageTotalsResult;
+}
+
+const READ_TIMEOUT_MESSAGE = 'LLM metrics reader request timed out';
+
 class SqliteReadWorkerClient {
   private worker: Worker | null = null;
   private readonly pending = new Map<number, PendingRequest>();
+  /**
+   * Posted request IDs in the order the worker serves them: it runs one
+   * request at a time, first in, first out. Only the head is being worked on,
+   * so only its deadline runs. A request queued behind a long aggregation is
+   * not timed out for waiting (which would also abort the aggregation and
+   * every other queued request with it).
+   */
+  private readonly served: number[] = [];
+  private headDeadline: NodeJS.Timeout | null = null;
   private startPromise: Promise<void> | null = null;
   private resolveReady: (() => void) | null = null;
   private rejectReady: ((error: Error) => void) | null = null;
@@ -208,29 +386,43 @@ class SqliteReadWorkerClient {
       }
 
       const id = this.nextRequestId++;
-      const result = new Promise<WorkerResult>((resolve, reject) => {
+      return await new Promise<WorkerResult>((resolve, reject) => {
         this.pending.set(id, { resolve, reject });
         try {
           worker.postMessage({ ...request, id } satisfies SqliteReaderWorkerRequest);
         } catch (error) {
           this.pending.delete(id);
           reject(error instanceof Error ? error : new Error('Failed to send LLM metrics reader request'));
+          return;
         }
+        this.served.push(id);
+        if (this.served.length === 1) this.armHeadDeadline(worker);
       });
-      const timeoutMessage = 'LLM metrics reader request timed out';
-      try {
-        return await withTimeout(result, this.requestTimeoutMs, timeoutMessage);
-      } catch (error) {
-        if (error instanceof Error && error.message === timeoutMessage) {
-          const failure = this.unavailable(error);
-          this.fail(worker, failure);
-          throw failure;
-        }
-        throw error;
-      }
     } finally {
       this.admittedRequests--;
     }
+  }
+
+  /** Start the deadline of the request the worker is now serving, if any. */
+  private armHeadDeadline(worker: Worker): void {
+    if (this.headDeadline !== null) clearTimeout(this.headDeadline);
+    this.headDeadline = null;
+    if (this.served.length === 0) return;
+    const deadline = setTimeout(() => {
+      if (this.headDeadline !== deadline) return;
+      this.headDeadline = null;
+      this.fail(worker, this.unavailable(new Error(READ_TIMEOUT_MESSAGE)));
+    }, this.requestTimeoutMs);
+    deadline.unref();
+    this.headDeadline = deadline;
+  }
+
+  /** A request was answered: when it was the head, the next one is now being served. */
+  private markAnswered(worker: Worker, id: number): void {
+    const index = this.served.indexOf(id);
+    if (index < 0) return;
+    this.served.splice(index, 1);
+    if (index === 0) this.armHeadDeadline(worker);
   }
 
   close(): Promise<void> {
@@ -319,13 +511,22 @@ class SqliteReadWorkerClient {
     }
     const pending = this.pending.get(id);
     if (pending === undefined) return;
-    if (response.kind === 'error' && response.category !== 'invalid_request') {
+    if (response.kind === 'error' && response.category !== 'invalid_request' && response.category !== 'limit') {
       this.fail(worker, new Error(response.message));
       return;
     }
     this.pending.delete(id);
-    if (response.kind === 'error') pending.reject(new Error(response.message));
-    else pending.resolve(response.value);
+    this.markAnswered(worker, id);
+    if (response.kind === 'error') {
+      // A rejected or over-limit query leaves the reader healthy.
+      pending.reject(
+        response.category === 'limit' && response.limit !== undefined
+          ? new StatisticsLimitError(response.limit.name, response.limit.maximum, response.message)
+          : new Error(response.message),
+      );
+    } else {
+      pending.resolve(response.value);
+    }
   }
 
   private fail(worker: Worker, error: unknown): void {
@@ -339,6 +540,9 @@ class SqliteReadWorkerClient {
     const failure = this.unavailable(error);
     this.worker = null;
     this.ready = false;
+    if (this.headDeadline !== null) clearTimeout(this.headDeadline);
+    this.headDeadline = null;
+    this.served.length = 0;
     if (!this.closed) {
       this.state = 'unavailable';
       this.lastError = sanitizeError(failure);
@@ -359,31 +563,58 @@ class SqliteReadWorkerClient {
 /**
  * Main-thread half of the SQLite repository. All SQLite work runs in a worker;
  * enqueue is bounded, synchronous in-memory work and deliberately fail-open.
+ *
+ * The writer worker is supervised. When it exits, throws, cannot start, or
+ * misses a per-request deadline, the repository enters `restarting`: the
+ * bounded queue keeps accepting, the unacknowledged batch goes back to its
+ * head (inserts are idempotent by exchange id), and a replacement worker
+ * starts after an exponential backoff (1 s doubling to 5 min). Each worker
+ * re-runs the full startup: migrations, the schema compatibility check, and
+ * the process-run start marker, under the same process run so its checkpoint
+ * counters stay monotonic. Persistence latches `disabled` only for failures no
+ * restart can repair: an incompatible schema, a corrupt database, or a
+ * permission error. State transitions are logged, rate-limited.
  */
 export class SqliteLlmMetricsRepository implements LlmMetricsRepository {
-  private readonly worker: Worker;
   private readonly reader: SqliteReadWorkerClient;
+  private readonly workerFactory: WorkerFactory;
+  private readonly workerData: SqliteWriterWorkerData;
+  private readonly healthLog: RateLimitedLog;
   private readonly queue: QueuedExchange[] = [];
+  private readonly inFlight = new Set<InFlightBatch>();
   private readonly pending = new Map<number, PendingRequest>();
+  private readonly invalidByReason = new Map<string, number>();
   private readonly maxQueuedRecords: number;
   private readonly maxQueuedBytes: number;
   private readonly maxRecordBytes: number;
   private readonly batchSize: number;
   private readonly flushIntervalMs: number;
   private readonly checkpointIntervalMs: number;
-  private readonly flushTimeoutMs: number;
+  private readonly writeTimeoutMs: number;
   private readonly readTimeoutMs: number;
   private readonly closeTimeoutMs: number;
   private readonly startupTimeoutMs: number;
-  private readonly readyPromise: Promise<void>;
-  private resolveReady: (() => void) | null = null;
+  private readonly restartDelayMs: number;
+  private readonly maxRestartDelayMs: number;
+  private readonly busyRetryDelayMs: number;
+  private readonly firstStartup: Promise<void>;
+  private resolveFirstStartup: (() => void) | null = null;
+  private worker: Worker | null = null;
+  private writerReady = false;
+  private startupTimer: NodeJS.Timeout | null = null;
+  private restartTimer: NodeJS.Timeout | null = null;
   private flushTimer: NodeJS.Timeout | null = null;
   private checkpointTimer: NodeJS.Timeout | null = null;
+  /** Set by a busy batch: the next scheduled flush waits this long instead of the flush interval. */
+  private retryDelayMs: number | null = null;
   private activeFlush: Promise<void> | null = null;
   private activeClose: Promise<void> | null = null;
   private activeDelete: ActiveDelete | null = null;
   private nextRequestId = 1;
-  private state: LlmMetricsRepositoryHealth['state'] = 'starting';
+  /** Consecutive writer failures; reset once a worker answers a request. */
+  private restartAttempt = 0;
+  private writerRestarts = 0;
+  private state: LlmMetricsRepositoryState = 'starting';
   private schemaVersion: number | null = null;
   private observed = 0;
   private finalized = 0;
@@ -410,10 +641,26 @@ export class SqliteLlmMetricsRepository implements LlmMetricsRepository {
       'checkpointIntervalMs',
     );
     this.startupTimeoutMs = positiveInteger(options.startupTimeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, 'startupTimeoutMs');
-    this.flushTimeoutMs = positiveInteger(options.flushTimeoutMs, DEFAULT_FLUSH_TIMEOUT_MS, 'flushTimeoutMs');
+    this.writeTimeoutMs = positiveInteger(options.writeTimeoutMs, DEFAULT_WRITE_TIMEOUT_MS, 'writeTimeoutMs');
     this.readTimeoutMs = positiveInteger(options.readTimeoutMs, DEFAULT_READ_TIMEOUT_MS, 'readTimeoutMs');
     this.closeTimeoutMs = positiveInteger(options.closeTimeoutMs, DEFAULT_CLOSE_TIMEOUT_MS, 'closeTimeoutMs');
+    this.restartDelayMs = positiveInteger(options.restartDelayMs, DEFAULT_RESTART_DELAY_MS, 'restartDelayMs');
+    this.maxRestartDelayMs = positiveInteger(
+      options.maxRestartDelayMs,
+      Math.max(DEFAULT_MAX_RESTART_DELAY_MS, this.restartDelayMs),
+      'maxRestartDelayMs',
+    );
+    if (this.maxRestartDelayMs < this.restartDelayMs) throw new Error('maxRestartDelayMs must cover restartDelayMs');
+    this.busyRetryDelayMs = positiveInteger(options.busyRetryDelayMs, DEFAULT_BUSY_RETRY_DELAY_MS, 'busyRetryDelayMs');
+    const processRunId = options.processRunId ?? randomUUID();
+    if (processRunId.length > STATISTICS_IDENTIFIER_MAX_LENGTH || !STATISTICS_IDENTIFIER_PATTERN.test(processRunId)) {
+      throw new Error('Invalid processRunId');
+    }
 
+    this.healthLog = createRateLimitedLog({
+      intervalMs: HEALTH_LOG_INTERVAL_MS,
+      sink: options.logSink ?? projectLogSink,
+    });
     this.reader = new SqliteReadWorkerClient(
       options.databasePath,
       options.readWorkerFactory ?? defaultWorkerFactory,
@@ -421,32 +668,27 @@ export class SqliteLlmMetricsRepository implements LlmMetricsRepository {
       this.readTimeoutMs,
     );
 
-    this.readyPromise = new Promise<void>((resolve) => {
-      this.resolveReady = resolve;
+    this.firstStartup = new Promise<void>((resolve) => {
+      this.resolveFirstStartup = resolve;
     });
-    const workerData: SqliteWriterWorkerData = {
+    this.workerFactory = options.workerFactory ?? defaultWorkerFactory;
+    this.workerData = {
       role: 'writer',
       databasePath: options.databasePath,
-      processRunId: options.processRunId ?? randomUUID(),
+      processRunId,
       startedAtMs: Date.now(),
     };
-    this.worker = (options.workerFactory ?? defaultWorkerFactory)(workerUrl(), { workerData });
-    this.worker.on('message', (message: unknown) => this.onMessage(message));
-    this.worker.on('error', (error) => this.disable(error));
-    this.worker.on('exit', (code) => {
-      if (!this.closing && this.state !== 'disabled' && this.state !== 'closed') {
-        this.disable(new Error(`LLM metrics worker exited with code ${code}`));
-      }
-    });
+    this.spawnWriter();
   }
 
+  /**
+   * Resolves once the first writer is ready, has failed and is restarting, or
+   * has latched persistence off. Opening never throws for storage failures;
+   * health reports them.
+   */
   static async open(options: SqliteLlmMetricsRepositoryOptions): Promise<SqliteLlmMetricsRepository> {
     const repository = new SqliteLlmMetricsRepository(options);
-    try {
-      await withTimeout(repository.readyPromise, repository.startupTimeoutMs, 'LLM metrics worker startup timed out');
-    } catch (error) {
-      repository.disable(error);
-    }
+    await repository.firstStartup;
     return repository;
   }
 
@@ -471,21 +713,38 @@ export class SqliteLlmMetricsRepository implements LlmMetricsRepository {
       return false;
     }
 
-    this.queue.push({ exchange, bytes });
+    this.queue.push({ exchange, bytes, attempts: 0 });
     this.queuedBytes += bytes;
     this.enqueued++;
-    this.scheduleFlush();
+    // While the writer restarts the queue only accumulates; readiness flushes it.
+    if (this.writerAvailable()) this.scheduleFlush();
     return true;
   }
 
+  /**
+   * Drains the queue batch by batch; each batch has its own request deadline.
+   * A drain that is already running may be past its last queue check (it ends
+   * by awaiting a checkpoint), so it does not cover records enqueued since:
+   * they would wait for the next scheduled flush, or be dropped by close. A
+   * call made during a drain therefore waits for it, then drains whatever is
+   * still queued.
+   */
   async flush(): Promise<void> {
-    if (this.activeFlush !== null) return this.activeFlush;
+    const running = this.activeFlush;
+    if (running !== null) {
+      await running;
+      // A drain started meanwhile began after this call, so it covers this caller's records too.
+      if (this.activeFlush !== null) return this.activeFlush;
+      if (this.queue.length === 0) return;
+    }
     this.clearFlushTimer();
-    this.activeFlush = withTimeout(this.drainQueue(), this.flushTimeoutMs, 'LLM metrics worker flush timed out')
-      .catch((error: unknown) => this.disable(error))
+    this.activeFlush = this.drainQueue()
+      .catch((error: unknown) => this.markDegraded(error))
       .finally(() => {
         this.activeFlush = null;
-        if (this.queue.length > 0 && this.acceptingWrites()) this.scheduleFlush();
+        const retryDelayMs = this.retryDelayMs;
+        this.retryDelayMs = null;
+        if (this.queue.length > 0 && this.writerAvailable()) this.scheduleFlush(retryDelayMs ?? this.flushIntervalMs);
       });
     return this.activeFlush;
   }
@@ -501,13 +760,14 @@ export class SqliteLlmMetricsRepository implements LlmMetricsRepository {
     this.closing = true;
     const readerClose = this.reader.close().catch(() => undefined);
     this.clearFlushTimer();
-    if (this.checkpointTimer !== null) clearInterval(this.checkpointTimer);
-    this.checkpointTimer = null;
+    this.clearRestartTimer();
+    this.clearCheckpointTimer();
+    this.retryDelayMs = null;
     try {
       await withTimeout(
         (async () => {
           await this.flush();
-          if (this.state !== 'ready' && this.state !== 'degraded') return;
+          if (!this.writerAvailable()) return;
           await this.request({
             kind: 'close',
             cleanEndedAtMs: Date.now(),
@@ -520,13 +780,19 @@ export class SqliteLlmMetricsRepository implements LlmMetricsRepository {
         'LLM metrics worker close timed out',
       );
     } catch (error) {
-      this.disable(error);
+      this.lastError = sanitizeError(error);
+      this.healthLog.emit('close', 'warn', `[llm-metrics] Statistics writer did not close cleanly: ${this.lastError}`);
     }
+    // Whatever was not written by now is lost with this process.
+    this.dropUnwritten();
     const remainingCloseMs = Math.max(1, Math.floor(this.closeTimeoutMs - (performance.now() - startedAt)));
     await withTimeout(readerClose, remainingCloseMs, 'LLM metrics reader close timed out').catch(() => undefined);
     this.rejectPending(new LlmMetricsRepositoryUnavailableError('LLM metrics repository closed'));
-    void this.worker.terminate();
+    const worker = this.worker;
+    this.detachWriter();
+    if (worker !== null) void worker.terminate();
     this.state = 'closed';
+    this.settleFirstStartup();
   }
 
   health(): LlmMetricsRepositoryHealth {
@@ -543,32 +809,38 @@ export class SqliteLlmMetricsRepository implements LlmMetricsRepository {
       queuedRecords: this.queue.length + this.inFlightRecords,
       queuedBytes: this.queuedBytes + this.inFlightBytes,
       lastError: this.lastError,
+      writerRestarts: this.writerRestarts,
+      invalidByReason: Object.freeze(Object.fromEntries(this.invalidByReason)),
       readerState: readerHealth.state,
       readerLastError: readerHealth.lastError,
     };
   }
 
-  async snapshotMaxSequence(): Promise<number> {
-    const value = await this.reader.request({ kind: 'snapshotMaxSequence' });
-    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
-      throw new Error('Invalid snapshot response from LLM metrics worker');
-    }
-    return value;
+  snapshotMaxSequence(): Promise<number> {
+    return readSnapshotMaxSequence(this.reader);
   }
 
-  async scan(query: LlmExchangeScanQuery): Promise<readonly StoredLlmExchange[]> {
-    const value = await this.reader.request({ kind: 'scan', query });
-    if (!Array.isArray(value)) throw new Error('Invalid scan response from LLM metrics worker');
-    return value as readonly StoredLlmExchange[];
+  scan(query: LlmExchangeScanQuery): Promise<readonly StoredLlmExchange[]> {
+    return readScan(this.reader, query);
   }
 
-  async dimensionValues(
+  dimensionValues(
     dimension: LlmStatisticsDimension,
     query: Omit<LlmExchangeScanQuery, 'cursor'>,
   ): Promise<readonly LlmDimensionCount[]> {
-    const value = await this.reader.request({ kind: 'dimensionValues', dimension, query });
-    if (!Array.isArray(value)) throw new Error('Invalid dimension response from LLM metrics worker');
-    return value as readonly LlmDimensionCount[];
+    return readDimensionValues(this.reader, dimension, query);
+  }
+
+  aggregate(query: LlmStatisticsAggregateQuery): Promise<readonly LlmStatisticsPartition[]> {
+    return readAggregate(this.reader, query);
+  }
+
+  distribution(query: LlmStatisticsDistributionQuery): Promise<LlmStatisticsDistributionResult> {
+    return readDistribution(this.reader, query);
+  }
+
+  sessionTotals(query: LlmSessionTotalsQuery): Promise<LlmSessionUsageTotalsResult> {
+    return readSessionTotals(this.reader, query);
   }
 
   async deleteBefore(cutoffMs: number, options: LlmDeleteBeforeOptions = {}): Promise<LlmDeleteBeforeResult> {
@@ -753,7 +1025,9 @@ export class SqliteLlmMetricsRepository implements LlmMetricsRepository {
         chunksProcessed,
       };
     } finally {
-      if (release.needed && (this.state === 'ready' || this.state === 'degraded')) {
+      // A writer lost meanwhile cannot release the lease; it expires on its
+      // own, and a restarted writer of this process run may take it again.
+      if (release.needed && this.writerAvailable()) {
         const cleanup = this.boundedMaintenanceRequest(
           activity,
           { kind: 'releaseMaintenanceLease', leaseName: DELETE_LEASE_NAME },
@@ -827,57 +1101,147 @@ export class SqliteLlmMetricsRepository implements LlmMetricsRepository {
     );
   }
 
+  /** Records are queued while the writer starts, runs, or restarts; never once it is latched off or closing. */
   private acceptingWrites(): boolean {
-    return !this.closing && (this.state === 'ready' || this.state === 'degraded');
+    return (
+      !this.closing &&
+      (this.state === 'starting' || this.state === 'ready' || this.state === 'degraded' || this.state === 'restarting')
+    );
+  }
+
+  /** A ready worker is attached and can take requests. */
+  private writerAvailable(): boolean {
+    return this.worker !== null && this.writerReady && (this.state === 'ready' || this.state === 'degraded');
   }
 
   private assertWriterAvailable(): void {
-    if (this.state !== 'ready' && this.state !== 'degraded') {
+    if (!this.writerAvailable()) {
       throw new LlmMetricsRepositoryUnavailableError(this.lastError ?? undefined);
     }
   }
 
   private async drainQueue(): Promise<void> {
-    while (this.queue.length > 0 && (this.state === 'ready' || this.state === 'degraded')) {
-      const batch = this.queue.splice(0, this.batchSize);
-      const batchBytes = batch.reduce((total, item) => total + item.bytes, 0);
-      this.queuedBytes -= batchBytes;
-      this.inFlightRecords += batch.length;
-      this.inFlightBytes += batchBytes;
+    while (this.queue.length > 0 && this.writerAvailable()) {
+      const batch = this.takeBatch();
       try {
         const value = await this.request({
           kind: 'insert',
-          exchanges: batch.map((item) => item.exchange),
+          exchanges: batch.items.map((item) => item.exchange),
         });
-        if (
-          value === null ||
-          Array.isArray(value) ||
-          typeof value !== 'object' ||
-          !('inserted' in value) ||
-          !('duplicates' in value)
-        ) {
-          throw new Error('Invalid insert response from LLM metrics worker');
-        }
-        this.persisted += value.inserted;
-        this.duplicates += value.duplicates;
-        this.markReady();
+        const result = parseInsertResult(value, batch.items.length);
+        if (this.settleBatch(batch)) this.recordInsertResult(result);
       } catch (error) {
-        this.recordBatchDrop(batch.length);
+        // A lost writer requeued the batch, a latched or closing repository
+        // dropped it; either way it has been accounted for already.
+        if (batch.settled) break;
+        if (error instanceof WriterRequestError && error.code === 'busy') {
+          // Busy beyond the worker's own bounded retries: back to the head,
+          // retried after a backoff, still inside the queue bounds.
+          const attempt = Math.max(...batch.items.map((item) => item.attempts)) + 1;
+          this.requeueBatch(batch);
+          this.retryDelayMs = this.busyRetryDelayMs * 2 ** Math.min(attempt - 1, MAX_BUSY_RETRY_BACKOFF_EXPONENT);
+          this.markDegraded(error);
+          break;
+        }
+        this.dropBatch(batch);
         this.markDegraded(error);
-      } finally {
-        this.inFlightRecords = Math.max(0, this.inFlightRecords - batch.length);
-        this.inFlightBytes = Math.max(0, this.inFlightBytes - batchBytes);
       }
     }
     await this.checkpoint();
   }
 
-  private scheduleFlush(): void {
-    if (this.flushTimer !== null || this.activeFlush !== null) return;
+  private recordInsertResult(result: ParsedInsertResult): void {
+    this.persisted += result.inserted;
+    this.duplicates += result.duplicates;
+    if (result.rejectedTotal === 0) {
+      this.markReady();
+      return;
+    }
+    this.dropped += result.rejectedTotal;
+    const reasons: string[] = [];
+    for (const [reason, count] of result.rejected) {
+      this.countInvalid(reason, count);
+      reasons.push(`${reason} (${count})`);
+    }
+    const summary = `Dropped ${result.rejectedTotal} invalid statistics record(s): ${reasons.join('; ')}`;
+    this.markDegraded(new Error(summary), false);
+    this.healthLog.emit('invalid', 'warn', `[llm-metrics] ${this.lastError ?? summary}`);
+  }
+
+  private countInvalid(reason: string, count: number): void {
+    const bounded = reason.substring(0, MAX_INVALID_REASON_LENGTH);
+    const key =
+      this.invalidByReason.has(bounded) || this.invalidByReason.size < MAX_INVALID_REASONS - 1
+        ? bounded
+        : OTHER_INVALID_REASON;
+    this.invalidByReason.set(key, (this.invalidByReason.get(key) ?? 0) + count);
+  }
+
+  private takeBatch(): InFlightBatch {
+    const items = this.queue.splice(0, this.batchSize);
+    const bytes = items.reduce((total, item) => total + item.bytes, 0);
+    this.queuedBytes -= bytes;
+    this.inFlightRecords += items.length;
+    this.inFlightBytes += bytes;
+    const batch: InFlightBatch = { items, bytes, settled: false };
+    this.inFlight.add(batch);
+    return batch;
+  }
+
+  /** Marks the batch's single outcome; false when another path already settled it. */
+  private settleBatch(batch: InFlightBatch): boolean {
+    if (batch.settled) return false;
+    batch.settled = true;
+    this.inFlight.delete(batch);
+    this.inFlightRecords = Math.max(0, this.inFlightRecords - batch.items.length);
+    this.inFlightBytes = Math.max(0, this.inFlightBytes - batch.bytes);
+    return true;
+  }
+
+  private dropBatch(batch: InFlightBatch): void {
+    if (this.settleBatch(batch)) this.dropped += batch.items.length;
+  }
+
+  /**
+   * Returns a batch to the head of the queue. Its records already count
+   * toward the queue bounds, so requeueing cannot grow the queue; a record
+   * that has used up its write attempts is dropped instead.
+   */
+  private requeueBatch(batch: InFlightBatch): void {
+    if (!this.settleBatch(batch)) return;
+    const retry: QueuedExchange[] = [];
+    let exhausted = 0;
+    for (const item of batch.items) {
+      const attempts = item.attempts + 1;
+      if (attempts >= MAX_RECORD_WRITE_ATTEMPTS) exhausted++;
+      else retry.push({ ...item, attempts });
+    }
+    this.queue.unshift(...retry);
+    this.queuedBytes += retry.reduce((total, item) => total + item.bytes, 0);
+    if (exhausted > 0) {
+      this.dropped += exhausted;
+      this.healthLog.emit(
+        'exhausted',
+        'warn',
+        `[llm-metrics] Dropped ${exhausted} statistics record(s) after ${MAX_RECORD_WRITE_ATTEMPTS} failed write attempts`,
+      );
+    }
+  }
+
+  /** Drops everything not yet written: the queue and any unacknowledged batch. */
+  private dropUnwritten(): void {
+    for (const batch of [...this.inFlight]) this.dropBatch(batch);
+    this.dropped += this.queue.length;
+    this.queue.length = 0;
+    this.queuedBytes = 0;
+  }
+
+  private scheduleFlush(delayMs = this.flushIntervalMs): void {
+    if (this.flushTimer !== null || this.activeFlush !== null || this.closing) return;
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
       void this.flush();
-    }, this.flushIntervalMs);
+    }, delayMs);
     this.flushTimer.unref();
   }
 
@@ -886,8 +1250,29 @@ export class SqliteLlmMetricsRepository implements LlmMetricsRepository {
     this.flushTimer = null;
   }
 
+  private ensureCheckpointTimer(): void {
+    if (this.checkpointTimer !== null || this.closing) return;
+    this.checkpointTimer = setInterval(() => void this.checkpoint(), this.checkpointIntervalMs);
+    this.checkpointTimer.unref();
+  }
+
+  private clearCheckpointTimer(): void {
+    if (this.checkpointTimer !== null) clearInterval(this.checkpointTimer);
+    this.checkpointTimer = null;
+  }
+
+  private clearStartupTimer(): void {
+    if (this.startupTimer !== null) clearTimeout(this.startupTimer);
+    this.startupTimer = null;
+  }
+
+  private clearRestartTimer(): void {
+    if (this.restartTimer !== null) clearTimeout(this.restartTimer);
+    this.restartTimer = null;
+  }
+
   private async checkpoint(): Promise<void> {
-    if (this.state !== 'ready' && this.state !== 'degraded') return;
+    if (!this.writerAvailable()) return;
     try {
       await this.request({
         kind: 'checkpoint',
@@ -901,89 +1286,222 @@ export class SqliteLlmMetricsRepository implements LlmMetricsRepository {
     }
   }
 
+  /**
+   * Sends one request to the current writer with its own deadline. A worker
+   * that misses the deadline is treated as wedged and replaced; this request
+   * is rejected through that failure path.
+   */
   private request(request: WriterRequestWithoutId): Promise<WorkerResult> {
-    this.assertWriterAvailable();
+    const worker = this.worker;
+    if (worker === null || !this.writerAvailable()) {
+      return Promise.reject(new LlmMetricsRepositoryUnavailableError(this.lastError ?? undefined));
+    }
     if (this.pending.size >= MAX_PENDING_WORKER_REQUESTS) {
       return Promise.reject(new LlmMetricsRepositoryUnavailableError('LLM metrics worker request limit reached'));
     }
     const id = this.nextRequestId++;
     return new Promise<WorkerResult>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.worker.postMessage({ ...request, id } satisfies SqliteWorkerRequest);
+      const deadline = setTimeout(() => {
+        this.onWriterFailure(worker, new Error(`LLM metrics worker ${request.kind} request timed out`));
+      }, this.writeTimeoutMs);
+      deadline.unref();
+      this.pending.set(id, {
+        resolve: (value) => {
+          clearTimeout(deadline);
+          resolve(value);
+        },
+        reject: (error) => {
+          clearTimeout(deadline);
+          reject(error);
+        },
+      });
+      try {
+        worker.postMessage({ ...request, id } satisfies SqliteWorkerRequest);
+      } catch (error) {
+        const pending = this.pending.get(id);
+        this.pending.delete(id);
+        pending?.reject(error instanceof Error ? error : new Error('Failed to send LLM metrics worker request'));
+      }
     });
   }
 
-  private onMessage(message: unknown): void {
+  private spawnWriter(): void {
+    let worker: Worker;
+    try {
+      worker = this.workerFactory(workerUrl(), { workerData: this.workerData });
+    } catch (error) {
+      this.scheduleRestart(error);
+      return;
+    }
+    this.worker = worker;
+    this.writerReady = false;
+    worker.on('message', (message: unknown) => this.onWorkerMessage(worker, message));
+    worker.on('error', (error) => this.onWriterFailure(worker, error));
+    worker.on('exit', (code) => this.onWriterFailure(worker, new Error(`LLM metrics worker exited with code ${code}`)));
+    this.startupTimer = setTimeout(
+      () => this.onWriterFailure(worker, new Error('LLM metrics worker startup timed out')),
+      this.startupTimeoutMs,
+    );
+    this.startupTimer.unref();
+  }
+
+  private onWorkerMessage(worker: Worker, message: unknown): void {
+    if (worker !== this.worker) return;
     if (typeof message !== 'object' || message === null || !('kind' in message)) {
-      this.disable(new Error('Invalid response from LLM metrics worker'));
+      this.onWriterFailure(worker, new Error('Invalid response from LLM metrics worker'));
       return;
     }
     const response = message as SqliteWorkerResponse;
     if (response.kind === 'ready') {
-      this.schemaVersion = response.schemaVersion;
-      this.state = 'ready';
-      this.resolveReady?.();
-      this.resolveReady = null;
-      this.checkpointTimer = setInterval(() => void this.checkpoint(), this.checkpointIntervalMs);
-      this.checkpointTimer.unref();
+      this.onWriterReady(worker, response.schemaVersion);
       return;
     }
     if (response.kind === 'error' && response.id === undefined) {
-      this.disable(new Error(response.message));
+      // Startup failed; the worker exits after reporting it.
+      this.onWriterFailure(worker, new Error(response.message), response.code);
       return;
     }
     const id = response.id;
     if (id === undefined) {
-      this.disable(new Error('LLM metrics worker response is missing a request ID'));
+      this.onWriterFailure(worker, new Error('LLM metrics worker response is missing a request ID'));
       return;
     }
     const pending = this.pending.get(id);
     if (pending === undefined) return;
     this.pending.delete(id);
+    // A worker that answers requests is healthy again.
+    this.restartAttempt = 0;
     if (response.kind === 'error') {
-      pending.reject(new Error(response.message));
-    } else {
-      pending.resolve(response.value);
+      const error = new WriterRequestError(response.message, response.code);
+      pending.reject(error);
+      if (isPermanentStorageError(response.code)) this.disable(error);
+      return;
     }
+    pending.resolve(response.value);
   }
 
+  private onWriterReady(worker: Worker, schemaVersion: unknown): void {
+    // A replacement that finishes starting during close is terminated with it.
+    if (this.writerReady || this.closing) return;
+    if (typeof schemaVersion !== 'number' || !Number.isSafeInteger(schemaVersion) || schemaVersion < 1) {
+      this.onWriterFailure(worker, new Error('Invalid schema response from LLM metrics worker'));
+      return;
+    }
+    this.clearStartupTimer();
+    this.writerReady = true;
+    this.schemaVersion = schemaVersion;
+    this.transition('ready');
+    this.ensureCheckpointTimer();
+    this.settleFirstStartup();
+    if (this.queue.length > 0) this.scheduleFlush(0);
+  }
+
+  /**
+   * The current writer exited, threw, could not start, or missed a deadline.
+   * Its unacknowledged batch goes back to the queue (inserts are idempotent by
+   * exchange id) and a replacement is scheduled, unless the failure is one no
+   * restart can repair.
+   */
+  private onWriterFailure(worker: Worker, error: unknown, code?: LlmMetricsStorageErrorCode): void {
+    if (worker !== this.worker) return;
+    if (isPermanentStorageError(code) && !this.closing) {
+      this.disable(error);
+      return;
+    }
+    this.detachWriter();
+    for (const batch of [...this.inFlight].reverse()) this.requeueBatch(batch);
+    this.rejectPending(new LlmMetricsRepositoryUnavailableError(sanitizeError(error)));
+    void worker.terminate();
+    if (this.closing || this.state === 'closed' || this.state === 'disabled') return;
+    this.scheduleRestart(error);
+  }
+
+  private scheduleRestart(error: unknown): void {
+    const exponent = Math.min(this.restartAttempt, MAX_RESTART_BACKOFF_EXPONENT);
+    const delayMs = Math.min(this.restartDelayMs * 2 ** exponent, this.maxRestartDelayMs);
+    this.restartAttempt++;
+    this.transition('restarting', error, delayMs);
+    this.settleFirstStartup();
+    this.clearRestartTimer();
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null;
+      if (this.closing || this.state !== 'restarting') return;
+      this.writerRestarts++;
+      this.spawnWriter();
+    }, delayMs);
+    this.restartTimer.unref();
+  }
+
+  private detachWriter(): void {
+    this.worker = null;
+    this.writerReady = false;
+    this.clearStartupTimer();
+  }
+
+  /** Latches persistence off for a failure no restart can repair. */
   private disable(error: unknown): void {
     if (this.state === 'closed' || this.state === 'disabled') return;
-    this.state = 'disabled';
-    this.lastError = sanitizeError(error);
-    this.dropped += this.queue.length + this.inFlightRecords;
-    this.queue.length = 0;
-    this.queuedBytes = 0;
-    this.inFlightRecords = 0;
-    this.inFlightBytes = 0;
+    const worker = this.worker;
+    this.detachWriter();
+    this.clearRestartTimer();
     this.clearFlushTimer();
-    if (this.checkpointTimer !== null) clearInterval(this.checkpointTimer);
-    this.checkpointTimer = null;
-    this.rejectPending(new LlmMetricsRepositoryUnavailableError(this.lastError));
-    this.resolveReady?.();
-    this.resolveReady = null;
-    void this.worker.terminate();
+    this.clearCheckpointTimer();
+    this.retryDelayMs = null;
+    this.transition('disabled', error);
+    this.dropUnwritten();
+    this.rejectPending(new LlmMetricsRepositoryUnavailableError(this.lastError ?? undefined));
+    this.settleFirstStartup();
+    if (worker !== null) void worker.terminate();
   }
 
   private markReady(): void {
-    if (this.state !== 'degraded') return;
-    this.state = 'ready';
-    this.lastError = null;
+    if (this.state === 'degraded') this.transition('ready');
   }
 
-  private markDegraded(error: unknown): void {
-    if (this.state === 'disabled' || this.state === 'closed') return;
-    this.state = 'degraded';
-    this.lastError = sanitizeError(error);
+  /** A failed operation on a running writer; ignored while the writer is restarting, latched, or closed. */
+  private markDegraded(error: unknown, log = true): void {
+    if (this.state !== 'ready' && this.state !== 'degraded') return;
+    this.transition('degraded', error, undefined, log);
   }
 
-  private recordBatchDrop(count: number): void {
-    if (this.state === 'ready' || this.state === 'degraded') this.dropped += count;
+  private transition(next: LlmMetricsRepositoryState, error?: unknown, restartDelayMs?: number, log = true): void {
+    const previous = this.state;
+    this.state = next;
+    if (error !== undefined) this.lastError = sanitizeError(error);
+    else if (next === 'ready') this.lastError = null;
+    if (!log) return;
+    const reason = this.lastError ?? 'unknown error';
+    if (next === 'restarting') {
+      this.healthLog.emit(
+        'restarting',
+        'warn',
+        `[llm-metrics] Statistics writer unavailable (${reason}); restarting it in ${restartDelayMs ?? 0} ms, ` +
+          'queued records are kept within the queue bounds',
+      );
+    } else if (next === 'disabled') {
+      this.healthLog.emit('disabled', 'error', `[llm-metrics] Statistics persistence disabled: ${reason}`);
+    } else if (next === 'degraded' && previous === 'ready') {
+      this.healthLog.emit('degraded', 'warn', `[llm-metrics] Statistics writer degraded: ${reason}`);
+    } else if (next === 'ready' && previous === 'restarting') {
+      this.healthLog.emit(
+        'recovered',
+        'info',
+        `[llm-metrics] Statistics writer running again after ${this.writerRestarts} restart(s)`,
+      );
+    } else if (next === 'ready' && previous === 'degraded') {
+      this.healthLog.emit('recovered', 'info', '[llm-metrics] Statistics writer recovered');
+    }
+  }
+
+  private settleFirstStartup(): void {
+    this.resolveFirstStartup?.();
+    this.resolveFirstStartup = null;
   }
 
   private rejectPending(error: Error): void {
-    for (const request of this.pending.values()) request.reject(error);
+    const requests = [...this.pending.values()];
     this.pending.clear();
+    for (const request of requests) request.reject(error);
   }
 }
 
@@ -991,4 +1509,63 @@ export async function openSqliteLlmMetricsRepository(
   options: SqliteLlmMetricsRepositoryOptions,
 ): Promise<SqliteLlmMetricsRepository> {
   return SqliteLlmMetricsRepository.open(options);
+}
+
+export interface SqliteLlmMetricsReaderOptions {
+  readonly databasePath: string;
+  readonly startupTimeoutMs?: number;
+  readonly readTimeoutMs?: number;
+  /** Reader test seam; production callers should use the default worker implementation. */
+  readonly readWorkerFactory?: WorkerFactory;
+}
+
+/** A read-only statistics handle that never writes (no writer worker, no process-run marker). */
+export interface SqliteLlmMetricsReader extends LlmMetricsReadRepository {
+  close(): Promise<void>;
+}
+
+/**
+ * Open only the reader worker, for local read paths such as
+ * `ironcurtain statistics summary`. The worker starts lazily on first read
+ * and opens the database read-only.
+ */
+export function openSqliteLlmMetricsReader(options: SqliteLlmMetricsReaderOptions): SqliteLlmMetricsReader {
+  if (options.databasePath.length === 0) throw new Error('databasePath is required');
+  const reader = new SqliteReadWorkerClient(
+    options.databasePath,
+    options.readWorkerFactory ?? defaultWorkerFactory,
+    positiveInteger(options.startupTimeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, 'startupTimeoutMs'),
+    positiveInteger(options.readTimeoutMs, DEFAULT_READ_TIMEOUT_MS, 'readTimeoutMs'),
+  );
+  return Object.freeze({
+    // This handle has no writer: report one that never started or restarted.
+    health: (): LlmMetricsRepositoryHealth => {
+      const readerHealth = reader.health();
+      return {
+        state: 'disabled',
+        schemaVersion: null,
+        observed: 0,
+        finalized: 0,
+        enqueued: 0,
+        persisted: 0,
+        duplicates: 0,
+        dropped: 0,
+        queuedRecords: 0,
+        queuedBytes: 0,
+        lastError: null,
+        writerRestarts: 0,
+        invalidByReason: Object.freeze({}),
+        readerState: readerHealth.state,
+        readerLastError: readerHealth.lastError,
+      };
+    },
+    snapshotMaxSequence: () => readSnapshotMaxSequence(reader),
+    scan: (query: LlmExchangeScanQuery) => readScan(reader, query),
+    dimensionValues: (dimension: LlmStatisticsDimension, query: Omit<LlmExchangeScanQuery, 'cursor'>) =>
+      readDimensionValues(reader, dimension, query),
+    aggregate: (query: LlmStatisticsAggregateQuery) => readAggregate(reader, query),
+    distribution: (query: LlmStatisticsDistributionQuery) => readDistribution(reader, query),
+    sessionTotals: (query: LlmSessionTotalsQuery) => readSessionTotals(reader, query),
+    close: () => reader.close(),
+  });
 }

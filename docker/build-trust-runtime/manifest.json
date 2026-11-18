@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "goVersion": "go version go1.26.1 linux/amd64",
+  "goVersion": "go version go1.26.11 linux/amd64",
   "targets": [
     {
       "architecture": "amd64",

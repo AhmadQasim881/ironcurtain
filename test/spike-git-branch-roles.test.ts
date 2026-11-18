@@ -8,12 +8,14 @@ import { describe, it, expect } from 'vitest';
 import type { CompiledPolicyFile, StoredToolAnnotationsFile } from '../src/pipeline/types.js';
 import { PolicyEngine } from '../src/trusted-process/policy-engine.js';
 import type { ToolCallRequest } from '../src/types/mcp.js';
+import { objectSchema } from './fixtures/test-policy.js';
 
 const SANDBOX = '/tmp/spike-sandbox';
 const OUTSIDE = '/home/user/project';
 
 // Minimal stored annotations with conditional role specs for git_branch
 const annotations: StoredToolAnnotationsFile = {
+  generatedAt: 'spike',
   servers: {
     git: {
       inputHash: 'spike',
@@ -22,7 +24,11 @@ const annotations: StoredToolAnnotationsFile = {
           toolName: 'git_branch',
           serverName: 'git',
           comment: 'List, create, or delete branches.',
-
+          inputSchema: objectSchema({
+            path: 'string',
+            operation: { type: 'string', enum: ['list', 'show-current', 'create', 'rename', 'delete'] },
+            name: 'string',
+          }),
           args: {
             path: {
               default: ['read-path', 'write-history', 'delete-history'],

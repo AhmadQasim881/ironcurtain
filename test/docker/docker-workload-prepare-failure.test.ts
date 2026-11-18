@@ -18,11 +18,13 @@
  * test/docker/docker-workload-admission.test.ts and is untouched here).
  */
 
-import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { IronCurtainConfig } from '../../src/config/types.js';
+import { USER_CONFIG_DEFAULTS } from '../../src/config/user-config.js';
+import type { BudgetGate } from '../../src/docker/budget-gate.js';
 import type { AgentAdapter, AgentId } from '../../src/docker/agent-adapter.js';
 import type { AuthMethod } from '../../src/docker/oauth-credentials.js';
 import type { CertificateAuthority } from '../../src/docker/ca.js';
@@ -75,6 +77,10 @@ interface PrepareSeam {
   publicSocketPath?: string;
   registrySocketMode?: number;
   publicSocketMode?: number;
+  /** Provenance sink the production wiring handed the registry listener. */
+  registryProvenance?: NonNullable<MitmProxyOptions['registryEgress']>['recordProvenance'];
+  /** Supervisor entrypoint the production wiring admitted with. */
+  supervisorEntrypointPath?: string;
 }
 
 const seam = vi.hoisted<PrepareSeam>(() => ({
@@ -219,6 +225,7 @@ vi.mock('../../src/docker-workload/infrastructure.js', async (importOriginal) =>
   return {
     ...actual,
     admitDockerWorkloadBundle: async (options: DockerWorkloadAdmissionOptions) => {
+      seam.supervisorEntrypointPath = options.watchdogSupervisorEntrypointPath;
       const handle = await actual.admitDockerWorkloadBundle({ ...options, ...seam.admissionOverrides() });
       seam.handle = handle;
       return handle;
@@ -252,6 +259,8 @@ beforeEach(() => {
   seam.publicSocketPath = undefined;
   seam.registrySocketMode = undefined;
   seam.publicSocketMode = undefined;
+  seam.registryProvenance = undefined;
+  seam.supervisorEntrypointPath = undefined;
   seam.makeProxy = (socketPath: string): DockerProxy => ({
     ...createMockProxy(socketPath),
     async start() {
@@ -272,10 +281,11 @@ beforeEach(() => {
       seam.stops.proxy += 1;
     },
   });
-  seam.makeMitm = ({ socketPath, controlSocketPath }: MitmProxyOptions): MitmProxy => {
+  seam.makeMitm = ({ socketPath, controlSocketPath, registryEgress }: MitmProxyOptions): MitmProxy => {
     if (socketPath?.endsWith('/registry-egress.sock')) {
       seam.lifecycle.push('construct-registry');
       seam.registrySocketPath = socketPath;
+      seam.registryProvenance = registryEgress?.recordProvenance;
     }
     return {
       ...createMockMitmProxy(),
@@ -410,6 +420,33 @@ describe('prepareDockerInfrastructure — Docker-workload lease teardown on fail
     expect(seam.stops).toEqual({ proxy: 1, mitm: 2, public: 0 });
   });
 
+  it('wires the registry listener to the admitted lease provenance log and the source supervisor entry', async () => {
+    installSupervisor(createFakeSupervisor({ clock: clock.clock, closeLeaseOnStop: true }));
+
+    await expect(prepare('images')).rejects.toThrow(/scripted post-attestation failure/u);
+
+    // A source run launches the supervisor source, never a stale dist/ build.
+    expect(seam.supervisorEntrypointPath).toBe(resolve('src/docker-workload/resource-watchdog-supervisor-main.ts'));
+    const recordProvenance = seam.registryProvenance;
+    if (recordProvenance === undefined) throw new Error('registry listener was built without a provenance sink');
+    const digest = `sha256:${'e'.repeat(64)}`;
+    recordProvenance({
+      originId: 'docker-hub:cdn',
+      operation: 'blob-pull',
+      method: 'GET',
+      destination: { hostname: 'production.cloudflare.docker.com', port: 443 },
+      status: 200,
+      repository: 'library/alpine',
+      reference: digest,
+      requestedDigest: digest,
+      resolvedDigest: digest,
+      sizeBytes: 42,
+    });
+    const handle = admittedHandle();
+    const record = JSON.parse(readFileSync(handle.registryPullProvenancePath, 'utf8')) as unknown;
+    expect(record).toMatchObject({ leaseId: handle.leaseId, bundleId: BUNDLE_ID, resolvedDigest: digest });
+  });
+
   it('stops both constructed listeners when package listener binding fails', async () => {
     const supervisor = installSupervisor(createFakeSupervisor({ clock: clock.clock, closeLeaseOnStop: true }));
     seam.publicStartError = new Error('scripted public listener bind failure');
@@ -498,6 +535,27 @@ describe('prepareDockerInfrastructure — Docker-workload lease teardown on fail
     expect(supervisor.calls.launched).toBe(0);
     expect(loadDockerWorkloadLease(admittedHandle().leasePath).status).toBe('closed');
     expect(seam.stops).toEqual({ proxy: 1, mitm: 1, public: 0 });
+  });
+
+  it("hands the agent MITM proxy the bundle's budget gate, in turn mode with the configured limits", async () => {
+    installSupervisor(createFakeSupervisor({ clock: clock.clock, closeLeaseOnStop: true }));
+    const gates: (BudgetGate | undefined)[] = [];
+    const makeMitm = seam.makeMitm;
+    seam.makeMitm = (options: MitmProxyOptions): MitmProxy => {
+      gates.push(options.budgetGate);
+      return makeMitm(options);
+    };
+
+    await expect(prepare()).rejects.toThrow(/scripted post-attestation failure/u);
+
+    // Offline nested Docker starts no registry listener: the one MITM proxy is the agent's.
+    expect(gates).toHaveLength(1);
+    expect(gates[0]?.mode).toBe('turn');
+    // This config names no budget, so the defaults apply (never "unlimited").
+    expect(gates[0]?.limits).toEqual({
+      maxTotalTokens: USER_CONFIG_DEFAULTS.resourceBudget.maxTotalTokens,
+      maxEstimatedCostUsd: USER_CONFIG_DEFAULTS.resourceBudget.maxEstimatedCostUsd,
+    });
   });
 
   it('tears the admitted lease down when a step AFTER attestation throws', async () => {

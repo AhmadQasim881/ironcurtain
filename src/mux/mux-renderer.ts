@@ -11,10 +11,55 @@
  *
  * The PTY viewport size is constant regardless of input mode.
  * Command-mode UI overlays the bottom of the viewport.
+ *
+ * Frames and damage tracking. Every redraw is one frame: everything it
+ * draws is collected and sent to the terminal as a single write wrapped in
+ * synchronized-output mode (frame-writer.ts), so the terminal never shows a
+ * half-drawn state. Within a frame only what changed is sent:
+ * - PTY rows: the bytes each viewport row was last drawn with are kept per
+ *   tab (keyed by screen row) and a row is sent only when its bytes differ.
+ *   The cache starts over on a full redraw (which clears the screen), a
+ *   resize, another tab, mode or scroll position; rows an overlay takes
+ *   over are dropped from it, so they are repainted when they come back.
+ * - Overlays are composed into the frame, not painted over it: the overlay
+ *   is drawn first into its own buffer and records the cells it covers, and
+ *   PTY rows skip those cells, so streaming output never paints under the
+ *   escalation dialog.
+ * - The tab bar, the footer and the overlay are sent when their bytes
+ *   differ from what was last sent for them (the footer, for one, changes
+ *   only with the flash, the pending count, the scroll offset or the label).
+ *   An overlay is also sent after any PTY span on a row it covers. A full
+ *   redraw or a resize sends every region again.
+ *
+ * Untrusted text. Everything the overlays show that did not originate in
+ * this process -- tool arguments, escalation reasons, whitelist descriptions,
+ * server and tool names, session labels, workspace paths, directory entries,
+ * picker descriptions, error messages -- is agent-influenced and reaches the
+ * user's real terminal. terminal-kit's styled calls (`term(...)`,
+ * `term.cyan(...)`) pass control bytes through verbatim and interpret `^`
+ * markup and `%` format specifiers, so raw text could move the cursor,
+ * overwrite the lines above it, set the clipboard or hide itself. Every such
+ * string therefore goes through {@link untrusted}: display-escape (controls,
+ * C1, bidi and invisible characters become visible `\u...` escapes), cut to
+ * a cell budget measured in display cells, then escape terminal-kit markup.
+ * Only the PTY viewport bypasses this, because it re-renders xterm-headless
+ * cells through `term.noFormat()` with SGR built by this module. A cell whose
+ * host display width differs from xterm's width, or which contains invisible
+ * formatting, is blanked within its recorded columns.
+ *
+ * Reviewer context. An escalation can carry the session's task and the
+ * human's last trusted message (trusted, written by the human) and the
+ * agent's justification (UNTRUSTED, written by the agent). The picker, the
+ * detail view and the approve-all list label each for what it is: the
+ * agent's text is always prefixed `Agent says (untrusted):` (in the detail
+ * view: headed, after the arguments, behind a gutter) and escaped on one
+ * line, so its line breaks never lay out rows of their own. See
+ * trusted-process/escalation-context.ts.
  */
 
 /* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
 
+import { performance } from 'node:perf_hooks';
 import type { Terminal as TerminalType } from '@xterm/headless';
 import {
   calculateLayout,
@@ -23,23 +68,45 @@ import {
   type InputMode,
   type Layout,
   type MuxTab,
+  type PendingRef,
 } from './types.js';
-import type { ListenerState } from '../escalation/listener-state.js';
+import type { ListenerState, PendingEscalation } from '../escalation/listener-state.js';
 import type {
   PickerState,
   ResumePickerState,
   PersonaPickerState,
   ProviderPickerState,
-  EscalationPickerState,
+  MessagePanelState,
 } from './mux-input-handler.js';
+import {
+  bulkApprovalKey,
+  decisionArmedAt,
+  ESCALATION_ARMING_DELAY_MS,
+  whitelistConfirmView,
+  type BulkApproveGroup,
+  type BulkApproveState,
+  type DisplayedBulkApproval,
+  type DisplayedEscalation,
+  type EscalationPickerState,
+  type EscalationView,
+} from './escalation-picker-state.js';
+import { directoryCandidateIndex, type WhitelistScope } from '../trusted-process/approval-whitelist.js';
 import { createSplashScreen, type SplashScreen } from './mux-splash.js';
+import { createFrameWriter, type FrameStream } from './frame-writer.js';
 import { formatRelativeTime, getWorkspaceLabel } from '../pty/session-scanner.js';
+import { escapeTerminalKitMarkup, toDisplayText } from '../terminal/display-sanitize.js';
+import { displayWidth, fitsWidth, truncateToWidth, wrapToWidth } from '../terminal/display-width.js';
+import { escalationGroupKey, groupMembers } from '../escalation/escalation-groups.js';
+import { displayedUserMessage } from '../escalation/escalation-review.js';
 
 // -- xterm.js color mode constants (from IBufferCell.getFgColorMode/getBgColorMode) --
 const CM_DEFAULT = 0;
 const CM_P16 = 16777216; // 0x01000000
 const CM_P256 = 33554432; // 0x02000000
 const CM_RGB = 50331648; // 0x03000000
+
+/** Formatting must not join or reorder independently positioned PTY cells. */
+const PTY_CELL_FORMAT = /[\p{Default_Ignorable_Code_Point}\p{Cf}]/u;
 
 /** Color type compatible with terminal-kit ScreenBufferHD. */
 export type TermkitColor = number | { r: number; g: number; b: number } | 'default';
@@ -135,10 +202,31 @@ export interface MuxRenderer {
   destroy(): void;
   /** Schedule a throttled PTY redraw. */
   scheduleRedraw(): void;
-  /** Shows a transient message in the footer that auto-clears. */
+  /**
+   * Shows a transient message in the footer that auto-clears. The footer is
+   * the last screen row, so the message is collapsed to its first line
+   * (display-sanitized) plus `(+N more)`, and cut to the terminal width: a
+   * line feed or wrap there would scroll the alternate screen and shift the
+   * whole layout. Multi-line output belongs in the message panel.
+   */
   showMessage(message: string): void;
   /** Current layout. */
   readonly layout: Layout;
+  /**
+   * The escalation whose picker dialog (summary, detail view or whitelist
+   * confirmation) the latest overlay draw showed in full, with the view and
+   * the time it has been on screen since, or null when it showed none: the
+   * picker is closed, or the terminal was too small and a notice was drawn
+   * instead. Approvals are accepted only for this escalation, once it has
+   * been shown for the arming delay (MuxInputHandlerOptions.displayedEscalation).
+   */
+  readonly displayedEscalation: DisplayedEscalation | null;
+  /**
+   * The approve-all list the latest overlay draw showed, and since when
+   * every line of it has been on screen; null when it was not drawn.
+   * `y` approves only a list seen completely (MuxInputHandlerOptions.displayedBulkApproval).
+   */
+  readonly displayedBulkApproval: DisplayedBulkApproval | null;
 }
 
 export interface MuxRendererDeps {
@@ -155,17 +243,114 @@ export interface MuxRendererDeps {
   getPersonaPickerState: () => PersonaPickerState | null;
   getProviderPickerState: () => ProviderPickerState | null;
   getEscalationPickerState: () => EscalationPickerState | null;
+  /** The approve-all confirmation screen's state. Omitted: never open. */
+  getBulkApproveState?: () => BulkApproveState | null;
+  getMessagePanelState: () => MessagePanelState | null;
   /** Returns the active tab's scroll offset (null = live/bottom). */
   getScrollOffset: () => number | null;
+  /**
+   * Monotonic clock in milliseconds, the same one the input handler uses
+   * for the arming delay. Default `performance.now`.
+   */
+  now?: () => number;
+  /** Arming delay in milliseconds, as given to the input handler. Default {@link ESCALATION_ARMING_DELAY_MS}. */
+  armingDelayMs?: number;
+}
+
+/** Widest session label drawn in the tab bar and footer, in cells. */
+const MAX_TAB_LABEL_WIDTH = 48;
+
+/**
+ * Trusted prefixes of the reason and whitelist rows: the command that adds
+ * each pattern (the exact one, and the directory-wide one when offered).
+ */
+const REASON_PREFIX = 'Reason: ';
+const WHITELIST_PREFIX = '/approve+ ';
+const DIRECTORY_WHITELIST_PREFIX = '/approve+dir ';
+/** Trusted prefixes of the reviewer-context rows (see the module comment). */
+const TASK_PREFIX = 'Task: ';
+const USER_MESSAGE_PREFIX = 'You said: ';
+const JUSTIFICATION_PREFIX = 'Agent says (untrusted): ';
+/** The detail view's heading for the agent's justification, and the gutter on each of its rows. */
+const DETAIL_JUSTIFICATION_HEADING = 'Agent says (UNTRUSTED: written by the agent, it authorizes nothing):';
+const DETAIL_JUSTIFICATION_GUTTER = '  │ ';
+
+/** The trusted prefix a reviewer-context or reason/whitelist row is drawn with. */
+function rowPrefix(
+  kind: 'reason' | 'whitelist' | 'whitelist-directory' | 'task' | 'user-message' | 'justification',
+): string {
+  switch (kind) {
+    case 'reason':
+      return REASON_PREFIX;
+    case 'whitelist':
+      return WHITELIST_PREFIX;
+    case 'whitelist-directory':
+      return DIRECTORY_WHITELIST_PREFIX;
+    case 'task':
+      return TASK_PREFIX;
+    case 'user-message':
+      return USER_MESSAGE_PREFIX;
+    case 'justification':
+      return JUSTIFICATION_PREFIX;
+  }
+}
+
+/**
+ * Untrusted text for a styled terminal-kit call: display-escaped, cut to
+ * `maxWidth` cells when given (an ellipsis marks the cut), then terminal-kit
+ * markup-escaped. `toDisplayText` is idempotent on its own output, so text
+ * that was sanitized earlier (for example by the row planners below) may pass
+ * through again.
+ */
+function untrusted(text: string, maxWidth?: number): string {
+  const shown = toDisplayText(text);
+  return escapeTerminalKitMarkup(maxWidth === undefined ? shown : truncateToWidth(shown, maxWidth));
+}
+
+/** `server/tool` for an escalation, display-sanitized. */
+function toolLabel(request: PendingEscalation['request']): string {
+  return `${toDisplayText(request.serverName)}/${toDisplayText(request.toolName)}`;
+}
+
+/** A region of the screen drawn whole, and sent only when its bytes change. */
+type ScreenRegion = 'tabBar' | 'footer' | 'overlay';
+
+/** Columns `[from, to)` of a screen row that the overlay covers. */
+interface CoveredSpan {
+  readonly from: number;
+  readonly to: number;
+}
+
+/**
+ * What the PTY viewport rows were last drawn with: the bytes of each screen
+ * row (with the span the overlay covered), valid for one tab, mode, scroll
+ * position, width and viewport position.
+ */
+interface ViewportRows {
+  readonly tab: MuxTab;
+  readonly mode: InputMode;
+  readonly scrollOffset: number | null;
+  readonly cols: number;
+  readonly top: number;
+  readonly rows: Map<number, string>;
 }
 
 /**
  * Creates a MuxRenderer.
  */
 export function createMuxRenderer(term: TerminalKit, cols: number, rows: number, deps: MuxRendererDeps): MuxRenderer {
+  /** Pending escalations offering a directory-wide pattern: each needs one more panel row. */
+  function directoryPatternCount(): number {
+    let count = 0;
+    for (const esc of deps.getEscalationState().pendingEscalations.values()) {
+      if (directoryCandidate(esc) !== undefined) count++;
+    }
+    return count;
+  }
+
   let _cols = cols;
   let _rows = rows;
-  let _layout = calculateLayout(_rows, deps.getMode(), deps.getPendingCount());
+  let _layout = calculateLayout(_rows, deps.getMode(), deps.getPendingCount(), 1, directoryPatternCount());
 
   // Render throttling
   let renderScheduled = false;
@@ -182,10 +367,200 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
   // Cached visual lines from recalcLayout(), reused by drawCommandOverlay()
   let _cachedVisualLines: VisualLine[] = [{ text: '', bufferOffset: 0 }];
 
+  // -- Frames and damage tracking (see the module comment) --
+  const frames = createFrameWriter(term.stdout as FrameStream | undefined);
+  /** The bytes last sent for each region that is drawn whole; identical bytes are not sent again. */
+  const _regionBytes = new Map<ScreenRegion, string>();
+  /** The cells the overlay of the current frame covers, by screen row: PTY rows skip them. */
+  let _covered = new Map<number, CoveredSpan>();
+  /** What the viewport rows show, for the tab, mode and scroll position they were drawn for. */
+  let _viewport: ViewportRows | null = null;
+  /** Where the frame leaves the (hidden) cursor: the agent's cursor, or the input line's. */
+  let _frameCursor: { readonly x: number; readonly y: number } | null = null;
+
+  const clock = deps.now ?? ((): number => performance.now());
+  const armingDelayMs = deps.armingDelayMs ?? ESCALATION_ARMING_DELAY_MS;
+  const getBulkApproveState = deps.getBulkApproveState ?? ((): BulkApproveState | null => null);
+
+  // The escalation whose picker dialog the latest overlay draw showed in
+  // full, and the one before it (an unbroken run keeps its `since`).
+  let _displayedEscalation: DisplayedEscalation | null = null;
+  let _previousDisplayedEscalation: DisplayedEscalation | null = null;
+
+  // The approve-all list the latest overlay draw showed, and which of its
+  // lines have been on screen while it stayed open at this width.
+  let _displayedBulkApproval: DisplayedBulkApproval | null = null;
+  let _bulkSeen: {
+    readonly setKey: string;
+    readonly width: number;
+    readonly seen: Uint8Array;
+    unseen: number;
+    seenAllSince: number | null;
+  } | null = null;
+  const _bulkLinesCache = new WeakMap<BulkApproveState, { width: number; lines: readonly BulkApprovalLine[] }>();
+
+  // Redraw when the shown "wait" hint expires, so the user sees the keys unlock.
+  let _armingTimer: ReturnType<typeof setTimeout> | null = null;
+
   // Transient flash message
   let _flashMessage: string | null = null;
   let _flashTimeout: ReturnType<typeof setTimeout> | null = null;
   const FLASH_DURATION_MS = 3000;
+
+  // Escalation formatting caches. A pending escalation never changes, but the
+  // overlays are redrawn with every frame of PTY output and an argument can
+  // be megabytes long, so its summary lines and its detail view are computed
+  // once per escalation and width. Keyed weakly: resolved escalations drop out.
+  const _argLinesCache = new WeakMap<PendingEscalation, Map<number, readonly ArgLine[]>>();
+  const _detailLinesCache = new WeakMap<PendingEscalation, { width: number; lines: readonly string[] }>();
+
+  function argLinesFor(esc: PendingEscalation, width: number): readonly ArgLine[] {
+    let byWidth = _argLinesCache.get(esc);
+    if (!byWidth) {
+      byWidth = new Map();
+      _argLinesCache.set(esc, byWidth);
+    }
+    let lines = byWidth.get(width);
+    if (!lines) {
+      if (byWidth.size >= 4) byWidth.clear(); // a few widths per escalation: panel, picker, recent resizes
+      lines = formatArgLines(esc.request.arguments, width);
+      byWidth.set(width, lines);
+    }
+    return lines;
+  }
+
+  function detailLinesFor(esc: PendingEscalation, width: number): readonly string[] {
+    const cached = _detailLinesCache.get(esc);
+    if (cached?.width === width) return cached.lines;
+    const lines = formatEscalationDetailLines(esc, width);
+    _detailLinesCache.set(esc, { width, lines });
+    return lines;
+  }
+
+  function bulkLinesFor(bulk: BulkApproveState, width: number): readonly BulkApprovalLine[] {
+    const cached = _bulkLinesCache.get(bulk);
+    if (cached?.width === width) return cached.lines;
+    const lines = formatBulkApprovalLines(
+      bulk.reviewed,
+      deps.getEscalationState().pendingEscalations,
+      width,
+      bulk.whitelist,
+      bulk.group,
+    );
+    _bulkLinesCache.set(bulk, { width, lines });
+    return lines;
+  }
+
+  /**
+   * Records that this draw shows `esc` in full in `view`. The `since` of an
+   * unbroken run of draws of the same escalation is kept; anything else
+   * starts a new run, so a request that was off screen (a notice, another
+   * escalation, a closed picker) must be on screen again for the arming
+   * delay before it can be approved.
+   */
+  function markEscalationDisplayed(esc: PendingEscalation, view: EscalationView): DisplayedEscalation {
+    const previous = _previousDisplayedEscalation;
+    const continuing =
+      previous !== null &&
+      previous.displayNumber === esc.displayNumber &&
+      previous.escalationId === esc.request.escalationId;
+    const shown: DisplayedEscalation = {
+      displayNumber: esc.displayNumber,
+      escalationId: esc.request.escalationId,
+      view,
+      since: continuing ? previous.since : clock(),
+      canWhitelist: firstCandidate(esc) !== undefined && esc.request.humanOnly !== true,
+      canWhitelistDirectory: directoryCandidate(esc) !== undefined && esc.request.humanOnly !== true,
+    };
+    _displayedEscalation = shown;
+    return shown;
+  }
+
+  /**
+   * Marks the approve-all lines `[scroll, scroll + rows)` as seen and returns
+   * since when every line has been. Changing the set or the width starts the
+   * count again (wrapping changes which text is on which line).
+   */
+  function markBulkLinesSeen(
+    bulk: BulkApproveState,
+    width: number,
+    lineCount: number,
+    scroll: number,
+    rows: number,
+  ): DisplayedBulkApproval {
+    const setKey = bulkApprovalKey(bulk.reviewed, bulk.whitelist);
+    let seen = _bulkSeen;
+    if (seen === null || seen.setKey !== setKey || seen.width !== width || seen.seen.length !== lineCount) {
+      seen = { setKey, width, seen: new Uint8Array(lineCount), unseen: lineCount, seenAllSince: null };
+      _bulkSeen = seen;
+    }
+    for (let i = scroll; i < Math.min(lineCount, scroll + rows); i++) {
+      if (seen.seen[i] === 0) {
+        seen.seen[i] = 1;
+        seen.unseen -= 1;
+      }
+    }
+    if (seen.unseen === 0 && seen.seenAllSince === null) seen.seenAllSince = clock();
+    _displayedBulkApproval = { setKey, seenAllSince: seen.seenAllSince };
+    return _displayedBulkApproval;
+  }
+
+  /**
+   * Schedules a redraw for when a "wait" hint on screen expires (`at` on the
+   * deps clock). Only the latest request counts: every disarmed draw asks
+   * again, and a key that re-arms moves the time.
+   */
+  function scheduleArmingRedraw(at: number): void {
+    if (_destroyed) return;
+    if (_armingTimer) clearTimeout(_armingTimer);
+    const delay = Math.max(0, Math.ceil(at - clock())) + 2;
+    _armingTimer = setTimeout(() => {
+      _armingTimer = null;
+      if (_destroyed) return;
+      frame(() => {
+        recalcLayout();
+        drawBody(false);
+      });
+    }, delay);
+    _armingTimer.unref();
+  }
+
+  /** A key hint: the key as a badge, then what it does. */
+  type KeyHint = readonly [key: string, label: string];
+
+  /**
+   * Draws key hints left to right within `width` cells, skipping any that
+   * would not fit (so put the ones that must stay, like Esc, early). Returns
+   * the cells used. Labels are trusted literals.
+   */
+  function drawKeyHints(hints: readonly KeyHint[], width: number): number {
+    let used = 0;
+    for (const [key, label] of hints) {
+      const badge = ` ${key} `;
+      const text = ` ${label} `;
+      const cells = displayWidth(badge) + displayWidth(text);
+      if (used + cells > width) continue;
+      term.bgWhite.black(badge);
+      term.styleReset();
+      term.dim(text);
+      used += cells;
+    }
+    term.styleReset();
+    return used;
+  }
+
+  /** The "wait" badge shown while decision keys are still disarmed, then `note`. Returns the cells used. */
+  function drawWaitHint(note: string, width: number): number {
+    const badge = ' wait ';
+    const text = note ? ` ${note} ` : ' ';
+    const cells = displayWidth(badge) + displayWidth(text);
+    if (cells > width) return 0;
+    term.bgYellow.black(badge);
+    term.styleReset();
+    term.dim(text);
+    term.styleReset();
+    return cells;
+  }
 
   /** Content width for the input area: _cols minus 2-char left margin minus 2-char prompt prefix. */
   function contentWidth(): number {
@@ -199,7 +574,13 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
       _cachedVisualLines = [{ text: '', bufferOffset: 0 }];
       _inputScrollOffset = 0;
     }
-    _layout = calculateLayout(_rows, deps.getMode(), deps.getPendingCount(), _cachedVisualLines.length);
+    _layout = calculateLayout(
+      _rows,
+      deps.getMode(),
+      deps.getPendingCount(),
+      _cachedVisualLines.length,
+      directoryPatternCount(),
+    );
   }
 
   function moveTo(x: number, y: number): void {
@@ -209,6 +590,77 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
   function clearLine(y: number): void {
     moveTo(0, y);
     term.eraseLine();
+  }
+
+  /** Forgets what is on screen: everything is sent again (after a clear or a resize). */
+  function invalidateScreen(): void {
+    _regionBytes.clear();
+    _viewport = null;
+  }
+
+  /**
+   * Runs one frame: one synchronized write of everything `draw` sends,
+   * ending with the cursor where the frame wants it. A draw that throws
+   * sends nothing, and nothing cached about the screen can be trusted.
+   * Nor does anything count as displayed: the overlay is drawn (and an
+   * escalation dialog or approve-all list recorded as shown) before the
+   * rest of the frame, so a frame that fails later never reached the
+   * terminal, and its dialog must not arm a decision key or carry its
+   * `since` into the next frame.
+   */
+  function frame(draw: () => void): void {
+    try {
+      frames.frame(draw, () => {
+        if (_frameCursor) moveTo(_frameCursor.x, _frameCursor.y);
+      });
+    } catch (err) {
+      invalidateScreen();
+      _displayedEscalation = null;
+      _previousDisplayedEscalation = null;
+      _displayedBulkApproval = null;
+      _bulkSeen = null;
+      throw err;
+    }
+  }
+
+  /** Adds a region's bytes to the frame unless exactly these bytes were last sent for it. */
+  function emitRegion(region: ScreenRegion, bytes: string): void {
+    if (_regionBytes.get(region) === bytes) return;
+    _regionBytes.set(region, bytes);
+    frames.append(bytes);
+  }
+
+  /** Draws a region into its own buffer and sends it only when it changed (see {@link emitRegion}). */
+  function drawRegion(region: ScreenRegion, draw: () => void): void {
+    emitRegion(region, frames.capture(draw));
+  }
+
+  /** Records that the overlay covers columns `[from, to)` of screen row `y`. */
+  function cover(y: number, from: number, to: number): void {
+    const start = Math.max(0, from);
+    const end = Math.min(_cols, to);
+    if (end <= start) return;
+    const previous = _covered.get(y);
+    _covered.set(
+      y,
+      previous ? { from: Math.min(previous.from, start), to: Math.max(previous.to, end) } : { from: start, to: end },
+    );
+  }
+
+  /**
+   * The PTY viewport and the active overlay, composed: the overlay is drawn
+   * first into its own buffer, recording the cells it covers; the viewport
+   * rows then skip those cells; the footer (when asked) and the overlay
+   * follow. The overlay is also sent when a covered row emitted PTY spans,
+   * restoring its cells after those spans in the same synchronized frame.
+   */
+  function drawBody(withFooter: boolean): void {
+    _covered = new Map();
+    _frameCursor = null;
+    const overlay = frames.capture(drawActiveOverlay);
+    drawPtyViewport();
+    if (withFooter) drawRegion('footer', drawFooter);
+    emitRegion('overlay', overlay);
   }
 
   function drawTabBar(): void {
@@ -221,7 +673,7 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
     for (let i = 0; i < tabs.length; i++) {
       const tab = tabs[i];
       const isActive = i === activeIdx;
-      const label = ` #${tab.number} ${tab.label} `;
+      const label = ` #${tab.number} ${untrusted(tab.label, MAX_TAB_LABEL_WIDTH)} `;
 
       if (isActive) {
         term.bgWhite.black(label);
@@ -262,6 +714,10 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
   function drawPtyViewport(): void {
     const activeTab = deps.getActiveTab();
     if (!activeTab) {
+      // The splash (or the blanked viewport) may draw where an overlay is:
+      // nothing cached about these rows or the overlay holds.
+      _viewport = null;
+      _regionBytes.delete('overlay');
       if (deps.getTabs().length === 0) {
         const reserved = activeOverlayRows();
         // Lazily create and start the splash screen
@@ -288,35 +744,93 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
     const baseY = xtermTerminal.buffer.active.baseY;
     const scrollOffset = deps.getScrollOffset();
     const readFrom = scrollOffset ?? baseY;
-    const cells = readTerminalBuffer(xtermTerminal, readFrom, _layout.ptyViewportRows, _cols);
 
     // Determine how many rows to render (skip overlay in command/bottom-panel picker mode).
-    // Escalation picker floats over the full viewport -- no rows subtracted.
+    // Escalation picker floats over the full viewport -- no rows subtracted;
+    // its rows skip the cells the dialog covers instead.
     const mode = deps.getMode();
     let visibleRows = _layout.ptyViewportRows;
     if (mode === 'command') visibleRows -= _layout.overlayRows;
     else if (isBottomPanelPicker(mode)) visibleRows -= _layout.pickerRows;
+    visibleRows = Math.max(0, visibleRows);
 
-    let lastStyle: TranslatedCell | null = null;
+    const viewport = viewportRowsFor(activeTab, mode, scrollOffset);
+    const cells = readTerminalBuffer(xtermTerminal, readFrom, visibleRows, _cols);
+    const top = _layout.ptyViewportY;
     for (let y = 0; y < visibleRows; y++) {
-      moveTo(0, _layout.ptyViewportY + y);
-      const row = cells[y];
-      if (row.length === 0) {
-        term.eraseLineAfter();
-        lastStyle = null;
-        continue;
-      }
-
-      renderRow(term, row, lastStyle);
-      term.noFormat('\x1b[0m'); // reset before eraseLineAfter
-      term.eraseLineAfter();
-      lastStyle = null;
+      drawViewportRow(viewport, top + y, cells[y]);
+    }
+    // Rows an overlay took over: forget them, so they are repainted once they
+    // are PTY rows again.
+    for (const screenY of [...viewport.rows.keys()]) {
+      if (screenY < top || screenY >= top + visibleRows) viewport.rows.delete(screenY);
     }
 
-    // Position cursor where xterm.js says it should be (only when at live viewport)
+    // Leave the cursor where xterm.js says it is (only when at live viewport)
     if (mode === 'pty' && scrollOffset === null) {
       const buffer = xtermTerminal.buffer.active;
-      moveTo(buffer.cursorX, _layout.ptyViewportY + buffer.cursorY);
+      _frameCursor = { x: buffer.cursorX, y: top + buffer.cursorY };
+    }
+  }
+
+  /**
+   * The row cache for `tab` drawn in `mode` at `scrollOffset`: a new, empty
+   * one when any of them, the width or the viewport's position changed.
+   */
+  function viewportRowsFor(tab: MuxTab, mode: InputMode, scrollOffset: number | null): ViewportRows {
+    const current = _viewport;
+    if (
+      current?.tab === tab &&
+      current.mode === mode &&
+      current.scrollOffset === scrollOffset &&
+      current.cols === _cols &&
+      current.top === _layout.ptyViewportY
+    ) {
+      return current;
+    }
+    _viewport = { tab, mode, scrollOffset, cols: _cols, top: _layout.ptyViewportY, rows: new Map() };
+    return _viewport;
+  }
+
+  /**
+   * Draws one PTY row at screen row `screenY`, skipping the cells the
+   * overlay covers, unless the same bytes were drawn there last time.
+   */
+  function drawViewportRow(viewport: ViewportRows, screenY: number, row: readonly TranslatedCell[]): void {
+    const covered = _covered.get(screenY);
+    if (covered && covered.from <= 0 && covered.to >= _cols) {
+      // The overlay draws this whole row.
+      viewport.rows.delete(screenY);
+      return;
+    }
+    if (!covered) {
+      const { text, end } = renderCellSpan(row, 0, _cols);
+      if (viewport.rows.get(screenY) === text) return;
+      viewport.rows.set(screenY, text);
+      moveTo(0, screenY);
+      term.noFormat(`${text}\x1b[0m`); // reset before eraseLineAfter
+      // A row that fills the width needs no erase (with autowrap off, an
+      // erase there could also take the character in the last column).
+      if (end < _cols) term.eraseLineAfter();
+      return;
+    }
+    const left = covered.from > 0 ? renderCellSpan(row, 0, covered.from) : undefined;
+    const right = covered.to < _cols ? renderCellSpan(row, covered.to, _cols) : undefined;
+    const key = `${covered.from}:${covered.to}\u0000${left?.text ?? ''}\u0000${right?.text ?? ''}`;
+    if (viewport.rows.get(screenY) === key) return;
+    viewport.rows.set(screenY, key);
+    // A changed PTY span shares this row with the overlay. Restore the
+    // overlay after the span even when its own bytes have not changed.
+    _regionBytes.delete('overlay');
+    if (left) {
+      // Padded to the overlay's edge: erasing to the end of the line would wipe it.
+      moveTo(0, screenY);
+      term.noFormat(`${left.text}\x1b[0m${' '.repeat(Math.max(0, covered.from - left.end))}`);
+    }
+    if (right) {
+      moveTo(covered.to, screenY);
+      term.noFormat(`${right.text}\x1b[0m`);
+      if (right.end < _cols) term.eraseLineAfter();
     }
   }
 
@@ -334,7 +848,9 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
     if (mode === 'pty') {
       // Row 1: status — tab label left, scroll indicator + escalation badge right
       moveTo(0, row1);
-      const tabLabel = activeTab ? `PTY #${activeTab.number} ${activeTab.label}` : 'No session';
+      const tabLabel = activeTab
+        ? `PTY #${activeTab.number} ${untrusted(activeTab.label, MAX_TAB_LABEL_WIDTH)}`
+        : 'No session';
       term.dim(`  [${tabLabel}]`);
 
       // Right-aligned badges: scroll indicator + escalation badge
@@ -356,21 +872,20 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
       }
       term.eraseLineAfter();
 
-      // Row 2: flash message or guidance
+      // Row 2: flash message, the pending-escalation banner, or guidance
       moveTo(0, row2);
       if (_flashMessage) {
-        term.yellow(`  ${_flashMessage}`);
+        drawFlashMessage(_flashMessage);
+      } else if (pendingCount > 0) {
+        drawPendingBanner('Ctrl-E to review');
       } else {
         term('  ');
         term.bgWhite.black(' ^^A ');
         term.styleReset();
-        if (pendingCount > 0) {
-          term.dim(
-            ` command mode \u00b7 ${pendingCount} escalation${pendingCount !== 1 ? 's' : ''} pending \u2014 Ctrl-E to review`,
-          );
-        } else {
-          term.dim(' command mode \u00b7 type a message to enable auto-approver \u00b7 Shift+drag to select');
-        }
+        const hint = ' command mode \u00b7 type a message to enable auto-approver \u00b7 Shift+drag to select';
+        // The badge took 7 cells. Nothing may reach the last column of the
+        // bottom row: a wrap there scrolls the alternate screen.
+        term.dim(truncateToWidth(hint, Math.max(0, _cols - 8)));
       }
       term.styleReset();
       term.eraseLineAfter();
@@ -388,16 +903,54 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
       term.dim(' clear');
       term.eraseLineAfter();
 
-      // Row 2: flash message or trusted input hint
+      // Row 2: flash message, the pending-escalation banner while another
+      // picker or panel holds the keyboard (the command-mode panel and the
+      // escalation screens show the escalations themselves), or the hint
       moveTo(0, row2);
       if (_flashMessage) {
-        term.yellow(`  ${_flashMessage}`);
+        drawFlashMessage(_flashMessage);
+      } else if (
+        pendingCount > 0 &&
+        mode !== 'command' &&
+        mode !== 'escalation-picker' &&
+        mode !== 'escalation-approve-all'
+      ) {
+        drawPendingBanner('Esc out, then Ctrl-E to review');
       } else {
-        term.dim('  type a message to send as trusted input to the agent');
+        term.dim(truncateToWidth('  type a message to send as trusted input to the agent', Math.max(0, _cols - 1)));
       }
       term.styleReset();
       term.eraseLineAfter();
     }
+  }
+
+  /**
+   * Draws the (already single-line, display-sanitized) flash message on the
+   * bottom row, cut so it can never reach the last column: a wrap there would
+   * scroll the alternate screen.
+   */
+  function drawFlashMessage(message: string): void {
+    term.yellow(escapeTerminalKitMarkup(truncateToWidth(`  ${message}`, Math.max(0, _cols - 3))));
+  }
+
+  /**
+   * The footer banner announcing pending escalations: how many, the newest
+   * one's number and tool, and how to review them. An arrival never takes
+   * the keyboard; this banner, the bell and the `[!N pending]` badge are
+   * how it is announced. Cut before the last column like the flash.
+   */
+  function drawPendingBanner(howToReview: string): void {
+    const pending = [...deps.getEscalationState().pendingEscalations.values()];
+    if (pending.length === 0) return;
+    const newest = pending.reduce((a, b) => (b.displayNumber > a.displayNumber ? b : a));
+    const what = `[${newest.displayNumber}] ${toolLabel(newest.request)}`;
+    const text =
+      pending.length === 1
+        ? ` ! Escalation ${what} is waiting for your decision · ${howToReview} `
+        : ` ! ${pending.length} escalations pending, newest ${what} · ${howToReview} `;
+    term('  ');
+    term.bgYellow.black(escapeTerminalKitMarkup(truncateToWidth(text, Math.max(0, _cols - 3))));
+    term.styleReset();
   }
 
   function drawCommandOverlay(): void {
@@ -406,72 +959,36 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
 
     let currentY = startY;
 
-    // Escalation panel
+    // Escalation panel. Rows are planned first so the tool header, the reason
+    // and the whitelist line of every shown escalation are always drawn;
+    // arguments that do not fit are reported, never silently dropped.
     if (_layout.escalationPanelRows > 0) {
       const pendingEscalations = [...deps.getEscalationState().pendingEscalations.values()].sort(
         (a, b) => a.displayNumber - b.displayNumber,
       );
-
-      let rowsUsed = 0;
-      let shownCount = 0;
-      for (const esc of pendingEscalations) {
-        if (rowsUsed >= _layout.escalationPanelRows) break;
-
-        // Row 1: header — [N] Session #M  server/tool
+      const argWidth = Math.max(1, _cols - 6);
+      const rows = planEscalationPanelRows(pendingEscalations, _layout.escalationPanelRows, argWidth, (esc) =>
+        argLinesFor(esc, argWidth),
+      );
+      for (const row of rows) {
         clearLine(currentY);
-        moveTo(2, currentY);
-        term.yellow(`[${esc.displayNumber}]`);
-        term(` Session #${esc.sessionDisplayNumber}  `);
-        term.cyan(`${esc.request.serverName}/${esc.request.toolName}`);
+        if (row.kind === 'header') {
+          moveTo(2, currentY);
+          const number = `[${row.displayNumber}]`;
+          const session = ` Session #${row.sessionDisplayNumber}  `;
+          term.yellow(number);
+          term(session);
+          term.cyan(untrusted(row.tool, Math.max(1, _cols - 2 - number.length - session.length)));
+        } else {
+          moveTo(6, currentY);
+          drawEscalationRow(row, _cols - 6);
+        }
         currentY++;
-        rowsUsed++;
-        shownCount++;
-
-        // Row 2+: arguments — packed key: value pairs
-        if (rowsUsed < _layout.escalationPanelRows) {
-          const argLines = formatArgLines(esc.request.arguments, _cols - 6);
-          for (const line of argLines) {
-            if (rowsUsed >= _layout.escalationPanelRows) break;
-            clearLine(currentY);
-            moveTo(6, currentY);
-            term(line);
-            currentY++;
-            rowsUsed++;
-          }
-        }
-
-        // Reason line
-        if (rowsUsed < _layout.escalationPanelRows) {
-          clearLine(currentY);
-          moveTo(6, currentY);
-          term.dim(`Reason: ${esc.request.reason}`);
-          currentY++;
-          rowsUsed++;
-        }
-
-        // Whitelist candidate line (shows what /approve+ would whitelist)
-        if (
-          rowsUsed < _layout.escalationPanelRows &&
-          esc.request.whitelistCandidates &&
-          esc.request.whitelistCandidates.length > 0
-        ) {
-          const candidate = esc.request.whitelistCandidates[0];
-          clearLine(currentY);
-          moveTo(6, currentY);
-          term.dim('/approve+ ');
-          term.cyan(candidate.description);
-          currentY++;
-          rowsUsed++;
-        }
       }
-
-      // Overflow indicator when not all escalations fit
-      const remaining = pendingEscalations.length - shownCount;
-      if (remaining > 0 && rowsUsed >= _layout.escalationPanelRows) {
-        const lastY = startY + _layout.escalationPanelRows - 1;
-        clearLine(lastY);
-        moveTo(6, lastY);
-        term.dim(`[+${remaining} more \u2014 /approve all or /deny all]`);
+      // Keep the panel's full height: rows the plan left unused stay blank.
+      for (let i = rows.length; i < _layout.escalationPanelRows; i++) {
+        clearLine(currentY);
+        currentY++;
       }
     }
 
@@ -480,14 +997,18 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
     moveTo(2, currentY);
     const pendingCount = deps.getPendingCount();
     if (pendingCount > 0) {
+      // `/approve all` is not advertised: it only opens a confirmation
+      // screen, and reviewing one at a time (Ctrl-E) is the way to decide.
       term.cyan('/approve');
       term.dim(' N  ');
       term.cyan('/approve+');
       term.dim(' N  ');
       term.cyan('/deny');
       term.dim(' N  ');
-      term.cyan('/approve all');
-      term.dim(' \u2502 ');
+      term.cyan('/deny all');
+      term.dim('  ');
+      term.cyan('Ctrl-E');
+      term.dim(' review \u2502 ');
       term.cyan('/new');
       term.dim('  ');
       term.cyan('/quit');
@@ -533,16 +1054,18 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
         term('  ');
       }
 
+      // The buffer is user-typed or pasted text, so `^`, `%` and pasted
+      // control characters must print literally rather than as markup.
       if (visLineIdx < visualLines.length) {
         const vLine = visualLines[visLineIdx];
         if (visLineIdx === cursorVis.row) {
           // This line contains the cursor
-          term(vLine.text.slice(0, cursorVis.col));
-          term.bgWhite.black(cursorVis.col < vLine.text.length ? vLine.text[cursorVis.col] : ' ');
+          term(untrusted(vLine.text.slice(0, cursorVis.col)));
+          term.bgWhite.black(untrusted(cursorVis.col < vLine.text.length ? vLine.text[cursorVis.col] : ' '));
           term.styleReset();
-          term(vLine.text.slice(cursorVis.col + 1));
+          term(untrusted(vLine.text.slice(cursorVis.col + 1)));
         } else {
-          term(vLine.text);
+          term(untrusted(vLine.text));
         }
       } else if (i === 0) {
         // Empty buffer: show cursor on blank line
@@ -554,9 +1077,60 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
       currentY++;
     }
 
-    // Position real terminal cursor for accessibility
+    // Position real terminal cursor for accessibility (the frame ends there)
     const cursorScreenRow = startY + _layout.escalationPanelRows + 1 + (cursorVis.row - _inputScrollOffset);
-    moveTo(2 + 2 + cursorVis.col, cursorScreenRow);
+    _frameCursor = { x: 2 + 2 + cursorVis.col, y: cursorScreenRow };
+    moveTo(_frameCursor.x, _frameCursor.y);
+  }
+
+  /**
+   * Draws one planned escalation row (everything but the header) at the
+   * current cursor position within `width` cells. Row texts are already
+   * display-sanitized; prefixes are trusted literals.
+   */
+  function drawEscalationRow(row: Exclude<EscalationRow, { kind: 'header' }>, width: number): void {
+    switch (row.kind) {
+      case 'args-label':
+        term.dim(untrusted(row.text, width));
+        break;
+      case 'arg':
+        term(untrusted(row.text, width));
+        break;
+      case 'hidden':
+      case 'more':
+        term.dim(untrusted(row.text, width));
+        break;
+      case 'reason':
+        term.dim(REASON_PREFIX);
+        term.styleReset();
+        term(untrusted(row.text, Math.max(1, width - REASON_PREFIX.length)));
+        break;
+      case 'whitelist':
+        term.dim(WHITELIST_PREFIX);
+        term.styleReset();
+        term.cyan(untrusted(row.text, Math.max(1, width - WHITELIST_PREFIX.length)));
+        break;
+      case 'whitelist-directory':
+        term.dim(DIRECTORY_WHITELIST_PREFIX);
+        term.styleReset();
+        term.cyan(untrusted(row.text, Math.max(1, width - DIRECTORY_WHITELIST_PREFIX.length)));
+        break;
+      case 'task':
+      case 'user-message':
+        term.green(rowPrefix(row.kind));
+        term.styleReset();
+        term(untrusted(row.text, Math.max(1, width - rowPrefix(row.kind).length)));
+        break;
+      case 'justification':
+        term.yellow(JUSTIFICATION_PREFIX);
+        term.styleReset();
+        term.dim(untrusted(row.text, Math.max(1, width - JUSTIFICATION_PREFIX.length)));
+        break;
+      case 'group':
+        term.dim(untrusted(row.text, width));
+        break;
+    }
+    term.styleReset();
   }
 
   /**
@@ -565,6 +1139,7 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
    * by the `renderContent` callback which receives the inner width.
    */
   function drawBoxRow(y: number, boxX: number, innerWidth: number, renderContent: (w: number) => void): void {
+    cover(y, boxX, boxX + innerWidth + 4);
     moveTo(boxX, y);
     term.brightCyan('\u2502');
     term(' ');
@@ -580,6 +1155,102 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
     term.brightCyan('\u2502');
   }
 
+  /** Geometry of the escalation box: centered, inner width clamped to the terminal. */
+  function escalationBoxGeometry(): { innerWidth: number; boxWidth: number; boxX: number } | null {
+    // Horizontal sizing: leave 3-column margin on each side, max 80 inner width.
+    // Clamp to available columns so we never draw past the right edge.
+    const boxMargin = 3;
+    const maxInnerWidth = 80;
+    const minBoxWidth = 12; // absolute minimum to show anything useful
+    const innerWidth = Math.min(maxInnerWidth, Math.max(minBoxWidth - 4, _cols - boxMargin * 2 - 4));
+    const boxWidth = innerWidth + 4; // 4 = border + space on each side
+    if (boxWidth > _cols) return null; // terminal too narrow for overlay
+    const boxX = Math.max(0, Math.floor((_cols - boxWidth) / 2));
+    return { innerWidth, boxWidth, boxX };
+  }
+
+  function drawBoxTopBorder(y: number, boxX: number, boxWidth: number, title: string): void {
+    cover(y, boxX, boxX + boxWidth);
+    moveTo(boxX, y);
+    const shownTitle = truncateToWidth(title, Math.max(0, boxWidth - 2));
+    const borderAfterTitle = Math.max(0, boxWidth - 2 - displayWidth(shownTitle));
+    term.brightCyan('┌' + escapeTerminalKitMarkup(shownTitle));
+    term.brightCyan('─'.repeat(borderAfterTitle) + '┐');
+    term.styleReset();
+  }
+
+  /**
+   * Shown instead of the escalation dialog when the terminal cannot hold the
+   * rows it must never drop (tool, reason, whitelist line, argument notice):
+   * a dialog with those rows missing would pass for a complete one. The
+   * escalation is then not displayed, so `a` and `w` do nothing until it is:
+   * in a larger terminal, or in the scrollable detail view (`v`), which needs
+   * fewer rows.
+   */
+  function drawEscalationTooSmallNotice(focused: PendingEscalation): void {
+    drawTooSmallNotice(
+      ` Escalation [${focused.displayNumber}] pending: the terminal is too small to show it. Enlarge it or press v to view it; d denies, Esc dismisses. `,
+    );
+  }
+
+  /** One highlighted row in the middle of the viewport, cut before the last column. */
+  function drawTooSmallNotice(notice: string): void {
+    const y = _layout.ptyViewportY + Math.floor((_layout.ptyViewportRows - 1) / 2);
+    cover(y, 0, _cols);
+    clearLine(y);
+    moveTo(0, y);
+    term.bgYellow.black(escapeTerminalKitMarkup(truncateToWidth(notice, Math.max(1, _cols - 1))));
+    term.styleReset();
+  }
+
+  function drawBoxSeparator(y: number, boxX: number, innerWidth: number): void {
+    drawBoxRow(y, boxX, innerWidth, (w) => {
+      term.dim('─'.repeat(w));
+      term.styleReset();
+    });
+  }
+
+  function drawBoxBottomBorder(y: number, boxX: number, boxWidth: number): void {
+    cover(y, boxX, boxX + boxWidth);
+    moveTo(boxX, y);
+    term.brightCyan('└' + '─'.repeat(boxWidth - 2) + '┘');
+    term.styleReset();
+  }
+
+  /** `Session #N  server/tool  12s ago`, shrinking the tool name and then the time to fit `w` cells. */
+  function drawEscalationToolHeader(focused: PendingEscalation, w: number): void {
+    const timeAgo = formatRelativeTime(focused.receivedAt.toISOString());
+    const sessionPrefix = `Session #${focused.sessionDisplayNumber}  `;
+    const toolName = toolLabel(focused.request);
+    const timeSuffix = `  ${timeAgo}`;
+    const totalLen = sessionPrefix.length + displayWidth(toolName) + timeSuffix.length;
+
+    if (totalLen <= w) {
+      // Everything fits
+      term(sessionPrefix);
+      term.cyan(escapeTerminalKitMarkup(toolName));
+      term.dim(timeSuffix);
+    } else {
+      // Truncate the tool name to fit; drop time suffix if still too long
+      const budgetForTool = w - sessionPrefix.length - timeSuffix.length;
+      if (budgetForTool >= 4) {
+        term(sessionPrefix);
+        term.cyan(untrusted(toolName, budgetForTool));
+        term.dim(timeSuffix);
+      } else {
+        // Not enough room for time suffix -- drop it entirely
+        const toolBudget = w - sessionPrefix.length;
+        if (toolBudget > 0) {
+          term(sessionPrefix);
+          term.cyan(untrusted(toolName, toolBudget));
+        } else {
+          term(truncate(sessionPrefix, w));
+        }
+      }
+    }
+    term.styleReset();
+  }
+
   function drawEscalationPickerOverlay(): void {
     const eps = deps.getEscalationPickerState();
     if (!eps) return;
@@ -588,210 +1259,496 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
     const sortedEscalations = [...pending.values()].sort((a, b) => a.displayNumber - b.displayNumber);
     if (sortedEscalations.length === 0) return;
 
+    // A focus that names another request than the one pending under its
+    // number draws nothing, so nothing can be decided on it.
     const focused = pending.get(eps.focusedDisplayNumber);
-    if (!focused) return;
+    if (focused?.request.escalationId !== eps.focusedEscalationId) return;
+
+    const geometry = escalationBoxGeometry();
+    if (!geometry) {
+      drawEscalationTooSmallNotice(focused);
+      return;
+    }
+
+    if (eps.whitelistConfirm) {
+      drawWhitelistConfirmation(focused, eps, eps.whitelistConfirm, geometry);
+      return;
+    }
+
+    if (eps.detailView) {
+      drawEscalationDetailView(focused, eps, eps.detailView, geometry);
+      return;
+    }
+
+    const { innerWidth, boxWidth, boxX } = geometry;
 
     // Compute dialog dimensions -- centered in the PTY viewport
     const viewportRows = _layout.ptyViewportRows;
     const viewportY = _layout.ptyViewportY;
 
-    // Horizontal sizing: leave 3-column margin on each side, max 80 inner width.
-    // Clamp to available columns so we never draw past the right edge.
-    const boxMargin = 3;
-    const maxInnerWidth = 80;
-    const minBoxWidth = 12; // absolute minimum to show anything useful
-    const innerWidth = Math.min(maxInnerWidth, Math.max(minBoxWidth - 4, _cols - boxMargin * 2 - 4));
-    const boxWidth = innerWidth + 4; // 4 = border + space on each side
-    if (boxWidth > _cols) return; // terminal too narrow for overlay
-    const boxX = Math.max(0, Math.floor((_cols - boxWidth) / 2));
+    // Content rows: tab bar + separator + header + separator + detail area + separator + hint bar.
+    // The detail area is planned, not clipped: the reason, the whitelist line
+    // and the argument notice are reserved and hidden arguments are reported.
+    // It gets the rows the viewport can spare, giving up the 2-row top/bottom
+    // margin before giving up content.
+    const fixedContentRows = 6;
+    const borderRows = 2;
+    const withMargin = Math.max(0, viewportRows - borderRows - fixedContentRows - 4);
+    const withoutMargin = Math.max(0, viewportRows - borderRows - fixedContentRows);
+    const argLines = argLinesFor(focused, Math.max(1, innerWidth - 2));
+    const groupSize = pendingGroupSize(focused, sortedEscalations);
+    const wanted = planEscalationDetailRows(focused, Number.MAX_SAFE_INTEGER, innerWidth, argLines, groupSize).length;
+    const detailBudget = wanted <= withMargin ? wanted : Math.min(wanted, withoutMargin);
+    const detailRows = planEscalationDetailRows(focused, detailBudget, innerWidth, argLines, groupSize);
 
-    // Content rows: tab bar + separator + header + separator + detail area + separator + hint bar
-    const minContentRows = 7; // minimum: tab + sep + header + sep + 1 detail + sep + hints
-    const maxContentRows = Math.max(minContentRows, viewportRows - 4); // leave 2 rows margin top+bottom
-    const detailBudget = maxContentRows - 6; // 6 = tab bar + 2 separators + header + separator + hint bar
-
-    // Collect detail lines — use innerWidth (minus arg indent) so line
-    // packing matches the actual box geometry.
-    const argLines = formatArgLines(focused.request.arguments, innerWidth - 2);
-    const detailLines: Array<{ kind: 'label' | 'arg' | 'reason' | 'whitelist'; text: string }> = [];
-
-    if (argLines.length > 0) {
-      detailLines.push({ kind: 'label', text: 'Arguments:' });
-      for (const line of argLines) {
-        detailLines.push({ kind: 'arg', text: line });
-      }
-    }
-    detailLines.push({ kind: 'reason', text: `Reason: ${focused.request.reason}` });
-    if (focused.request.whitelistCandidates && focused.request.whitelistCandidates.length > 0) {
-      const candidate = focused.request.whitelistCandidates[0];
-      const wlText = candidate.description;
-      detailLines.push({ kind: 'whitelist', text: `/approve+ ${wlText}` });
+    const totalBoxHeight = fixedContentRows + detailRows.length + borderRows;
+    if (totalBoxHeight > viewportRows) {
+      drawEscalationTooSmallNotice(focused);
+      return;
     }
 
-    const actualDetailRows = Math.min(detailLines.length, detailBudget);
-    const totalBoxRows = 6 + actualDetailRows; // includes top+bottom border
-    const totalBoxHeight = totalBoxRows + 2; // +2 for top and bottom border lines
-
-    if (totalBoxHeight > viewportRows) return; // terminal too small
+    // The whole dialog fits and is drawn below.
+    const shown = markEscalationDisplayed(focused, 'summary');
+    const unlockAt = decisionArmedAt(eps.armedAt, shown.since, armingDelayMs);
 
     // Vertical centering within the viewport
     const startY = viewportY + Math.max(0, Math.floor((viewportRows - totalBoxHeight) / 2));
 
     let currentY = startY;
 
-    // Top border with title
-    moveTo(boxX, currentY);
-    const title = ' Escalation ';
-    const borderAfterTitle = Math.max(0, boxWidth - 2 - title.length);
-    term.brightCyan('\u250c' + title);
-    term.brightCyan('\u2500'.repeat(borderAfterTitle) + '\u2510');
-    term.styleReset();
+    // Anything the summary had to cut (hidden or shortened arguments, a long
+    // reason or whitelist pattern) is announced where it cannot be missed.
+    // The widths match drawEscalationRow's cuts; fitsWidth reads only the
+    // head of a long reason or pattern, since this runs on every frame.
+    const summaryCut = detailRows.some(
+      (row) =>
+        (row.kind === 'args-label' && row.text !== 'Arguments:') ||
+        ((row.kind === 'reason' ||
+          row.kind === 'whitelist' ||
+          row.kind === 'whitelist-directory' ||
+          row.kind === 'task' ||
+          row.kind === 'user-message' ||
+          row.kind === 'justification') &&
+          !fitsWidth(row.text, Math.max(1, innerWidth - rowPrefix(row.kind).length))),
+    );
+    drawBoxTopBorder(currentY, boxX, boxWidth, summaryCut ? ' Escalation (truncated: v shows all) ' : ' Escalation ');
     currentY++;
 
     // Escalation tab bar
     drawBoxRow(currentY, boxX, innerWidth, (w) => {
       const tabs = sortedEscalations.map((esc) => ({
         displayNumber: esc.displayNumber,
-        label: `[${esc.displayNumber}] ${esc.request.serverName}/${esc.request.toolName}`,
+        label: `[${esc.displayNumber}] ${toolLabel(esc.request)}`,
       }));
       const fitted = fitTabLabels(tabs, eps.focusedDisplayNumber, w);
       let written = 0;
       for (const tab of fitted) {
+        const cell = ' ' + tab.label + ' ';
         if (tab.isFocused) {
-          term.bgCyan.black(' ' + tab.label + ' ');
+          term.bgCyan.black(escapeTerminalKitMarkup(cell));
         } else {
-          term.dim(' ' + tab.label + ' ');
+          term.dim(escapeTerminalKitMarkup(cell));
         }
         term.styleReset();
-        written += tab.label.length + 2;
+        written += displayWidth(cell);
       }
       const pad = Math.max(0, w - written);
       if (pad > 0) term(' '.repeat(pad));
     });
     currentY++;
 
-    // Separator
+    drawBoxSeparator(currentY, boxX, innerWidth);
+    currentY++;
+
     drawBoxRow(currentY, boxX, innerWidth, (w) => {
-      term.dim('\u2500'.repeat(w));
-      term.styleReset();
+      drawEscalationToolHeader(focused, w);
     });
     currentY++;
 
-    // Tool header (truncated to fit within inner width)
-    drawBoxRow(currentY, boxX, innerWidth, (w) => {
-      const timeAgo = formatRelativeTime(focused.receivedAt.toISOString());
-      const sessionPrefix = `Session #${focused.sessionDisplayNumber}  `;
-      const toolName = `${focused.request.serverName}/${focused.request.toolName}`;
-      const timeSuffix = `  ${timeAgo}`;
-      const totalLen = sessionPrefix.length + toolName.length + timeSuffix.length;
-
-      if (totalLen <= w) {
-        // Everything fits
-        term(sessionPrefix);
-        term.cyan(toolName);
-        term.dim(timeSuffix);
-      } else {
-        // Truncate the tool name to fit; drop time suffix if still too long
-        const budgetForTool = w - sessionPrefix.length - timeSuffix.length;
-        if (budgetForTool >= 4) {
-          term(sessionPrefix);
-          term.cyan(truncate(toolName, budgetForTool));
-          term.dim(timeSuffix);
-        } else {
-          // Not enough room for time suffix -- drop it entirely
-          const toolBudget = w - sessionPrefix.length;
-          if (toolBudget > 0) {
-            term(sessionPrefix);
-            term.cyan(truncate(toolName, toolBudget));
-          } else {
-            term(truncate(sessionPrefix, w));
-          }
-        }
-      }
-      term.styleReset();
-    });
-    currentY++;
-
-    // Separator
-    drawBoxRow(currentY, boxX, innerWidth, (w) => {
-      term.dim('\u2500'.repeat(w));
-      term.styleReset();
-    });
+    drawBoxSeparator(currentY, boxX, innerWidth);
     currentY++;
 
     // Detail rows — drawBoxRow pre-clears the inner area with spaces and
     // handles right-border positioning, so callbacks only need to write
     // content (no manual padding required).
-    for (let i = 0; i < actualDetailRows; i++) {
-      const detail = detailLines[i];
+    for (const row of detailRows) {
       drawBoxRow(currentY, boxX, innerWidth, (w) => {
-        const indent = detail.kind === 'arg' ? 2 : 0;
-        const maxTextWidth = w - indent;
+        const indent = row.kind === 'arg' ? 2 : 0;
         if (indent > 0) term(' '.repeat(indent));
-        if (detail.kind === 'label') {
-          term.dim(truncate(detail.text, maxTextWidth));
-        } else if (detail.kind === 'reason') {
-          term.dim('Reason: ');
-          term.styleReset();
-          term(truncate(focused.request.reason, maxTextWidth - 8));
-        } else if (detail.kind === 'whitelist') {
-          term.dim('/approve+ ');
-          term.styleReset();
-          const candidate = focused.request.whitelistCandidates?.[0];
-          if (candidate) {
-            const descBudget = maxTextWidth - 10;
-            term.cyan(truncate(candidate.description, descBudget));
-          }
-        } else {
-          term(truncate(detail.text, maxTextWidth));
-        }
+        if (row.kind !== 'header') drawEscalationRow(row, w - indent);
+      });
+      currentY++;
+    }
+
+    drawBoxSeparator(currentY, boxX, innerWidth);
+    currentY++;
+
+    // Hint bar. While the picker is disarmed (just opened, focus just moved,
+    // a stray key) it says so instead of offering the decision keys. There
+    // is no approve-all key: `/approve all` opens a confirmation screen.
+    const multiple = sortedEscalations.length > 1;
+    drawBoxRow(currentY, boxX, innerWidth, (w) => {
+      const navigation: KeyHint[] = multiple ? [['←→', 'switch']] : [];
+      if (clock() < unlockAt) {
+        const used = drawWaitHint('decision keys unlock in a moment', w);
+        drawKeyHints([['Esc', 'dismiss'], ...navigation, ['v', 'view']], w - used);
+        scheduleArmingRedraw(unlockAt);
+        return;
+      }
+      const hints: KeyHint[] = [
+        ['a', 'approve'],
+        ['d', 'deny'],
+      ];
+      if (shown.canWhitelist) hints.push(['w', 'approve+']);
+      if (shown.canWhitelistDirectory) hints.push(['W', 'approve+dir']);
+      if (multiple) hints.push(['D', 'deny all']);
+      // Esc before the optional view hint: when space runs out, `v` goes first
+      // (the arguments row and the title already point to it).
+      hints.push(...navigation, ['Esc', 'dismiss'], ['v', 'view']);
+      drawKeyHints(hints, w);
+    });
+    currentY++;
+
+    drawBoxBottomBorder(currentY, boxX, boxWidth);
+  }
+
+  /**
+   * `w` or `W` was pressed: the box shows the complete whitelist pattern of
+   * `scope` (`exact`: the one `/approve+` selects; `directory`: the
+   * directory-wide one `/approve+dir` selects, introduced as reaching every
+   * file and subdirectory) and asks for `y`. When the pattern cannot be
+   * shown in full, a notice replaces the box and nothing counts as
+   * displayed, so `y` cannot whitelist a pattern the user did not see.
+   */
+  function drawWhitelistConfirmation(
+    focused: PendingEscalation,
+    eps: EscalationPickerState,
+    scope: WhitelistScope,
+    geometry: { innerWidth: number; boxWidth: number; boxX: number },
+  ): void {
+    const { innerWidth, boxWidth, boxX } = geometry;
+    const candidate = scope === 'directory' ? directoryCandidate(focused) : firstCandidate(focused);
+    if (!candidate || focused.request.humanOnly === true) {
+      const what = scope === 'directory' ? 'directory-wide whitelist pattern' : 'whitelist pattern';
+      drawTooSmallNotice(` Escalation [${focused.displayNumber}] offers no ${what}. Press n to go back. `);
+      return;
+    }
+
+    const intro = wordWrap(
+      scope === 'directory'
+        ? 'y approves this call and, for the rest of this session, every call that matches this pattern. It is recursive: it covers every file in the directories it names and in all of their subdirectories:'
+        : 'y approves this call and, for the rest of this session, every call that matches this pattern:',
+      innerWidth,
+    );
+    const pattern = wrapToWidth(toDisplayText(candidate.description), Math.max(1, innerWidth - 2));
+    // Borders, tool header, separator, intro, pattern, separator, hint bar.
+    const totalBoxHeight = 2 + 2 + intro.length + pattern.length + 2;
+    const viewportRows = _layout.ptyViewportRows;
+    if (totalBoxHeight > viewportRows) {
+      drawTooSmallNotice(
+        ` Escalation [${focused.displayNumber}]: the terminal is too small to show the whitelist pattern in full. Enlarge it, or press n to go back. `,
+      );
+      return;
+    }
+
+    const shown = markEscalationDisplayed(focused, whitelistConfirmView(scope));
+    const unlockAt = decisionArmedAt(eps.armedAt, shown.since, armingDelayMs);
+    let currentY = _layout.ptyViewportY + Math.max(0, Math.floor((viewportRows - totalBoxHeight) / 2));
+
+    drawBoxTopBorder(
+      currentY,
+      boxX,
+      boxWidth,
+      scope === 'directory'
+        ? ` Approve [${focused.displayNumber}] and whitelist the directory `
+        : ` Approve [${focused.displayNumber}] and whitelist `,
+    );
+    currentY++;
+    drawBoxRow(currentY, boxX, innerWidth, (w) => {
+      drawEscalationToolHeader(focused, w);
+    });
+    currentY++;
+    drawBoxSeparator(currentY, boxX, innerWidth);
+    currentY++;
+    for (const line of intro) {
+      drawBoxRow(currentY, boxX, innerWidth, () => {
+        term(line);
+      });
+      currentY++;
+    }
+    for (const line of pattern) {
+      drawBoxRow(currentY, boxX, innerWidth, (w) => {
+        term('  ');
+        term.cyan(untrusted(line, Math.max(1, w - 2)));
+        term.styleReset();
+      });
+      currentY++;
+    }
+    drawBoxSeparator(currentY, boxX, innerWidth);
+    currentY++;
+    drawBoxRow(currentY, boxX, innerWidth, (w) => {
+      if (clock() < unlockAt) {
+        const used = drawWaitHint('y unlocks in a moment', w);
+        drawKeyHints([['n', 'back']], w - used);
+        scheduleArmingRedraw(unlockAt);
+        return;
+      }
+      drawKeyHints(
+        [
+          ['y', scope === 'directory' ? 'approve and whitelist the directory' : 'approve and whitelist'],
+          ['n', 'back'],
+          ['Esc', 'back'],
+        ],
+        w,
+      );
+    });
+    currentY++;
+    drawBoxBottomBorder(currentY, boxX, boxWidth);
+  }
+
+  /**
+   * Full-detail view of the focused escalation in the same box: the complete
+   * reason, the whitelist patterns, the context and every argument as
+   * pretty-printed, sanitized JSON, hard-wrapped to the box and scrollable.
+   * Nothing is cut, so the approver can read exactly what `a` would approve.
+   * The scroll offset is clamped to the content and written back, so paging
+   * past the end does not pile up offset that must be scrolled back first.
+   */
+  function drawEscalationDetailView(
+    focused: PendingEscalation,
+    eps: EscalationPickerState,
+    view: { scrollOffset: number },
+    geometry: { innerWidth: number; boxWidth: number; boxX: number },
+  ): void {
+    const { innerWidth, boxWidth, boxX } = geometry;
+    const viewportRows = _layout.ptyViewportRows;
+    const viewportY = _layout.ptyViewportY;
+
+    const lines = detailLinesFor(focused, innerWidth);
+    const fixedRows = 4; // top border + separator + hint bar + bottom border
+    const marginRows = viewportRows - fixedRows - lines.length >= 4 ? 4 : 0;
+    const contentRows = Math.min(lines.length, Math.max(1, viewportRows - fixedRows - marginRows));
+    if (fixedRows + contentRows > viewportRows) {
+      drawEscalationTooSmallNotice(focused);
+      return;
+    }
+
+    const shown = markEscalationDisplayed(focused, 'detail');
+    const unlockAt = decisionArmedAt(eps.armedAt, shown.since, armingDelayMs);
+    const maxScroll = Math.max(0, lines.length - contentRows);
+    const scroll = Math.min(maxScroll, Math.max(0, view.scrollOffset));
+    view.scrollOffset = scroll;
+    const totalBoxHeight = fixedRows + contentRows;
+    const startY = viewportY + Math.max(0, Math.floor((viewportRows - totalBoxHeight) / 2));
+    let currentY = startY;
+
+    drawBoxTopBorder(currentY, boxX, boxWidth, ` Escalation [${focused.displayNumber}] details `);
+    currentY++;
+
+    for (let i = 0; i < contentRows; i++) {
+      const line = lines[scroll + i];
+      drawBoxRow(currentY, boxX, innerWidth, (w) => {
+        term(untrusted(line, w));
+      });
+      currentY++;
+    }
+
+    drawBoxSeparator(currentY, boxX, innerWidth);
+    currentY++;
+
+    drawBoxRow(currentY, boxX, innerWidth, (w) => {
+      // The decision keys (a, d, w, W) work here too, once armed.
+      let used = 0;
+      if (clock() < unlockAt) {
+        used += drawWaitHint('', w);
+        scheduleArmingRedraw(unlockAt);
+      }
+      used += drawKeyHints(
+        [
+          ['↑↓', 'scroll'],
+          ['v', 'summary'],
+          ['Esc', 'dismiss'],
+        ],
+        w - used,
+      );
+      const position = `lines ${scroll + 1}-${scroll + contentRows} of ${lines.length}`;
+      if (used + position.length + 2 <= w) {
+        term(' '.repeat(w - used - position.length));
+        term.dim(position);
+      }
+      term.styleReset();
+    });
+    currentY++;
+
+    drawBoxBottomBorder(currentY, boxX, boxWidth);
+  }
+
+  /**
+   * Bottom panel for multi-line command output (`/sessions`, bulk resolve
+   * results). Lines are display-sanitized and cut to the terminal width; the
+   * panel scrolls when there are more lines than rows.
+   */
+  function drawMessagePanelOverlay(): void {
+    const panel = deps.getMessagePanelState();
+    if (!panel) return;
+
+    const startY = _layout.pickerY;
+    const totalRows = _layout.pickerRows;
+    if (totalRows < 3) return;
+
+    let currentY = startY;
+    const lineWidth = Math.max(1, _cols - 4);
+
+    // Title
+    clearLine(currentY);
+    moveTo(2, currentY);
+    term.cyan(untrusted(panel.title, lineWidth));
+    term.eraseLineAfter();
+    currentY++;
+
+    const listRows = Math.max(0, totalRows - 2); // title + hint bar
+    const maxScroll = Math.max(0, panel.lines.length - listRows);
+    const scroll = Math.min(maxScroll, Math.max(0, panel.scrollOffset));
+    panel.scrollOffset = scroll; // only the renderer knows how many rows fit
+
+    for (let i = 0; i < listRows; i++) {
+      clearLine(currentY);
+      const idx = scroll + i;
+      if (idx < panel.lines.length) {
+        moveTo(2, currentY);
+        term(untrusted(panel.lines[idx], lineWidth));
+      }
+      term.eraseLineAfter();
+      currentY++;
+    }
+
+    // Hint bar
+    clearLine(currentY);
+    moveTo(2, currentY);
+    term.bgWhite.black(' Esc ');
+    term.styleReset();
+    term.dim(' close  ');
+    if (panel.lines.length > listRows) {
+      term.bgWhite.black(' ↑↓ ');
+      term.styleReset();
+      const last = Math.min(panel.lines.length, scroll + listRows);
+      term.dim(` scroll  (${scroll + 1}-${last} of ${panel.lines.length})`);
+    }
+    term.styleReset();
+    term.eraseLineAfter();
+  }
+
+  /**
+   * The approve-all confirmation: every escalation that `y` would approve
+   * (or leave pending, for a human-only one) with its tool, arguments,
+   * reason and, for `/approve+ all`, the complete whitelist pattern. The
+   * list scrolls; `y` counts only once every line has been on screen for
+   * the arming delay (tracked here, see markBulkLinesSeen). When even one
+   * row of the list cannot be shown, a notice replaces the box.
+   */
+  function drawBulkApproveOverlay(): void {
+    const bulk = getBulkApproveState();
+    if (!bulk) return;
+
+    const geometry = escalationBoxGeometry();
+    const viewportRows = _layout.ptyViewportRows;
+    const fixedRows = 4; // top border + separator + hint bar + bottom border
+    if (!geometry || viewportRows < fixedRows + 1) {
+      drawTooSmallNotice(
+        bulk.group
+          ? ' Approve group: the terminal is too small to list the escalations. Enlarge it, or press Esc. '
+          : ' Approve all: the terminal is too small to list the escalations. Enlarge it, or press Esc. ',
+      );
+      return;
+    }
+    const { innerWidth, boxWidth, boxX } = geometry;
+
+    const lines = bulkLinesFor(bulk, innerWidth);
+    const marginRows = viewportRows - fixedRows - lines.length >= 4 ? 4 : 0;
+    const contentRows = Math.min(lines.length, Math.max(1, viewportRows - fixedRows - marginRows));
+    const maxScroll = Math.max(0, lines.length - contentRows);
+    const scroll = Math.min(maxScroll, Math.max(0, bulk.scrollOffset));
+    bulk.scrollOffset = scroll;
+
+    const shown = markBulkLinesSeen(bulk, innerWidth, lines.length, scroll, contentRows);
+    const unlockAt = shown.seenAllSince === null ? null : Math.max(bulk.armedAt, shown.seenAllSince + armingDelayMs);
+
+    const pending = deps.getEscalationState().pendingEscalations;
+    const approvable = bulk.reviewed.filter((ref) => pending.get(ref.displayNumber)?.request.humanOnly !== true).length;
+    const noun = `${approvable} escalation${approvable === 1 ? '' : 's'}`;
+    const scope = bulk.group ? 'group of ' : '';
+    const title = bulk.whitelist ? ` Approve and whitelist ${scope}${noun}? ` : ` Approve ${scope}${noun}? `;
+
+    const totalBoxHeight = fixedRows + contentRows;
+    let currentY = _layout.ptyViewportY + Math.max(0, Math.floor((viewportRows - totalBoxHeight) / 2));
+
+    drawBoxTopBorder(currentY, boxX, boxWidth, title);
+    currentY++;
+
+    for (let i = 0; i < contentRows; i++) {
+      const line = lines[scroll + i];
+      drawBoxRow(currentY, boxX, innerWidth, (w) => {
+        const text = untrusted(line.text, w);
+        if (line.kind === 'header') term.yellow(text);
+        else if (line.kind === 'pattern') term.cyan(text);
+        else if (line.kind === 'note') term.dim(text);
+        else term(text);
         term.styleReset();
       });
       currentY++;
     }
 
-    // Separator before hint bar
+    drawBoxSeparator(currentY, boxX, innerWidth);
+    currentY++;
+
     drawBoxRow(currentY, boxX, innerWidth, (w) => {
-      term.dim('\u2500'.repeat(w));
-      term.styleReset();
-    });
-    currentY++;
-
-    // Hint bar
-    drawBoxRow(currentY, boxX, innerWidth, () => {
-      term.bgWhite.black(' a ');
-      term.styleReset();
-      term.dim(' approve ');
-      term.bgWhite.black(' d ');
-      term.styleReset();
-      term.dim(' deny ');
-      term.bgWhite.black(' w ');
-      term.styleReset();
-      term.dim(' approve+ ');
-      if (sortedEscalations.length > 1) {
-        term.bgWhite.black(' A ');
-        term.styleReset();
-        term.dim(' all ');
-        term.bgWhite.black(' D ');
-        term.styleReset();
-        term.dim(' deny all ');
-        term.bgWhite.black(' \u2190\u2192 ');
-        term.styleReset();
-        term.dim(' switch ');
+      let used: number;
+      if (unlockAt === null) {
+        used = drawKeyHints(
+          [
+            ['↓', 'scroll to review every line first'],
+            ['Esc', 'cancel'],
+          ],
+          w,
+        );
+      } else if (clock() < unlockAt) {
+        used = drawWaitHint('y unlocks in a moment', w);
+        used += drawKeyHints(
+          [
+            ['Esc', 'cancel'],
+            ['↑↓', 'scroll'],
+          ],
+          w - used,
+        );
+        scheduleArmingRedraw(unlockAt);
+      } else {
+        used = drawKeyHints(
+          [
+            ['y', bulk.whitelist ? `approve and whitelist ${approvable}` : `approve ${approvable}`],
+            ['Esc', 'cancel'],
+            ['↑↓', 'scroll'],
+          ],
+          w,
+        );
       }
-      term.bgWhite.black(' Esc ');
+      const position = `${scroll + 1}-${scroll + contentRows} of ${lines.length}`;
+      if (lines.length > contentRows && used + position.length + 2 <= w) {
+        term(' '.repeat(w - used - position.length));
+        term.dim(position);
+      }
       term.styleReset();
-      term.dim(' dismiss');
     });
     currentY++;
 
-    // Bottom border
-    moveTo(boxX, currentY);
-    term.brightCyan('\u2514' + '\u2500'.repeat(boxWidth - 2) + '\u2518');
-    term.styleReset();
+    drawBoxBottomBorder(currentY, boxX, boxWidth);
   }
 
   function drawActiveOverlay(): void {
+    // Set again only by a complete escalation dialog or approve-all list
+    // drawn below; an unbroken run of the same escalation keeps its `since`.
+    _previousDisplayedEscalation = _displayedEscalation;
+    _displayedEscalation = null;
+    _displayedBulkApproval = null;
     const mode = deps.getMode();
     if (mode === 'command') {
       drawCommandOverlay();
@@ -805,6 +1762,24 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
       drawProviderPickerOverlay();
     } else if (mode === 'escalation-picker') {
       drawEscalationPickerOverlay();
+    } else if (mode === 'escalation-approve-all') {
+      drawBulkApproveOverlay();
+    } else if (mode === 'message-panel') {
+      drawMessagePanelOverlay();
+    }
+    settleArmingState();
+  }
+
+  /**
+   * After an overlay draw: a list that was not drawn (screen closed, or the
+   * notice) must be scrolled through again before `y` counts, and with
+   * nothing on screen that waits for arming no redraw is due.
+   */
+  function settleArmingState(): void {
+    if (_displayedBulkApproval === null) _bulkSeen = null;
+    if (_displayedEscalation === null && _displayedBulkApproval === null && _armingTimer) {
+      clearTimeout(_armingTimer);
+      _armingTimer = null;
     }
   }
 
@@ -881,21 +1856,23 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
     clearLine(currentY);
     moveTo(2, currentY);
     term.cyan('Path: ');
+    // The path is typed or pasted by the user; pasted text can carry control
+    // characters and `^`/`%`, so it is display-escaped like any other text.
     const pathPrefix = 'Path: ';
-    const beforeCursor = ps.inputPath.slice(0, ps.cursorPos);
-    const cursorChar = ps.cursorPos < ps.inputPath.length ? ps.inputPath[ps.cursorPos] : ' ';
-    const afterCursor = ps.cursorPos < ps.inputPath.length ? ps.inputPath.slice(ps.cursorPos + 1) : '';
-    term(beforeCursor);
+    const beforeCursor = toDisplayText(ps.inputPath.slice(0, ps.cursorPos));
+    const cursorChar = toDisplayText(ps.cursorPos < ps.inputPath.length ? ps.inputPath[ps.cursorPos] : ' ');
+    const afterCursor = toDisplayText(ps.cursorPos < ps.inputPath.length ? ps.inputPath.slice(ps.cursorPos + 1) : '');
+    term(escapeTerminalKitMarkup(beforeCursor));
     if (!ps.inList) {
       // Show block cursor when input field has focus
-      term.bgWhite.black(cursorChar);
+      term.bgWhite.black(escapeTerminalKitMarkup(cursorChar));
       term.styleReset();
     } else {
-      term(cursorChar);
+      term(escapeTerminalKitMarkup(cursorChar));
     }
-    term(afterCursor);
+    term(escapeTerminalKitMarkup(afterCursor));
     term.eraseLineAfter();
-    const cursorX = 2 + pathPrefix.length + ps.cursorPos;
+    const cursorX = 2 + pathPrefix.length + displayWidth(beforeCursor);
     currentY++;
 
     // Separator
@@ -922,9 +1899,11 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
       const entryIdx = ps.scrollOffset + i;
       if (entryIdx < ps.entries.length) {
         moveTo(2, currentY);
-        const entry = ps.entries[entryIdx];
+        // Directory entries are file names the agent may have created in a
+        // workspace: display-escaped and cut to the row.
+        const entry = untrusted(ps.entries[entryIdx], Math.max(1, _cols - 4));
         const isHighlighted = ps.inList && entryIdx === ps.selectedIndex;
-        const isDir = entry.endsWith('/');
+        const isDir = ps.entries[entryIdx].endsWith('/');
 
         if (isHighlighted) {
           term.bgCyan.black('> ' + entry);
@@ -946,7 +1925,7 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
     clearLine(currentY);
     moveTo(2, currentY);
     if (ps.error) {
-      term.red(truncate(ps.error, _cols - 4));
+      term.red(untrusted(ps.error, _cols - 4));
     } else if (ps.inList) {
       term.bgWhite.black(' Enter ');
       term.styleReset();
@@ -1021,37 +2000,41 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
       clearLine(currentY);
       const idx = scrollOffset + i;
       if (idx < rps.sessions.length) {
+        // Snapshots are read from mutable on-disk JSON; every field is untrusted text.
         const s = rps.sessions[idx];
         const isSelected = idx === rps.selectedIndex;
-        const shortId = s.sessionId.substring(0, 8);
+        const shortId = toDisplayText(s.sessionId.substring(0, 8));
+        const agent = toDisplayText(s.agent);
+        const label = toDisplayText(s.label);
         const timeAgo = formatRelativeTime(s.lastActivity);
-        const workspace = getWorkspaceLabel(s);
+        const workspaceLabel = getWorkspaceLabel(s);
+        const workspace = workspaceLabel === undefined ? undefined : toDisplayText(workspaceLabel);
         const workspaceSuffix = workspace ? `  ${workspace}` : '';
-        const line = `${shortId}  ${s.agent}  ${s.label}${workspaceSuffix}  ${timeAgo}  [${s.status}]`;
+        const line = `${shortId}  ${agent}  ${label}${workspaceSuffix}  ${timeAgo}  [${s.status}]`;
 
         moveTo(2, currentY);
         if (isSelected) {
-          term.bgCyan.black('> ' + truncate(line, Math.max(1, _cols - 6)));
+          term.bgCyan.black('> ' + untrusted(line, Math.max(1, _cols - 6)));
           term.styleReset();
         } else {
           term('  ');
-          term.dim(shortId);
+          term.dim(escapeTerminalKitMarkup(shortId));
           term('  ');
-          term(s.agent);
+          term(untrusted(agent, Math.max(1, _cols - 14)));
           term('  ');
           // Fixed columns: "  " prefix (2) + shortId (8) + "  " (2) + agent + "  " (2) +
           // label + "  " (2) + timeAgo + "  " (2) + [status]
-          const fixedWidth = 2 + 8 + 2 + s.agent.length + 2 + 2 + timeAgo.length + 2 + s.status.length + 2;
+          const fixedWidth = 2 + 8 + 2 + displayWidth(agent) + 2 + 2 + timeAgo.length + 2 + s.status.length + 2;
           const availForLabelAndWs = Math.max(10, _cols - fixedWidth);
           if (workspace) {
             // Split available space: label gets half, workspace gets the rest
             const labelWidth = Math.max(5, Math.floor(availForLabelAndWs * 0.4));
             const wsWidth = Math.max(5, availForLabelAndWs - labelWidth - 2);
-            term.cyan(truncate(s.label, labelWidth));
+            term.cyan(untrusted(label, labelWidth));
             term('  ');
-            term.yellow(truncate(workspace, wsWidth));
+            term.yellow(untrusted(workspace, wsWidth));
           } else {
-            term.cyan(truncate(s.label, availForLabelAndWs));
+            term.cyan(untrusted(label, availForLabelAndWs));
           }
           term('  ');
           term.dim(timeAgo);
@@ -1124,24 +2107,41 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
       if (idx < pps.personas.length) {
         const p = pps.personas[idx];
         const isSelected = idx === pps.selectedIndex;
-        const status = p.compiled ? '' : ' [not compiled]';
-        const desc = truncate(p.description, Math.max(10, _cols - p.name.length - status.length - 10));
-        const line = `${p.name}  ${desc}${status}`;
+        // Persona names and descriptions come from files on disk: untrusted text.
+        const usable = p.compiled && !p.stale && p.invalidOverrides === undefined;
+        const status = !p.compiled
+          ? ' [not compiled]'
+          : p.stale
+            ? ' [policy stale]'
+            : p.invalidOverrides !== undefined
+              ? ' [invalid model or limits]'
+              : '';
+        // A validated model ID is printable ASCII; escape it anyway.
+        const model = p.agentModelId !== undefined ? ` (${toDisplayText(p.agentModelId)})` : '';
+        const name = toDisplayText(p.name);
+        const desc = truncate(
+          toDisplayText(p.description),
+          Math.max(10, _cols - displayWidth(name) - model.length - status.length - 10),
+        );
+        const line = `${name}  ${desc}${model}${status}`;
 
         moveTo(2, currentY);
         if (isSelected) {
-          term.bgCyan.black('> ' + truncate(line, Math.max(1, _cols - 6)));
+          term.bgCyan.black('> ' + untrusted(line, Math.max(1, _cols - 6)));
           term.styleReset();
         } else {
           term('  ');
-          if (p.compiled) {
-            term.cyan(p.name);
+          if (usable) {
+            term.cyan(untrusted(name, Math.max(1, _cols - 6)));
           } else {
-            term.dim(p.name);
+            term.dim(untrusted(name, Math.max(1, _cols - 6)));
           }
           term('  ');
-          term.dim(desc);
-          if (!p.compiled) {
+          term.dim(escapeTerminalKitMarkup(desc));
+          if (model !== '') {
+            term.cyan(escapeTerminalKitMarkup(model));
+          }
+          if (!usable) {
             term.yellow(status);
           }
         }
@@ -1197,19 +2197,25 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
       if (idx < pps.profiles.length) {
         const p = pps.profiles[idx];
         const isSelected = idx === pps.selectedIndex;
+        // Profile names and model labels come from the user's config file;
+        // escaped anyway so `^`/`%` and odd characters print literally.
         const defaultMark = p.isDefault ? ' (default)' : '';
-        const label = truncate(p.primaryModelLabel, Math.max(10, _cols - p.name.length - defaultMark.length - 12));
-        const line = `${p.name}  ${label}${defaultMark}`;
+        const name = toDisplayText(p.name);
+        const label = truncate(
+          toDisplayText(p.primaryModelLabel),
+          Math.max(10, _cols - displayWidth(name) - defaultMark.length - 12),
+        );
+        const line = `${name}  ${label}${defaultMark}`;
 
         moveTo(2, currentY);
         if (isSelected) {
-          term.bgCyan.black('> ' + truncate(line, Math.max(1, _cols - 6)));
+          term.bgCyan.black('> ' + untrusted(line, Math.max(1, _cols - 6)));
           term.styleReset();
         } else {
           term('  ');
-          term.cyan(p.name);
+          term.cyan(untrusted(name, Math.max(1, _cols - 6)));
           term('  ');
-          term.dim(label);
+          term.dim(escapeTerminalKitMarkup(label));
           if (p.isDefault) {
             term.dim(defaultMark);
           }
@@ -1237,41 +2243,57 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
       return _layout;
     },
 
+    get displayedEscalation() {
+      return _displayedEscalation;
+    },
+
+    get displayedBulkApproval() {
+      return _displayedBulkApproval;
+    },
+
     fullRedraw(): void {
-      recalcLayout();
-      term.clear();
-      drawTabBar();
-      drawPtyViewport();
-      drawFooter();
-      drawActiveOverlay();
+      // One frame: the clear and the repaint reach the terminal together.
+      frame(() => {
+        recalcLayout();
+        invalidateScreen();
+        term.clear();
+        drawRegion('tabBar', drawTabBar);
+        drawBody(true);
+      });
     },
 
     redrawPty(): void {
-      recalcLayout();
-      drawPtyViewport();
-      drawActiveOverlay();
+      frame(() => {
+        recalcLayout();
+        drawBody(false);
+      });
     },
 
     redrawTabBar(): void {
-      drawTabBar();
+      frame(() => {
+        drawRegion('tabBar', drawTabBar);
+      });
     },
 
     redrawCommandArea(): void {
-      recalcLayout();
-      const mode = deps.getMode();
-      if (mode === 'command' || isPickerMode(mode)) {
-        // Repaint viewport first to clear stale overlay rows from a
-        // previously larger overlay (e.g., after resolving an escalation).
-        drawPtyViewport();
-        drawActiveOverlay();
-      } else {
-        drawFooter();
-      }
+      frame(() => {
+        recalcLayout();
+        const mode = deps.getMode();
+        if (mode === 'command' || isPickerMode(mode)) {
+          // The viewport repaints rows a previously larger overlay held
+          // (e.g., after resolving an escalation). Pickers other than the
+          // escalation screens show the pending banner in the footer.
+          drawBody(mode !== 'command');
+        } else {
+          drawRegion('footer', drawFooter);
+        }
+      });
     },
 
     resize(newCols: number, newRows: number): void {
       _cols = newCols;
       _rows = newRows;
+      invalidateScreen();
       recalcLayout();
       _splash?.resize(_cols, _layout.ptyViewportRows, _layout.ptyViewportY, activeOverlayRows());
     },
@@ -1283,6 +2305,10 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
         clearTimeout(renderTimeout);
         renderTimeout = null;
       }
+      if (_armingTimer) {
+        clearTimeout(_armingTimer);
+        _armingTimer = null;
+      }
       if (_flashTimeout) {
         clearTimeout(_flashTimeout);
         _flashTimeout = null;
@@ -1290,14 +2316,19 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
     },
 
     showMessage(message: string): void {
-      _flashMessage = message;
+      _flashMessage = collapseFlashMessage(message);
       if (_flashTimeout) clearTimeout(_flashTimeout);
       _flashTimeout = setTimeout(() => {
         _flashMessage = null;
         _flashTimeout = null;
-        drawFooter();
+        if (_destroyed) return;
+        frame(() => {
+          drawRegion('footer', drawFooter);
+        });
       }, FLASH_DURATION_MS);
-      drawFooter();
+      frame(() => {
+        drawRegion('footer', drawFooter);
+      });
     },
 
     scheduleRedraw(): void {
@@ -1310,10 +2341,12 @@ export function createMuxRenderer(term: TerminalKit, cols: number, rows: number,
       renderTimeout = setTimeout(() => {
         renderScheduled = false;
         lastRenderTime = Date.now();
-        recalcLayout();
-        drawPtyViewport();
-        drawFooter();
-        drawActiveOverlay();
+        // Output frames send changed rows/regions and restore any overlay
+        // whose covered rows emitted adjacent PTY spans.
+        frame(() => {
+          recalcLayout();
+          drawBody(true);
+        });
       }, delay);
     },
   };
@@ -1453,88 +2486,573 @@ export function cellStyleEquals(a: TranslatedCell, b: TranslatedCell): boolean {
 }
 
 /**
- * Renders a row by batching consecutive same-styled cells into runs.
- * Skips SGR output when the run's style matches the last emitted style
- * (Option C). Returns the style of the last emitted run for cross-row
- * carry-over.
+ * The bytes that paint the cells of `row` (as read by
+ * {@link readTerminalBuffer}) lying in columns `[from, to)`: consecutive
+ * same-styled cells share one SGR sequence. A character cut by either edge,
+ * containing invisible formatting, or whose host display width differs
+ * from xterm's recorded width is drawn as blanks in its style, so nothing
+ * is painted outside the span. `end` is the column after the last cell drawn
+ * (the row can end before `to`). Pure; the PTY viewport compares the result
+ * with what it drew last time and sends only rows that changed.
  */
-function renderRow(term: TerminalKit, row: TranslatedCell[], lastStyle: TranslatedCell | null): void {
-  let prevStyle = lastStyle;
-  let i = 0;
-  while (i < row.length) {
-    // Find the end of the current same-style run
-    let j = i + 1;
-    while (j < row.length && cellStyleEquals(row[i], row[j])) {
-      j++;
-    }
-
-    // Collect characters for this run
-    let chars = '';
-    for (let k = i; k < j; k++) {
-      chars += row[k].char;
-    }
-
-    // Only emit SGR if the style changed from the last emitted style
-    if (prevStyle && cellStyleEquals(prevStyle, row[i])) {
-      term.noFormat(chars);
-    } else {
-      term.noFormat(`\x1b[${buildSgrSequence(row[i])}m${chars}`);
-    }
-
-    prevStyle = row[i];
-    i = j;
+export function renderCellSpan(
+  row: readonly TranslatedCell[],
+  from: number,
+  to: number,
+): { readonly text: string; readonly end: number } {
+  let text = '';
+  let end = from;
+  let column = 0;
+  let previous: TranslatedCell | null = null;
+  for (const cell of row) {
+    const start = column;
+    column += cell.width;
+    if (column <= from) continue;
+    if (start >= to) break;
+    const cut = start < from || column > to;
+    const unsafeWidth = PTY_CELL_FORMAT.test(cell.char) || displayWidth(cell.char) !== cell.width;
+    const chars = cut || unsafeWidth ? ' '.repeat(Math.min(column, to) - Math.max(start, from)) : cell.char;
+    if (previous === null || !cellStyleEquals(previous, cell)) text += `\x1b[${buildSgrSequence(cell)}m`;
+    text += chars;
+    previous = cell;
+    end = Math.min(column, to);
   }
+  return { text, end };
+}
+
+// -- Escalation text formatting and row planning --
+//
+// Pure functions, exported for tests. Every string they return is already
+// display-sanitized (toDisplayText): no control, C1, bidi or invisible
+// characters remain, hidden characters show as `\u...` escapes. The drawing
+// code only adds terminal-kit markup escaping on top. Because the escaping
+// happens before any cut, a cut can shorten an escape's visible spelling
+// (`\u00…`) but can never leave a fragment of a control sequence that the
+// terminal would act on.
+
+/** One packed line of `key: value` pairs and how many arguments it holds. */
+export interface ArgLine {
+  readonly text: string;
+  /** Arguments whose pair starts on this line (used to count hidden arguments). */
+  readonly args: number;
+  /** A value on this line was cut to fit; the detail view shows it whole. */
+  readonly cut: boolean;
 }
 
 /**
- * Formats tool call arguments into packed display lines.
- * Each line contains as many `key: value` pairs as fit within maxWidth,
- * separated by double spaces.
+ * A planned row of the command-mode escalation panel or of the picker's
+ * detail area. `header` is drawn with its own styling; the other kinds carry
+ * display-sanitized text.
  */
-function formatArgLines(args: Record<string, unknown>, maxWidth: number): string[] {
-  const entries = Object.entries(args);
+export type EscalationRow =
+  | {
+      readonly kind: 'header';
+      readonly displayNumber: number;
+      readonly sessionDisplayNumber: number;
+      readonly tool: string;
+    }
+  | { readonly kind: 'args-label'; readonly text: string }
+  | { readonly kind: 'arg'; readonly text: string }
+  | { readonly kind: 'hidden'; readonly text: string }
+  | { readonly kind: 'reason'; readonly text: string }
+  | { readonly kind: 'whitelist'; readonly text: string }
+  | { readonly kind: 'whitelist-directory'; readonly text: string }
+  /** Trusted: the session's task. */
+  | { readonly kind: 'task'; readonly text: string }
+  /** Trusted: the human's last message. */
+  | { readonly kind: 'user-message'; readonly text: string }
+  /** Untrusted: the agent's justification, drawn with its "untrusted" label. */
+  | { readonly kind: 'justification'; readonly text: string }
+  /** Trusted: other pending escalations share this one's pattern. */
+  | { readonly kind: 'group'; readonly text: string }
+  | { readonly kind: 'more'; readonly text: string };
+
+/** Marks text that was cut short. */
+const ELLIPSIS = '…';
+
+function argumentEntries(args: unknown): Array<[string, unknown]> {
+  if (typeof args !== 'object' || args === null) return [];
+  return Object.entries(args);
+}
+
+/** The first `maxUnits` UTF-16 units of `text`, never ending inside a surrogate pair. */
+function headOf(text: string, maxUnits: number): string {
+  const end = Math.max(0, Math.floor(maxUnits));
+  if (text.length <= end) return text;
+  const last = text.charCodeAt(end - 1);
+  return text.slice(0, last >= 0xd800 && last <= 0xdbff ? end - 1 : end);
+}
+
+/** Display text plus whether it was cut short (and ends with an ellipsis). */
+interface ShownText {
+  readonly text: string;
+  readonly cut: boolean;
+}
+
+/**
+ * JSON for one value, cut to `maxLength` UTF-16 units when given. A long
+ * string is serialized from its head only (the JSON of a prefix is a prefix
+ * of the JSON when the cut falls between code points), so summarizing a
+ * multi-megabyte argument costs no more than summarizing a short one.
+ */
+function formatJson(value: unknown, maxLength: number | undefined): ShownText {
+  let json: string;
+  let cut = false;
+  if (typeof value === 'string' && maxLength !== undefined && value.length > maxLength) {
+    json = JSON.stringify(headOf(value, maxLength)).slice(0, -1); // drop the closing quote
+    cut = true;
+  } else {
+    // JSON.stringify is typed as returning string but yields undefined for
+    // functions and symbols. Tool arguments come from JSON, so that cannot
+    // happen; render the type name rather than crash the approval UI.
+    const serialized = JSON.stringify(value) as string | undefined;
+    json = serialized ?? typeof value;
+  }
+  if (maxLength !== undefined && json.length > maxLength) {
+    json = headOf(json, maxLength);
+    cut = true;
+  }
+  // The ellipsis is added even when the kept head would fit the row (a run
+  // of zero-width marks, say), so a cut value never looks complete.
+  return cut ? { text: `${toDisplayText(json)}${ELLIPSIS}`, cut } : { text: toDisplayText(json), cut };
+}
+
+const PLAIN_KEY = /^[A-Za-z_$][\w$-]*$/u;
+
+/** Argument keys are agent-controlled too: quote any that is not a plain identifier. */
+function formatArgKey(key: string, maxLength?: number): ShownText {
+  if (PLAIN_KEY.test(key) && (maxLength === undefined || key.length <= maxLength)) {
+    return { text: key, cut: false };
+  }
+  return formatJson(key, maxLength);
+}
+
+/**
+ * One argument value as JSON (strings quoted, so a hidden character shows as
+ * `\u001b` and a value's boundaries are unambiguous), display-escaped to a
+ * single line. With `maxLength`, at most that many UTF-16 units of the JSON
+ * are kept and a cut ends with an ellipsis.
+ */
+export function formatArgValue(value: unknown, maxLength?: number): string {
+  return formatJson(value, maxLength).text;
+}
+
+/**
+ * Formats tool-call arguments into packed display lines: each line holds as
+ * many `key: value` pairs as fit within `maxWidth` cells, separated by double
+ * spaces; a pair that does not fit starts a new line and is cut to the width
+ * (by display cells, after escaping; an ellipsis marks the cut). Only the
+ * head of each value is serialized, since one row can show no more.
+ */
+export function formatArgLines(args: Record<string, unknown>, maxWidth: number): ArgLine[] {
+  const entries = argumentEntries(args);
   if (entries.length === 0) return [];
 
-  const lines: string[] = [];
+  const width = Math.max(1, Math.floor(maxWidth));
+  // Enough UTF-16 units to fill a row even when every character is wide.
+  const valueLimit = width * 2 + 16;
+  const lines: ArgLine[] = [];
   let currentLine = '';
+  let currentWidth = 0;
+  let currentArgs = 0;
+  let currentCut = false;
+  const flush = (): void => {
+    const text = truncateToWidth(currentLine, width);
+    lines.push({ text, args: currentArgs, cut: currentCut || text !== currentLine });
+  };
 
   for (const [key, value] of entries) {
-    const formatted = formatArgValue(value);
-    const pair = `${key}: ${formatted}`;
+    const shownKey = formatArgKey(key, valueLimit);
+    const shownValue = formatJson(value, valueLimit);
+    const pair = `${shownKey.text}: ${shownValue.text}`;
+    const pairWidth = displayWidth(pair);
+    const pairCut = shownKey.cut || shownValue.cut;
 
-    if (currentLine.length === 0) {
-      currentLine = pair;
-    } else if (currentLine.length + 2 + pair.length <= maxWidth) {
+    if (currentArgs > 0 && currentWidth + 2 + pairWidth <= width) {
       currentLine += '  ' + pair;
-    } else {
-      lines.push(truncate(currentLine, maxWidth));
-      currentLine = pair;
+      currentWidth += 2 + pairWidth;
+      currentArgs += 1;
+      currentCut ||= pairCut;
+      continue;
     }
+    if (currentArgs > 0) flush();
+    currentLine = pair;
+    currentWidth = pairWidth;
+    currentArgs = 1;
+    currentCut = pairCut;
   }
-
-  if (currentLine.length > 0) {
-    lines.push(truncate(currentLine, maxWidth));
-  }
+  flush();
 
   return lines;
 }
 
-function formatArgValue(value: unknown): string {
-  if (typeof value === 'string') return value;
-  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-  if (value == null) return String(value);
-  return JSON.stringify(value);
+/** The pattern `/approve+` (`w`) whitelists: the first candidate, which binds paths exactly. */
+function firstCandidate(esc: PendingEscalation): { readonly description: string } | undefined {
+  return esc.request.whitelistCandidates?.[0];
 }
 
+/** The pattern `/approve+dir` (`W`) whitelists: the directory-wide candidate, when there is one. */
+function directoryCandidate(esc: PendingEscalation): { readonly description: string } | undefined {
+  const index = directoryCandidateIndex(esc.request.whitelistCandidates);
+  return index === undefined ? undefined : esc.request.whitelistCandidates?.[index];
+}
+
+/** A row that shows a whitelist pattern. */
+type WhitelistRow = Extract<EscalationRow, { readonly kind: 'whitelist' | 'whitelist-directory' }>;
+
+/** The whitelist rows of an escalation: `/approve+`'s pattern, then `/approve+dir`'s, as there are. */
+function whitelistRows(esc: PendingEscalation): WhitelistRow[] {
+  const rows: WhitelistRow[] = [];
+  const exact = firstCandidate(esc);
+  if (exact) rows.push({ kind: 'whitelist', text: toDisplayText(exact.description) });
+  const directory = directoryCandidate(esc);
+  if (directory) rows.push({ kind: 'whitelist-directory', text: toDisplayText(directory.description) });
+  return rows;
+}
+
+/**
+ * Plans the argument block within `budget` rows. When every line fits, the
+ * block is the optional `Arguments:` label followed by the lines; the label
+ * says `(values cut, <viewHint> to view)` when a line had to be cut to the
+ * width. Otherwise the block says how many arguments were hidden and how to
+ * see them in full (`viewHint`, e.g. `v`): on the label row when there is
+ * one, as a trailing row otherwise. The agent controls argument order and
+ * length and may place the decisive value past the cut, so a cut is never
+ * silent.
+ */
+export function planArgumentRows(
+  argLines: readonly ArgLine[],
+  budget: number,
+  viewHint: string,
+  withLabel: boolean,
+): EscalationRow[] {
+  if (argLines.length === 0 || budget <= 0) return [];
+  const labelRows = withLabel ? 1 : 0;
+  if (labelRows + argLines.length <= budget) {
+    const label = argLines.some((line) => line.cut) ? `Arguments: (values cut, ${viewHint} to view)` : 'Arguments:';
+    const rows: EscalationRow[] = withLabel ? [{ kind: 'args-label', text: label }] : [];
+    for (const line of argLines) rows.push({ kind: 'arg', text: line.text });
+    return rows;
+  }
+
+  // One row carries the notice; the rest show as many lines as fit.
+  const shown = Math.max(0, budget - 1);
+  const hidden = argLines.slice(shown).reduce((count, line) => count + line.args, 0);
+  const notice = `(+${hidden} hidden, ${viewHint} to view)`;
+  const rows: EscalationRow[] = withLabel ? [{ kind: 'args-label', text: `Arguments: ${notice}` }] : [];
+  for (const line of argLines.slice(0, shown)) rows.push({ kind: 'arg', text: line.text });
+  if (!withLabel) rows.push({ kind: 'hidden', text: notice });
+  return rows;
+}
+
+/**
+ * Plans the escalation picker's detail area for a box of `innerWidth` cells:
+ * the trusted reviewer context (task, the human's last message), the
+ * argument block (indented by two cells), then the reason, the whitelist
+ * lines, the agent's untrusted justification and, with `groupSize` of two
+ * or more, the group hint. Everything but the argument block, plus one
+ * argument row (when there are arguments: the label with the hidden count),
+ * is reserved and always returned, even past `budget`, so the patterns that
+ * `w` and `W` would whitelist are never pushed out by long arguments and
+ * arguments are never dropped without a notice. Further argument rows fill
+ * the rest of `budget`. A caller that cannot fit the result must not show a
+ * partial dialog. `argLines` defaults to the arguments formatted for the box.
+ */
+export function planEscalationDetailRows(
+  esc: PendingEscalation,
+  budget: number,
+  innerWidth: number,
+  argLines: readonly ArgLine[] = formatArgLines(esc.request.arguments, Math.max(1, innerWidth - 2)),
+  groupSize = 0,
+): EscalationRow[] {
+  const { request } = esc;
+  // Reviewer context, one row each (the detail view shows it whole): the
+  // trusted task and last message above the arguments, the agent's
+  // untrusted justification below the reason, apart from the human's text.
+  const head: EscalationRow[] = [];
+  const userMessage = displayedUserMessage(request);
+  if (request.taskSummary !== undefined) head.push({ kind: 'task', text: toDisplayText(request.taskSummary) });
+  if (userMessage !== undefined) head.push({ kind: 'user-message', text: toDisplayText(userMessage.text) });
+  const tail: EscalationRow[] = [{ kind: 'reason', text: toDisplayText(request.reason) }, ...whitelistRows(esc)];
+  if (request.agentJustification !== undefined) {
+    tail.push({ kind: 'justification', text: toDisplayText(request.agentJustification) });
+  }
+  if (groupSize >= 2) {
+    tail.push({
+      kind: 'group',
+      text: `${groupSize} pending escalations share this pattern: /approve group ${esc.displayNumber} reviews them`,
+    });
+  }
+  const argBudget = Math.max(argLines.length > 0 ? 1 : 0, budget - head.length - tail.length);
+  return [...head, ...planArgumentRows(argLines, argBudget, 'v', true), ...tail];
+}
+
+/**
+ * How many pending escalations, `esc` included, share `esc`'s whitelist
+ * pattern (escalation/escalation-groups.ts); 0 when `esc` is never grouped.
+ */
+export function pendingGroupSize(esc: PendingEscalation, pending: Iterable<PendingEscalation>): number {
+  const key = escalationGroupKey(esc.request);
+  if (key === undefined) return 0;
+  return groupMembers(pending, (other) => other.request, key).length;
+}
+
+/**
+ * Plans the command-mode escalation panel within `panelRows` rows, argument
+ * lines being `argWidth` cells wide. Every shown escalation gets its header,
+ * at least one argument row (when it has arguments), its reason and its
+ * whitelist lines; rows are shared evenly so one long argument list cannot
+ * crowd the others out. An escalation whose reserved rows do not fit is not
+ * shown at all and is counted in a trailing `[+N more ...]` row, so a partial
+ * escalation never passes for a complete one and the notice never overwrites
+ * content. `argLinesFor` defaults to formatting each escalation's arguments
+ * for `argWidth`; the renderer passes a cached version.
+ */
+export function planEscalationPanelRows(
+  pending: readonly PendingEscalation[],
+  panelRows: number,
+  argWidth: number,
+  argLinesFor: (esc: PendingEscalation) => readonly ArgLine[] = (esc) =>
+    formatArgLines(esc.request.arguments, argWidth),
+): EscalationRow[] {
+  if (pending.length === 0 || panelRows <= 0) return [];
+
+  const attempt = (budget: number): { rows: EscalationRow[]; shown: number } => {
+    const rows: EscalationRow[] = [];
+    let shown = 0;
+    for (const esc of pending) {
+      const whitelist = whitelistRows(esc);
+      const argLines = argLinesFor(esc);
+      // header + reason + whitelist lines + one row for arguments (content or notice)
+      const fixed = 2 + whitelist.length + (argLines.length > 0 ? 1 : 0);
+      if (rows.length + fixed > budget) break;
+      const share = Math.max(fixed, Math.floor(budget / pending.length));
+      const argBudget = Math.min(budget - rows.length - (fixed - 1), share - (fixed - 1));
+      rows.push({
+        kind: 'header',
+        displayNumber: esc.displayNumber,
+        sessionDisplayNumber: esc.sessionDisplayNumber,
+        tool: toolLabel(esc.request),
+      });
+      rows.push(...planArgumentRows(argLines, argLines.length > 0 ? argBudget : 0, 'Ctrl-E, v', false));
+      rows.push({ kind: 'reason', text: toDisplayText(esc.request.reason) });
+      rows.push(...whitelist);
+      shown += 1;
+    }
+    return { rows, shown };
+  };
+
+  let plan = attempt(panelRows);
+  if (plan.shown < pending.length) {
+    plan = attempt(Math.max(0, panelRows - 1));
+    // Hidden escalations are reviewed one at a time; approving them in bulk
+    // unseen is not suggested.
+    plan.rows.push({
+      kind: 'more',
+      text: `[+${pending.length - plan.shown} more — Ctrl-E to review them, or /deny all]`,
+    });
+  }
+  return plan.rows;
+}
+
+/** One line of the approve-all list, display-sanitized; `kind` selects the styling. */
+export interface BulkApprovalLine {
+  readonly kind: 'header' | 'detail' | 'pattern' | 'note';
+  readonly text: string;
+}
+
+/**
+ * Word-wraps trusted text (no control characters, ASCII spaces between
+ * words) into rows of at most `width` cells; a word longer than the row is
+ * hard-wrapped.
+ */
+export function wordWrap(text: string, width: number): string[] {
+  const limit = Math.max(1, Math.floor(width));
+  const rows: string[] = [];
+  let current = '';
+  for (const word of text.split(' ')) {
+    const candidate = current ? `${current} ${word}` : word;
+    if (displayWidth(candidate) <= limit) {
+      current = candidate;
+      continue;
+    }
+    if (current) rows.push(current);
+    const pieces = wrapToWidth(word, limit);
+    current = pieces.pop() ?? '';
+    rows.push(...pieces);
+  }
+  rows.push(current);
+  return rows;
+}
+
+/**
+ * The approve-all list for a box `width` cells wide: for every reviewed
+ * escalation a header (`[N] Session #M  server/tool`), its arguments as
+ * packed `key: value` lines (a cut value ends with an ellipsis and a note
+ * says where to see it whole), its reason, and either the note that a
+ * human-only escalation stays pending or, with `whitelist`, the complete
+ * pattern `/approve+` would add (or that there is none). Every string is
+ * display-sanitized. An escalation that is no longer pending under its
+ * number says so.
+ */
+export function formatBulkApprovalLines(
+  reviewed: readonly PendingRef[],
+  pending: ReadonlyMap<number, PendingEscalation>,
+  width: number,
+  whitelist: boolean,
+  group?: BulkApproveGroup,
+): BulkApprovalLine[] {
+  const lines: BulkApprovalLine[] = [];
+  const indent = '    ';
+  const inner = Math.max(1, width - indent.length);
+  // Agent-derived text is hard-wrapped, so the rows joined give it back
+  // exactly; trusted notes are word-wrapped.
+  const push = (kind: BulkApprovalLine['kind'], text: string): void => {
+    const rows = kind === 'note' ? wordWrap(text, inner) : wrapToWidth(text, inner);
+    for (const row of rows) lines.push({ kind, text: `${indent}${row}` });
+  };
+
+  if (group) {
+    // The pattern every listed call shares, in full. Approving the group
+    // approves each call once; it whitelists nothing unless /approve+.
+    for (const row of wrapToWidth(`Every call below matches: ${toDisplayText(group.description)}`, width)) {
+      lines.push({ kind: 'pattern', text: row });
+    }
+  }
+
+  for (const ref of [...reviewed].sort((a, b) => a.displayNumber - b.displayNumber)) {
+    const esc = pending.get(ref.displayNumber);
+    if (esc?.request.escalationId !== ref.escalationId) {
+      lines.push({ kind: 'note', text: `[${ref.displayNumber}] no longer pending` });
+      continue;
+    }
+    for (const row of wrapToWidth(
+      `[${esc.displayNumber}] Session #${esc.sessionDisplayNumber}  ${toolLabel(esc.request)}`,
+      width,
+    )) {
+      lines.push({ kind: 'header', text: row });
+    }
+    const argLines = formatArgLines(esc.request.arguments, inner);
+    if (argLines.length === 0) push('note', '(no arguments)');
+    for (const line of argLines) lines.push({ kind: 'detail', text: `${indent}${line.text}` });
+    if (argLines.some((line) => line.cut)) {
+      push('note', `(values cut: Esc, then Ctrl-E and v show escalation ${esc.displayNumber} in full)`);
+    }
+    push('detail', `Reason: ${toDisplayText(esc.request.reason)}`);
+    // Reviewer context: the human's own last message on one row (the detail
+    // view shows it whole), the agent's untrusted justification in full.
+    const userMessage = displayedUserMessage(esc.request);
+    if (userMessage !== undefined) {
+      lines.push({
+        kind: 'detail',
+        text: `${indent}${truncateToWidth(`${USER_MESSAGE_PREFIX}${toDisplayText(userMessage.text)}`, inner)}`,
+      });
+    }
+    if (esc.request.agentJustification !== undefined) {
+      push('detail', `${JUSTIFICATION_PREFIX}${toDisplayText(esc.request.agentJustification)}`);
+    }
+    if (esc.request.humanOnly === true) {
+      push('note', `human-only: stays pending; approve it on its own with /approve ${esc.displayNumber}`);
+      continue;
+    }
+    if (whitelist) {
+      const candidate = firstCandidate(esc);
+      if (candidate) push('pattern', `/approve+ ${toDisplayText(candidate.description)}`);
+      else push('note', 'no whitelist pattern: approved this once');
+    }
+  }
+  return lines;
+}
+
+/**
+ * Every line of the escalation detail view, hard-wrapped to `width` cells:
+ * session and tool, the session's task and the human's last message (the
+ * human's own text, line breaks kept), the complete reason, the whitelist
+ * patterns (what `/approve+` and `/approve+dir` add), the context and all
+ * arguments as pretty-printed JSON (strings quoted; hidden characters
+ * visible as escapes), and last the agent's untrusted justification on its
+ * own gutter. Nothing is cut; the view scrolls instead. The cost is linear
+ * in the size of the request, so the renderer caches the result per
+ * escalation and width.
+ */
+export function formatEscalationDetailLines(esc: PendingEscalation, width: number): string[] {
+  const lines: string[] = [];
+  const push = (text: string): void => {
+    for (const row of wrapToWidth(text, width)) lines.push(row);
+  };
+  // Free text keeps its line breaks; every other control character is escaped.
+  const pushMultiline = (prefix: string, text: string): void => {
+    toDisplayText(text, { multiline: true })
+      .replace(/\t/gu, '  ')
+      .split('\n')
+      .forEach((line, index) => push(`${index === 0 ? prefix : ' '.repeat(prefix.length)}${line}`));
+  };
+
+  push(`Session #${esc.sessionDisplayNumber}  ${toolLabel(esc.request)}`);
+  const { request } = esc;
+  // Trusted reviewer context first: what the human asked for.
+  if (request.taskSummary !== undefined) pushMultiline(TASK_PREFIX, request.taskSummary);
+  const userMessage = displayedUserMessage(request);
+  if (userMessage !== undefined) {
+    const when = userMessage.sentAt !== undefined ? ` (${formatRelativeTime(userMessage.sentAt)})` : '';
+    pushMultiline(`You said${when}: `, userMessage.text);
+  }
+  push(`Reason: ${toDisplayText(esc.request.reason)}`);
+  for (const row of whitelistRows(esc)) {
+    push(`${row.kind === 'whitelist-directory' ? DIRECTORY_WHITELIST_PREFIX : WHITELIST_PREFIX}${row.text}`);
+  }
+  if (esc.request.context) {
+    for (const [key, value] of Object.entries(esc.request.context)) {
+      push(`${toDisplayText(key)}: ${formatArgValue(value)}`);
+    }
+  }
+
+  if (argumentEntries(esc.request.arguments).length === 0) {
+    push('Arguments: (none)');
+  } else {
+    push('Arguments:');
+    const json = JSON.stringify(esc.request.arguments, null, 2) as string | undefined;
+    for (const jsonLine of toDisplayText(json ?? '{}', { multiline: true }).split('\n')) {
+      push(`  ${jsonLine}`);
+    }
+  }
+
+  // The agent's own text comes last, after the call it is about, as one
+  // escaped paragraph (a line break shows as `\n`) with the gutter on every
+  // row. Nothing in it can start a row of its own, imitate the arguments or
+  // the other rows, or push the real arguments off the first screen: this
+  // view takes decisions once armed, and a small terminal opens it directly.
+  if (request.agentJustification !== undefined) {
+    push(DETAIL_JUSTIFICATION_HEADING);
+    const rowWidth = Math.max(1, width - displayWidth(DETAIL_JUSTIFICATION_GUTTER));
+    for (const row of wrapToWidth(toDisplayText(request.agentJustification), rowWidth)) {
+      lines.push(`${DETAIL_JUSTIFICATION_GUTTER}${row}`);
+    }
+  }
+  return lines;
+}
+
+/**
+ * Collapses a flash message to the single line the footer can hold: the
+ * first line, display-sanitized, plus `(+N more)` when there were more.
+ */
+export function collapseFlashMessage(message: string): string {
+  const lines = message.split(/\r\n|\n|\r/u);
+  if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+  const first = toDisplayText(lines[0]);
+  const extra = lines.length - 1;
+  return extra > 0 ? `${first} (+${extra} more)` : first;
+}
+
+/** Cuts `str` to `maxLen` display cells, marking the cut with an ellipsis. */
 export function truncate(str: string, maxLen: number): string {
-  if (str.length <= maxLen) return str;
-  return str.slice(0, maxLen - 1) + '\u2026';
+  return truncateToWidth(str, maxLen);
 }
 
 /**
  * Computes which tab labels to render in the escalation tab bar,
  * truncating the focused tab if needed. Returns an array of
- * { label, isFocused } entries that fit within `width`.
+ * { label, isFocused } entries that fit within `width` cells.
  *
  * Exported for testing.
  */
@@ -1547,7 +3065,7 @@ export function fitTabLabels(
   let written = 0;
   for (const tab of tabs) {
     const isFocused = tab.displayNumber === focusedDisplayNumber;
-    const cellWidth = tab.label.length + 2; // +2 for surrounding spaces
+    const cellWidth = displayWidth(tab.label) + 2; // +2 for surrounding spaces
     if (written + cellWidth > width) {
       // Truncate the focused tab to fit; need at least 3 cols: space + 1 char + space
       const remaining = width - written;

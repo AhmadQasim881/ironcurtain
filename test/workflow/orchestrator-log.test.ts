@@ -12,6 +12,7 @@ import {
   type AgentReceivedEntry,
 } from '../../src/workflow/message-log.js';
 import {
+  resolveActiveGate,
   MockSession,
   approvedResponse,
   rejectedResponse,
@@ -165,9 +166,6 @@ describe('WorkflowOrchestrator message log', () => {
     }
     cleanupPersonas?.();
     rmSync(tmpDir, { recursive: true, force: true });
-    const baseName = resolve(tmpDir).split('/').pop()!;
-    const ckptDir = resolve(tmpDir, '..', `${baseName}-ckpt`);
-    rmSync(ckptDir, { recursive: true, force: true });
   });
 
   // -----------------------------------------------------------------------
@@ -212,7 +210,7 @@ describe('WorkflowOrchestrator message log', () => {
 
     // Wait for plan_gate
     await waitForGate(raiseGate, 1);
-    orchestrator.resolveGate(workflowId, { type: 'APPROVE' });
+    resolveActiveGate(orchestrator, workflowId, { type: 'APPROVE' });
 
     await waitForCompletion(orchestrator, workflowId);
 
@@ -445,14 +443,14 @@ describe('WorkflowOrchestrator message log', () => {
     await waitForGate(raiseGate, 1);
 
     // Resolve with FORCE_REVISION + prompt
-    orchestrator.resolveGate(workflowId, {
+    resolveActiveGate(orchestrator, workflowId, {
       type: 'FORCE_REVISION',
       prompt: 'Add error handling to the plan',
     });
 
     // Will loop back to plan, then hit gate again
     await waitForGate(raiseGate, 2);
-    orchestrator.resolveGate(workflowId, { type: 'APPROVE' });
+    resolveActiveGate(orchestrator, workflowId, { type: 'APPROVE' });
 
     await waitForCompletion(orchestrator, workflowId);
 
@@ -563,7 +561,7 @@ describe('WorkflowOrchestrator message log', () => {
     await waitForGate(raiseGate2, 1);
 
     // Resolve gate to complete
-    orchestrator2.resolveGate(workflowId, { type: 'APPROVE' });
+    resolveActiveGate(orchestrator2, workflowId, { type: 'APPROVE' });
     await waitForCompletion(orchestrator2, workflowId);
 
     // Read all entries - should include entries from both runs

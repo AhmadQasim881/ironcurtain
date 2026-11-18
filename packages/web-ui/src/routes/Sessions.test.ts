@@ -22,8 +22,10 @@ const {
       persona?: string;
       turnCount: number;
       budget: { estimatedCostUsd: number };
+      osSandboxWarning?: string;
     } | null,
     escalationDismissedAt: 0,
+    sessionNotices: new Map(),
   },
   mockCreateSession: vi.fn<(opts?: unknown) => Promise<{ label: number }>>(),
   mockListPersonas: vi.fn<() => Promise<unknown[]>>(),
@@ -34,6 +36,8 @@ const {
 }));
 
 vi.mock('../lib/stores.svelte.js', () => ({
+  // Non-reactive stand-in: these tests never reconnect. The reconnect
+  // re-attach path is covered with the real store in Sessions.reattach.test.ts.
   appState: mockAppState,
   createSession: mockCreateSession,
   endSession: vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
@@ -50,6 +54,8 @@ vi.mock('../lib/stores.svelte.js', () => ({
   getModelProviders: mockGetModelProviders,
   listResumableSessions: mockListResumableSessions,
   resumeSession: mockResumeSession,
+  loadSessionNotices: vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
+  dismissSessionNotice: vi.fn(),
 }));
 
 vi.mock('$lib/components/features/terminal-console.svelte', async () => await import('../__test_stubs__/Stub.svelte'));
@@ -112,6 +118,50 @@ describe('Sessions create flow guards', () => {
     expect(screen.getByRole('button', { name: 'Stopping…' })).toHaveProperty('disabled', true);
     expect(screen.getByTestId('pty-prompt-input')).toHaveProperty('disabled', true);
     expect(screen.getByTestId('pty-prompt-send')).toHaveProperty('disabled', true);
+  });
+
+  it('renders the OS-sandbox warning as an alert banner in the terminal view', () => {
+    const warning =
+      'IronCurtain: OS sandbox unavailable (ripgrep (rg) not found); not starting MCP server(s) that require it: git';
+    const warnedSession = {
+      label: 5,
+      source: { kind: 'web-pty' },
+      status: 'ready',
+      persona: undefined,
+      turnCount: 0,
+      budget: { estimatedCostUsd: 0 },
+      osSandboxWarning: warning,
+    };
+    mockAppState.sessions = new Map([[5, warnedSession]]);
+    mockAppState.selectedSessionLabel = 5;
+    mockAppState.selectedSession = warnedSession;
+
+    render(Sessions);
+
+    const banner = screen.getByTestId('pty-os-sandbox-warning');
+    expect(banner.getAttribute('role')).toBe('alert');
+    expect(banner.textContent).toContain(warning);
+    // A connected, attached terminal shows no detached/reattaching banner.
+    expect(screen.queryByTestId('pty-reattach-banner')).toBeNull();
+  });
+
+  it('omits the OS-sandbox banner when the session carries no warning', () => {
+    const quietSession = {
+      label: 6,
+      source: { kind: 'web-pty' },
+      status: 'ready',
+      persona: undefined,
+      turnCount: 0,
+      budget: { estimatedCostUsd: 0 },
+    };
+    mockAppState.sessions = new Map([[6, quietSession]]);
+    mockAppState.selectedSessionLabel = 6;
+    mockAppState.selectedSession = quietSession;
+
+    render(Sessions);
+
+    expect(screen.queryByTestId('pty-os-sandbox-warning')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
   });
 
   it('suppresses terminal input while stopping but forwards it when ready', async () => {

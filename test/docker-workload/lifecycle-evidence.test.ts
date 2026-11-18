@@ -15,12 +15,16 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { admitDockerWorkloadBundle } from '../../src/docker-workload/infrastructure.js';
 import { PRIVATE_DOCKER_READINESS_TEXT_BOUNDS } from '../../src/docker-workload/private-docker.js';
-import { loadFrozenWatchdogPolicyTemplate } from '../../src/docker-workload/watchdog-policy.js';
+import {
+  buildRuntimeWatchdogPolicy,
+  loadFrozenWatchdogPolicyTemplate,
+} from '../../src/docker-workload/watchdog-policy.js';
 import {
   createJsonlDockerWorkloadAuditSink,
   createRecordingDockerWorkloadAuditSink,
   writeLifecycleEvidence,
   DAEMON_READY_ATTESTATION,
+  type DockerWorkloadAuditEvent,
   type WriteLifecycleEvidenceOptions,
 } from '../../src/docker-workload/lifecycle-evidence.js';
 import {
@@ -102,12 +106,11 @@ describe('Docker-workload lifecycle evidence', () => {
       bundleId: 'bundle-current',
       runtimeKind: 'docker' as const,
       configuration: ADMISSION_CONFIGURATION,
-      watchdogPolicy: {
-        ...loadFrozenWatchdogPolicyTemplate(WATCHDOG_TEMPLATE_PATH),
-        targetRoot: '/state',
-        targetDevice: 1,
-        targetInode: 2,
-      },
+      watchdogPolicy: buildRuntimeWatchdogPolicy(loadFrozenWatchdogPolicyTemplate(WATCHDOG_TEMPLATE_PATH), 'docker', {
+        root: '/state',
+        device: 1,
+        inode: 2,
+      }),
       detail: 'current admission',
     };
     sink.emit(admission);
@@ -359,7 +362,7 @@ describe('Docker-workload lifecycle evidence', () => {
       securityOptions: ['o'.repeat(bounds.securityOptionLength)],
       serverVersion: 's'.repeat(bounds.serverVersionLength),
       readinessMs: 4_200,
-    };
+    } satisfies DockerWorkloadAuditEvent;
     expect(() => sink.emit(atBound)).not.toThrow();
     expect(() => sink.emit({ ...atBound, driver: 'v'.repeat(bounds.driverLength + 1) })).toThrow();
     expect(() => sink.emit({ ...atBound, serverVersion: 's'.repeat(bounds.serverVersionLength + 1) })).toThrow();
@@ -374,11 +377,12 @@ describe('Docker-workload lifecycle evidence', () => {
 
   it('requires backend-discriminated private-Docker image evidence', () => {
     const sink = createRecordingDockerWorkloadAuditSink();
-    const bootstrap = {
+    // The event without its image evidence, which each case supplies.
+    const bootstrap: Omit<Extract<DockerWorkloadAuditEvent, { kind: 'private-docker-bootstrap' }>, 'image'> = {
       at: '2026-07-29T12:00:00.000Z',
       leaseId: 'dw-private-docker',
       generation: 'gen-dw-private-docker',
-      kind: 'private-docker-bootstrap' as const,
+      kind: 'private-docker-bootstrap',
       attestation: DAEMON_READY_ATTESTATION,
       toolchain: {
         dockerCli: '29.2.1',

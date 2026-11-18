@@ -1,7 +1,9 @@
 # Design: Safe Docker PTY ownership reconciliation
 
-**Status:** Proposed
-**Scope:** Docker-managed PTY containers and per-session networks
+**Status (2026-11-14):** Implemented (see [Implementation notes](#implementation-notes)).
+
+**Scope:** Docker-managed PTY containers and per-session networks; Apple
+Container agent VMs use the same leases
 
 ## Problem and evidence
 
@@ -20,11 +22,12 @@ whether the resource was classified `unattributed` or `dead`; the design must
 make that classification observable before relying on it as the final incident
 explanation.
 
-`releaseManagedResourceLease()` currently deletes the lease even while its
-owner process is alive. That intentionally enables a later reconciliation to
-clean up resources left by a failed teardown, and its test relies on it. Simply
-retaining all `unattributed` resources would prevent the deletion incident but
-would leak those failed teardowns.
+`releaseManagedResourceLease()` deleted the lease even while its owner process
+was alive. That was meant to let a later reconciliation clean up resources left
+by a failed teardown. Simply retaining all `unattributed` resources prevents the
+deletion incident but leaks those failed teardowns until the owner exits, which
+for the daemon means until it restarts. The `released` tombstone below closes
+that gap.
 
 ## Goals
 
@@ -93,6 +96,7 @@ logging the reason and does not add the owner token to lease-file deletion.
 | Exact `active` record and matching live PID identity | active/live | Retain |
 | Valid recorded PID is demonstrably dead | dead | Reclaim |
 | Exact `active` record but its live PID identity differs | PID reused | Reclaim |
+| Exact `active` record whose identity was measured another way (an older version's `ps -o lstart`), live PID | ambiguous | Retain |
 | Exact matching `released` record | explicitly released | Reclaim |
 | Unknown lease state or inconsistent `released` record | ambiguous | Retain |
 
@@ -182,3 +186,76 @@ operator runs an explicit diagnostic/cleanup or later evidence proves it dead.
 That is preferable to terminating a live interactive session. Atomic lease
 transitions and exact label-to-record matching limit the risk that a stale
 `released` record authorizes deletion of an unrelated resource.
+
+## Implementation notes
+
+The design is implemented in `src/docker/docker-resource-lifecycle.ts`, with
+teardown in `src/docker/container-lifecycle.ts` and the operator surface in
+`src/docker/gc-command.ts`. Where it refines the outline above:
+
+- **Record.** Lease files are
+  `{ leaseSchema: 2, token, pid, identity: { kind, value }, bundleId, runtime, state, createdAt, releasedAt? }`.
+  `runtime` (`docker` | `apple-container`) names the runtime whose inventory
+  holds the lease's resources; legacy records without `leaseSchema` parse as
+  active Docker leases, and a record with an unknown schema, state, runtime or
+  identity kind is ambiguous. Creation stays exclusive (`wx`); the `released`
+  transition is an fsynced same-directory rename (`writeStableJsonAtomic`).
+- **Owner identity.** `identity` is `getProcessStartIdentity`
+  (`src/docker-workload/process-lock.ts`, the identity process locks use by
+  default) named by its kind: `linux-boot-ticks` is
+  `<kernel boot ID>:<start ticks>` from `/proc/sys/kernel/random/boot_id` and
+  field 22 of `/proc/<pid>/stat`, and Linux runs no `ps`; `ps-lstart-utc`
+  (macOS, other platforms) is `ps -o lstart` under the C locale and UTC, which
+  macOS fixes at fork. Schema 1 and older records hold `{ bootId, startedAt }`
+  from `ps -o lstart` plus a boot marker (`kern.boottime` on macOS). On Linux
+  procps prints lstart as the wall-clock boot time (`btime` in `/proc/stat`)
+  plus the start ticks, and btime moves whenever the wall clock is stepped
+  (NTP or timesyncd after a suspend, VM or WSL clock jumps, `date -s`), so
+  after a step every such record differed from its live owner and was
+  reclaimed as `pid-reused`, tearing down live sessions. Such an identity, or
+  one of another kind, is never compared: a live owner is `ambiguous` and
+  retained, and its record is not pruned; the resources go once the PID is
+  demonstrably dead or the lease is released. Older versions reject schema 2
+  as ambiguous instead of comparing the new identity with theirs. The
+  reconcile lock is adjudicated with the same identity, and a holder whose
+  identity cannot be read keeps it.
+- **Finalization.** `cleanupContainers()` returns
+  `{ verified, remaining }` instead of swallowing its verification.
+  `destroyBundleOuterResources()` (and the batch create-failure path) then call
+  `finalizeManagedResourceLease(bundleId, { runtime, teardownVerified })`: the
+  record is deleted only when the teardown was verified and a token-filtered
+  container plus network inventory finds nothing carrying the token; otherwise
+  `releaseManagedResourceLease()` writes the tombstone. If the tombstone cannot
+  be written, or a verified record cannot be deleted, the lease stays active
+  (and is removed by the exit hook), the previous fail-safe behavior.
+  Finalization never throws, because it runs on teardown and error-recovery
+  paths that must still stop the proxies.
+- **Classification.** `classifyOwnership()` returns `foreign`, `ambiguous`,
+  `live`, `dead`, `pid-reused` or `released`, exactly as in the decision table;
+  only the last three are reclaimed. A released record must name the
+  resource's `ironcurtain.bundle` label and carry `releasedAt`. Owner tokens are
+  used as file names only when they are plain names (no path separators); any
+  other token is a malformed label and therefore ambiguous.
+- **Pruning.** After the removal loop, reconciliation reads the finished
+  records of its runtime (released, owner PID dead, or PID reused) and only then
+  takes a fresh inventory; a record is deleted when nothing in that inventory
+  carries its token. Because a finished owner creates nothing new, the later
+  inventory is authoritative even for a resource created while the pass ran.
+  An inventory failure prunes nothing, and a record that cannot be deleted is
+  left for the next pass without failing this one. This also removes the
+  stale active records that crashed processes used to leave behind.
+- **Apple Container.** Agent VMs that have no Docker-workload lease carry the
+  same owner labels, and reconciliation works on any runtime with container
+  inventory: Apple networks cannot carry labels, so an Apple pass reconciles
+  containers only. Session startup (batch and PTY) reconciles the session's
+  runtime, and `ironcurtain gc --runtime docker|apple-container|all` selects
+  the runtime explicitly (default `docker`).
+- **Observability.** Every candidate gets one
+  `[docker-gc] <kind> <name>: <classification> -> <reclaim|retain|skip> (<reason>) pid=… token=<8 chars>…`
+  line and every pass a summary with counts by classification. The same
+  decisions are returned in `ReconcileResult.decisions`, which
+  `ironcurtain gc` prints.
+
+Not implemented: a periodic reconcile inside the long-running daemon (a failed
+teardown there is reclaimed by the next session start or `ironcurtain gc
+--force`) and a sweep of orphaned `~/.ironcurtain/run/<bid12>/` directories.

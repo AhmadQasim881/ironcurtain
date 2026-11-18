@@ -13,6 +13,7 @@ import { createHash, type Hash } from 'node:crypto';
 import { createDaemonClient, type DaemonClient, type DaemonEvent } from '../daemon-client/daemon-client.js';
 import { getWorkflowRunDir } from '../config/paths.js';
 import { sha256Hex } from '../hash.js';
+import { toTerminalSafeJsonText } from '../terminal/display-sanitize.js';
 import { isPlainObject } from '../utils/is-plain-object.js';
 import type { WorkflowDetailDto } from '../web-ui/web-ui-types.js';
 import { parseArgsResult } from './cli-shared.js';
@@ -562,7 +563,11 @@ export async function runWorkflowWatch(args: string[], deps: WorkflowWatchDepend
           return;
         const filter = filterForRecord(record.type);
         if (!filter || !filters.has(filter)) return;
-        const output = json ? `${raw}\n` : `${formatHumanRecord(record)}\n`;
+        // JSON permits CR/tab whitespace outside strings; flatten it too so
+        // a valid raw record cannot reposition text on the terminal.
+        const output = json
+          ? `${toTerminalSafeJsonText(raw.replace(/[\r\t]/gu, ' '))}\n`
+          : `${formatHumanRecord(record)}\n`;
         if (lineLimit !== undefined) rememberSnapshotLine(output);
         else await stdout(output);
       },
@@ -885,8 +890,11 @@ function filterForRecord(type: string): EventFilter | undefined {
       return 'transient';
     case 'quota_exhausted':
       return 'quota';
+    // A tool-call escalation is a human decision point too; it rides the
+    // `gate` filter so operators watching for gates see it.
     case 'gate_raised':
     case 'gate_resolved':
+    case 'tool_call_escalation':
       return 'gate';
     case 'fanout_join':
       return 'fanout';
@@ -916,7 +924,9 @@ function formatHumanRecord(record: WatchRecord): string {
     case 'gate_raised':
       return `${ts} gate raised ${stringList(record.acceptedEvents)}`.trimEnd();
     case 'gate_resolved':
-      return `${ts} gate resolved ${scalar(record.event)}`;
+      return `${ts} gate resolved ${scalar(record.event)}${record.resolvedBy !== undefined ? ` via ${scalar(record.resolvedBy)}` : ''}`;
+    case 'tool_call_escalation':
+      return `${ts} escalation ${scalar(record.outcome)} ${scalar(record.serverName)}/${scalar(record.toolName)} ${oneLine(record.reason)}`.trimEnd();
     case 'fanout_join':
       return `${ts} fanout ${scalar(record.fanOutState ?? record.state)} workers=${scalar(record.workers)}`;
     case 'agent_sent':
@@ -945,7 +955,7 @@ function stringList(value: unknown): string {
 
 // Strip complete CSI/OSC sequences first, then every remaining control or
 // formatting code. Even an unrecognized escape form becomes inert when its
-// ESC/C1 byte is removed. JSON mode intentionally bypasses this function.
+// ESC/C1 byte is removed. JSON mode uses lossless Unicode escaping instead.
 // eslint-disable-next-line no-control-regex
 const TERMINAL_ESCAPE_SEQUENCE = /\u001b\][^\u0007]*(?:\u0007|\u001b\\)|\u001b\[[0-?]*[ -/]*[@-~]/gu;
 const TERMINAL_CONTROL_CHARACTER = /[\p{Cc}\p{Cf}]/gu;

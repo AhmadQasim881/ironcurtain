@@ -71,7 +71,15 @@ export interface FrozenRegistryEgressManifest {
 
 /** Digest provenance recorded for audit; never a security control (§16.6). */
 export interface RegistryPullProvenance {
+  /** The reviewed origin, suffixed `:cdn` once per followed redirect to an unlisted (derived) CDN host. */
   readonly originId: string;
+  readonly operation: 'manifest-pull' | 'blob-pull';
+  /** `HEAD` is how a client resolves a tag to the digest it then pulls. */
+  readonly method: 'GET' | 'HEAD';
+  /** The HTTPS host and port that served the terminal response (the CDN after a followed redirect). */
+  readonly destination: { readonly hostname: string; readonly port: number };
+  /** HTTP status of that response. A refusal (401, 404) completes too and is recorded with its status. */
+  readonly status: number;
   readonly repository?: string;
   readonly reference?: string;
   /** Requested digest from a by-digest URL, if any. */
@@ -136,6 +144,12 @@ export interface CreateRegistryEgressGuardOptions {
    * draft manifest set this; the production admission path never does.
    */
   readonly allowUnfrozenManifest?: boolean;
+  /**
+   * Directory the manifest must ship under (default: the IronCurtain package
+   * root). Only hermetic tests point it at a temporary directory; the
+   * production admission path never sets it.
+   */
+  readonly manifestPackageRoot?: string;
 }
 
 /** Build a per-session cumulative ledger from the manifest's session ceilings. */
@@ -207,7 +221,7 @@ export function createRegistryEgressGuard(options: CreateRegistryEgressGuardOpti
   const { manifestPath } = options;
   if (manifestPath === undefined) throw new Error('public-registry egress requires a manifest path');
 
-  const loaded = loadRegistryEgressManifest(manifestPath);
+  const loaded = loadRegistryEgressManifest(manifestPath, options.manifestPackageRoot);
   const manifest = loaded.manifest;
   if (manifest.status !== 'frozen' && options.allowUnfrozenManifest !== true) {
     throw new Error(
@@ -241,14 +255,23 @@ export function createRegistryEgressGuard(options: CreateRegistryEgressGuardOpti
 
 export interface RegistryEgressForwardContext {
   readonly guard: RegistryEgressGuard;
-  /** Destination-bound transport: fixed-parent in nested mode, direct only in tests. */
+  /**
+   * Destination-bound transport. Production passes a direct one; the
+   * fixed-parent transport is not yet wired (reserved for the
+   * IronCurtain-in-IronCurtain slice) and appears only in tests. Either way it
+   * must screen addresses locally (`assertLocalAddressAuthority`).
+   */
   readonly transport: OutboundTransport;
   readonly scheme: 'http:' | 'https:';
   readonly targetHost: string;
   readonly targetPort: number;
   /** Origin-form request target (path + query) as seen after TLS termination. */
   readonly requestTarget: string;
-  /** Optional audit sink; receives provenance once a content pull completes. */
+  /**
+   * Audit sink; receives provenance once a content pull completes. Production
+   * wires the admitted lease's append-only log; tests may omit it. A sink
+   * failure is logged, never thrown into the finished transfer.
+   */
   readonly recordProvenance?: (record: RegistryPullProvenance) => void;
 }
 
@@ -287,8 +310,8 @@ export function handleRegistryEgressRequest(
     assertReady: () => assertLocalAddressAuthority(context.transport),
     session: context.guard.session,
     followRedirect: (current, location) => context.guard.authorizeRedirect(current, location),
-    onComplete: (request, streamedBytes, responseHeaders) =>
-      recordProvenance(request, context, reportedDigest(responseHeaders), streamedBytes),
+    onComplete: (request, streamedBytes, responseHeaders, status) =>
+      recordProvenance(request, context, reportedDigest(responseHeaders), streamedBytes, status),
   });
 }
 
@@ -328,17 +351,30 @@ function recordProvenance(
   context: RegistryEgressForwardContext,
   resolvedDigest: string | undefined,
   sizeBytes: number,
+  status: number,
 ): void {
   if (context.recordProvenance === undefined) return;
   if (authorized.operation !== 'manifest-pull' && authorized.operation !== 'blob-pull') return;
-  context.recordProvenance({
-    originId: authorized.originId,
-    repository: authorized.repository,
-    reference: authorized.reference,
-    requestedDigest: authorized.requestedDigest ? `sha256:${authorized.requestedDigest.hex}` : undefined,
-    resolvedDigest,
-    sizeBytes,
-  });
+  try {
+    context.recordProvenance({
+      originId: authorized.originId,
+      operation: authorized.operation,
+      method: authorized.method,
+      destination: { hostname: authorized.destination.hostname, port: authorized.destination.port },
+      status,
+      repository: authorized.repository,
+      reference: authorized.reference,
+      requestedDigest: authorized.requestedDigest ? `sha256:${authorized.requestedDigest.hex}` : undefined,
+      resolvedDigest,
+      sizeBytes,
+    });
+  } catch (error) {
+    // The transfer already completed; a throw here would escape the stream
+    // callback and take down the listener. Report the provenance gap instead.
+    logger.warn(
+      `[registry-egress] could not record pull provenance for ${authorized.originId}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }
 
 /** Registry-reported content digest recorded as provenance only (never verified). */

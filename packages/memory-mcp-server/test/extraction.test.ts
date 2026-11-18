@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   parseExtractedFacts,
   chunkBlob,
+  chunkBlobReport,
   splitToPassages,
   MAX_INGEST_CHUNK_TOKENS,
   MAX_PASSAGE_TOKENS,
@@ -217,6 +218,20 @@ describe('chunkBlob', () => {
     }
     // Round-trips losslessly (the cut only partitions, never drops characters).
     expect(chunks.join('')).toBe(hugeToken);
+  });
+
+  it('reports whether content was left past the chunk cap', () => {
+    const line = 'words in a line of a long document '.repeat(6);
+    const long = Array.from({ length: MAX_INGEST_CHUNKS * 150 }, (_, i) => `${i} ${line}`).join('\n');
+    const cut = chunkBlobReport(long);
+    expect(cut.chunks).toHaveLength(MAX_INGEST_CHUNKS);
+    expect(cut.truncated).toBe(true);
+    // The last line never made it into a chunk.
+    expect(cut.chunks.some((chunk) => chunk.includes(`${MAX_INGEST_CHUNKS * 150 - 1} words`))).toBe(false);
+
+    const short = chunkBlobReport(Array.from({ length: 300 }, (_, i) => `${i} ${line}`).join('\n'));
+    expect(short.truncated).toBe(false);
+    expect(short.chunks.at(-1)).toContain(`299 words`);
   });
 
   it('bounds the total chunk count at MAX_INGEST_CHUNKS', () => {

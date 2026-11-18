@@ -1,8 +1,9 @@
 # Implementation Plan: Policy Compilation Pipeline
 
+**Status (2026-11-14):** Implemented: all steps completed. `policy-compilation-pipeline.md` and the code describe the current pipeline.
+
 **Design spec:** `docs/designs/policy-compilation-pipeline.md`
 **Date:** 2026-02-17
-**Status:** Implemented -- all steps completed.
 
 ## Principles
 

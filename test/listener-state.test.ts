@@ -26,7 +26,7 @@ function createMockWatcher(): EscalationWatcher {
     start() {},
     stop() {},
     getPending() {
-      return undefined;
+      return [];
     },
     resolve() {
       return true;

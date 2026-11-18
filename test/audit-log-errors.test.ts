@@ -13,11 +13,21 @@
  */
 
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { AuditLog } from '../src/trusted-process/audit-log.js';
+import { AUDIT_LOG_UNAVAILABLE, AuditLog, isAuditLogUnavailableError } from '../src/trusted-process/audit-log.js';
 import type { AuditEntry } from '../src/types/audit.js';
+
+/** Runs `fn` and returns what it threw; fails if it returned. */
+function captureThrow(fn: () => void): unknown {
+  try {
+    fn();
+  } catch (err) {
+    return err;
+  }
+  throw new Error('expected the call to throw');
+}
 
 function makeEntry(): AuditEntry {
   return {
@@ -113,5 +123,85 @@ describe('AuditLog write-error handling', () => {
 
     const log = new AuditLog(badPath);
     await expect(log.close()).resolves.toBeUndefined();
+  });
+});
+
+/**
+ * `assertWritable()` is the pipeline's pre-flight check: it surfaces a
+ * latched failure (or a closed log) BEFORE a tool call is evaluated, so
+ * the call is refused instead of running unaudited. Every failure the
+ * log raises carries the `AUDIT_LOG_UNAVAILABLE` code, which is how the
+ * coordinator recognises it without an `instanceof` across modules.
+ */
+describe('AuditLog.assertWritable() and the AUDIT_LOG_UNAVAILABLE code', () => {
+  let tmpDir: string;
+
+  afterEach(() => {
+    if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('passes on a healthy log, before and after successful writes', () => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'audit-ok-'));
+    const log = new AuditLog(join(tmpDir, 'audit.jsonl'));
+
+    expect(() => log.assertWritable()).not.toThrow();
+    log.log(makeEntry());
+    expect(() => log.assertWritable()).not.toThrow();
+  });
+
+  it('throws the latched ctor failure with the code, before any write was attempted', () => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'audit-err-'));
+    const notADir = join(tmpDir, 'im-a-file');
+    writeFileSync(notADir, '');
+    const log = new AuditLog(join(notADir, 'audit.jsonl'));
+
+    const err = captureThrow(() => log.assertWritable());
+    expect(isAuditLogUnavailableError(err)).toBe(true);
+    expect((err as Error).message).toMatch(/AuditLog stream error/);
+    expect((err as { code?: string }).code).toBe(AUDIT_LOG_UNAVAILABLE);
+  });
+
+  it('latches a failure that first surfaces on a write, and a repaired path does not clear it', () => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'audit-err-'));
+    const auditPath = join(tmpDir, 'audit.jsonl');
+    const log = new AuditLog(auditPath);
+    log.log(makeEntry());
+
+    // A directory now sits where the file was: the next append fails
+    // (EISDIR). The check cannot foresee a failure that has not happened
+    // yet -- that is why the pipeline also writes a `dispatching` record
+    // before every dispatch -- but once a write failed, it reports it.
+    rmSync(auditPath);
+    mkdirSync(auditPath);
+    expect(() => log.assertWritable()).not.toThrow();
+
+    const err = captureThrow(() => log.log(makeEntry()));
+    expect(isAuditLogUnavailableError(err)).toBe(true);
+    expect((err as Error).message).toMatch(/EISDIR|ENOTDIR|EEXIST/);
+    expect(() => log.assertWritable()).toThrow(/AuditLog stream error/);
+
+    // Repairing the path does not reopen the log: the gap in the record
+    // is permanent for this session, so the session must end.
+    rmSync(auditPath, { recursive: true, force: true });
+    expect(() => log.assertWritable()).toThrow(/AuditLog stream error/);
+    expect(() => log.log(makeEntry())).toThrow(/AuditLog stream error/);
+    expect(existsSync(auditPath)).toBe(false);
+  });
+
+  it('throws with the code after close()', async () => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'audit-ok-'));
+    const log = new AuditLog(join(tmpDir, 'audit.jsonl'));
+    await log.close();
+
+    expect(isAuditLogUnavailableError(captureThrow(() => log.assertWritable()))).toBe(true);
+    expect(isAuditLogUnavailableError(captureThrow(() => log.log(makeEntry())))).toBe(true);
+  });
+
+  it('isAuditLogUnavailableError goes by the code, not the class', () => {
+    const foreign = Object.assign(new Error('AuditLog stream error: ENOSPC'), { code: AUDIT_LOG_UNAVAILABLE });
+    expect(isAuditLogUnavailableError(foreign)).toBe(true);
+    expect(isAuditLogUnavailableError(new Error('AuditLog stream error: ENOSPC'))).toBe(false);
+    expect(isAuditLogUnavailableError(AUDIT_LOG_UNAVAILABLE)).toBe(false);
+    expect(isAuditLogUnavailableError(undefined)).toBe(false);
   });
 });

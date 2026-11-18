@@ -48,6 +48,16 @@ export function readActiveRegistrations(registryDir: string): PtySessionRegistra
 }
 
 /**
+ * Whether a live mux (or the web UI daemon, which registers its PTY sessions
+ * the same way) owns the session: its escalations are shown there, so the
+ * standalone escalation listener must not show them too. A session whose
+ * owner died is orphaned and fair game.
+ */
+export function isOwnedByLiveMux(registration: PtySessionRegistration): boolean {
+  return registration.muxId !== undefined && typeof registration.muxPid === 'number' && isPidAlive(registration.muxPid);
+}
+
+/**
  * Reads and parses a single registration file.
  * Returns undefined if the file is missing or malformed.
  */

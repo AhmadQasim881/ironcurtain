@@ -1,0 +1,145 @@
+name: Scheduled checks
+
+# Weekly checks that need Docker or the network and can start failing without
+# any commit: Go releases go out of support or get security patches, npm
+# advisories are published and sandbox-runtime releases, base images and agent
+# CLIs move under their tags, and the MCP servers pinned in
+# src/config/mcp-servers.json can stop matching the shipped tool annotations.
+# Nothing here can write to the repository or publish.
+
+on:
+  schedule:
+    # Mondays, 05:17 UTC.
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Fails when a pinned Go release is out of support or behind the newest
+  # patch of its minor, and on a golang builder image not pinned by digest.
+  go-toolchain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      # The check needs only tsx and yaml.
+      - run: npm ci --ignore-scripts
+      - name: Fetch the supported Go releases
+        run: curl --fail --silent --show-error --location --retry 3 --output "$RUNNER_TEMP/go-releases.json" 'https://go.dev/dl/?mode=json'
+      - name: Check the Go toolchain pins against them
+        run: npm run check:go-toolchain -- --strict --releases "$RUNNER_TEMP/go-releases.json"
+
+  # New advisories and sandbox-runtime releases appear without any commit
+  # (BLD-9). The npm audit gate as in ci.yml, and whether the lockfile's
+  # @anthropic-ai/sandbox-runtime, the OS sandbox around MCP servers, is the
+  # newest release: it is pinned to one version, so users get its fixes only
+  # through an IronCurtain release that bumps it.
+  dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      # The gate needs only tsx.
+      - run: npm ci --ignore-scripts
+      - run: npm run check:audit
+      - name: Check sandbox-runtime is the newest release
+        if: ${{ !cancelled() }}
+        run: |
+          pinned="$(node -p "require('./package-lock.json').packages['node_modules/@anthropic-ai/sandbox-runtime'].version")"
+          latest="$(npm view @anthropic-ai/sandbox-runtime version)"
+          if [ "$pinned" != "$latest" ]; then
+            echo "::error::@anthropic-ai/sandbox-runtime $pinned is behind the newest release $latest: bump it to that exact version and run the sandbox tests before the next release"
+            exit 1
+          fi
+          echo "@anthropic-ai/sandbox-runtime $pinned is the newest release"
+
+  # Builds the images IronCurtain builds on users' machines, from the same
+  # Dockerfiles: the agent base each architecture uses, the agent images on
+  # top of it, and the nested-Docker relay, daemon and transport sidecar.
+  images:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            base: Dockerfile.base
+          # arm64 hosts (Apple silicon) build the arm64-native base.
+          - runner: ubuntu-24.04-arm
+            base: Dockerfile.base.arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # The amd64 base (devcontainers/universal plus toolchains) needs more
+      # disk than a hosted runner leaves free.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Build the agent base image
+        env:
+          BASE_DOCKERFILE: ${{ matrix.base }}
+        run: docker build --tag ironcurtain-base:latest --file "docker/$BASE_DOCKERFILE" docker
+      - name: Build the agent images
+        run: |
+          for agent in claude-code codex goose; do
+            docker build --tag "ironcurtain-$agent:latest" --file "docker/Dockerfile.$agent" docker
+          done
+      - name: Build the nested-Docker relay, daemon and transport sidecar images
+        run: |
+          docker build --tag ironcurtain-fixed-relay:latest docker/nested-relay
+          docker build --tag ironcurtain-nested-daemon:latest docker/nested-daemon
+          docker build --tag ironcurtain-transport-sidecar:latest docker/transport-sidecar
+
+  # The test suite checks the annotations of the servers installed from
+  # package-lock.json. github (a container pinned by digest) is checked here,
+  # against the live server: `annotate-tools --check` lists its tools and
+  # diffs them with the shipped annotations, with no LLM. google-workspace
+  # (npx at an exact version) cannot be: tool listings outside a session never
+  # start a server backed by an IronCurtain OAuth login
+  # (src/trusted-process/tool-listing-launch.ts), so
+  # `annotate-tools --check --server google-workspace` reports it unchecked
+  # and exits 1 on every run.
+  annotation-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      # Retried as in ci.yml: some postinstall scripts download from a CDN.
+      - name: Install dependencies (retry on transient network failure)
+        run: |
+          for attempt in 1 2 3; do
+            if npm ci --foreground-scripts; then exit 0; fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::npm ci attempt $attempt failed; cleaning and retrying in 15s"
+              rm -rf node_modules
+              sleep 15
+            fi
+          done
+          echo "::error::npm ci failed after 3 attempts"
+          exit 1
+      # The github server needs a token to start. The job token can only read
+      # this repository; a repository secret holding a read-only token can
+      # replace it.
+      - name: Check the github server's annotations
+        env:
+          GITHUB_PERSONAL_ACCESS_TOKEN: ${{ secrets.ANNOTATION_DRIFT_GITHUB_TOKEN || github.token }}
+        run: npx tsx src/cli.ts annotate-tools --check --server github

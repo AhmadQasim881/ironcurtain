@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { parseModelId, createLanguageModel, createLanguageModelFromEnv } from '../src/config/model-provider.js';
 import type { ResolvedUserConfig } from '../src/config/user-config.js';
+import { testUserConfig } from './helpers/user-config.js';
 
 // Mock all provider packages so tests don't need real API keys
 vi.mock('@ai-sdk/anthropic', () => ({
@@ -34,32 +35,18 @@ vi.mock('@ai-sdk/openai', () => ({
 }));
 
 function createTestUserConfig(overrides: Partial<ResolvedUserConfig> = {}): ResolvedUserConfig {
-  return {
-    agentModelId: 'anthropic:claude-sonnet-4-6',
-    policyModelId: 'anthropic:claude-sonnet-4-6',
+  return testUserConfig({
     anthropicApiKey: 'test-anthropic-key',
     googleApiKey: 'test-google-key',
     openaiApiKey: 'test-openai-key',
-    anthropicBaseUrl: '',
-    openaiBaseUrl: '',
-    googleBaseUrl: '',
-    escalationTimeoutSeconds: 300,
-    resourceBudget: {
-      maxTotalTokens: 1_000_000,
-      maxSteps: 200,
-      maxSessionSeconds: 1800,
-      maxEstimatedCostUsd: 5.0,
-      warnThresholdPercent: 80,
-    },
     autoCompact: {
       enabled: true,
       thresholdTokens: 160_000,
       keepRecentMessages: 10,
       summaryModelId: 'anthropic:claude-haiku-4-5',
     },
-    autoApprove: { enabled: false, modelId: 'anthropic:claude-haiku-4-5' },
     ...overrides,
-  };
+  });
 }
 
 describe('parseModelId', () => {

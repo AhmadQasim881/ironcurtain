@@ -1,5 +1,7 @@
 # Prompt and Workflow Definition Redesign
 
+**Status (2026-11-14):** Implemented: workflow states carry their own `prompt`, and `src/workflow/prompt-builder.ts` assembles first-visit and re-visit prompts from it.
+
 ## 1. Problem Statement
 
 The current prompt builder and workflow definition have four architectural problems:

@@ -52,6 +52,7 @@ import {
   writeConstitution,
   revertConstitution,
   seedBaseConstitution,
+  compileAfterSave,
   CustomizerResponseSchema,
   type DiffLine,
 } from '../src/pipeline/constitution-customizer.js';
@@ -278,7 +279,7 @@ describe('formatAnnotationsForPrompt', () => {
       args: {
         longArgName1: ['read-path'],
         longArgName2: ['write-path'],
-        longArgName3: ['domain'],
+        longArgName3: ['fetch-url'],
       },
     }));
 
@@ -565,5 +566,33 @@ describe('seedBaseConstitution', () => {
 
     const result = seedBaseConstitution();
     expect(result).toBe('existing content');
+  });
+});
+
+// WP-15: the compile run after saving goes through runCompilePolicy, which
+// returns the exit status instead of calling process.exit(), so a partial
+// failure is reported (not claimed as success, not an abrupt exit).
+describe('compileAfterSave', () => {
+  it('reports success only when compile-policy returns 0, passing argv through', async () => {
+    const run = vi.fn<(argv: string[]) => Promise<number>>(() => Promise.resolve(0));
+    expect(await compileAfterSave(['customize-policy'], run)).toEqual({ kind: 'compiled' });
+    expect(run).toHaveBeenCalledWith(['customize-policy']);
+  });
+
+  it('reports a partial failure (policy written, some servers failed) with its exit status', async () => {
+    expect(await compileAfterSave([], () => Promise.resolve(2))).toEqual({ kind: 'partial', exitCode: 2 });
+  });
+
+  it('reports a failure for any other non-zero status', async () => {
+    expect(await compileAfterSave([], () => Promise.resolve(1))).toEqual({
+      kind: 'failed',
+      message: 'compile-policy exited with status 1',
+      exitCode: 1,
+    });
+  });
+
+  it('reports a thrown compile error (nothing written) as a failure', async () => {
+    const outcome = await compileAfterSave([], () => Promise.reject(new Error('All 2 server(s) failed compilation')));
+    expect(outcome).toEqual({ kind: 'failed', message: 'All 2 server(s) failed compilation' });
   });
 });

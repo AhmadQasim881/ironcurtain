@@ -1,8 +1,20 @@
-FROM ironcurtain-base:latest
+# IronCurtain builds every image under a build-hash tag and passes the exact
+# base build it resolved (ironcurtain-base:build-<hash>), so a concurrent build
+# from another checkout cannot swap the base under this one. The default keeps
+# a manual `docker build` working against the moving alias.
+ARG IRONCURTAIN_BASE_IMAGE=ironcurtain-base:latest
+FROM ${IRONCURTAIN_BASE_IMAGE}
 
-# Install Claude Code CLI (Node.js is already in the base image)
+# Install Claude Code CLI (Node.js is already in the base image).
+# Pinned to the version qualified with this IronCurtain release
+# (CLAUDE_CODE_CLI_VERSION in src/docker/agent-cli-version.ts; a test ties the
+# two together). The version is part of this file, so a bump changes the image
+# build hash and triggers a rebuild. `agentCliVersions["claude-code"]` in
+# ~/.ironcurtain/config.json overrides it with an exact version or "latest"
+# (passed as this build arg and folded into the build hash).
+ARG CLAUDE_CODE_VERSION=2.1.292
 USER root
-RUN npm install -g @anthropic-ai/claude-code
+RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
 # The entrypoint script copies runtime-generated config into the right
 # location before the agent is invoked via docker exec. It sources the

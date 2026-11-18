@@ -11,6 +11,7 @@ import {
   collapseHiddenTrendSignals,
   createStatisticsRequestLimiter,
   seriesStyle,
+  statisticsErrorMessage,
   statisticsIdentityDimensions,
 } from './statistics-helpers.js';
 
@@ -178,9 +179,52 @@ describe('statistics helpers', () => {
     });
   });
 
-  it('centralizes the provider/model dimension pair for each identity mode', () => {
+  it('centralizes the grouping dimensions for each identity mode', () => {
     expect(statisticsIdentityDimensions('routed')).toEqual(['logicalProvider', 'forwardedModel']);
     expect(statisticsIdentityDimensions('served')).toEqual(['servedProvider', 'servedModel']);
+    expect(statisticsIdentityDimensions('persona')).toEqual(['personaId']);
+    expect(statisticsIdentityDimensions('workflow')).toEqual(['workflowRunId']);
+  });
+
+  it('shows configured persona names for pseudonymized personas and keeps groups keyed by stored value', () => {
+    const named = 'hmac:0123456789abcdef0123456789abcdef';
+    const unnamed = 'hmac:fedcba9876543210fedcba9876543210';
+    const rail = buildModelRail(
+      [
+        summary('requestCount', 5, { dimensions: { personaId: named }, labels: { personaId: 'security-reviewer' } }),
+        summary('requestCount', 3, { dimensions: { personaId: unnamed } }),
+        summary('requestCount', 2, { dimensions: { personaId: null } }),
+      ],
+      'persona',
+    );
+    expect(rail.map((item) => [item.provider, item.model])).toEqual([
+      ['Persona', 'security-reviewer'],
+      ['Persona', unnamed],
+      ['Persona', 'No persona'],
+    ]);
+    expect(new Set(rail.map((item) => item.key)).size).toBe(3);
+
+    const bucket: StatisticsTimeBucketDto = {
+      fromMs: 1_700_000_000_000,
+      toMs: 1_700_086_399_999,
+      summaries: [
+        summary('effectiveOutputTokensPerSecond', 20, {
+          dimensions: { workflowRunId: 'run-42' },
+          median: 20,
+          lowerQuartile: 18,
+          upperQuartile: 22,
+        }),
+      ],
+    };
+    expect(buildTrendData([bucket], 'workflow', 'UTC').points[0]?.seriesLabel).toBe('Workflow run · run-42');
+  });
+
+  it('turns an over-limit statistics error into guidance', () => {
+    const limited = Object.assign(new Error('Statistics query exceeds the scanned-row limit'), {
+      code: 'STATISTICS_LIMIT',
+    });
+    expect(statisticsErrorMessage(limited)).toMatch(/scanned-row limit.*Choose a shorter time range/);
+    expect(statisticsErrorMessage(new Error('reader timed out'))).toBe('reader timed out');
   });
 
   it('creates trend points with routed and served model semantics', () => {

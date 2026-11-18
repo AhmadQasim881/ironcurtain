@@ -8,6 +8,7 @@
 import type {
   SessionDto,
   EscalationDto,
+  EscalationGroupApprovalDto,
   DaemonStatusDto,
   JobListDto,
   OutputLine,
@@ -26,10 +27,12 @@ import type {
   WorkflowDefinitionDto,
   WorkflowReadmeDto,
   HumanGateRequestDto,
+  WorkflowEscalationDto,
   FileTreeResponseDto,
   FileContentResponseDto,
   ArtifactContentDto,
   MessageLogResponseDto,
+  MessageLogEntryResponseDto,
   GetModelProvidersDto,
   StatisticsConfigDto,
   SetModelProvidersDto,
@@ -38,6 +41,9 @@ import type {
   PtySink,
   CreateSessionOptions,
   ResumableSessionDto,
+  SessionDetailDto,
+  SessionNoticeEntry,
+  SessionNoticeEvent,
   StatisticsCapabilitiesDto,
   StatisticsSummaryQuery,
   StatisticsMetricSummaryDto,
@@ -53,6 +59,19 @@ import type {
 import { PHASE } from './types.js';
 import { createWsClient, type PreflightResult, type WsClient } from './ws-client.js';
 import { handleEvent as handleEventPure, SESSION_MUTATION_EVENTS } from './event-handler.js';
+import {
+  ESCALATION_EVENTS,
+  mergeEscalationSnapshot,
+  mergeWorkflowEscalationSnapshot,
+  type ReceivedEvent,
+} from './escalation-snapshots.js';
+import {
+  dismissSessionNoticeEntry,
+  retainSessionNotices,
+  seedSessionNotices,
+  toSessionNotice,
+  type RetainedHostNotice,
+} from './session-notices.js';
 
 export type ViewId =
   'dashboard' | 'statistics' | 'sessions' | 'escalations' | 'jobs' | 'workflows' | 'personas' | 'settings';
@@ -75,6 +94,7 @@ export function setTheme(theme: ThemeId): void {
 }
 
 class AppState {
+  retainedHostNotices: readonly RetainedHostNotice[] = $state([]);
   connected: boolean = $state(false);
   hasToken: boolean = $state(false);
   /**
@@ -84,6 +104,17 @@ class AppState {
    * surface the result here to drive UI state.
    */
   authError: 'invalid_token' | null = $state(null);
+  escalationLoadError: string | null = $state(null);
+  refreshErrors: Readonly<Record<string, string>> = $state({});
+  workflowReviewErrors: Map<string, string> = $state(new Map());
+  get reviewRefreshError(): string | null {
+    return (
+      this.escalationLoadError ||
+      Object.values(this.refreshErrors)[0] ||
+      [...this.workflowReviewErrors.values()][0] ||
+      null
+    );
+  }
   daemonStatus: DaemonStatusDto | null = $state(null);
   sessions: Map<number, SessionDto> = $state(new Map());
   selectedSessionLabel: number | null = $state(null);
@@ -98,12 +129,22 @@ class AppState {
   workflows: Map<string, WorkflowSummaryDto> = $state(new Map());
   selectedWorkflowId: string | null = $state(null);
   pendingGates: Map<string, HumanGateRequestDto> = $state(new Map());
+  /** Workflow tool-call escalations waiting for a human, keyed by escalationId. */
+  pendingWorkflowEscalations: Map<string, WorkflowEscalationDto> = $state(new Map());
 
   // Persona streamed-compile state, keyed by operationId. Holds both live
   // (started/running) and recently-terminal (done/failed) operations as they
   // arrive via persona.compile.* events, hydrated on (re)connect via
   // personas.listCompiles.
   personaCompiles: Map<string, PersonaCompileOperationDto> = $state(new Map());
+
+  /**
+   * Notices each session reported for the user (a stale policy, an MCP server
+   * that did not start, host-mount findings, ...; see `session-notices.ts`),
+   * keyed by session label: seeded from the session's diagnostic log when it
+   * is selected (`loadSessionNotices`), and from `session.diagnostic` events.
+   */
+  sessionNotices: Map<number, readonly SessionNoticeEntry[]> = $state(new Map());
 
   get selectedSession(): SessionDto | null {
     if (this.selectedSessionLabel === null) return null;
@@ -332,6 +373,34 @@ let activeSessionBuffer: BufferedSessionEvent[] | null = null;
 const queuedSessionRefreshes: Array<{ client: WsClient; buffered: BufferedSessionEvent[] }> = [];
 let sessionRefreshQueueRunning = false;
 
+/**
+ * One log per escalation snapshot request in flight (`escalations.list`,
+ * `workflows.get`): every escalation event received meanwhile is appended to
+ * each, so the answer can be merged with them (see escalation-snapshots.ts).
+ */
+const escalationEventLogs = new Set<ReceivedEvent[]>();
+
+/**
+ * Sends a request whose answer is a snapshot of pending escalations, and
+ * returns the answer with the escalation events received while it was in
+ * flight. The log is closed when the answer arrives; the caller merges it in
+ * the same microtask run, before the client handles any later frame.
+ */
+async function requestEscalationSnapshot<T>(
+  client: WsClient,
+  method: string,
+  params?: Record<string, unknown>,
+): Promise<{ answer: T; events: readonly ReceivedEvent[] }> {
+  const events: ReceivedEvent[] = [];
+  escalationEventLogs.add(events);
+  try {
+    const answer = await client.request<T>(method, params);
+    return { answer, events };
+  } finally {
+    escalationEventLogs.delete(events);
+  }
+}
+
 function applyWebEvent(client: WsClient, event: string, payload: unknown): void {
   handleEventPure(
     appState,
@@ -345,6 +414,9 @@ function applyWebEvent(client: WsClient, event: string, payload: unknown): void 
       },
       refreshConfig: () => {
         configChangedGeneration.value++;
+      },
+      resync: () => {
+        void refreshAll(client);
       },
       assignDisplayNumber: (_escalationId: string) => ++appState.escalationDisplayNumber,
       getPtySink: (label: number) => ptySinks.get(label),
@@ -374,6 +446,9 @@ function wireEventHandlers(client: WsClient): void {
     if (SESSION_MUTATION_EVENTS.has(event)) {
       activeSessionBuffer?.push({ event, payload });
     }
+    if (ESCALATION_EVENTS.has(event)) {
+      for (const log of escalationEventLogs) log.push({ event, payload });
+    }
   });
 }
 
@@ -391,7 +466,13 @@ function applySessionsSnapshot(sessions: SessionDto[]): void {
   for (const session of sessions) {
     newSessions.set(session.label, session);
   }
+  const previous = appState.sessions;
   appState.sessions = newSessions;
+  // Each session's notices are its own: drop those of sessions that ended
+  // while the socket was down, and of labels a restarted daemon gave to
+  // other sessions.
+  const notices = retainSessionNotices(appState.sessionNotices, previous, newSessions);
+  if (notices !== undefined) appState.sessionNotices = notices;
 }
 
 function completeSessionRefresh(client: WsClient, buffered: BufferedSessionEvent[], sessions: SessionDto[]): void {
@@ -436,21 +517,174 @@ function enqueueSessionRefresh(client: WsClient): void {
   }
 }
 
+/**
+ * Removes the gates in `heldIds` (the ones the client held before a refresh
+ * started) that `shouldDrop` selects. Gates that arrived by event since then
+ * are newer than any answer the refresh is acting on and are never touched.
+ */
+function dropHeldGates(heldIds: ReadonlySet<string>, shouldDrop: (gate: HumanGateRequestDto) => boolean): void {
+  const next = new Map<string, HumanGateRequestDto>();
+  for (const [gateId, gate] of appState.pendingGates) {
+    if (!heldIds.has(gateId) || !shouldDrop(gate)) next.set(gateId, gate);
+  }
+  appState.pendingGates = next;
+}
+
+/**
+ * Removes the workflow tool-call escalations in `heldIds` (held before a
+ * refresh started) that `shouldDrop` selects; ones raised by events since then
+ * are newer than the refresh's answers and are kept.
+ */
+function dropHeldWorkflowEscalations(
+  heldIds: ReadonlySet<string>,
+  shouldDrop: (escalation: WorkflowEscalationDto) => boolean,
+): void {
+  let next: Map<string, WorkflowEscalationDto> | null = null;
+  for (const [escalationId, escalation] of appState.pendingWorkflowEscalations) {
+    if (!heldIds.has(escalationId) || !shouldDrop(escalation)) continue;
+    next ??= new Map(appState.pendingWorkflowEscalations);
+    next.delete(escalationId);
+  }
+  if (next) appState.pendingWorkflowEscalations = next;
+}
+
+/**
+ * Applies an `escalations.list` answer, merged with the escalation events
+ * received while it was requested (`mergeEscalationSnapshot`): an escalation
+ * raised meanwhile stays, one resolved or expired meanwhile does not come
+ * back, and escalations missed while disconnected appear or disappear.
+ */
+function applyEscalationsSnapshot(listed: readonly EscalationDto[], events: readonly ReceivedEvent[]): void {
+  // Escalations the UI already knows keep their display number; a number
+  // above `escalationDismissedAt` re-opens the modal, and the user already
+  // dismissed (or is looking at) these. Only escalations that arrived while
+  // the socket was down get a fresh number and count as new.
+  const next = mergeEscalationSnapshot(
+    appState.pendingEscalations,
+    listed,
+    events,
+    () => ++appState.escalationDisplayNumber,
+  );
+  appState.pendingEscalations = next;
+  // Remove stale escalation output lines that are no longer pending
+  for (const [label, lines] of appState.sessionOutputs) {
+    const filtered = lines.filter(
+      (line) => line.kind !== 'escalation' || (line.escalationId && next.has(line.escalationId)),
+    );
+    if (filtered.length !== lines.length) {
+      appState.sessionOutputs = new Map(appState.sessionOutputs).set(label, filtered);
+    }
+  }
+  // On initial connect, suppress auto-open for the escalations pending now;
+  // one raised after this answer is new and opens the modal. On reconnect,
+  // preserve the watermark so new escalations during disconnect will
+  // trigger the modal.
+  if (isInitialConnect) {
+    appState.escalationDismissedAt = appState.escalationDisplayNumber;
+    isInitialConnect = false;
+  }
+}
+
+/**
+ * Fetches the pending session escalations and applies them the moment the
+ * answer arrives, so the events after it land on top of it instead of being
+ * overwritten when the rest of the refresh finishes.
+ */
+async function refreshEscalations(client: WsClient): Promise<void> {
+  try {
+    const { answer, events } = await requestEscalationSnapshot<EscalationDto[]>(client, 'escalations.list');
+    applyEscalationsSnapshot(answer, events);
+    appState.escalationLoadError = null;
+  } catch {
+    appState.escalationLoadError = 'Pending requests could not be refreshed. Previously shown reviews remain visible.';
+  }
+}
+
+async function refreshDomain<T>(name: string, request: Promise<T>): Promise<T | undefined> {
+  try {
+    const answer = await request;
+    const next = { ...appState.refreshErrors };
+    delete next[name];
+    appState.refreshErrors = next;
+    return answer;
+  } catch {
+    appState.refreshErrors = {
+      ...appState.refreshErrors,
+      [name]: `Could not refresh ${name}. Previously shown data remains visible.`,
+    };
+    return undefined;
+  }
+}
+
+/**
+ * Fetches a workflow's detail. Its `escalations` are the daemon's view of the
+ * workflow's pending tool-call escalations: the moment the answer arrives
+ * they replace what the client holds for that workflow, merged with the
+ * escalation events received meanwhile (`mergeWorkflowEscalationSnapshot`).
+ * The workflow's gate is left to the caller (`syncWorkflowGateFromDetail`).
+ */
+async function fetchWorkflowDetail(client: WsClient, workflowId: string): Promise<WorkflowDetailDto> {
+  const { answer, events } = await requestEscalationSnapshot<WorkflowDetailDto>(client, 'workflows.get', {
+    workflowId,
+  });
+  appState.pendingWorkflowEscalations = mergeWorkflowEscalationSnapshot(
+    appState.pendingWorkflowEscalations,
+    workflowId,
+    // The daemon leaves `escalations` out while nothing is pending.
+    answer.escalations ?? [],
+    events,
+  );
+  const errors = new Map(appState.workflowReviewErrors);
+  errors.delete(workflowId);
+  appState.workflowReviewErrors = errors;
+  return answer;
+}
+
+/**
+ * Replaces whatever gate the client holds for `workflowId` with the server's
+ * view from a fresh `workflows.get`: the gate it reports, or none when the
+ * workflow is not waiting. A workflow has at most one active gate, so any
+ * other entry for it is stale (its `gate_dismissed` was missed) and is
+ * dropped rather than left to be resolved by mistake.
+ */
+export function syncWorkflowGateFromDetail(workflowId: string, detail: WorkflowDetailDto): void {
+  const next = new Map<string, HumanGateRequestDto>();
+  for (const [gateId, gate] of appState.pendingGates) {
+    if (gate.workflowId !== workflowId) next.set(gateId, gate);
+  }
+  if (detail.phase === PHASE.WAITING_HUMAN && detail.gate) {
+    next.set(detail.gate.gateId, detail.gate);
+  }
+  appState.pendingGates = next;
+}
+
 async function refreshAll(client: WsClient): Promise<void> {
   enqueueSessionRefresh(client);
+  // Snapshot the gates and workflow tool-call escalations held before any
+  // request goes out: every one of them is superseded by the server's answers
+  // below, while a gate or escalation raised by an event during the refresh
+  // is newer than those answers and kept.
+  const gatesBeforeRefresh: ReadonlySet<string> = new Set(appState.pendingGates.keys());
+  const workflowEscalationsBeforeRefresh: ReadonlySet<string> = new Set(appState.pendingWorkflowEscalations.keys());
   try {
-    const [status, jobs, escalations, workflowsList, personaCompiles] = await Promise.all([
-      client.request<DaemonStatusDto>('status'),
-      client.request<JobListDto[]>('jobs.list'),
-      client.request<EscalationDto[]>('escalations.list'),
-      client.request<WorkflowSummaryDto[]>('workflows.list').catch(() => [] as WorkflowSummaryDto[]),
+    const [status, jobs, , workflowsList, personaCompiles] = await Promise.all([
+      refreshDomain('status', client.request<DaemonStatusDto>('status')),
+      refreshDomain('jobs', client.request<JobListDto[]>('jobs.list')),
+      // Applied on arrival, not with the rest (see refreshEscalations).
+      refreshEscalations(client),
+      refreshDomain('workflows', client.request<WorkflowSummaryDto[]>('workflows.list')),
       client
         .request<PersonaListCompilesDto>('personas.listCompiles', {})
         .catch(() => ({ active: [], recent: [], queueDepth: 0 }) as PersonaListCompilesDto),
     ]);
 
-    appState.daemonStatus = status;
-    appState.jobs = jobs;
+    if (status !== undefined) appState.daemonStatus = status;
+    if (jobs !== undefined) appState.jobs = jobs;
+
+    if (workflowsList === undefined) {
+      connectionGeneration.value++;
+      return;
+    }
 
     const newWorkflows = new Map<string, WorkflowSummaryDto>();
     for (const wf of workflowsList) {
@@ -464,55 +698,50 @@ async function refreshAll(client: WsClient): Promise<void> {
     for (const op of personaCompiles.active) newPersonaCompiles.set(op.operationId, op);
     appState.personaCompiles = newPersonaCompiles;
 
-    // Repopulate pending gates for any workflow stuck at a human gate.
-    // Events may have been lost during disconnect, leaving pendingGates empty.
-    const newGates = new Map<string, HumanGateRequestDto>();
-    const gatePromises = workflowsList
-      .filter((wf) => wf.phase === PHASE.WAITING_HUMAN)
-      .map(async (wf) => {
+    // Rebuild pending gates from server state. Events may have been lost
+    // while disconnected in both directions: a gate raised meanwhile is
+    // missing from `pendingGates`, and a gate dismissed meanwhile is still
+    // in it. A stale entry is dangerous, not just untidy -- the review panel
+    // would show one gate's summary while the user decides about it (the
+    // daemon refuses a decision bound to a raise that is gone, but the user
+    // has still been shown the wrong gate) -- so the server's view replaces
+    // what the client held: only workflows the list reports as waiting keep a
+    // gate, and only the gate `workflows.get` returns for them.
+    const waiting = workflowsList.filter((wf) => wf.phase === PHASE.WAITING_HUMAN);
+    const waitingIds = new Set(waiting.map((wf) => wf.workflowId));
+    dropHeldGates(gatesBeforeRefresh, (gate) => !waitingIds.has(gate.workflowId));
+    // Workflow tool-call escalations (the Workflows badge counts them) are
+    // rebuilt the same way, from every workflow still live: an agent blocked
+    // in an escalated call is `running`, and one at a gate may still hold one.
+    // What was held for a workflow that finished or is gone is dropped.
+    const live = workflowsList.filter((wf) => wf.phase === PHASE.RUNNING || wf.phase === PHASE.WAITING_HUMAN);
+    const liveIds = new Set(live.map((wf) => wf.workflowId));
+    appState.workflowReviewErrors = new Map([...appState.workflowReviewErrors].filter(([id]) => liveIds.has(id)));
+    dropHeldWorkflowEscalations(workflowEscalationsBeforeRefresh, (escalation) => !liveIds.has(escalation.workflowId));
+    await Promise.all(
+      live.map(async (wf) => {
         try {
-          const detail = await client.request<WorkflowDetailDto>('workflows.get', { workflowId: wf.workflowId });
-          if (detail.gate) {
-            newGates.set(detail.gate.gateId, detail.gate);
-          }
+          // The detail's escalations are applied inside fetchWorkflowDetail.
+          const detail = await fetchWorkflowDetail(client, wf.workflowId);
+          // Applied the moment it arrives: responses and events share one
+          // ordered socket, so an event handled after this answer (a dismissal
+          // or a newer raise) lands on top of it instead of being overwritten
+          // when the remaining fetches finish. A gate raised for a workflow
+          // the list reported as running arrives by event and is kept.
+          if (waitingIds.has(wf.workflowId)) syncWorkflowGateFromDetail(wf.workflowId, detail);
         } catch {
-          // Best-effort -- gate will appear on next event
+          // Keep the held review visible, explicitly unavailable for approval
+          // until its current detail can be read. A later event still wins.
+          appState.workflowReviewErrors = new Map(appState.workflowReviewErrors).set(
+            wf.workflowId,
+            'A workflow review could not be refreshed. Approval is unavailable until it can be read again.',
+          );
         }
-      });
-    await Promise.all(gatePromises);
-    // Merge fetched gates into current pendingGates rather than replacing,
-    // so gate_raised events that arrived during the async fetch are preserved.
-    const merged = new Map(appState.pendingGates);
-    for (const [id, gate] of newGates) {
-      merged.set(id, gate);
-    }
-    appState.pendingGates = merged;
+      }),
+    );
 
     // Bump connection generation so detail views re-fetch
     connectionGeneration.value++;
-
-    const newEscalations = new Map<string, PendingEscalation>();
-    for (const esc of escalations) {
-      const displayNumber = ++appState.escalationDisplayNumber;
-      newEscalations.set(esc.escalationId, { ...esc, displayNumber });
-    }
-    appState.pendingEscalations = newEscalations;
-    // Remove stale escalation output lines that are no longer pending
-    for (const [label, lines] of appState.sessionOutputs) {
-      const filtered = lines.filter(
-        (line) => line.kind !== 'escalation' || (line.escalationId && newEscalations.has(line.escalationId)),
-      );
-      if (filtered.length !== lines.length) {
-        appState.sessionOutputs = new Map(appState.sessionOutputs).set(label, filtered);
-      }
-    }
-    // On initial connect, suppress auto-open for pre-existing escalations.
-    // On reconnect, preserve the watermark so new escalations during
-    // disconnect will trigger the modal.
-    if (isInitialConnect) {
-      appState.escalationDismissedAt = appState.escalationDisplayNumber;
-      isInitialConnect = false;
-    }
   } catch (err) {
     console.error('Failed to refresh state:', err);
   }
@@ -593,6 +822,23 @@ export async function resolveEscalation(
   await getWsClient().request('escalations.resolve', params);
 }
 
+/**
+ * Approves every member of one whitelist-pattern group, after the user
+ * confirmed the list. `escalationIds` must be exactly the members that were
+ * shown: the daemon refuses (ESCALATION_GROUP_CHANGED), approving nothing,
+ * when the group changed since. Each member is approved once; nothing is
+ * whitelisted.
+ */
+export async function approveEscalationGroup(
+  groupKey: string,
+  escalationIds: readonly string[],
+): Promise<EscalationGroupApprovalDto> {
+  return getWsClient().request<EscalationGroupApprovalDto>('escalations.approveGroup', {
+    groupKey,
+    escalationIds: [...escalationIds],
+  });
+}
+
 // ── Session RPC actions ──────────────────────────────────────────────
 
 /**
@@ -622,6 +868,33 @@ export async function endSession(label: number): Promise<void> {
   await getWsClient().request('sessions.end', { label });
 }
 
+/**
+ * Seeds the session view's notices from the session's diagnostic log
+ * (`sessions.get`): the start-up notices it emitted before this client was
+ * watching, and host-mount findings. Notices already held are kept; a
+ * dismissed one stays dismissed. A session that ended meanwhile is skipped.
+ */
+export async function loadSessionNotices(label: number): Promise<void> {
+  const detail = await getWsClient().request<SessionDetailDto>('sessions.get', { label });
+  const logged: SessionNoticeEvent[] = [];
+  for (const event of Array.isArray(detail.diagnosticLog) ? detail.diagnosticLog : []) {
+    const notice = toSessionNotice(event);
+    if (notice !== undefined) logged.push(notice);
+  }
+  if (!appState.sessions.has(label)) return;
+  appState.sessionNotices = new Map(appState.sessionNotices).set(
+    label,
+    seedSessionNotices(appState.sessionNotices.get(label), logged),
+  );
+}
+
+/** Hides one notice of a session's view (it stays hidden when the notices are seeded again). */
+export function dismissSessionNotice(label: number, key: string): void {
+  const entries = appState.sessionNotices.get(label);
+  if (entries === undefined) return;
+  appState.sessionNotices = new Map(appState.sessionNotices).set(label, dismissSessionNoticeEntry(entries, key));
+}
+
 // ── PTY terminal RPC actions (web-pty sessions) ──────────────────────
 //
 // Attach/detach manage this client's subscription to a session's terminal
@@ -641,8 +914,29 @@ export async function sendPtyInput(label: number, dataB64: string): Promise<void
   await getWsClient().request('sessions.ptyInput', { label, data: dataB64 });
 }
 
+/**
+ * PTY size range the daemon accepts on `sessions.ptyResize` (mirrors
+ * src/pty/pty-size.ts; out-of-range frames are rejected there because an
+ * unbounded size makes the daemon's headless terminal allocate gigabytes).
+ */
+const PTY_MIN_COLS = 2;
+const PTY_MAX_COLS = 1000;
+const PTY_MIN_ROWS = 1;
+const PTY_MAX_ROWS = 500;
+
+function clampDimension(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, Math.trunc(value)));
+}
+
 export async function sendPtyResize(label: number, cols: number, rows: number): Promise<void> {
-  await getWsClient().request('sessions.ptyResize', { label, cols, rows });
+  // A zoomed-out or ultra-wide browser can fit more than the daemon accepts.
+  // Clamp so the PTY still adopts the largest supported size; an out-of-range
+  // frame would be rejected and leave the PTY at its previous size.
+  await getWsClient().request('sessions.ptyResize', {
+    label,
+    cols: clampDimension(cols, PTY_MIN_COLS, PTY_MAX_COLS),
+    rows: clampDimension(rows, PTY_MIN_ROWS, PTY_MAX_ROWS),
+  });
 }
 
 /**
@@ -681,6 +975,16 @@ export async function recompileJob(jobId: string): Promise<void> {
 
 export async function listPersonas(): Promise<PersonaListItem[]> {
   return getWsClient().request<PersonaListItem[]>('personas.list');
+}
+
+/**
+ * The configured MCP servers a persona can be narrowed to, in configuration
+ * order (the built-ins, then the user's own servers): exactly the names
+ * `personas.create` accepts in `servers`. A read, not gated on the mutation
+ * kill switch. Rejects when the daemon cannot load its server configuration.
+ */
+export async function listPersonaServers(): Promise<string[]> {
+  return getWsClient().request<string[]>('personas.listServers');
 }
 
 // ── Persona CRUD mutation RPC actions (Phase 1c) ──────────────────────
@@ -733,8 +1037,9 @@ export async function setPersonaMemory(name: string, enabled: boolean): Promise<
 /**
  * Set a persona's broad-policy opt-in. This is the ONLY way to set
  * `allowBroadPolicy`; it is never inferred from the constitution. When enabled,
- * the compiler's broad-policy validator permits wildcard domains/lists and
- * out-of-workspace paths. Errors: PERSONA_NOT_FOUND, POLICY_MUTATION_FORBIDDEN.
+ * the compiler's broad-policy validator permits allow rules with wildcard
+ * domains/lists, out-of-workspace paths or unconstrained resource arguments.
+ * Errors: PERSONA_NOT_FOUND, POLICY_MUTATION_FORBIDDEN.
  */
 export async function setPersonaBroadPolicyOptIn(name: string, enabled: boolean): Promise<PersonaDetailDto> {
   return getWsClient().request<PersonaDetailDto>('personas.setBroadPolicyOptIn', { name, enabled });
@@ -788,10 +1093,69 @@ export async function abortWorkflow(workflowId: string): Promise<void> {
   await getWsClient().request('workflows.abort', { workflowId });
 }
 
-export async function resolveWorkflowGate(workflowId: string, event: string, prompt?: string): Promise<void> {
-  const params: Record<string, unknown> = { workflowId, event };
+/**
+ * Refusals of a gate decision that mean the gate the client displayed is no
+ * longer the one the workflow waits at (another decider acted first, or a
+ * `gate_dismissed` was missed).
+ */
+const STALE_GATE_ERROR_CODES: ReadonlySet<string> = new Set(['GATE_MISMATCH', 'WORKFLOW_NOT_AT_GATE']);
+
+function rpcErrorCode(err: unknown): string | undefined {
+  return err !== null && typeof err === 'object' && 'code' in err && typeof err.code === 'string'
+    ? err.code
+    : undefined;
+}
+
+/**
+ * Submits a gate decision bound to the raise the user reviewed. `gateId` is
+ * the id of the gate the panel displayed; the daemon rejects the decision
+ * (`GATE_MISMATCH`) if the workflow has since moved to another raise, and
+ * declares this client as the `web-ui` channel for the audit log.
+ *
+ * On a stale-gate refusal nothing was applied. Before rethrowing, the
+ * workflow's gate is re-read from the daemon and replaces the stale entry
+ * (or removes it when nothing is waiting), so the panel shows what is
+ * actually pending and the next click reviews that, not the old raise.
+ */
+export async function resolveWorkflowGate(
+  workflowId: string,
+  gateId: string,
+  event: string,
+  prompt?: string,
+): Promise<void> {
+  if (event === 'APPROVE' && (appState.workflowReviewErrors.has(workflowId) || appState.refreshErrors.workflows)) {
+    throw new Error('Refresh this workflow review before approving it.');
+  }
+  const params: Record<string, unknown> = { workflowId, gateId, event, resolvedBy: 'web-ui' };
   if (prompt) params.prompt = prompt;
-  await getWsClient().request('workflows.resolveGate', params);
+  try {
+    await getWsClient().request('workflows.resolveGate', params);
+  } catch (err) {
+    const code = rpcErrorCode(err);
+    if (code !== undefined && STALE_GATE_ERROR_CODES.has(code)) {
+      try {
+        syncWorkflowGateFromDetail(workflowId, await getWorkflowDetail(workflowId));
+      } catch {
+        // Best-effort: the next gate event or reconnect refresh resyncs.
+      }
+    }
+    throw err;
+  }
+}
+
+/**
+ * Approves or denies a workflow tool-call escalation. `whitelistSelection`
+ * (approvals only) indexes the escalation's `whitelistCandidates`.
+ */
+export async function resolveWorkflowEscalation(
+  workflowId: string,
+  escalationId: string,
+  decision: 'approved' | 'denied',
+  whitelistSelection?: number,
+): Promise<void> {
+  const params: Record<string, unknown> = { workflowId, escalationId, decision };
+  if (whitelistSelection !== undefined) params.whitelistSelection = whitelistSelection;
+  await getWsClient().request('workflows.resolveEscalation', params);
 }
 
 export async function refreshWorkflows(): Promise<void> {
@@ -807,8 +1171,14 @@ export async function refreshWorkflows(): Promise<void> {
   }
 }
 
+/**
+ * Fetches a workflow's detail (`workflows.get`). The answer's pending
+ * tool-call escalations also replace the ones the store holds for that
+ * workflow, merged with the escalation events received while it was in
+ * flight (see `fetchWorkflowDetail`); applying its gate is up to the caller.
+ */
 export async function getWorkflowDetail(workflowId: string): Promise<WorkflowDetailDto> {
-  return getWsClient().request<WorkflowDetailDto>('workflows.get', { workflowId });
+  return fetchWorkflowDetail(getWsClient(), workflowId);
 }
 
 export async function listResumableWorkflows(): Promise<ResumableWorkflowDto[]> {
@@ -838,8 +1208,18 @@ export async function getWorkflowFileContent(workflowId: string, path: string): 
   return getWsClient().request<FileContentResponseDto>('workflows.fileContent', { workflowId, path });
 }
 
+/** Lists an artifact's files (names and sizes); contents come from {@link getWorkflowArtifactFile}. */
 export async function getWorkflowArtifacts(workflowId: string, artifactName: string): Promise<ArtifactContentDto> {
   return getWsClient().request<ArtifactContentDto>('workflows.artifacts', { workflowId, artifactName });
+}
+
+/** Fetches one artifact file (same shape as a workspace file read). */
+export async function getWorkflowArtifactFile(
+  workflowId: string,
+  artifactName: string,
+  path: string,
+): Promise<FileContentResponseDto> {
+  return getWsClient().request<FileContentResponseDto>('workflows.artifactFile', { workflowId, artifactName, path });
 }
 
 /**
@@ -857,6 +1237,14 @@ export async function getWorkflowMessageLog(
   if (opts?.before !== undefined) params.before = opts.before;
   if (opts?.limit !== undefined) params.limit = opts.limit;
   return getWsClient().request<MessageLogResponseDto>('workflows.messageLog', params);
+}
+
+/**
+ * Fetch the complete entry behind a truncated page entry's `ref` (long agent
+ * messages are cut in `workflows.messageLog` pages).
+ */
+export async function getWorkflowMessageLogEntry(workflowId: string, ref: string): Promise<MessageLogEntryResponseDto> {
+  return getWsClient().request<MessageLogEntryResponseDto>('workflows.messageLogEntry', { workflowId, ref });
 }
 
 // ── Persona RPC actions (extended) ─────────────────────────────────────

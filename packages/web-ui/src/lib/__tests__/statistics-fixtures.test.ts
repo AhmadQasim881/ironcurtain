@@ -51,7 +51,7 @@ describe('statistics fixture engine', () => {
     const fixture = createStatisticsFixtureEngine('mixed');
     const summaries = fixture.summary({
       ...RANGE,
-      measures: ['requestCount', 'refusalRate', 'thinkingTokens', 'observableOutputTokensPerSecond'],
+      measures: ['requestCount', 'refusalRate', 'thinkingTokens', 'effectiveOutputTokensPerSecond'],
       groupBy: ['logicalProvider'],
     });
 
@@ -68,7 +68,7 @@ describe('statistics fixture engine', () => {
     ).toBe(true);
     expect(
       summaries.some(
-        (summary) => summary.measure === 'observableOutputTokensPerSecond' && summary.sampleSessionCount > 0,
+        (summary) => summary.measure === 'effectiveOutputTokensPerSecond' && summary.sampleSessionCount > 0,
       ),
     ).toBe(true);
 

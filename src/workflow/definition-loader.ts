@@ -12,7 +12,7 @@
  */
 
 import { parseDefinitionFile } from './discovery.js';
-import { validateDefinition, WorkflowValidationError } from './validate.js';
+import { validateDefinition, WorkflowValidationError, type ValidateDefinitionOptions } from './validate.js';
 import type { WorkflowDefinition } from './types.js';
 
 export type DefinitionLoadResult =
@@ -27,8 +27,11 @@ export type DefinitionLoadResult =
  * - `kind: 'validate'` covers `WorkflowValidationError` from `validateDefinition`
  *   and any other unexpected error during validation. The `issues` array is
  *   populated only for the `WorkflowValidationError` path.
+ *
+ * `options` is passed to `validateDefinition`; only the display-only past-run
+ * loader relaxes anything.
  */
-export function loadDefinition(path: string): DefinitionLoadResult {
+export function loadDefinition(path: string, options: ValidateDefinitionOptions = {}): DefinitionLoadResult {
   let raw: unknown;
   try {
     raw = parseDefinitionFile(path);
@@ -41,7 +44,7 @@ export function loadDefinition(path: string): DefinitionLoadResult {
   }
 
   try {
-    const definition = validateDefinition(raw);
+    const definition = validateDefinition(raw, options);
     return { ok: true, definition };
   } catch (err) {
     if (err instanceof WorkflowValidationError) {

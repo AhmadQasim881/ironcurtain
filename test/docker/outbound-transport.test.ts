@@ -87,6 +87,74 @@ describe('direct destination-bound transport', () => {
     ).toThrow(/local|metadata/u);
   });
 
+  it('never hands a socket opened for a trusted private gateway to a public-only request (MITM-4)', async () => {
+    const seen: string[] = [];
+    const server = http.createServer((request, response) => {
+      seen.push(request.url ?? '');
+      response.end('gateway-ok');
+    });
+    servers.push(server);
+    const port = await listenTcp(server);
+    // A multi-label name, so only the DNS answer (loopback) separates the policies.
+    const transport = createDirectOutboundTransport({ lookup: stubLookup({ 'gw.mycorp.example': '127.0.0.1' }) });
+    const destination = { protocol: 'http:', hostname: 'gw.mycorp.example', port } as const;
+
+    await expect(
+      requestBody(transport, {
+        destination,
+        addressPolicy: 'trusted-provider-override',
+        method: 'GET',
+        path: '/v1/models',
+      }),
+    ).resolves.toBe('gateway-ok');
+    // The keep-alive socket is now idle in a pool.
+    await new Promise((resolve) => setImmediate(resolve));
+
+    await expect(requestBody(transport, { destination, method: 'GET', path: '/admin/secret' })).rejects.toThrow(
+      /non-public address/u,
+    );
+    expect(seen).toEqual(['/v1/models']);
+    transport.close?.();
+  });
+
+  it('reuses keep-alive sockets within one address policy and drops them on close()', async () => {
+    let connections = 0;
+    let serverSide: import('node:net').Socket | undefined;
+    const server = http.createServer((_request, response) => response.end('ok'));
+    server.on('connection', (socket: import('node:net').Socket) => {
+      connections += 1;
+      serverSide = socket;
+    });
+    servers.push(server);
+    const port = await listenTcp(server);
+    const transport = createDirectOutboundTransport({ lookup: stubLookup({ 'gw.mycorp.example': '127.0.0.1' }) });
+    const request = {
+      destination: { protocol: 'http:', hostname: 'gw.mycorp.example', port },
+      addressPolicy: 'trusted-provider-override',
+      method: 'GET',
+      path: '/',
+    } as const;
+
+    await expect(requestBody(transport, request)).resolves.toBe('ok');
+    await new Promise((resolve) => setImmediate(resolve));
+    await expect(requestBody(transport, request)).resolves.toBe('ok');
+    expect(connections).toBe(1);
+
+    // Idle, the pooled connection would otherwise stay open until the
+    // keep-alive timeout (about 4 s), so a no-op close() misses this bound.
+    const pooledClosed = new Promise<void>((resolve) => serverSide?.once('close', () => resolve()));
+    transport.close?.();
+    let timer: NodeJS.Timeout | undefined;
+    const closedInTime = await Promise.race([
+      pooledClosed.then(() => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), 2_000);
+      }),
+    ]);
+    clearTimeout(timer);
+    expect(closedInTime).toBe(true);
+  });
+
   it('keeps metadata destinations forbidden for trusted provider overrides', () => {
     const transport = createDirectOutboundTransport();
     for (const hostname of ['metadata.google.internal', '169.254.169.254']) {
@@ -160,6 +228,49 @@ describe('direct destination-bound transport', () => {
         headers: { 'x-test': ['ok', 'bad\r\ninjected: yes'] },
       }),
     ).toThrow(/invalid outbound header/u);
+  });
+
+  it('forwards header names using every RFC 9110 token character, the backtick included', async () => {
+    const tokenHeader = "X-`token`!#$%&'*+.^_|~";
+    const observed = new Promise<string | undefined>((resolve) => {
+      const server = http.createServer((request, response) => {
+        resolve(request.headers[tokenHeader.toLowerCase()]?.toString());
+        response.end('ok');
+      });
+      servers.push(server);
+    });
+    const port = await listenTcp(servers[0]);
+    const transport = createDirectOutboundTransport({ allowPrivateDestinationsForTests: true });
+
+    const response = requestBody(transport, {
+      destination: { protocol: 'http:', hostname: '127.0.0.1', port },
+      method: 'GET',
+      path: '/',
+      headers: { [tokenHeader]: 'kept' },
+    });
+
+    await expect(response).resolves.toBe('ok');
+    await expect(observed).resolves.toBe('kept');
+    // Non-token characters are still refused before any I/O.
+    for (const name of ['x test', 'x(test)', 'x"test', 'x:test', 'xé']) {
+      expect(() =>
+        transport.request({
+          destination: { protocol: 'http:', hostname: '127.0.0.1', port },
+          method: 'GET',
+          path: '/',
+          headers: { [name]: 'refused' },
+        }),
+      ).toThrow(/invalid outbound header/u);
+    }
+  });
+
+  it('refuses destination names the URL host parser would fold into another host', () => {
+    const transport = createDirectOutboundTransport();
+    for (const hostname of ['example.com/x', 'example%2ecom', 'exa\\mple.com', 'example.com?x']) {
+      expect(() =>
+        transport.request({ destination: { protocol: 'https:', hostname, port: 443 }, method: 'GET', path: '/' }),
+      ).toThrow(/invalid outbound hostname/u);
+    }
   });
 
   it('does not expose CONNECT to callers', () => {

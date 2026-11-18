@@ -5,6 +5,11 @@
  * translates them into concrete policy statements via an LLM. Uses
  * a conversational loop with accept/refine/reject feedback.
  *
+ * Before the conversation it offers the amendments proposed from the
+ * user's repeated human approvals under the global policy (policy
+ * learning, `amendment-review.ts`): each one is shown as a diff and added
+ * only on an explicit accept, then saved and compiled like any other change.
+ *
  * CLI entry point: `ironcurtain customize-policy`
  */
 
@@ -16,13 +21,22 @@ import type { LanguageModel, ModelMessage, SystemModelMessage } from 'ai';
 import { generateText, Output } from 'ai';
 import chalk from 'chalk';
 import { z } from 'zod';
+import { checkHelp, parseArgsStrict, type CommandSpec } from '../cli-help.js';
 import { getBaseUserConstitutionPath, getUserConstitutionPath, getUserGeneratedDir } from '../config/paths.js';
 import { loadUserConfig } from '../config/user-config.js';
 import { createCacheStrategy } from '../session/prompt-cache.js';
 import type { GitHubIdentity } from './github-identity.js';
 import { discoverGitHubIdentity, resolveGitHubToken } from './github-identity.js';
-import { createPipelineLlm, loadExistingArtifact } from './pipeline-shared.js';
-import type { ToolAnnotation, ToolAnnotationsFile } from './types.js';
+import { createPipelineLlm, loadToolAnnotationsFile } from './pipeline-shared.js';
+import type { ToolAnnotation } from './types.js';
+import { reviewPendingAmendments } from './amendment-review.js';
+import { GLOBAL_APPROVAL_SCOPE } from '../audit/approval-history.js';
+import { applyChanges, computeLineDiff, formatDiff } from './constitution-diff.js';
+import { toDisplayText } from '../terminal/display-sanitize.js';
+
+// The constitution diff helpers live in a leaf module so the amendment review
+// can use them without importing this one; re-exported for existing callers.
+export { applyChanges, computeLineDiff, formatDiff, type DiffLine } from './constitution-diff.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -47,34 +61,6 @@ export const CustomizerResponseSchema = z.object({
 });
 
 export type CustomizerResponse = z.infer<typeof CustomizerResponseSchema>;
-
-/**
- * Merges LLM-proposed changes into the current constitution text.
- * Removes lines matching `removeRules`, then appends `addRules`.
- */
-export function applyChanges(current: string, addRules: string[], removeRules: string[]): string {
-  let lines = current.split('\n');
-
-  // Remove lines that match removeRules (normalized comparison: strip
-  // leading whitespace, bullet prefixes like "- " or "* ", and trailing space)
-  if (removeRules.length > 0) {
-    const normalize = (s: string) => s.trim().replace(/^[-*]\s*/, '');
-    const removals = new Set(removeRules.map(normalize));
-    lines = lines.filter((line) => !removals.has(normalize(line)));
-  }
-
-  // Remove trailing blank lines before appending
-  while (lines.length > 0 && lines[lines.length - 1].trim() === '') {
-    lines.pop();
-  }
-
-  // Append new rules
-  for (const rule of addRules) {
-    lines.push(` - ${rule}`);
-  }
-
-  return lines.join('\n') + '\n';
-}
 
 // ---------------------------------------------------------------------------
 // Tool Annotation Formatting
@@ -228,83 +214,6 @@ export function buildUserMessage(currentUserConstitution: string | undefined, us
 }
 
 // ---------------------------------------------------------------------------
-// Line-Level Diff
-// ---------------------------------------------------------------------------
-
-export interface DiffLine {
-  type: 'added' | 'removed' | 'unchanged';
-  text: string;
-}
-
-/**
- * Computes a simple line-level diff between two texts.
- * Uses a longest common subsequence approach for accuracy.
- */
-export function computeLineDiff(oldText: string, newText: string): DiffLine[] {
-  const oldLines = oldText ? oldText.split('\n') : [];
-  const newLines = newText ? newText.split('\n') : [];
-
-  if (oldLines.length === 0 && newLines.length === 0) return [];
-  if (oldLines.length === 0) return newLines.map((text) => ({ type: 'added', text }));
-  if (newLines.length === 0) return oldLines.map((text) => ({ type: 'removed', text }));
-
-  // LCS table
-  const m = oldLines.length;
-  const n = newLines.length;
-  const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0) as number[]);
-
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      if (oldLines[i - 1] === newLines[j - 1]) {
-        dp[i][j] = dp[i - 1][j - 1] + 1;
-      } else {
-        dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
-      }
-    }
-  }
-
-  // Backtrack to produce diff
-  const result: DiffLine[] = [];
-  let i = m;
-  let j = n;
-
-  while (i > 0 || j > 0) {
-    if (i > 0 && j > 0 && oldLines[i - 1] === newLines[j - 1]) {
-      result.push({ type: 'unchanged', text: oldLines[i - 1] });
-      i--;
-      j--;
-    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
-      result.push({ type: 'added', text: newLines[j - 1] });
-      j--;
-    } else {
-      result.push({ type: 'removed', text: oldLines[i - 1] });
-      i--;
-    }
-  }
-
-  return result.reverse();
-}
-
-/**
- * Formats a line diff with chalk colors for terminal display.
- * Red for removed, green for added, plain for unchanged context.
- */
-export function formatDiff(diff: DiffLine[]): string {
-  return diff
-    .map((line) => {
-      switch (line.type) {
-        case 'added':
-          return chalk.green(`+ ${line.text}`);
-        case 'removed':
-          return chalk.red(`- ${line.text}`);
-        case 'unchanged':
-          return `  ${line.text}`;
-      }
-    })
-    .join('\n');
-}
-
-// ---------------------------------------------------------------------------
 // Backup / Revert
 // ---------------------------------------------------------------------------
 
@@ -393,8 +302,13 @@ export async function callLlm(
 // Load Tool Annotations
 // ---------------------------------------------------------------------------
 
+/**
+ * Loads the effective tool annotations (the user overlay in `generatedDir`
+ * layered per server over the package annotations) with conditional role
+ * specs resolved to their default roles.
+ */
 export function loadAnnotations(generatedDir: string, packageGeneratedDir: string): ToolAnnotation[] {
-  const file = loadExistingArtifact<ToolAnnotationsFile>(generatedDir, 'tool-annotations.json', packageGeneratedDir);
+  const file = loadToolAnnotationsFile(generatedDir, packageGeneratedDir);
   if (!file) {
     throw new Error(
       "tool-annotations.json not found. Run 'ironcurtain annotate-tools' first to generate tool annotations.",
@@ -404,10 +318,64 @@ export function loadAnnotations(generatedDir: string, packageGeneratedDir: strin
 }
 
 // ---------------------------------------------------------------------------
+// Compile After Save
+// ---------------------------------------------------------------------------
+
+/** What the compile run after saving a customized constitution produced. */
+export type PostSaveCompileOutcome =
+  /** Every server compiled and the policy was written. */
+  | { readonly kind: 'compiled' }
+  /** The policy was written, but some servers failed and have no rules. */
+  | { readonly kind: 'partial'; readonly exitCode: number }
+  /** No policy was written. `exitCode` is set when compile-policy returned one. */
+  | { readonly kind: 'failed'; readonly message: string; readonly exitCode?: number };
+
+/**
+ * Runs compile-policy in-process through `runCompilePolicy`, which returns the
+ * exit status instead of exiting, so the customizer can finish its flow and
+ * tell a partial failure apart from a success. `runCompile` is a test seam.
+ */
+export async function compileAfterSave(
+  argv: string[],
+  runCompile?: (argv: string[]) => Promise<number>,
+): Promise<PostSaveCompileOutcome> {
+  try {
+    const { runCompilePolicy, COMPILE_PARTIAL_FAILURE_EXIT_CODE } = await import('./compile.js');
+    const exitCode = await (runCompile ?? runCompilePolicy)(argv);
+    if (exitCode === 0) return { kind: 'compiled' };
+    if (exitCode === COMPILE_PARTIAL_FAILURE_EXIT_CODE) return { kind: 'partial', exitCode };
+    return { kind: 'failed', message: `compile-policy exited with status ${exitCode}`, exitCode };
+  } catch (err) {
+    return { kind: 'failed', message: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main Conversational Loop
 // ---------------------------------------------------------------------------
 
-export async function main(): Promise<void> {
+export const customizePolicySpec: CommandSpec = {
+  name: 'ironcurtain customize-policy',
+  description: 'Customize your policy in an LLM-assisted conversation (interactive)',
+  usage: ['ironcurtain customize-policy'],
+  options: [{ flag: 'help', short: 'h', description: 'Show this help message' }],
+  examples: [
+    'ironcurtain customize-policy   # Amend ~/.ironcurtain/constitution-user.md by conversation, then compile',
+  ],
+};
+
+/**
+ * `ironcurtain customize-policy`. `--help` is answered before anything else:
+ * the conversation needs a terminal, loads (and may create) the user config
+ * and seeds the user constitution.
+ */
+export async function main(args: readonly string[] = []): Promise<void> {
+  const { values } = parseArgsStrict(
+    { args: [...args], options: { help: { type: 'boolean', short: 'h' } } },
+    customizePolicySpec.name,
+  );
+  if (checkHelp(values, customizePolicySpec)) return;
+
   if (!process.stdin.isTTY) {
     console.error('Error: ironcurtain customize-policy requires an interactive terminal (TTY).');
     process.exit(1);
@@ -429,7 +397,7 @@ export async function main(): Promise<void> {
   try {
     annotations = loadAnnotations(generatedDir, packageGeneratedDir);
   } catch (err) {
-    p.log.error(err instanceof Error ? err.message : String(err));
+    p.log.error(toDisplayText(err instanceof Error ? err.message : String(err), { multiline: true }));
     process.exit(1);
   }
   const serverCount = new Set(annotations.map((a) => a.serverName)).size;
@@ -446,7 +414,7 @@ export async function main(): Promise<void> {
     ghIdentity = await discoverGitHubIdentity(ghToken);
     if (ghIdentity) {
       const owners = [ghIdentity.login, ...ghIdentity.orgs].join(', ');
-      spinner.stop(`GitHub identity: ${owners}`);
+      spinner.stop(`GitHub identity: ${toDisplayText(owners)}`);
     } else {
       spinner.stop('GitHub identity discovery failed (continuing without it)');
     }
@@ -461,9 +429,27 @@ export async function main(): Promise<void> {
 
   // Display current state
   if (currentConstitution) {
-    p.note(currentConstitution.trim(), 'Current User Constitution');
+    p.note(toDisplayText(currentConstitution, { multiline: true }), 'Current User Constitution');
   } else {
     p.log.info('No user constitution yet. Starting from scratch.');
+  }
+
+  // Track whether we have unsaved changes
+  let hasUnsavedChanges = false;
+
+  // Amendments learned from repeated human approvals: shown as diffs, added
+  // only when accepted. A dismissal is recorded right away.
+  const amendmentReview = await reviewPendingAmendments(GLOBAL_APPROVAL_SCOPE, currentConstitution ?? '');
+  if (amendmentReview?.cancelled === true) {
+    p.cancel('Customization cancelled.');
+    process.exit(0);
+  }
+  if (amendmentReview !== undefined && amendmentReview.accepted.length > 0) {
+    currentConstitution = amendmentReview.constitution;
+    hasUnsavedChanges = true;
+    p.log.success(
+      `${amendmentReview.accepted.length} suggested amendment(s) accepted. They are saved when you finish ("done").`,
+    );
   }
 
   // Set up LLM
@@ -476,9 +462,6 @@ export async function main(): Promise<void> {
 
   // Conversation history for multi-turn context
   const conversationHistory: ModelMessage[] = [];
-
-  // Track whether we have unsaved changes
-  let hasUnsavedChanges = false;
 
   // Main loop
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- interactive loop exited via break
@@ -513,7 +496,7 @@ export async function main(): Promise<void> {
       llmSpinner.stop('Done.');
     } catch (err) {
       llmSpinner.stop('Failed.');
-      p.log.error(`LLM error: ${err instanceof Error ? err.message : String(err)}`);
+      p.log.error(`LLM error: ${toDisplayText(err instanceof Error ? err.message : String(err), { multiline: true })}`);
       // Remove the user message we just added since the call failed
       conversationHistory.pop();
       continue;
@@ -524,7 +507,7 @@ export async function main(): Promise<void> {
 
     // Handle question response
     if (response.type === 'question') {
-      p.log.info(response.question ?? 'Could you clarify your request?');
+      p.log.info(toDisplayText(response.question ?? 'Could you clarify your request?', { multiline: true }));
       continue;
     }
 
@@ -534,7 +517,10 @@ export async function main(): Promise<void> {
       const proposed = applyChanges(currentConstitution ?? '', response.addRules ?? [], response.removeRules ?? []);
       const diff = computeLineDiff(currentConstitution ?? '', proposed);
       const diffText = formatDiff(diff);
-      p.note(`${diffText}\n\n${chalk.dim(response.summary ?? '')}`, 'Proposed changes');
+      p.note(
+        `${diffText}\n\n${chalk.dim(toDisplayText(response.summary ?? '', { multiline: true }))}`,
+        'Proposed changes',
+      );
 
       const action = await p.select({
         message: 'What would you like to do?',
@@ -577,7 +563,9 @@ export async function main(): Promise<void> {
         refineSpinner.stop('Done.');
       } catch (err) {
         refineSpinner.stop('Failed.');
-        p.log.error(`LLM error: ${err instanceof Error ? err.message : String(err)}`);
+        p.log.error(
+          `LLM error: ${toDisplayText(err instanceof Error ? err.message : String(err), { multiline: true })}`,
+        );
         conversationHistory.pop();
         break;
       }
@@ -585,7 +573,7 @@ export async function main(): Promise<void> {
       conversationHistory.push({ role: 'assistant', content: JSON.stringify(response) });
 
       if (response.type === 'question') {
-        p.log.info(response.question ?? 'Could you clarify your request?');
+        p.log.info(toDisplayText(response.question ?? 'Could you clarify your request?', { multiline: true }));
         break;
       }
 
@@ -600,7 +588,7 @@ export async function main(): Promise<void> {
   }
 
   const writtenPath = writeConstitution(currentConstitution);
-  p.log.success(`Saved to ${writtenPath}`);
+  p.log.success(`Saved to ${toDisplayText(writtenPath)}`);
 
   // Ask about compilation
   const shouldCompile = await p.confirm({
@@ -615,28 +603,44 @@ export async function main(): Promise<void> {
     return;
   }
 
-  // Invoke compile-policy programmatically
-  try {
-    const { main: compileMain } = await import('./compile.js');
-    await compileMain();
+  // Invoke compile-policy programmatically, with its default options (this
+  // command takes none to pass on).
+  const outcome = await compileAfterSave([]);
+  if (outcome.kind === 'compiled') {
     p.outro('Policy compiled successfully.');
-  } catch (err) {
-    p.log.error(`Compilation failed: ${err instanceof Error ? err.message : String(err)}`);
-
-    const shouldRevert = await p.confirm({
-      message: 'Revert to previous constitution?',
-      initialValue: true,
-    });
-    handleCancel(shouldRevert);
-
-    if (shouldRevert) {
-      try {
-        revertConstitution();
-        p.log.success('Reverted to previous constitution.');
-      } catch (revertErr) {
-        p.log.error(`Revert failed: ${revertErr instanceof Error ? revertErr.message : String(revertErr)}`);
-      }
-    }
-    p.outro('Done.');
+    return;
   }
+  if (outcome.kind === 'partial') {
+    // The policy was written without the failed servers (listed above), so
+    // reverting the constitution would not undo it. Report it and keep the
+    // partial-failure exit status.
+    process.exitCode = outcome.exitCode;
+    p.log.warn(
+      'Policy compiled, but some servers failed and have no rules, so their tools are denied. ' +
+        'Re-run `ironcurtain compile-policy` to retry them.',
+    );
+    p.outro('Done.');
+    return;
+  }
+
+  if (outcome.exitCode !== undefined) process.exitCode = outcome.exitCode;
+  p.log.error(`Compilation failed: ${toDisplayText(outcome.message, { multiline: true })}`);
+
+  const shouldRevert = await p.confirm({
+    message: 'Revert to previous constitution?',
+    initialValue: true,
+  });
+  handleCancel(shouldRevert);
+
+  if (shouldRevert) {
+    try {
+      revertConstitution();
+      p.log.success('Reverted to previous constitution.');
+    } catch (revertErr) {
+      p.log.error(
+        `Revert failed: ${toDisplayText(revertErr instanceof Error ? revertErr.message : String(revertErr), { multiline: true })}`,
+      );
+    }
+  }
+  p.outro('Done.');
 }

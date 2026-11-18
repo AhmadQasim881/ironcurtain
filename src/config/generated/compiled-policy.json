@@ -2,6 +2,19 @@
   "generatedAt": "2026-04-26T21:38:47.257Z",
   "constitutionHash": "bbf15ed2068f7fba533653b20c0a3d81dd11c9d292fdcbea4780506c29397d26",
   "inputHash": "109fe1f6b130d1e85d7669fd4ea6733cd99ac0ca0f2547d53e808a51555b5705",
+  "provenance": {
+    "schemaVersion": 1,
+    "producerVersion": "0.14.0",
+    "policyCompilerEpoch": 1,
+    "engineSemanticsVersion": 2,
+    "verifierVersion": 2,
+    "annotationDigests": {
+      "fetch": "1c71d646cff273da9f9c3c444e843946867ef333209bafeea8367e85a4bae4d6",
+      "filesystem": "068f105632402f13dfa2cbc202b8c603ba9d47fabc4f2440562d2efa4e32e4af",
+      "git": "42eaeeff2739369a7ec8d2dc6782396b4443980f167ef28f2b80cac20c28d207",
+      "github": "f5f0308b6a1e8dc12e2ffaee2a873e1fb5c32e58c3fff77c81426226c66bf8de"
+    }
+  },
   "rules": [
     {
       "name": "allow-web-search",
@@ -38,7 +51,7 @@
           ]
         }
       },
-      "then": "allow",
+      "then": "assess",
       "reason": "Constitution explicitly permits fetching content from popular news sites."
     },
     {
@@ -61,7 +74,7 @@
           ]
         }
       },
-      "then": "allow",
+      "then": "assess",
       "reason": "Constitution explicitly permits fetching content from popular development sites."
     },
     {
@@ -224,9 +237,9 @@
       "reason": "Reads outside explicitly permitted folders require human judgment rather than outright denial."
     },
     {
-      "name": "allow-git-wrapup-instructions",
-      "description": "Allow fetching git wrap-up instructions as they have no path or remote roles.",
-      "principle": "Least privilege: returning workflow instructions is a safe read-only operation with no resource access.",
+      "name": "escalate-git-wrapup-instructions",
+      "description": "Review git wrap-up calls because they read the server session repository.",
+      "principle": "Repository snapshots require a fresh human decision when their path is implicit.",
       "if": {
         "server": [
           "git"
@@ -235,8 +248,8 @@
           "git_wrapup_instructions"
         ]
       },
-      "then": "allow",
-      "reason": "git_wrapup_instructions has no path or network roles and is always safe to execute."
+      "then": "escalate",
+      "reason": "git_wrapup_instructions reads the server session repository and requires per-call human approval."
     },
     {
       "name": "allow-git-clear-working-dir",
@@ -364,7 +377,7 @@
           "within": "~/Downloads"
         }
       },
-      "then": "allow",
+      "then": "assess",
       "reason": "Committing within Downloads is permitted since the agent has full write access there."
     },
     {
@@ -454,7 +467,7 @@
           "within": "~/Downloads"
         }
       },
-      "then": "allow",
+      "then": "assess",
       "reason": "Merge within Downloads is permitted since the agent has full write access there."
     },
     {
@@ -544,7 +557,7 @@
           "within": "~/Downloads"
         }
       },
-      "then": "allow",
+      "then": "assess",
       "reason": "All tag operations including deletion are permitted within Downloads since the agent has full access there."
     },
     {
@@ -568,7 +581,7 @@
         }
       },
       "then": "allow",
-      "reason": "Local remote config operations (list, add, remove, rename, set-url) within Downloads are permitted."
+      "reason": "Local remote config operations (list, get-url, remove, rename) within Downloads are permitted; adding a remote or changing its URL escalates (escalate-git-remote-url)."
     },
     {
       "name": "allow-git-clean-in-downloads",
@@ -672,6 +685,24 @@
       },
       "then": "escalate",
       "reason": "Clone is a remote network operation and always requires human approval per policy."
+    },
+    {
+      "name": "escalate-git-remote-url",
+      "description": "Require human approval for adding a git remote or changing a remote URL.",
+      "principle": "The agent must ask for human approval for all other git operations.",
+      "if": {
+        "roles": [
+          "git-remote-url"
+        ],
+        "server": [
+          "git"
+        ],
+        "tool": [
+          "git_remote"
+        ]
+      },
+      "then": "escalate",
+      "reason": "Adding a remote or changing its URL points the repository at a new network destination and requires human approval per policy."
     },
     {
       "name": "github-read-operations-allow",

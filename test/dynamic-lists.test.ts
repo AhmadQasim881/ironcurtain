@@ -4,7 +4,7 @@
  * ListCondition evaluation, and MCP-backed resolution.
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, type Mock } from 'vitest';
 import { MockLanguageModelV3 } from 'ai/test';
 import {
   buildRepairInstructions,
@@ -15,6 +15,7 @@ import {
 import { LIST_TYPE_REGISTRY } from '../src/pipeline/dynamic-list-types.js';
 import { getListMatcher } from '../src/trusted-process/list-matcher.js';
 import { resolveList, resolveAllLists, type ListResolverConfig } from '../src/pipeline/list-resolver.js';
+import type { MediatedTool, MediatedToolCaller, MediatedToolResult } from '../src/pipeline/proxy-mcp-connections.js';
 import { buildGeneratorSystemPrompt, formatDynamicListsSection } from '../src/pipeline/scenario-generator.js';
 import { buildJudgeSystemPrompt } from '../src/pipeline/policy-verifier.js';
 import { PolicyEngine } from '../src/trusted-process/policy-engine.js';
@@ -128,6 +129,20 @@ const fetchAnnotation: StoredToolAnnotation = {
   serverName: 'fetch',
   comment: 'Fetches URL',
   args: { url: ['fetch-url'] },
+  inputSchema: {},
+};
+
+/**
+ * A tool whose argument has an identifier-category role, the stand-in for
+ * list conditions on values that are not URLs (email recipients, tickers).
+ * A url-category role would not do: the structural domain gate treats a
+ * fetch-url value that is not an http(s) URL as unverifiable and escalates.
+ */
+const identifierAnnotation: StoredToolAnnotation = {
+  toolName: 'lookup',
+  serverName: 'directory',
+  comment: 'Looks up an identifier',
+  args: { id: ['github-owner'] },
   inputSchema: {},
 };
 
@@ -440,6 +455,78 @@ describe('Dynamic Lists Compiler Output', () => {
     expect(result.listDefinitions[0].name).toBe('my-contacts');
   });
 
+  describe('MCP scope of data-backed lists', () => {
+    const contactsRule: CompiledRule = {
+      name: 'allow-contacts',
+      description: 'Allow sending to contacts',
+      principle: 'send to contacts',
+      if: { lists: [{ roles: ['fetch-url'], allowed: ['@my-contacts'], matchType: 'emails' }] },
+      then: 'allow',
+      reason: 'Contact is known',
+    };
+
+    /** Model whose first answer uses `firstDefinition`, and whose repair answer uses contactsListDef. */
+    function createRepairingModel(firstDefinition: Record<string, unknown>): MockLanguageModelV3 {
+      let call = 0;
+      return new MockLanguageModelV3({
+        doGenerate: async () => {
+          call++;
+          const listDefinitions = call === 1 ? [firstDefinition] : [contactsListDef];
+          return {
+            content: [{ type: 'text' as const, text: JSON.stringify({ rules: [contactsRule], listDefinitions }) }],
+            ...MOCK_GENERATE_RESULT,
+          };
+        },
+      });
+    }
+
+    it('rejects a data-backed list without mcpServerHint and asks the compiler to repair it', async () => {
+      const unhinted = {
+        name: contactsListDef.name,
+        type: contactsListDef.type,
+        principle: contactsListDef.principle,
+        generationPrompt: contactsListDef.generationPrompt,
+        requiresMcp: true,
+      };
+      const model = createRepairingModel(unhinted);
+
+      const result = await compileConstitution('Email my contacts.', sampleAnnotations, compilerConfig, model);
+
+      expect(model.doGenerateCalls).toHaveLength(2);
+      expect(JSON.stringify(model.doGenerateCalls[1].prompt)).toContain('no mcpServerHint');
+      expect(result.listDefinitions[0].mcpServerHint).toBe('contacts');
+    });
+
+    it('rejects a list backed by the network-fetch server', async () => {
+      const model = createRepairingModel({ ...contactsListDef, mcpServerHint: 'fetch' });
+
+      const result = await compileConstitution('Email my contacts.', sampleAnnotations, compilerConfig, model);
+
+      expect(model.doGenerateCalls).toHaveLength(2);
+      expect(JSON.stringify(model.doGenerateCalls[1].prompt)).toContain('network server');
+      expect(result.listDefinitions[0].mcpServerHint).toBe('contacts');
+    });
+
+    it('accepts a knowledge-based list without mcpServerHint', async () => {
+      const mockLLM = createMockModel({
+        rules: [makeRuleWithDomainList('major-news-sites')],
+        listDefinitions: [newsListDef],
+      });
+
+      const result = await compileConstitution('Collect news.', sampleAnnotations, compilerConfig, mockLLM);
+
+      expect(result.listDefinitions[0].mcpServerHint).toBeUndefined();
+    });
+
+    it('tells the compiler that mcpServerHint is required for data-backed lists', async () => {
+      const { model, getSystemPrompt } = createPromptCapturingModel({ rules: [] });
+
+      await compileConstitution('Email my contacts.', sampleAnnotations, compilerConfig, model);
+
+      expect(getSystemPrompt()).toContain('mcpServerHint: REQUIRED when requiresMcp is true');
+    });
+  });
+
   it('system prompt includes Dynamic Lists section', async () => {
     const { model, getSystemPrompt } = createPromptCapturingModel({ rules: [] });
 
@@ -734,7 +821,7 @@ describe('List Resolver', () => {
   it('fails with descriptive error for requiresMcp lists without proxy connection', async () => {
     const mockLLM = createMockModel({ values: [] });
 
-    await expect(resolveList(contactsListDef, { model: mockLLM })).rejects.toThrow(/no proxy connection/);
+    await expect(resolveList(contactsListDef, { model: mockLLM })).rejects.toThrow(/has no MCP access/);
   });
 
   describe('resolveAllLists', () => {
@@ -813,7 +900,7 @@ describe('Policy Engine List Expansion', () => {
       if: {
         lists: [
           {
-            roles: ['fetch-url'],
+            roles: ['github-owner'],
             allowed: ['@tech-stock-tickers'],
             matchType: 'identifiers',
           },
@@ -826,15 +913,15 @@ describe('Policy Engine List Expansion', () => {
     const lists = makeDynamicLists({
       'tech-stock-tickers': { values: ['AAPL', 'GOOG'] },
     });
-    const annotations = makeToolAnnotationsFile([fetchAnnotation]);
+    const annotations = makeToolAnnotationsFile([identifierAnnotation]);
 
     const engine = new PolicyEngine(policy, annotations, [], undefined, undefined, lists);
 
     const result = engine.evaluate({
       requestId: 'test',
-      serverName: 'fetch',
-      toolName: 'fetch',
-      arguments: { url: 'AAPL' },
+      serverName: 'directory',
+      toolName: 'lookup',
+      arguments: { id: 'AAPL' },
       timestamp: '',
     });
     expect(result.decision).toBe('allow');
@@ -962,7 +1049,7 @@ describe('ListCondition Evaluation', () => {
       if: {
         lists: [
           {
-            roles: ['fetch-url'],
+            roles: ['github-owner'],
             allowed: ['alice@example.com', 'bob@example.com'],
             matchType: 'emails',
           },
@@ -972,14 +1059,14 @@ describe('ListCondition Evaluation', () => {
       reason: 'Contact',
     };
     const policy = makePolicyFile([rule]);
-    const annotations = makeToolAnnotationsFile([fetchAnnotation]);
+    const annotations = makeToolAnnotationsFile([identifierAnnotation]);
     const engine = new PolicyEngine(policy, annotations, []);
 
     const result = engine.evaluate({
       requestId: 'test',
-      serverName: 'fetch',
-      toolName: 'fetch',
-      arguments: { url: 'ALICE@EXAMPLE.COM' },
+      serverName: 'directory',
+      toolName: 'lookup',
+      arguments: { id: 'ALICE@EXAMPLE.COM' },
       timestamp: '',
     });
     expect(result.decision).toBe('allow');
@@ -993,7 +1080,7 @@ describe('ListCondition Evaluation', () => {
       if: {
         lists: [
           {
-            roles: ['fetch-url'],
+            roles: ['github-owner'],
             allowed: ['AAPL', 'GOOG'],
             matchType: 'identifiers',
           },
@@ -1003,14 +1090,14 @@ describe('ListCondition Evaluation', () => {
       reason: 'Known ticker',
     };
     const policy = makePolicyFile([rule]);
-    const annotations = makeToolAnnotationsFile([fetchAnnotation]);
+    const annotations = makeToolAnnotationsFile([identifierAnnotation]);
     const engine = new PolicyEngine(policy, annotations, []);
 
     const matchResult = engine.evaluate({
       requestId: '1',
-      serverName: 'fetch',
-      toolName: 'fetch',
-      arguments: { url: 'AAPL' },
+      serverName: 'directory',
+      toolName: 'lookup',
+      arguments: { id: 'AAPL' },
       timestamp: '',
     });
     expect(matchResult.decision).toBe('allow');
@@ -1018,9 +1105,9 @@ describe('ListCondition Evaluation', () => {
     // Case mismatch should not match
     const noMatchResult = engine.evaluate({
       requestId: '2',
-      serverName: 'fetch',
-      toolName: 'fetch',
-      arguments: { url: 'aapl' },
+      serverName: 'directory',
+      toolName: 'lookup',
+      arguments: { id: 'aapl' },
       timestamp: '',
     });
     expect(noMatchResult.decision).not.toBe('allow');
@@ -1171,64 +1258,95 @@ describe('Per-Role Evaluation with Lists', () => {
 // Shared fixtures for Phase 3 tests
 // ---------------------------------------------------------------------------
 
+const TEXT_RESULT_EMPTY: MediatedToolResult = { content: [{ type: 'text', text: '[]' }], isError: false };
+
+interface MockToolSpec {
+  readonly name: string;
+  readonly serverName?: string;
+  readonly offered?: boolean;
+}
+
 /**
- * Creates a mock proxy connection compatible with ListResolverConfig.proxyConnection.
- * The proxy already handles policy mediation, so tools are exposed directly.
+ * Creates a mock mediated MCP connection (the shape `connectViaProxy`
+ * returns). `callTool` stands in for the security kernel; the real
+ * kernel path is covered by list-resolver-mediation.integration.test.ts.
  */
-function createMockProxyConnection(
-  toolNames: string[] = ['list_contacts'],
-  toolResult: unknown = { content: [{ type: 'text', text: '[]' }] },
-): NonNullable<ListResolverConfig['proxyConnection']> {
-  return {
-    client: {
-      callTool: vi.fn().mockResolvedValue(toolResult),
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any,
-    tools: toolNames.map((name) => ({
+function createMockMcpConnection(
+  tools: ReadonlyArray<string | MockToolSpec> = ['list_contacts'],
+  callResult: MediatedToolResult = TEXT_RESULT_EMPTY,
+): { connection: NonNullable<ListResolverConfig['mcpConnection']>; callTool: Mock<MediatedToolCaller['callTool']> } {
+  const callTool = vi.fn<MediatedToolCaller['callTool']>().mockResolvedValue(callResult);
+  const mediatedTools: MediatedTool[] = tools.map((spec) => {
+    const { name, serverName = 'contacts', offered = true } = typeof spec === 'string' ? { name: spec } : spec;
+    return {
+      serverName,
       name,
       description: `Mock tool: ${name}`,
-      inputSchema: { type: 'object' as const, properties: {} },
-    })),
+      inputSchema: { type: 'object', properties: {} },
+      offered,
+    };
+  });
+  return { connection: { tools: mediatedTools, callTool }, callTool };
+}
+
+/** A model step that calls one tool. */
+function toolCallStep(toolCallId: string, toolName: string, input: Record<string, unknown>) {
+  return {
+    ...MOCK_GENERATE_RESULT,
+    content: [{ type: 'tool-call' as const, toolCallId, toolName, input: JSON.stringify(input) }],
+    finishReason: { unified: 'tool-calls' as const, raw: 'tool_use' },
+  };
+}
+
+/** A model step that answers with the final list. */
+function finalValuesStep(values: string[]) {
+  return {
+    ...MOCK_GENERATE_RESULT,
+    content: [{ type: 'text' as const, text: JSON.stringify({ values }) }],
   };
 }
 
 /**
- * Creates a MockLanguageModelV3 that simulates a multi-step tool-use conversation:
- *   Step 1: LLM calls the specified tool
- *   Step 2: LLM returns text with the final JSON values
+ * Creates a function-form MockLanguageModelV3 that simulates a multi-step
+ * tool-use conversation: step 1 calls the given tool, step 2 answers with
+ * the final JSON values. (Array-form doGenerate is effectively 1-indexed in
+ * ai@6, so it would skip the tool call and make these tests vacuous.)
  */
 function createToolUseModel(
   toolName: string,
-  toolArgs: Record<string, unknown>,
+  toolInput: Record<string, unknown>,
   finalValues: string[],
 ): MockLanguageModelV3 {
+  let step = 0;
   return new MockLanguageModelV3({
-    doGenerate: [
-      // Step 1: LLM decides to call a tool
-      {
-        ...MOCK_GENERATE_RESULT,
-        content: [
-          {
-            type: 'tool-call' as const,
-            toolCallId: 'call-1',
-            toolName,
-            args: JSON.stringify(toolArgs),
-          },
-        ],
-        finishReason: { unified: 'tool-calls' as const, raw: 'tool_use' },
-      },
-      // Step 2: LLM returns text with the final answer
-      {
-        ...MOCK_GENERATE_RESULT,
-        content: [
-          {
-            type: 'text' as const,
-            text: JSON.stringify({ values: finalValues }),
-          },
-        ],
-      },
-    ],
+    doGenerate: async () => {
+      step++;
+      return step === 1 ? toolCallStep('call-1', toolName, toolInput) : finalValuesStep(finalValues);
+    },
   });
+}
+
+/** Names of the tools described to the model on its first step. */
+function offeredToolNames(model: MockLanguageModelV3): string[] {
+  return (model.doGenerateCalls[0].tools ?? []).map((t) => t.name);
+}
+
+/**
+ * Asserts the resolution took the MCP path: exactly one tool call through
+ * the mediated connection, with these arguments, and a second model step
+ * that received its result. Without this a test could pass on the model's
+ * final text alone, never touching the tool path it is named after.
+ */
+function expectOneMediatedToolCall(
+  model: MockLanguageModelV3,
+  callTool: Mock<MediatedToolCaller['callTool']>,
+  serverName: string,
+  toolName: string,
+  args: Record<string, unknown>,
+): void {
+  expect(callTool).toHaveBeenCalledTimes(1);
+  expect(callTool).toHaveBeenCalledWith(serverName, toolName, args);
+  expect(model.doGenerateCalls).toHaveLength(2);
 }
 
 // ---------------------------------------------------------------------------
@@ -1237,7 +1355,7 @@ function createToolUseModel(
 
 describe('MCP-Backed List Resolution', () => {
   it('resolves a data-backed list via MCP tools', async () => {
-    const proxyConnection = createMockProxyConnection(['list_contacts'], {
+    const { connection, callTool } = createMockMcpConnection(['list_contacts'], {
       content: [
         {
           type: 'text',
@@ -1247,92 +1365,136 @@ describe('MCP-Backed List Resolution', () => {
           ]),
         },
       ],
+      isError: false,
     });
 
     const model = createToolUseModel('list_contacts', {}, ['alice@example.com', 'bob@company.org']);
 
-    const config: ListResolverConfig = { model, proxyConnection };
+    const config: ListResolverConfig = { model, mcpConnection: connection };
     const result = await resolveList(contactsListDef, config);
 
+    // The tool call really happened, routed through the mediated connection.
+    expectOneMediatedToolCall(model, callTool, 'contacts', 'list_contacts', {});
     expect(result.values).toContain('alice@example.com');
     expect(result.values).toContain('bob@company.org');
     expect(result.resolvedAt).toBeTruthy();
     expect(result.inputHash).toBeTruthy();
   });
 
-  it('fails when requiresMcp but no proxyConnection is provided', async () => {
-    const model = createMockModel({ values: [] });
+  it('feeds the tool result back to the model', async () => {
+    const { connection, callTool } = createMockMcpConnection(['list_contacts'], {
+      content: [{ type: 'text', text: 'alice@example.com' }],
+      isError: false,
+    });
+    const model = createToolUseModel('list_contacts', {}, ['alice@example.com']);
 
-    await expect(resolveList(contactsListDef, { model })).rejects.toThrow(/no proxy connection/);
+    await resolveList(contactsListDef, { model, mcpConnection: connection });
+
+    expectOneMediatedToolCall(model, callTool, 'contacts', 'list_contacts', {});
+    const secondStepPrompt = JSON.stringify(model.doGenerateCalls[1].prompt);
+    expect(secondStepPrompt).toContain('alice@example.com');
   });
 
-  it('fails when requiresMcp but proxyConnection has no tools', async () => {
+  it('fails when requiresMcp but no mcpConnection is provided', async () => {
     const model = createMockModel({ values: [] });
-    const proxyConnection = createMockProxyConnection([]);
 
-    await expect(resolveList(contactsListDef, { model, proxyConnection })).rejects.toThrow(
+    await expect(resolveList(contactsListDef, { model })).rejects.toThrow(/has no MCP access/);
+  });
+
+  it('fails when requiresMcp but mcpConnection has no tools', async () => {
+    const model = createMockModel({ values: [] });
+    const { connection } = createMockMcpConnection([]);
+
+    await expect(resolveList(contactsListDef, { model, mcpConnection: connection })).rejects.toThrow(
       /no MCP tools are available/,
     );
   });
 
-  it('uses mcpServerHint to select the correct connection', async () => {
-    // With the proxy-based approach, server selection happens before the resolver.
-    // The proxy exposes only the relevant tools. We verify that the resolver
-    // correctly uses the tools from the proxy connection.
-    const proxyConnection = createMockProxyConnection(['list_contacts'], {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify([{ email: 'alice@example.com' }]),
-        },
+  it('offers only the tools of the server named by mcpServerHint', async () => {
+    const { connection, callTool } = createMockMcpConnection(
+      [
+        { name: 'list_contacts', serverName: 'contacts' },
+        { name: 'list_records', serverName: 'crm' },
       ],
-    });
+      { content: [{ type: 'text', text: JSON.stringify([{ email: 'alice@example.com' }]) }], isError: false },
+    );
 
     const model = createToolUseModel('list_contacts', {}, ['alice@example.com']);
 
-    const config: ListResolverConfig = { model, proxyConnection };
-    const result = await resolveList(contactsListDef, config);
+    const result = await resolveList(contactsListDef, { model, mcpConnection: connection });
 
+    expect(offeredToolNames(model)).toEqual(['list_contacts']);
+    expectOneMediatedToolCall(model, callTool, 'contacts', 'list_contacts', {});
     expect(result.values).toContain('alice@example.com');
   });
 
-  it('falls back to first connection when mcpServerHint does not match', async () => {
-    // With the proxy-based approach, the proxy pre-selects tools.
-    // This test verifies that the resolver works with whatever tools the proxy provides,
-    // even if they come from a different server than the hint.
-    const proxyConnection = createMockProxyConnection(['query_data'], {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify([{ email: 'fallback@example.com' }]),
-        },
-      ],
-    });
-
+  it('never falls back to another server when the hinted server has no tools', async () => {
+    // Previously an unhinted or mismatched list could use any connected
+    // server's tools. A data-backed list now reads only the server it names.
+    const { connection, callTool } = createMockMcpConnection([{ name: 'query_data', serverName: 'crm' }]);
     const model = createToolUseModel('query_data', {}, ['fallback@example.com']);
 
-    const config: ListResolverConfig = { model, proxyConnection };
-    const result = await resolveList(contactsListDef, config);
+    await expect(resolveList(contactsListDef, { model, mcpConnection: connection })).rejects.toThrow(
+      /no MCP tools are available from server "contacts"/,
+    );
+    expect(callTool).not.toHaveBeenCalled();
+    expect(model.doGenerateCalls).toHaveLength(0);
+  });
 
-    expect(result.values).toContain('fallback@example.com');
+  it('describes only offered tools to the model, and mediates a call to a hidden tool', async () => {
+    // The model is told about list_contacts only. When (e.g. after a prompt
+    // injection) it calls delete_contact anyway, the call still goes through
+    // the mediated connection -- where the security kernel refuses and
+    // audits it -- and the refusal text is returned to the model.
+    const refusal = 'ESCALATION REQUIRED: deleting contacts needs approval. Action denied (no escalation handler).';
+    const { connection, callTool } = createMockMcpConnection([
+      'list_contacts',
+      { name: 'delete_contact', offered: false },
+    ]);
+    callTool.mockImplementation(async (_server, toolName) =>
+      toolName === 'delete_contact'
+        ? { content: [{ type: 'text', text: refusal }], isError: true }
+        : { content: [{ type: 'text', text: '[]' }], isError: false },
+    );
+
+    const model = createToolUseModel('delete_contact', { id: '123' }, ['alice@example.com']);
+    const result = await resolveList(contactsListDef, { model, mcpConnection: connection });
+
+    expect(offeredToolNames(model)).toEqual(['list_contacts']);
+    expectOneMediatedToolCall(model, callTool, 'contacts', 'delete_contact', { id: '123' });
+    expect(JSON.stringify(model.doGenerateCalls[1].prompt)).toContain('Action denied (no escalation handler)');
+    // Resolution still completes from the model's final text.
+    expect(result.values).toContain('alice@example.com');
+  });
+
+  it('tells the model that tool results are untrusted data', async () => {
+    const { connection, callTool } = createMockMcpConnection(['list_contacts']);
+    const model = createToolUseModel('list_contacts', {}, ['alice@example.com']);
+
+    await resolveList(contactsListDef, { model, mcpConnection: connection });
+
+    expectOneMediatedToolCall(model, callTool, 'contacts', 'list_contacts', {});
+    const system = model.doGenerateCalls[0].prompt.find((m) => m.role === 'system');
+    expect(system?.content).toContain('untrusted data');
   });
 
   it('applies type validation to MCP-resolved values', async () => {
-    const proxyConnection = createMockProxyConnection(['list_contacts']);
+    const { connection, callTool } = createMockMcpConnection(['list_contacts']);
 
     // LLM returns some invalid emails mixed with valid ones
     const model = createToolUseModel('list_contacts', {}, ['alice@example.com', 'not-an-email', 'bob@company.org']);
 
-    const config: ListResolverConfig = { model, proxyConnection };
+    const config: ListResolverConfig = { model, mcpConnection: connection };
     const result = await resolveList(contactsListDef, config);
 
+    expectOneMediatedToolCall(model, callTool, 'contacts', 'list_contacts', {});
     expect(result.values).toContain('alice@example.com');
     expect(result.values).toContain('bob@company.org');
     expect(result.values).not.toContain('not-an-email');
   });
 
   it('preserves manual overrides for MCP-resolved lists', async () => {
-    const proxyConnection = createMockProxyConnection(['list_contacts']);
+    const { connection, callTool } = createMockMcpConnection(['list_contacts']);
 
     const model = createToolUseModel('list_contacts', {}, ['alice@example.com']);
 
@@ -1344,53 +1506,35 @@ describe('MCP-Backed List Resolution', () => {
       inputHash: 'old-hash',
     };
 
-    const config: ListResolverConfig = { model, proxyConnection };
+    const config: ListResolverConfig = { model, mcpConnection: connection };
     const result = await resolveList(contactsListDef, config, existing);
 
+    expectOneMediatedToolCall(model, callTool, 'contacts', 'list_contacts', {});
     expect(result.values).toContain('manual@example.com');
     expect(result.values).not.toContain('alice@example.com');
     expect(result.manualAdditions).toEqual(['manual@example.com']);
     expect(result.manualRemovals).toEqual(['alice@example.com']);
   });
 
-  it('resolution succeeds even when proxy blocks a mutating tool call', async () => {
-    // With the proxy-based approach, policy evaluation happens inside the proxy.
-    // The proxy exposes only allowed tools, or returns "POLICY BLOCKED" for
-    // blocked calls. The resolver doesn't need to know about policy -- it just
-    // uses whatever tools the proxy provides. If the LLM calls a tool that
-    // gets blocked, it should still produce final values from its text response.
-    const proxyConnection = createMockProxyConnection(['delete_contact'], {
-      content: [{ type: 'text', text: 'POLICY BLOCKED: delete_contact is not allowed' }],
-    });
-
-    // Model calls delete_contact then returns final values in text
-    const model = createToolUseModel('delete_contact', { id: '123' }, ['alice@example.com']);
-
-    const config: ListResolverConfig = { model, proxyConnection };
-    const result = await resolveList(contactsListDef, config);
-
-    // Resolution still succeeds (LLM returned values in text)
-    expect(result.values).toContain('alice@example.com');
-  });
-
-  it('knowledge-based lists ignore proxyConnection', async () => {
-    const proxyConnection = createMockProxyConnection(['list_contacts']);
+  it('knowledge-based lists ignore mcpConnection', async () => {
+    const { connection, callTool } = createMockMcpConnection(['list_contacts']);
     const model = createMockModel({
       values: ['cnn.com', 'bbc.com'],
     });
 
     // newsListDef has requiresMcp: false -- should use LLM directly
-    const config: ListResolverConfig = { model, proxyConnection };
+    const config: ListResolverConfig = { model, mcpConnection: connection };
     const result = await resolveList(newsListDef, config);
 
     expect(result.values).toContain('cnn.com');
     expect(result.values).toContain('bbc.com');
+    expect(callTool).not.toHaveBeenCalled();
   });
 });
 
 describe('MCP-Backed resolveAllLists', () => {
   it('resolves mixed knowledge-based and MCP-backed lists', async () => {
-    const proxyConnection = createMockProxyConnection(['list_contacts']);
+    const { connection, callTool } = createMockMcpConnection(['list_contacts']);
 
     let callIndex = 0;
     const model = new MockLanguageModelV3({
@@ -1398,45 +1542,18 @@ describe('MCP-Backed resolveAllLists', () => {
         callIndex++;
         // First call: knowledge-based list (stocksListDef)
         // Second+: MCP-backed list tool call then text
-        if (callIndex === 1) {
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: JSON.stringify({ values: ['AAPL', 'GOOG'] }),
-              },
-            ],
-            ...MOCK_GENERATE_RESULT,
-          };
-        }
-        if (callIndex === 2) {
-          return {
-            ...MOCK_GENERATE_RESULT,
-            content: [
-              {
-                type: 'tool-call' as const,
-                toolCallId: 'call-1',
-                toolName: 'list_contacts',
-                args: '{}',
-              },
-            ],
-            finishReason: { unified: 'tool-calls' as const, raw: 'tool_use' },
-          };
-        }
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify({ values: ['alice@example.com'] }),
-            },
-          ],
-          ...MOCK_GENERATE_RESULT,
-        };
+        if (callIndex === 1) return finalValuesStep(['AAPL', 'GOOG']);
+        if (callIndex === 2) return toolCallStep('call-1', 'list_contacts', {});
+        return finalValuesStep(['alice@example.com']);
       },
     });
 
-    const result = await resolveAllLists([stocksListDef, contactsListDef], { model, proxyConnection });
+    const result = await resolveAllLists([stocksListDef, contactsListDef], { model, mcpConnection: connection });
 
+    // One step for the knowledge-based list, two for the MCP round trip.
+    expect(callTool).toHaveBeenCalledTimes(1);
+    expect(callTool).toHaveBeenCalledWith('contacts', 'list_contacts', {});
+    expect(model.doGenerateCalls).toHaveLength(3);
     expect(result.lists['tech-stock-tickers']).toBeDefined();
     expect(result.lists['tech-stock-tickers'].values).toContain('AAPL');
     expect(result.lists['my-contacts']).toBeDefined();
@@ -1498,6 +1615,15 @@ describe('Dynamic List Values in Prompts', () => {
       expect(section).toContain('@financial-sites');
       expect(section).toContain('bloomberg.com, wsj.com');
       expect(section).toContain('obviously unrelated');
+    });
+
+    it('presents the values as part of the policy under test, never as "allow" cases (PIP-12)', () => {
+      const section = formatDynamicListsSection(testDynamicLists);
+
+      expect(section).toContain('The rules under test reference');
+      expect(section).toContain('may be wrong: being on a list does not make a value permitted');
+      expect(section).toContain('expect "allow" for a list value only when the constitution permits that value');
+      expect(section).not.toContain('positive/allow cases');
     });
 
     it('truncates lists longer than 5 values', () => {

@@ -11,12 +11,18 @@ export type GuardFunction = (params: { readonly context: WorkflowContext; readon
 // ---------------------------------------------------------------------------
 
 /**
- * Per-state round limit check. Compares the maximum visit count
+ * Workflow-wide round limit check. Compares the maximum visit count
  * across all states against maxRounds. This fires when any state
  * has been visited enough times to hit the limit.
  *
  * In the typical coder-critic loop, this checks whether the loop
- * has iterated enough times to warrant escalation.
+ * has iterated enough times to warrant escalation. Because every state
+ * counts, a loop elsewhere in the workflow spends the same budget: a
+ * workflow that revisits states outside the loop (a plan revised at a
+ * gate, say) should reset their counts when that phase is done
+ * (`resetVisitCounts` on the approving transition, as design-and-code
+ * does), or bound the loop per state with `maxVisits` and
+ * `isStateVisitLimitReached` instead.
  */
 const isRoundLimitReached: GuardFunction = ({ context }) => {
   const counts = Object.values(context.visitCounts);

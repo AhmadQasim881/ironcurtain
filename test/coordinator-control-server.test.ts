@@ -11,6 +11,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { isDispatchingAuditEntry } from '../src/types/audit.js';
 import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { request as httpRequest, type IncomingMessage } from 'node:http';
@@ -83,12 +84,18 @@ function makeRequest(overrides: Partial<ToolCallRequest> = {}): ToolCallRequest 
   };
 }
 
+/**
+ * Reads the audit log's outcome records (one per tool call). The
+ * write-ahead `dispatching` record that precedes every dispatched call is
+ * left out; `tool-call-coordinator.test.ts` covers it.
+ */
 function readAudit(path: string): Record<string, unknown>[] {
   if (!existsSync(path)) return [];
   return readFileSync(path, 'utf-8')
     .split('\n')
     .filter((l) => l.length > 0)
-    .map((l) => JSON.parse(l) as Record<string, unknown>);
+    .map((l) => JSON.parse(l) as Record<string, unknown>)
+    .filter((entry) => !isDispatchingAuditEntry(entry));
 }
 
 interface HttpResponse {
@@ -157,7 +164,7 @@ afterEach(() => {
 describe('ToolCallCoordinator.loadPolicy (unit)', () => {
   it('swaps the policy engine and stamps the new persona on subsequent audit entries', async () => {
     const auditPath = join(TEST_ROOT, 'audit.single.jsonl');
-    const newPolicyDir = mkdir(join(TEST_ROOT, 'new-policy'));
+    const newPolicyDir = mkdir(join(TEST_ROOT, 'personas', 'new-policy', 'generated'));
     // A minimal but valid policy with zero rules.
     writePersonaPolicy(newPolicyDir, {
       ...testCompiledPolicy,
@@ -221,7 +228,7 @@ describe('ToolCallCoordinator.loadPolicy (unit)', () => {
 
     try {
       await expect(coordinator.loadPolicy({ persona: 'reviewer', policyDir: evilDir })).rejects.toThrow(
-        /policyDir must be under a trusted directory/,
+        /policyDir must be one of IronCurtain's compiled-policy directories/,
       );
 
       // Engine reference is unchanged -- the attempted load was
@@ -235,7 +242,7 @@ describe('ToolCallCoordinator.loadPolicy (unit)', () => {
 
   it('leaves the old engine active when the new policy dir is missing', async () => {
     const auditPath = join(TEST_ROOT, 'audit.keep.jsonl');
-    const missingDir = join(TEST_ROOT, 'does-not-exist');
+    const missingDir = join(TEST_ROOT, 'personas', 'does-not-exist', 'generated');
 
     const coordinator = new ToolCallCoordinator({
       compiledPolicy: testCompiledPolicy,
@@ -274,7 +281,7 @@ describe('ToolCallCoordinator control endpoint (UDS)', () => {
   it('accepts a valid load request, returns 200, and swaps the engine', async () => {
     const auditPath = join(TEST_ROOT, 'audit.http-success.jsonl');
     const socketPath = join(TEST_ROOT, 'control-success.sock');
-    const newPolicyDir = mkdir(join(TEST_ROOT, 'policy-success'));
+    const newPolicyDir = mkdir(join(TEST_ROOT, 'personas', 'policy-success', 'generated'));
     writePersonaPolicy(newPolicyDir, { ...testCompiledPolicy, rules: [] });
 
     const coordinator = new ToolCallCoordinator({
@@ -499,7 +506,7 @@ describe('ToolCallCoordinator control endpoint (UDS)', () => {
         '/__ironcurtain/policy/load',
         JSON.stringify({
           persona: 'reviewer',
-          policyDir: join(TEST_ROOT, 'does-not-exist'),
+          policyDir: join(TEST_ROOT, 'personas', 'does-not-exist', 'generated'),
         }),
       );
       expect(res.status).toBe(500);
@@ -547,7 +554,7 @@ describe('ToolCallCoordinator control endpoint (UDS)', () => {
       );
       expect(res.status).toBe(400);
       const parsed = JSON.parse(res.body) as { error: string };
-      expect(parsed.error).toMatch(/policyDir must be under a trusted directory/);
+      expect(parsed.error).toMatch(/policyDir must be one of IronCurtain's compiled-policy directories/);
       expect(coordinator.getPolicyEngine()).toBe(oldEngine);
     } finally {
       await coordinator.close();
@@ -663,7 +670,7 @@ describe('ToolCallCoordinator loadPolicy concurrency', () => {
     // the PolicyEngine reference swap. While the tool call is gated,
     // `getPolicyEngine()` must still return the old engine.
     const auditPath = join(TEST_ROOT, 'audit.concurrency.jsonl');
-    const newPolicyDir = mkdir(join(TEST_ROOT, 'policy-concurrent'));
+    const newPolicyDir = mkdir(join(TEST_ROOT, 'personas', 'policy-concurrent', 'generated'));
     writePersonaPolicy(newPolicyDir, { ...testCompiledPolicy, rules: [] });
 
     // Two explicit barriers:
@@ -678,7 +685,8 @@ describe('ToolCallCoordinator loadPolicy concurrency', () => {
     const callStarted = new Promise<void>((r) => {
       resolveCallStarted = r;
     });
-    let releaseCall: (() => void) | null = null;
+    // Replaced synchronously by the executor below.
+    let releaseCall: () => void = () => undefined;
     const callGate = new Promise<void>((r) => {
       releaseCall = r;
     });
@@ -736,7 +744,7 @@ describe('ToolCallCoordinator loadPolicy concurrency', () => {
 
       // 6. Release the tool call. loadPolicy can now proceed into its
       //    body and swap the engine.
-      releaseCall?.();
+      releaseCall();
 
       // Both promises must settle. The tool call returns successfully
       // (it ran under the old engine); loadPolicy returns once the
@@ -771,7 +779,8 @@ describe('ToolCallCoordinator loadPolicy concurrency', () => {
     const callStarted = new Promise<void>((r) => {
       resolveCallStarted = r;
     });
-    let releaseCall: (() => void) | null = null;
+    // Replaced synchronously by the executor below.
+    let releaseCall: () => void = () => undefined;
     const callGate = new Promise<void>((r) => {
       releaseCall = r;
     });
@@ -821,7 +830,7 @@ describe('ToolCallCoordinator loadPolicy concurrency', () => {
 
     // 4. Release the tool call. close() can now acquire the mutex and
     //    proceed with its teardown.
-    releaseCall?.();
+    releaseCall();
 
     // Both promises settle without throwing. A 'write after end' or
     // similar async stream error from a missed drain would surface here

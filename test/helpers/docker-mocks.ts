@@ -15,12 +15,24 @@ import type { AgentAdapter, AgentId, AgentResponse } from '../../src/docker/agen
 import type { CertificateAuthority } from '../../src/docker/ca.js';
 import type { DockerProxy } from '../../src/docker/code-mode-proxy.js';
 import type { MitmProxy } from '../../src/docker/mitm-proxy.js';
+import { TRANSPORT_SIDECAR_IMAGE } from '../../src/docker/transport-sidecar-image.js';
 import type {
   DockerContainerConfig,
   DockerExecResult,
   DockerImageInfo,
   ContainerRuntime,
 } from '../../src/docker/types.js';
+
+/** The immutable ID the mock runtime reports for the locally built transport sidecar image. */
+export const MOCK_TRANSPORT_SIDECAR_IMAGE_ID = `sha256:${'5'.repeat(64)}`;
+
+/** Synthetic public fixture credentials; never used against a real proxy. */
+export function testTcpTransportCredentials() {
+  return {
+    mcpToken: '1'.repeat(64),
+    proxyAuthorization: { header: `Basic ${Buffer.from(`ironcurtain:${'2'.repeat(43)}`).toString('base64')}` },
+  };
+}
 
 /**
  * Call-tracking for `createMockDocker`. When a tracker is passed in,
@@ -77,6 +89,7 @@ export function createMockDocker(options: CreateMockDockerOptions = {}): Contain
   const imageIds = new Map<string, string>();
   let createSeq = 0;
   let commitSeq = 0;
+  const createdConfigs = new Map<string, DockerContainerConfig>();
 
   return {
     supportsImageSnapshots: true,
@@ -85,9 +98,9 @@ export function createMockDocker(options: CreateMockDockerOptions = {}): Contain
     async preflight() {},
     async create(config: DockerContainerConfig) {
       tracker?.createCalls.push(config);
-      if (createOverride) return createOverride(config);
-      createSeq++;
-      return `container-${createSeq}`;
+      const id = createOverride ? await createOverride(config) : `container-${++createSeq}`;
+      createdConfigs.set(id, config);
+      return id;
     },
     async start(id: string) {
       tracker?.startCalls.push(id);
@@ -106,8 +119,6 @@ export function createMockDocker(options: CreateMockDockerOptions = {}): Contain
       return true;
     },
     async imageExists(image: string) {
-      // alpine/socat is always available (no build needed).
-      if (image === 'alpine/socat') return true;
       if (image.startsWith('sha256:')) return imageIds.has(image);
       // Other images "exist" once they have been built (have labels).
       // Tests that want all images to exist without building pass a
@@ -136,6 +147,19 @@ export function createMockDocker(options: CreateMockDockerOptions = {}): Contain
       return images;
     },
     async inspectImage(ref: string) {
+      // The transport sidecar image resolves to a fixed immutable ID once it
+      // has been built, carrying the labels the build stamped
+      // (transport-sidecar-image.ts verifies them).
+      if (ref === TRANSPORT_SIDECAR_IMAGE) {
+        const built = labels.get(ref);
+        if (built === undefined) return undefined;
+        return {
+          id: MOCK_TRANSPORT_SIDECAR_IMAGE_ID,
+          repoTags: [ref],
+          labels: built,
+          created: new Date(0).toISOString(),
+        };
+      }
       if (!imageIds.has(ref)) return undefined;
       return { id: ref, repoTags: [], labels: {}, created: new Date(0).toISOString() };
     },
@@ -149,6 +173,13 @@ export function createMockDocker(options: CreateMockDockerOptions = {}): Contain
     async getImageLabel(image: string, label: string) {
       return labels.get(image)?.[label];
     },
+    async getImageId(nameOrId: string) {
+      // Images only, as inspectImage reports them; containers are not
+      // tracked (tests that need a container's image ID override this).
+      if (imageIds.has(nameOrId)) return nameOrId;
+      if (nameOrId === TRANSPORT_SIDECAR_IMAGE && labels.has(nameOrId)) return MOCK_TRANSPORT_SIDECAR_IMAGE_ID;
+      return undefined;
+    },
     async createNetwork(name: string, networkOptions?: { internal?: boolean; subnet?: string; gateway?: string }) {
       tracker?.createdNetworks.push({ name, options: networkOptions });
     },
@@ -156,8 +187,8 @@ export function createMockDocker(options: CreateMockDockerOptions = {}): Contain
       tracker?.removedNetworks.push(name);
     },
     async connectNetwork() {},
-    async getContainerIp() {
-      return '172.30.0.3';
+    async getContainerIp(containerId: string) {
+      return createdConfigs.get(containerId)?.ipv4Address ?? '172.30.0.3';
     },
     async containerExists() {
       return false;
@@ -247,6 +278,9 @@ export function createMockProxy(socketPath: string, port?: number): DockerProxy 
       };
     },
     async stop() {},
+    getPolicySwapTarget() {
+      return null;
+    },
   };
 }
 
@@ -263,6 +297,12 @@ export function createMockMitmProxy(): MitmProxy {
       listHosts: () => ({ providers: [], dynamic: [] }),
     },
     setTokenSessionId: () => {},
+    setCaptureSessionId: () => {},
+    setCapturePersona: () => {},
+    // No attribution credential: the lease hands back the base URL unchanged.
+    beginMetricsInvocation: (baseProxyUrl) => ({ proxyUrl: baseProxyUrl, end: async () => {} }),
+    // Policy-evaluated egress is off for the mock: it never asks a decider.
+    setEgressAuthorizer: () => {},
   };
 }
 

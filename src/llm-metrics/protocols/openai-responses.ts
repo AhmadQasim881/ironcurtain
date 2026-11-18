@@ -142,6 +142,10 @@ export class OpenAiResponsesAccumulator implements LlmProtocolAccumulator {
     if (model !== null) this.responseModel = model;
     if (id !== null) this.providerResponseId = id;
     if (tier !== null) this.actualServiceTier = tier;
+    // An unrecognized tier may bill at its own prices: never price it as standard.
+    else if (response['service_tier'] !== undefined && response['service_tier'] !== null) {
+      this.flags.add('unknown_response_service_tier');
+    }
     this.usage.observe(response['usage'], terminal);
     const mapped = responseStatus(response['status']);
     if (mapped.stop !== 'not_reported') {

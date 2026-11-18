@@ -1,0 +1,139 @@
+{
+  "$comment": "Reviewed acceptances for the npm audit gate (scripts/check-npm-audit.ts, docs/designs/dependency-hygiene.md). Each entry accepts the listed advisories (GHSA id -> severity at review) in one package, says why they cannot be exploited here, and expires at most 180 days after its review. Remove an entry once its fix is merged; the gate reports such entries as stale.",
+  "entries": [
+    {
+      "package": "@modelcontextprotocol/sdk",
+      "advisories": {
+        "GHSA-6qxp-vccf-f47h": "high",
+        "GHSA-22jm-h49p-29qw": "high",
+        "GHSA-46jr-4wx8-v453": "high"
+      },
+      "reason": "IronCurtain implements its own Code Mode socket transport and does not use SDK HTTP OAuth or configure a task store. Filesystem and memory backends do use SDK tool validators. The coordinator and relay admit at most 4,096 JSON nodes and depth 32 across all fields before forwarding calls to those validators. Code Mode also caps serialized tool arguments at 1 MiB. This bounds validation per call. Aggregate load across concurrent sessions is a separate review item.",
+      "reviewed": "2026-11-18",
+      "expires": "2026-12-31"
+    },
+    {
+      "package": "axios",
+      "advisories": {
+        "GHSA-c29m-xwm3-cm6r": "high",
+        "GHSA-mghh-pgcx-3jjj": "high",
+        "GHSA-x97p-jq2g-jp4f": "high",
+        "GHSA-3pq3-5fj3-cg6v": "high",
+        "GHSA-542g-h47m-68v8": "high",
+        "GHSA-m8m8-qj5v-23w3": "high",
+        "GHSA-r4gj-5m52-g5wh": "high"
+      },
+      "reason": "Only @utcp/mcp depends on axios, to fetch OAuth2 tokens for 'mcp' call templates. IronCurtain registers only its own 'ironcurtain' call templates (src/sandbox/ironcurtain-protocol.ts), so @utcp/mcp never sends a request. Fixed in 1.20.0, inside @utcp/mcp's ^1.11.0: merge the security update.",
+      "reviewed": "2026-11-14",
+      "expires": "2026-12-31"
+    },
+    {
+      "package": "follow-redirects",
+      "advisories": {
+        "GHSA-q3jh-wrc6-jgq8": "high",
+        "GHSA-8r9p-f939-6h3c": "high",
+        "GHSA-mrwp-f3q8-3g9p": "high"
+      },
+      "reason": "Credential headers kept across redirects. Reached only through axios in @utcp/mcp, which never sends a request in IronCurtain (see the axios entry). A fixed release is inside axios's ^1.16.0: merge the security update.",
+      "reviewed": "2026-11-14",
+      "expires": "2026-12-31"
+    },
+    {
+      "package": "body-parser",
+      "advisories": {
+        "GHSA-27r3-jxmh-p828": "high"
+      },
+      "reason": "Denial of service in request body parsing. Reached only through express, which the MCP SDK uses for its HTTP server transports and auth router; no IronCurtain component runs an HTTP MCP server or imports those modules. Fixed in 2.4.0, inside express's ^2.2.1: merge the security update.",
+      "reviewed": "2026-11-14",
+      "expires": "2026-12-31"
+    },
+    {
+      "package": "picomatch",
+      "advisories": {
+        "GHSA-fc5q-39xc-vjpf": "high"
+      },
+      "reason": "The private web UI workspace brings picomatch 4.0.7 into the production dependency tree through phosphor-svelte's optional Vite peer. The builtin harness does not run Vite, and the daemon serves prebuilt UI assets. The owner accepts the availability risk only for builds and local UI development from trusted sources and glob patterns. Exposed development servers and untrusted inputs are outside this acceptance. Review on any change to those conditions and apply a compatible upstream fix when available.",
+      "reviewed": "2026-11-18",
+      "expires": "2026-12-17"
+    },
+    {
+      "package": "proxy-addr",
+      "advisories": {
+        "GHSA-jqcg-44mw-7w3h": "critical"
+      },
+      "reason": "Client IP spoofing through express's 'trust proxy' evaluation. Reached only through express in the MCP SDK's HTTP server modules, which no IronCurtain component runs. Fixed in 2.0.8, inside express's ^2.0.7: merge the security update.",
+      "reviewed": "2026-11-14",
+      "expires": "2026-12-31"
+    },
+    {
+      "package": "devalue",
+      "advisories": {
+        "GHSA-j22f-vq7h-c4qm": "high",
+        "GHSA-mcm9-63f2-9j32": "high",
+        "GHSA-x5rw-q4pp-hg5g": "high",
+        "GHSA-r9w8-h9r3-54w4": "high"
+      },
+      "reason": "Serializer and reviver issues. Svelte imports devalue only in its server renderer (svelte/src/internal/server); the web UI is a client-only build, so devalue is not in the shipped bundle and never runs. A fixed release is inside svelte's ^5.9.2: merge the security update.",
+      "reviewed": "2026-11-14",
+      "expires": "2026-12-31"
+    },
+    {
+      "package": "dompurify",
+      "advisories": {
+        "GHSA-cg2g-xh64-v4q7": "critical",
+        "GHSA-mrv2-3pqr-j5jr": "high"
+      },
+      "reason": "The bypasses need SAFE_FOR_TEMPLATES with a DOM return mode, or IN_PLACE sanitizing with a node-removing hook. The web UI sanitizes markdown HTML from string to string with neither option (packages/web-ui/src/lib/markdown.ts). The sanitizer is bundled into dist/web-ui-static: a fix reaches users only with the next release. A fixed release is inside ^3.4.16: merge the security update and release.",
+      "reviewed": "2026-11-14",
+      "expires": "2026-12-31"
+    },
+    {
+      "package": "sharp",
+      "advisories": {
+        "GHSA-wq5f-xc86-pv6w": "high"
+      },
+      "reason": "librsvg flaw when decoding SVG images. Installed through @huggingface/transformers for the memory server, which only embeds text (a feature-extraction pipeline); sharp never decodes an image there. Fixed in 0.35.5, inside transformers' ^0.35.4: merge the security update.",
+      "reviewed": "2026-11-14",
+      "expires": "2026-12-31"
+    },
+    {
+      "package": "shell-quote",
+      "advisories": {
+        "GHSA-pqg4-j6r4-53mv": "critical"
+      },
+      "reason": "The vulnerable quote() input combines a comment-token object with an untrusted string. IronCurtain passes validated string arguments or internally constructed strings and never passes parse() tokens to quote(). The sandbox-runtime uses its own strings-only shim. A compatible fix is available in 1.11.0.",
+      "reviewed": "2026-11-18",
+      "expires": "2026-12-31"
+    },
+    {
+      "package": "source-map-js",
+      "advisories": {
+        "GHSA-68fv-2mgg-jv7q": "high"
+      },
+      "reason": "Denial of service when parsing an indexed source map. At run time only css-tree (through jsdom) loads it, and only its SourceMapGenerator; postcss consumes source maps only while building the web UI from this repository's own CSS. Fixed in 1.2.2, inside ^1.2.1: merge the security update.",
+      "reviewed": "2026-11-14",
+      "expires": "2026-12-31"
+    },
+    {
+      "package": "undici",
+      "advisories": {
+        "GHSA-xjj6-f33q-929c": "high",
+        "GHSA-qrxm-fqhp-jwvm": "high",
+        "GHSA-4w7w-5xrc-9h26": "high",
+        "GHSA-2m5v-pch6-74hx": "high"
+      },
+      "reason": "The affected copy is jsdom's nested Undici 7.30.0. The fetch server constructs JSDOM without subresource loading or script execution (src/servers/fetch-server.ts). Agent-selected fetch destinations and the Signal bridge use the patched direct Undici 8.12.2. Recheck if jsdom resource loading is enabled or another caller resolves the nested copy. A compatible fix for 7.x starts at 7.30.1.",
+      "reviewed": "2026-11-18",
+      "expires": "2026-12-14"
+    },
+    {
+      "package": "zod",
+      "advisories": {
+        "GHSA-mrhx-c7xc-m3w5": "high"
+      },
+      "reason": "Root Zod is patched at 4.6.6. The remaining 3.25.76 copies belong to @anthropic-ai/sandbox-runtime and @utcp/sdk. The former validates host-generated sandbox settings. The latter accepts backend schemas, but its reviewed collection validators have no upper size constraint affected by this check-order issue. Recheck when either dependency changes. Unconstrained backend schemas and workflow documents still need their own input budgets.",
+      "reviewed": "2026-11-18",
+      "expires": "2027-02-14"
+    }
+  ]
+}

@@ -8,9 +8,13 @@
  * Node instrumentation from delaying or intercepting exact-ID probes.
  *
  * Supported subcommands (everything else fails loudly):
- * - container list/inspect/stop/rm for the leased agent and proxy
+ * - container list/inspect/stop/rm for the leased agent, nested daemon, and proxy
  * - network list/inspect/rm for the leased transport network
- * - `inspect <id>` existence probes for either container
+ * - volume list/inspect/rm for the leased daemon volume
+ * - `inspect <id>` existence probes for any container
+ * - the watchdog's two Docker Desktop readings: `exec` of the VM-disk statfs in
+ *   the nested daemon, and `system df` volume sizes (read from `volumeSizePath`,
+ *   which the test rewrites to grow the volume)
  */
 
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
@@ -35,7 +39,13 @@ const containers = [
     name: config.proxyContainerName,
     removedMarkerPath: config.proxyRemovedMarkerPath,
   },
+  {
+    id: config.daemonContainerId,
+    name: config.daemonContainerName,
+    removedMarkerPath: config.daemonRemovedMarkerPath,
+  },
 ];
+const volumeRemoved = () => existsSync(config.volumeRemovedMarkerPath);
 const activeContainers = () => containers.filter(({ removedMarkerPath }) => !existsSync(removedMarkerPath));
 const containerPayload = (resources) =>
   JSON.stringify(
@@ -93,6 +103,55 @@ if (args[0] === 'inspect' && inspectedContainer !== undefined) {
     process.exit(1);
   }
   writeFileSync(1, `${containerPayload([inspectedContainer])}\n`);
+  process.exit(0);
+}
+if (
+  args[0] === 'exec' &&
+  args[1] === '--user' &&
+  args[2] === '0:0' &&
+  args[3] === config.daemonContainerId &&
+  args.slice(4).join(' ') === '/bin/busybox stat -f -c %S %b %f %a /home/codespace/.local/share'
+) {
+  if (existsSync(config.daemonRemovedMarkerPath)) {
+    process.stderr.write(`Error: No such container: ${config.daemonContainerId}\n`);
+    process.exit(1);
+  }
+  // 4 KiB blocks, 64 GiB disk, plenty free: the runtime reserve never trips here.
+  writeFileSync(1, '4096 16777216 15728640 15728640\n');
+  process.exit(0);
+}
+if (args.join(' ') === 'system df --verbose --format {{json .Volumes}}') {
+  const size = existsSync(config.volumeSizePath) ? readFileSync(config.volumeSizePath, 'utf8').trim() : '0B';
+  const volumes = volumeRemoved() ? [] : [{ Name: config.volumeName, Driver: 'local', Links: '1', Size: size }];
+  writeFileSync(1, `${JSON.stringify(volumes)}\n`);
+  process.exit(0);
+}
+if (args[0] === 'volume' && args[1] === 'ls') {
+  if (!volumeRemoved()) writeFileSync(1, `${config.volumeName}\n`);
+  process.exit(0);
+}
+if (args[0] === 'volume' && args[1] === 'inspect') {
+  if (volumeRemoved() || !args.slice(2).includes(config.volumeName)) {
+    process.stderr.write(`Error: No such volume: ${args.slice(2).join(' ')}\n`);
+    process.exit(1);
+  }
+  writeFileSync(
+    1,
+    `${JSON.stringify([
+      {
+        Name: config.volumeName,
+        CreatedAt: '2026-07-21T00:00:00Z',
+        Driver: 'local',
+        Labels: { [config.labelKey]: config.labelValue },
+        Mountpoint: `/var/lib/docker/volumes/${config.volumeName}/_data`,
+      },
+    ])}\n`,
+  );
+  process.exit(0);
+}
+if (args[0] === 'volume' && args[1] === 'rm' && args[2] === config.volumeName) {
+  writeFileSync(config.volumeRemovedMarkerPath, 'removed\n', { mode: 0o600 });
+  writeFileSync(1, `${config.volumeName}\n`);
   process.exit(0);
 }
 if (args[0] === 'network' && args[1] === 'ls') {

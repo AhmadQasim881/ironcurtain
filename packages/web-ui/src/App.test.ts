@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/svelte';
+import type { RetainedHostNotice } from './lib/session-notices.js';
 
 // ---------------------------------------------------------------------------
 // Stub matchMedia (read for reduced-motion in App.svelte's onMount path).
@@ -33,6 +34,8 @@ const { mockAppState, mockInitConnection } = vi.hoisted(() => ({
     escalationCount: 0,
     activeSessionCount: 0,
     pendingGates: new Map(),
+    pendingWorkflowEscalations: new Map(),
+    retainedHostNotices: [] as readonly RetainedHostNotice[],
     currentView: 'dashboard' as 'dashboard' | 'sessions' | 'escalations' | 'jobs' | 'workflows' | 'personas',
     sessionOutputs: new Map(),
     getOutput: () => [],
@@ -75,9 +78,35 @@ import App from './App.svelte';
 
 describe('App mobile drawer', () => {
   beforeEach(() => {
+    mockAppState.retainedHostNotices = [];
     mockAppState.connected = true;
     mockAppState.hasToken = true;
     mockAppState.currentView = 'dashboard';
+  });
+
+  it('shows a retained host-file warning outside a live session and allows explicit dismissal', async () => {
+    mockAppState.retainedHostNotices = [
+      {
+        key: 'example',
+        label: 1,
+        notice: {
+          kind: 'host_privileged_files',
+          when: 'session end',
+          rootOwned: 1,
+          stripped: 0,
+          unstripped: 0,
+          unlisted: 0,
+          paths: ['/workspace/example\u0007'],
+          incomplete: false,
+          hint: 'Inspect the example file.',
+        },
+      },
+    ];
+    render(App);
+    expect(screen.getByRole('alert').textContent).toContain('Inspect the example file.');
+    expect(screen.getByRole('alert').textContent).toContain('/workspace/example\\u0007');
+    await fireEvent.click(screen.getByRole('button', { name: 'Dismiss warning' }));
+    expect(mockAppState.retainedHostNotices).toHaveLength(0);
   });
 
   it('renders the hamburger button for the mobile top bar', () => {

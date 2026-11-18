@@ -6,8 +6,10 @@ import { v4 as uuidv4 } from 'uuid';
 import { TrustedProcess, type EscalationPromptFn } from '../src/trusted-process/index.js';
 import type { IronCurtainConfig } from '../src/config/types.js';
 import type { ToolCallRequest } from '../src/types/mcp.js';
-import type { CompiledPolicyFile, ToolAnnotationsFile } from '../src/pipeline/types.js';
+import type { CompiledPolicyFile, StoredToolAnnotationsFile } from '../src/pipeline/types.js';
 import { testCompiledPolicy, testToolAnnotations } from './fixtures/test-policy.js';
+import { packagedFilesystemServer } from './helpers/filesystem-server.js';
+import { testUserConfig } from './helpers/user-config.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(__dirname, '..');
@@ -22,21 +24,18 @@ const AUDIT_LOG_PATH = `/tmp/ironcurtain-test-audit-${process.pid}.jsonl`;
 function writeTestArtifacts(
   dir: string,
   compiledPolicy: CompiledPolicyFile,
-  toolAnnotations: ToolAnnotationsFile,
+  toolAnnotations: StoredToolAnnotationsFile,
 ): void {
   mkdirSync(dir, { recursive: true });
   writeFileSync(resolve(dir, 'compiled-policy.json'), JSON.stringify(compiledPolicy));
   writeFileSync(resolve(dir, 'tool-annotations.json'), JSON.stringify(toolAnnotations));
 }
 
-/** Shared userConfig for integration tests (no API keys, auto-features off). */
-const TEST_USER_CONFIG: IronCurtainConfig['userConfig'] = {
-  agentModelId: 'anthropic:claude-sonnet-4-6',
-  policyModelId: 'anthropic:claude-sonnet-4-6',
-  anthropicApiKey: '',
-  googleApiKey: '',
-  openaiApiKey: '',
-  escalationTimeoutSeconds: 300,
+/**
+ * Shared userConfig for integration tests (no API keys, auto-features off,
+ * no stored server credentials, no budget limits).
+ */
+const TEST_USER_CONFIG: IronCurtainConfig['userConfig'] = testUserConfig({
   resourceBudget: {
     maxTotalTokens: null,
     maxSteps: null,
@@ -44,15 +43,7 @@ const TEST_USER_CONFIG: IronCurtainConfig['userConfig'] = {
     maxEstimatedCostUsd: null,
     warnThresholdPercent: 80,
   },
-  autoCompact: {
-    enabled: false,
-    thresholdTokens: 80_000,
-    keepRecentMessages: 10,
-    summaryModelId: 'anthropic:claude-haiku-4-5',
-  },
-  autoApprove: { enabled: false, modelId: 'anthropic:claude-haiku-4-5' },
-  auditRedaction: { enabled: true },
-};
+});
 
 function makeRequest(overrides: Partial<ToolCallRequest> = {}): ToolCallRequest {
   return {
@@ -91,8 +82,11 @@ describe('Integration: TrustedProcess with filesystem MCP server', () => {
       allowedDirectory: SANDBOX_DIR,
       mcpServers: {
         filesystem: {
-          command: 'npx',
-          args: ['-y', '@modelcontextprotocol/server-filesystem', SANDBOX_DIR],
+          ...packagedFilesystemServer(SANDBOX_DIR),
+          // In-process mode never applies an OS sandbox; declare the opt-out
+          // explicitly (as mcp-servers.json does) so the default "enforce"
+          // sandboxPolicy does not refuse the server.
+          sandbox: false,
         },
       },
       protectedPaths: [
@@ -293,10 +287,12 @@ describe('Integration: TrustedProcess with filesystem MCP server', () => {
     const logContent = readFileSync(AUDIT_LOG_PATH, 'utf-8').trim();
     const entries = logContent.split('\n').map((line) => JSON.parse(line));
 
-    // Find the move_file entry -- it should be logged as 'error', not 'success'
+    // Find the move_file outcome entry -- it should be logged as 'error', not
+    // 'success'. The call's write-ahead `dispatching` record precedes it.
     const moveEntry = entries.find(
       (e: Record<string, unknown>) =>
         (e as { toolName: string }).toolName === 'move_file' &&
+        (e as { result: { status: string } }).result.status !== 'dispatching' &&
         (e as { arguments: { source: string } }).arguments.source.includes('does-not-exist'),
     );
     expect(moveEntry).toBeDefined();
@@ -351,12 +347,10 @@ describe('Integration: graceful degradation when MCP server fails to connect', (
         github: {
           command: 'nonexistent-github-server-binary',
           args: [],
+          sandbox: false,
         },
         // The real filesystem server should still work
-        filesystem: {
-          command: 'npx',
-          args: ['-y', '@modelcontextprotocol/server-filesystem', sandboxDir],
-        },
+        filesystem: { ...packagedFilesystemServer(sandboxDir), sandbox: false },
       },
       protectedPaths: [],
       generatedDir,
@@ -367,7 +361,7 @@ describe('Integration: graceful degradation when MCP server fails to connect', (
     };
 
     trustedProcess = new TrustedProcess(config, {
-      onEscalation: async () => 'denied',
+      onEscalation: async () => ({ decision: 'denied' }),
     });
     // initialize() must not throw even though one server fails
     await trustedProcess.initialize();

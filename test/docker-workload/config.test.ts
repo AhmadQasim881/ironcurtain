@@ -2,11 +2,13 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   assertAdmittedDockerWorkloadRuntimeAvailable,
   assertDockerWorkloadVariantAdmitted,
+  DOCKER_WORKLOAD_DISABLE_HINT,
   resolvedDockerWorkloadConfigSchema,
   dockerWorkloadRequestedSchema,
   formatDockerWorkloadStatus,
   resolveDockerWorkloadConfig,
 } from '../../src/docker-workload/config.js';
+import { unsupportedNestedDockerHostReason } from '../../src/docker-workload/environment.js';
 
 const checkAppleContainerAvailable = vi.fn();
 const checkDockerAvailable = vi.fn();
@@ -82,9 +84,40 @@ describe('secure nested Docker configuration', () => {
       resources: {
         memoryMb: 4096,
         cpus: 2,
-        pids: { desired: 512, required: false },
+        daemonShare: 0.5,
+        pids: { desired: 4096, required: false },
         diskMb: null,
       },
+    });
+  });
+
+  it('keeps a configured daemon share and takes the PID budget from dockerResources.pidsLimit', () => {
+    expect(dockerWorkloadRequestedSchema.parse({ enabled: true, resources: { daemonShare: 0.7 } })).toEqual({
+      enabled: true,
+      networkAccess: 'images',
+      resources: { daemonShare: 0.7 },
+    });
+    // Legacy defaults beside the share are still absorbed.
+    expect(
+      dockerWorkloadRequestedSchema.parse({
+        enabled: false,
+        resources: { daemonShare: 0.3, pids: { desired: 512, required: false }, diskMb: null },
+      }),
+    ).toEqual({ enabled: false, resources: { daemonShare: 0.3 } });
+    for (const daemonShare of [0, 0.05, 0.95, 1, Number.NaN]) {
+      expect(dockerWorkloadRequestedSchema.safeParse({ enabled: true, resources: { daemonShare } }).success).toBe(
+        false,
+      );
+    }
+    expect(
+      resolveDockerWorkloadConfig({ enabled: true, resources: { daemonShare: 0.7 } }, { pidsLimit: 10_000 }),
+    ).toMatchObject({ resources: { daemonShare: 0.7, pids: { desired: 10_000, required: false } } });
+    // An unlimited or tiny ordinary ceiling falls back into the nested bounds.
+    expect(resolveDockerWorkloadConfig({ enabled: true }, { pidsLimit: 64 })).toMatchObject({
+      resources: { pids: { desired: 512 } },
+    });
+    expect(resolveDockerWorkloadConfig({ enabled: true }, {})).toMatchObject({
+      resources: { pids: { desired: 4096 } },
     });
   });
 
@@ -183,6 +216,28 @@ describe('secure nested Docker configuration', () => {
     );
   });
 
+  it('tells the user how to restore ordinary sessions when it refuses the host', () => {
+    const enabled = resolveDockerWorkloadConfig({ enabled: true });
+    expect(() => assertDockerWorkloadVariantAdmitted(enabled, 'docker', 'linux', '7.0.0-42-generic')).toThrow(
+      `not this linux host; no image, relay, daemon, or lease action was performed. ${DOCKER_WORKLOAD_DISABLE_HINT}`,
+    );
+    expect(DOCKER_WORKLOAD_DISABLE_HINT).toContain('set dockerWorkload.enabled to false');
+  });
+
+  it('refuses exactly the hosts the settings editors refuse', () => {
+    const enabled = resolveDockerWorkloadConfig({ enabled: true });
+    for (const host of [
+      { platform: 'darwin', release: '25.0.0' },
+      { platform: 'linux', release: '7.0.0-42-generic' },
+      { platform: 'freebsd', release: '14.1-RELEASE' },
+    ] as const) {
+      const refusedBySettings = unsupportedNestedDockerHostReason(host) !== undefined;
+      const admit = () => assertDockerWorkloadVariantAdmitted(enabled, 'docker', host.platform, host.release);
+      if (refusedBySettings) expect(admit).toThrow(/not this .* host/u);
+      else expect(admit).not.toThrow();
+    }
+  });
+
   it('preserves feature-off without applying the runtime or platform admission gate', () => {
     expect(() => assertDockerWorkloadVariantAdmitted(undefined, 'docker', 'linux')).not.toThrow();
     expect(() =>
@@ -222,6 +277,10 @@ describe('secure nested Docker configuration', () => {
     await expect(assertAdmittedDockerWorkloadRuntimeAvailable('docker')).rejects.toThrow(
       /Docker runtime is unavailable: Docker not available \(Start Docker Desktop\.\)/u,
     );
+    checkDockerAvailable.mockResolvedValueOnce({ available: false, reason: 'Docker not available' });
+    await expect(assertAdmittedDockerWorkloadRuntimeAvailable('docker')).rejects.toThrow(
+      `Docker runtime is unavailable: Docker not available. ${DOCKER_WORKLOAD_DISABLE_HINT}`,
+    );
 
     checkAppleContainerAvailable.mockResolvedValueOnce({
       available: false,
@@ -231,6 +290,85 @@ describe('secure nested Docker configuration', () => {
     await expect(assertAdmittedDockerWorkloadRuntimeAvailable('apple-container')).rejects.toThrow(
       /Apple runtime is unavailable: container services not running \(Start them first\.\)/u,
     );
+  });
+
+  it('holds only the online network modes to the isolated-relay engine requirement', async () => {
+    const originalPlatform = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'darwin' });
+    try {
+      checkDockerAvailable.mockResolvedValue({
+        available: true,
+        server: {
+          architecture: 'arm64',
+          operatingSystem: 'Docker Desktop',
+          osType: 'linux',
+          serverVersion: '27.5.1',
+          kernelVersion: '6.10',
+          cgroupVersion: '2',
+          securityOptions: ['name=seccomp,profile=builtin', 'name=cgroupns'],
+        },
+      });
+      await expect(assertAdmittedDockerWorkloadRuntimeAvailable('docker', 'offline')).resolves.toMatchObject({
+        profile: 'macos-desktop',
+      });
+      await expect(assertAdmittedDockerWorkloadRuntimeAvailable('docker', 'images')).rejects.toThrow(
+        `Update Docker Desktop, or use networkAccess "offline". ${DOCKER_WORKLOAD_DISABLE_HINT}`,
+      );
+      // Without a mode the stricter online requirement applies.
+      await expect(assertAdmittedDockerWorkloadRuntimeAvailable('docker')).rejects.toThrow(/Docker Engine 28/u);
+    } finally {
+      Object.defineProperty(process, 'platform', { value: originalPlatform });
+    }
+  });
+
+  it('refuses a non-Desktop macOS engine before any provisioning, with the disable hint', async () => {
+    const originalPlatform = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'darwin' });
+    try {
+      checkDockerAvailable.mockResolvedValueOnce({
+        available: true,
+        server: {
+          architecture: 'arm64',
+          operatingSystem: 'OrbStack',
+          osType: 'linux',
+          serverVersion: '28.3.3',
+          kernelVersion: '6.15',
+          cgroupVersion: '2',
+          securityOptions: ['name=seccomp,profile=builtin', 'name=cgroupns'],
+        },
+      });
+      await expect(assertAdmittedDockerWorkloadRuntimeAvailable('docker', 'images')).rejects.toThrow(
+        /Nested Docker on macOS requires Docker Desktop; the selected server reports operating system "OrbStack".*To run ordinary Docker sessions/u,
+      );
+    } finally {
+      Object.defineProperty(process, 'platform', { value: originalPlatform });
+    }
+  });
+
+  it('adds the disable hint when the selected Docker server is not a qualified profile', async () => {
+    const originalPlatform = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'linux' });
+    try {
+      checkDockerAvailable.mockResolvedValueOnce({
+        available: true,
+        server: {
+          architecture: 'amd64',
+          operatingSystem: 'Ubuntu 26.04.1 LTS',
+          osType: 'linux',
+          serverVersion: '29.1.3',
+          kernelVersion: '6.18',
+          cgroupVersion: '2',
+          securityOptions: ['name=seccomp,profile=builtin', 'name=cgroupns'],
+        },
+      });
+      const failure = assertAdmittedDockerWorkloadRuntimeAvailable('docker');
+      await expect(failure).rejects.toThrow(
+        `Nested Docker on WSL2 requires Docker Desktop; the selected server is not Docker Desktop. ${DOCKER_WORKLOAD_DISABLE_HINT}`,
+      );
+      await expect(failure).rejects.toHaveProperty('cause.message', expect.stringContaining('not Docker Desktop'));
+    } finally {
+      Object.defineProperty(process, 'platform', { value: originalPlatform });
+    }
   });
 
   it('rejects raw runtime authority', () => {
@@ -275,6 +413,8 @@ describe('secure nested Docker configuration', () => {
         resources: { diskMb: null },
       }).success,
     ).toBe(true);
-    expect(resolveDockerWorkloadConfig({ enabled: true }).resources.diskMb).toBeNull();
+    const resolved = resolveDockerWorkloadConfig({ enabled: true });
+    if (!resolved.enabled) expect.unreachable('an explicit opt-in resolves to an enabled configuration');
+    expect(resolved.resources.diskMb).toBeNull();
   });
 });

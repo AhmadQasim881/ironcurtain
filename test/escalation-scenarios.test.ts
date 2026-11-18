@@ -15,11 +15,12 @@
 
 import 'dotenv/config';
 import { describe, it, expect, beforeAll } from 'vitest';
-import { PolicyEngine } from '../src/trusted-process/policy-engine.js';
+import { PolicyEngine, reasonForAutoApprover } from '../src/trusted-process/policy-engine.js';
 import {
   autoApprove,
   extractArgsForAutoApprove,
   sanitizeForPrompt,
+  unanchoredArguments,
   type AutoApproveContext,
 } from '../src/trusted-process/auto-approver.js';
 import { createLanguageModelFromEnv } from '../src/config/model-provider.js';
@@ -81,6 +82,22 @@ describe('Escalation scenarios — policy engine validation', () => {
     }
   });
 
+  /** The approver's view of a scenario's arguments, built the way the pipeline builds it. */
+  function extractForScenario(scenario: EscalationScenario, annotation: ToolAnnotation | undefined) {
+    const result = engine.evaluate({
+      requestId: 'test',
+      serverName: scenario.request.serverName,
+      toolName: scenario.request.toolName,
+      arguments: scenario.request.arguments,
+      timestamp: new Date().toISOString(),
+    });
+    return extractArgsForAutoApprove(scenario.request.arguments, annotation, {
+      escalatedRoles: result.escalatedRoles,
+      destinationGate: result.rule === 'structural-domain-escalate',
+      allowedDirectory: SANDBOX_DIR,
+    });
+  }
+
   describe('arg extraction produces resource identifiers for non-injection scenarios', () => {
     const nonInjection = scenarios.filter((s) => s.category !== 'prompt-injection');
 
@@ -89,15 +106,20 @@ describe('Escalation scenarios — policy engine validation', () => {
         const annotation = getAnnotation(scenario);
         expect(annotation).toBeDefined();
 
-        const extracted = extractArgsForAutoApprove(scenario.request.arguments, annotation);
+        const extracted = extractForScenario(scenario, annotation);
 
         // Every non-injection scenario has at least one resource-identifier arg
         expect(extracted).toBeDefined();
         expect(Object.keys(extracted!).length).toBeGreaterThan(0);
 
-        // All extracted values should be strings
-        for (const val of Object.values(extracted!)) {
-          expect(typeof val).toBe('string');
+        // Every argument is described by string values and literal anchor requirements
+        for (const arg of Object.values(extracted!)) {
+          expect(['path', 'destination', 'identifier']).toContain(arg.kind);
+          for (const val of arg.values) expect(typeof val).toBe('string');
+          expect(arg.anchors.length).toBeGreaterThan(0);
+          for (const requirement of arg.anchors) {
+            for (const anchor of requirement) expect(typeof anchor).toBe('string');
+          }
         }
 
         // Opaque args (content, mode, branch) should NOT be in extracted
@@ -106,6 +128,51 @@ describe('Escalation scenarios — policy engine validation', () => {
         expect(extracted).not.toHaveProperty('mode');
       });
     }
+  });
+
+  describe('injected argument text never reaches the approver as prose', () => {
+    const injectionScenarios = scenarios.filter((s) => s.category === 'prompt-injection');
+
+    it('shows a git remote only as its destination host, never the injected URL', () => {
+      const scenario = injectionScenarios.find((s) => s.label.includes('git remote'));
+      expect(scenario).toBeDefined();
+      const extracted = extractForScenario(scenario!, getAnnotation(scenario!));
+      expect(extracted?.remote.kind).toBe('destination');
+      expect(JSON.stringify(extracted)).not.toContain('APPROVE');
+      // URL canonicalization percent-encodes the spaces, so the destination
+      // resolves to github.com; the injected path never appears and a URL
+      // remote has no name to anchor on, only its host.
+      expect(extracted?.remote.values).toEqual(['github.com']);
+      expect(extracted?.remote.remote).toBeUndefined();
+      expect(extracted?.remote.anchors).toEqual([['github.com']]);
+    });
+
+    it('shows a fetch URL only as its host, dropping the injection in the query string', () => {
+      const scenario = injectionScenarios.find((s) => s.label.includes('fetch URL'));
+      expect(scenario).toBeDefined();
+      const extracted = extractForScenario(scenario!, getAnnotation(scenario!));
+      // A private-network literal: a cloud-metadata destination is denied
+      // structurally and never reaches the approver (WP-28).
+      expect(extracted?.url.values).toEqual(['10.0.0.1']);
+      expect(JSON.stringify(extracted)).not.toContain('approve');
+      expect(JSON.stringify(extracted)).not.toContain('admin');
+    });
+
+    it('does not anchor an injected path in a vague message, so the model is never consulted', () => {
+      const scenario = injectionScenarios.find((s) => s.label.includes('embedded APPROVE'));
+      expect(scenario).toBeDefined();
+      const extracted = extractForScenario(scenario!, getAnnotation(scenario!));
+      expect(extracted?.path.escalated).toBe(true);
+      expect(
+        unanchoredArguments({
+          userMessage: scenario!.userMessage,
+          toolName: 'filesystem/read_file',
+          rule: 'escalate-read-outside-permitted-areas',
+          escalationReason: 'fixed',
+          arguments: extracted,
+        }),
+      ).toEqual(['path']);
+    });
   });
 
   describe('sanitizeForPrompt handles injection attempts', () => {
@@ -169,7 +236,6 @@ describe.skipIf(!process.env.LLM_INTEGRATION_TEST)(
     for (const scenario of scenarios) {
       it(`[${scenario.category}] ${scenario.expectedAutoApprove}s: ${scenario.label}`, async () => {
         const annotation = getAnnotation(scenario);
-        const extracted = extractArgsForAutoApprove(scenario.request.arguments, annotation);
 
         // Build the escalation reason from the policy engine
         const policyResult = engine.evaluate({
@@ -179,11 +245,17 @@ describe.skipIf(!process.env.LLM_INTEGRATION_TEST)(
           arguments: scenario.request.arguments,
           timestamp: new Date().toISOString(),
         });
+        const extracted = extractArgsForAutoApprove(scenario.request.arguments, annotation, {
+          escalatedRoles: policyResult.escalatedRoles,
+          destinationGate: policyResult.rule === 'structural-domain-escalate',
+          allowedDirectory: SANDBOX_DIR,
+        });
 
         const context: AutoApproveContext = {
           userMessage: scenario.userMessage,
           toolName: `${scenario.request.serverName}/${scenario.request.toolName}`,
-          escalationReason: policyResult.reason,
+          rule: policyResult.rule,
+          escalationReason: reasonForAutoApprover(policyResult),
           arguments: extracted,
         };
 

@@ -1,5 +1,7 @@
 # Parallel Server Compilation
 
+**Status (2026-11-14):** Implemented: `compile-policy` compiles servers in parallel (`src/pipeline/pipeline-runner.ts`).
+
 ## Overview
 
 `compileAllServers()` in `pipeline-runner.ts` processes servers sequentially in a `for` loop. Per the performance investigation (`compile-policy-performance.md`), all 5 exec-assistant servers are independent -- their compilation, scenario generation, and verification have no cross-server dependencies. Sequential execution means total time = sum of all servers (~16.4 min). Parallel execution would reduce this to time of slowest server (~7 min for git).
@@ -408,12 +410,13 @@ Extend `ServerCompilationUnit` to include `model: LanguageModel` and `logContext
 - `wrapSystemPrompt(prompt)` returns a new object or the input string -- no mutation
 - `wrapTools(tools)` returns a new object via `Object.fromEntries()` -- no mutation
 - `applyHistoryBreakpoint(messages)` returns a shallow copy -- no mutation of input
+- `applyStepBreakpoint(messages)` (added later for the builtin agent's per-step breakpoint) returns a shallow copy -- no mutation of input
 
 **Conclusion: `this.cacheStrategy` is safe for concurrent use.** No per-server instances needed. A single shared instance can be used by all concurrent `compileServer()` calls without any risk of data races. The `compileServer()` code uses it at two sites (line 749 for compiler system prompt, line 877 for verifier system prompt, and line 1033 for repair verifier prompt, plus line 1360 for scenario generation) and all calls are pure projections.
 
 ### MCP proxy contention -- dismissed (Issue 3)
 
-The original design considered whether two servers could contend on the same underlying MCP server via `resolveServerLists()`. **This concern is dismissed.** Each server entry in `tool-annotations.json` corresponds to a distinct MCP server process. Two servers never refer to the same underlying MCP server -- that does not make sense in practice. The `resolveServerLists()` function connects to its own proxy per invocation and shuts it down in the `finally` block. No cross-server contention exists.
+The original design considered whether two servers could contend on the same underlying MCP server via `resolveServerLists()`. **This concern is dismissed.** Each server entry in `tool-annotations.json` corresponds to a distinct MCP server process. Two servers never refer to the same underlying MCP server -- that does not make sense in practice. Each server's compile opens its own mediated connection (only when a data-backed list misses the list cache), reuses it for every list resolution of that compile, and shuts it down when the server's compile ends. No cross-server contention exists.
 
 ---
 

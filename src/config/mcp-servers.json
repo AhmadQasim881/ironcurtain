@@ -1,9 +1,16 @@
 {
   "filesystem": {
     "description": "Read, write, search, and manage files and directories",
-    "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp/ironcurtain-sandbox"],
-    "sandbox": false
+    "command": "node",
+    "args": ["node_modules/@modelcontextprotocol/server-filesystem/dist/index.js", "/tmp/ironcurtain-sandbox"],
+    "_comment": "Runs the exact version pinned in package.json dependencies (the one tool-annotations.json describes); the node_modules/ path is resolved from IronCurtain's package root. Never launch it through npx, which resolves the package and .npmrc from the working directory and would otherwise run whatever upstream tags as latest. The allowed directory must stay the last argument (applyAllowedDirectoryToMcpArgs replaces it).",
+    "_comment2": "Confined to its MCP roots (docs/designs/filesystem-server-confinement.md): the server validates a path and then reopens it by name, so an agent that can rename workspace entries (Docker mode) could swap a directory for a symlink in between. Under srt (bubblewrap on Linux, Seatbelt on macOS) the home, temporary and runtime directories are hidden and only the roots are exposed, so such a swap leads nowhere the roots do not reach. The relay restarts the server whenever its roots change. Never set sandbox to false here.",
+    "sandbox": {
+      "filesystem": {
+        "confineToRoots": true
+      },
+      "network": false
+    }
   },
   "git": {
     "description": "Git version control operations (commits, branches, diffs, etc.)",
@@ -26,16 +33,20 @@
     "command": "tsx",
     "args": ["./src/servers/fetch-server.ts"],
     "sandbox": false,
-    "_comment": "sandbox: false because srt's network sandbox (seccomp/bubblewrap) blocks Unix domain sockets needed by tsx in dev mode and cannot selectively allow network while restricting filesystem. The policy engine handles URL-level security (SSRF blocking, domain allowlists) independently."
+    "_comment": "sandbox: false because srt's network sandbox (seccomp/bubblewrap) blocks Unix domain sockets needed by tsx in dev mode and cannot selectively allow network while restricting filesystem. Without sandbox.network.allowedDomains the policy engine gates fetch with its default ['*']: names pass to the compiled rules, IP literals escalate, and localhost, *.localhost, *.local, *.internal and cloud-metadata hosts are denied structurally; nothing at the policy layer resolves names. SSRF defence is in the fetch server itself (src/servers/guarded-fetch.ts): every connection is screened at connect time, so loopback, private, link-local and metadata addresses are refused (DNS rebinding included), and cross-origin redirects are returned to the agent instead of followed. fetch.allowPrivateNetworks in ~/.ironcurtain/config.json admits private destinations named literally in a URL (as an IP literal, which the policy escalates; local hostnames stay denied)."
   },
   "github": {
     "description": "GitHub API operations (issues, pull requests, repos, search)",
     "command": "docker",
     "args": [
-      "run", "-i", "--rm",
-      "-e", "GITHUB_PERSONAL_ACCESS_TOKEN",
-      "ghcr.io/github/github-mcp-server"
+      "run",
+      "-i",
+      "--rm",
+      "-e",
+      "GITHUB_PERSONAL_ACCESS_TOKEN",
+      "ghcr.io/github/github-mcp-server@sha256:f6056fc10bfffcc8c81a6417a2e9ca12808647e8dd6049642a4feaadee0e0f8a"
     ],
+    "_comment": "Pinned by digest to the github-mcp-server v2.1.0 release (the digest its :v2.1.0 tag resolved to). This container receives the user's GitHub token, and policy evaluates only the arguments tool-annotations.json classifies: the shipped entry covers this release's issue_write, pull_request_review_write and sub_issue_write arguments, while its other new tools and arguments are unannotated, so calls using them are denied until the server is re-annotated. A mutable tag would let an upstream push change which arguments policy sees (v2.0 added issue_write.parent_owner/parent_repo, a cross-repository write) without any change here. To upgrade: replace the digest with that of the reviewed release, run `ironcurtain annotate-tools --server github`, review the result, promote it with scripts/stamp-package-annotations.ts and recompile the policy; `ironcurtain annotate-tools --check --server github` and `ironcurtain doctor` report the drift until then.",
     "sandbox": false
   },
   "google-workspace": {
@@ -47,7 +58,7 @@
     "_comment2": "On Linux, the @anthropic-ai/sandbox-runtime apply-seccomp binary is executed from node_modules inside the sandbox. Denying ~ blocks access to this binary if the project is in the home directory. We deny specific sensitive directories instead. TODO: separate development and production into different sandbox configs.",
     "sandbox": {
       "filesystem": {
-        "denyRead": ["~/.gnupg", "~/.aws", "~/.ssh"]
+        "denyRead": ["~/.gnupg", "~/.aws", "~/.ssh", "~/.ironcurtain/oauth"]
       },
       "network": {
         "allowedDomains": [

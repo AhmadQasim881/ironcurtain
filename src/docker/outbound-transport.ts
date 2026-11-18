@@ -26,6 +26,11 @@
  * whose destination is attacker-influenced (registry-egress redirect following)
  * can *require* it instead of assuming it.
  *
+ * The direct transport keeps one keep-alive pool per address policy and passes
+ * it on every request, because the guarded resolver only screens the sockets a
+ * pool opens: a socket opened for a trusted private provider gateway must never
+ * serve a public-only request for the same name and port.
+ *
  * ## Accepted residual: no address pinning through the parent
  *
  * On the direct path the screened answer set is also the answer set used to
@@ -40,6 +45,22 @@
  * project's trusted-host model (an IronCurtain-owned parent on a trusted host,
  * reaching a reviewed frozen set of origins) and is recorded here rather than
  * left implied.
+ *
+ * ## Not yet wired: the parent-proxy transport
+ *
+ * Production uses only {@link createDirectOutboundTransport}: the provider MITM
+ * creates one by default and shares it with the registry proxy, the nested
+ * registry-egress listener is handed one, and package egress refuses an
+ * injected transport. {@link createParentProxyOutboundTransport} has no
+ * production caller. It is the transport an inner IronCurtain coordinator
+ * would select from trusted parent-bootstrap state in the
+ * IronCurtain-in-IronCurtain slice, which is reserved and not scheduled
+ * (docs/designs/ironcurtain-in-ironcurtain-hermetic-slice.md). It is kept,
+ * with its tests, as that slice's foundation, and is never a user-configurable
+ * parent-proxy setting.
+ *
+ * The address classifiers and the guarded resolver live in the shared leaf
+ * `src/net/address-policy.ts`; they are re-exported here for existing callers.
  */
 
 import * as dns from 'node:dns';
@@ -47,11 +68,21 @@ import * as http from 'node:http';
 import * as https from 'node:https';
 import * as net from 'node:net';
 import * as tls from 'node:tls';
-import { domainToASCII } from 'node:url';
 import type { Duplex } from 'node:stream';
 
+import {
+  canonicalizeHostname,
+  createGuardedLookup,
+  isAddressAllowed,
+  isLocalOrMetadataHostname,
+  isMetadataHostname,
+  type AddressPolicy,
+} from '../net/address-policy.js';
+
+export { createGuardedLookup, isPublicAddress } from '../net/address-policy.js';
+
 export type OutboundProtocol = 'http:' | 'https:';
-export type OutboundAddressPolicy = 'public-only' | 'trusted-provider-override';
+export type OutboundAddressPolicy = AddressPolicy;
 
 export interface OutboundDestination {
   readonly protocol: OutboundProtocol;
@@ -88,6 +119,8 @@ export interface OutboundTransport {
   /** Checked capability, not an assumption; see {@link OutboundAddressGuard}. */
   readonly addressGuard: OutboundAddressGuard;
   request(request: DestinationBoundRequest, onResponse?: (response: http.IncomingMessage) => void): http.ClientRequest;
+  /** Drop the transport's pooled idle connections. Its owner calls this when it stops using the transport. */
+  close?(): void;
 }
 
 export interface DirectOutboundTransportOptions {
@@ -111,10 +144,31 @@ export interface ParentProxyOutboundTransportOptions {
   readonly allowPrivateDestinationsForTests?: boolean;
 }
 
+/**
+ * One keep-alive pool per address policy. The guarded resolver runs only when a
+ * pool opens a new socket, and Node keys pooled sockets by host and port (plus
+ * TLS options), never by resolver. A single shared pool, such as Node's global
+ * agents, would therefore hand a socket that the trusted-provider lookup opened
+ * to a private gateway to a later public-only request for the same name and
+ * port (an approved passthrough host, a plain-HTTP or `ws://` passthrough),
+ * skipping that request's address screen.
+ */
+interface AddressPolicyPool {
+  readonly lookup: typeof dns.lookup;
+  readonly http: http.Agent;
+  readonly https: https.Agent;
+}
+
+function createAddressPolicyPool(lookup: typeof dns.lookup): AddressPolicyPool {
+  // The same pooling behavior as Node's global agents.
+  const agentOptions = { keepAlive: true, scheduling: 'lifo', timeout: 5_000, lookup } as const;
+  return { lookup, http: new http.Agent(agentOptions), https: new https.Agent(agentOptions) };
+}
+
 export function createDirectOutboundTransport(options: DirectOutboundTransportOptions = {}): OutboundTransport {
   const resolver = options.lookup ?? dns.lookup;
-  const publicLookup = createGuardedLookup(resolver, false);
-  const trustedPrivateLookup = createGuardedLookup(resolver, true);
+  const publicPool = createAddressPolicyPool(createGuardedLookup(resolver, false));
+  const trustedPrivatePool = createAddressPolicyPool(createGuardedLookup(resolver, true));
   const allowPrivateForEveryRequest = options.allowPrivateDestinationsForTests === true;
   return {
     kind: 'direct',
@@ -122,21 +176,35 @@ export function createDirectOutboundTransport(options: DirectOutboundTransportOp
     request(request, onResponse) {
       const allowPrivate = allowPrivateForEveryRequest || request.addressPolicy === 'trusted-provider-override';
       const normalized = normalizeRequest(request, allowPrivate);
+      // Every request names its policy's pool explicitly: no request, including
+      // the passthrough WebSocket bridge, falls back to a shared global agent.
+      const pool = allowPrivate ? trustedPrivatePool : publicPool;
       const requestOptions: http.RequestOptions = {
         hostname: normalized.destination.hostname,
         port: normalized.destination.port,
         method: normalized.method,
         path: normalized.path,
         headers: normalized.headers,
-        lookup: allowPrivate ? trustedPrivateLookup : publicLookup,
+        lookup: pool.lookup,
       };
       return normalized.destination.protocol === 'https:'
-        ? https.request(requestOptions, onResponse)
-        : http.request(requestOptions, onResponse);
+        ? https.request({ ...requestOptions, agent: pool.https }, onResponse)
+        : http.request({ ...requestOptions, agent: pool.http }, onResponse);
+    },
+    close() {
+      for (const pool of [publicPool, trustedPrivatePool]) {
+        pool.http.destroy();
+        pool.https.destroy();
+      }
     },
   };
 }
 
+/**
+ * Route every request through one fixed parent HTTP proxy. Not yet wired: no
+ * production path calls this; it is reserved for the IronCurtain-in-IronCurtain
+ * slice (see the module comment).
+ */
 export function createParentProxyOutboundTransport(options: ParentProxyOutboundTransportOptions): OutboundTransport {
   const proxy = normalizeProxyEndpoint(options.proxy);
   const resolver = options.lookup ?? dns.lookup;
@@ -337,16 +405,18 @@ function normalizeHeaders(
   for (const [name, value] of Object.entries(headers ?? {})) {
     const lower = name.toLowerCase();
     // This is the final destination-bound transport, not a general forwarding
-    // proxy: its callers own message framing and have already stripped the
-    // full request-direction hop-by-hop set (see `HOP_BY_HOP_HEADERS`). It
-    // deliberately strips only the proxy-routing headers and rewrites `host` —
-    // stripping `transfer-encoding` here would corrupt the chunked LLM request
-    // bodies streamed through it (mitm-proxy `forwardRequest`).
+    // proxy: its callers own message framing and strip the request-direction
+    // hop-by-hop set themselves (`stripHopByHopRequestHeaders`, which keeps a
+    // streamed body's framing headers). It deliberately strips only the
+    // proxy-routing headers and rewrites `host` — stripping `transfer-encoding`
+    // here would corrupt the chunked LLM request bodies streamed through it
+    // (mitm-proxy `forwardRequest`).
     if (lower === 'host' || lower === 'proxy-authorization' || lower === 'proxy-connection') continue;
     const invalidValue =
       (typeof value === 'string' && /[\r\n]/u.test(value)) ||
       (Array.isArray(value) && value.some((entry) => /[\r\n]/u.test(entry)));
-    if (name === '' || /[^!#$%&'*+.^_a-z0-9|~-]/iu.test(name) || invalidValue) {
+    // RFC 9110 §5.6.2 token characters, the backtick included.
+    if (name === '' || /[^!#$%&'*+.^_`a-z0-9|~-]/iu.test(name) || invalidValue) {
       throw new Error(`invalid outbound header: ${name}`);
     }
     if (value !== undefined) result[lower] = value;
@@ -355,17 +425,15 @@ function normalizeHeaders(
   return result;
 }
 
+/**
+ * The shared canonical spelling (lowercase, no trailing dot, IDNA ASCII), so
+ * a destination is screened and connected under exactly the name the MITM
+ * proxy's allowlists are keyed by. IPv6 literals are refused here as before:
+ * the transports take IPv4 literals and names only.
+ */
 function normalizeHostname(value: string): string {
-  const candidate = value.trim().replace(/\.$/u, '').toLowerCase();
-  const ascii = domainToASCII(candidate);
-  if (
-    ascii === '' ||
-    ascii.length > 253 ||
-    /[\r\n/:]/u.test(ascii) ||
-    ascii.split('.').some((label) => label === '' || label.length > 63)
-  ) {
-    throw new Error(`invalid outbound hostname: ${value}`);
-  }
+  const ascii = canonicalizeHostname(value);
+  if (ascii === undefined) throw new Error(`invalid outbound hostname: ${value}`);
   return ascii;
 }
 
@@ -375,143 +443,21 @@ function normalizePort(port: number): number {
 }
 
 function assertHostnameIsEligible(hostname: string, allowPrivate: boolean): void {
-  const lower = hostname.toLowerCase();
-  if (lower === 'metadata.google.internal') {
+  // Metadata names are refused under every policy, including the trusted
+  // provider override; other local names only under public-only.
+  if (isMetadataHostname(hostname)) {
     throw new Error(`outbound destination is metadata-scoped: ${hostname}`);
   }
-  if (
-    !allowPrivate &&
-    (lower === 'localhost' ||
-      lower.endsWith('.localhost') ||
-      lower.endsWith('.local') ||
-      lower.endsWith('.internal') ||
-      lower.endsWith('.docker.internal'))
-  ) {
+  if (!allowPrivate && isLocalOrMetadataHostname(hostname)) {
     throw new Error(`outbound destination is local or metadata-scoped: ${hostname}`);
   }
-  if (net.isIP(hostname) !== 0 && !(allowPrivate ? isTrustedProviderAddress(hostname) : isPublicAddress(hostname))) {
+  if (net.isIP(hostname) !== 0 && !isAddressAllowed(hostname, allowPrivate)) {
     throw new Error(
       allowPrivate
         ? `outbound destination address is not allowed by its address policy: ${hostname}`
         : `outbound destination address is not public: ${hostname}`,
     );
   }
-}
-
-/**
- * Wrap a resolver so it fails the whole lookup when *any* returned address is
- * non-public. This is the single implementation of the address policy for name
- * destinations; it is shared by the direct transport (as `RequestOptions.lookup`),
- * by the fixed-parent transport's destination screen, and by the MITM proxy's
- * raw passthrough tunnel, so none of them can drift from the others.
- */
-export function createGuardedLookup(lookup: typeof dns.lookup, allowPrivate: boolean): typeof dns.lookup {
-  type LookupResult = string | dns.LookupAddress[];
-  type LookupCallback = (error: NodeJS.ErrnoException | null, result: LookupResult, family?: number) => void;
-  const invokeLookup = lookup as unknown as (
-    hostname: string,
-    options: dns.LookupAllOptions,
-    callback: LookupCallback,
-  ) => void;
-  return ((hostname: string, options: dns.LookupOptions, callback: LookupCallback) => {
-    const allOptions: dns.LookupAllOptions = { ...options, all: true, verbatim: true };
-    invokeLookup(hostname, allOptions, (error, result, family) => {
-      if (error) {
-        callback(error, []);
-        return;
-      }
-      const addresses = Array.isArray(result) ? result : [{ address: result, family: family === 6 ? 6 : 4 }];
-      if (
-        addresses.length === 0 ||
-        addresses.some(
-          (entry) =>
-            net.isIP(entry.address) === 0 ||
-            !(allowPrivate ? isTrustedProviderAddress(entry.address) : isPublicAddress(entry.address)),
-        )
-      ) {
-        callback(new Error(`DNS resolution for ${hostname} included a non-public address or disallowed address`), []);
-        return;
-      }
-      if (options.all) callback(null, addresses);
-      else {
-        const selected = addresses[0];
-        callback(null, selected.address, selected.family);
-      }
-    });
-  }) as typeof dns.lookup;
-}
-
-/** Conservative routability classifier used for SSRF and rebinding defense. */
-export function isPublicAddress(address: string): boolean {
-  const family = net.isIP(address);
-  if (family === 4) {
-    const octets = address.split('.').map(Number);
-    const value = (((octets[0] << 24) >>> 0) + (octets[1] << 16) + (octets[2] << 8) + octets[3]) >>> 0;
-    return ![
-      ['0.0.0.0', 8],
-      ['10.0.0.0', 8],
-      ['100.64.0.0', 10],
-      ['127.0.0.0', 8],
-      ['169.254.0.0', 16],
-      ['172.16.0.0', 12],
-      ['192.0.0.0', 24],
-      ['192.0.2.0', 24],
-      ['192.168.0.0', 16],
-      ['198.18.0.0', 15],
-      ['198.51.100.0', 24],
-      ['203.0.113.0', 24],
-      ['224.0.0.0', 4],
-      ['240.0.0.0', 4],
-    ].some(([network, bits]) => ipv4InCidr(value, String(network), Number(bits)));
-  }
-  if (family === 6) {
-    const normalized = address.toLowerCase();
-    if (normalized.startsWith('::ffff:')) return isPublicAddress(normalized.slice('::ffff:'.length));
-    return !(
-      normalized === '::' ||
-      normalized === '::1' ||
-      normalized.startsWith('fc') ||
-      normalized.startsWith('fd') ||
-      /^fe[89ab]/u.test(normalized) ||
-      normalized.startsWith('ff') ||
-      normalized.startsWith('2001:db8:')
-    );
-  }
-  return false;
-}
-
-/**
- * Private destinations intentionally supported for a trusted provider gateway.
- * Link-local/metadata, unspecified, multicast, and documentation-only ranges
- * remain denied even on this path.
- */
-function isTrustedProviderAddress(address: string): boolean {
-  if (isPublicAddress(address)) return true;
-  const family = net.isIP(address);
-  if (family === 4) {
-    const octets = address.split('.').map(Number);
-    const value = (((octets[0] << 24) >>> 0) + (octets[1] << 16) + (octets[2] << 8) + octets[3]) >>> 0;
-    return [
-      ['10.0.0.0', 8],
-      ['100.64.0.0', 10],
-      ['127.0.0.0', 8],
-      ['172.16.0.0', 12],
-      ['192.168.0.0', 16],
-    ].some(([network, bits]) => ipv4InCidr(value, String(network), Number(bits)));
-  }
-  if (family === 6) {
-    const normalized = address.toLowerCase();
-    if (normalized.startsWith('::ffff:')) return isTrustedProviderAddress(normalized.slice('::ffff:'.length));
-    return normalized === '::1' || normalized.startsWith('fc') || normalized.startsWith('fd');
-  }
-  return false;
-}
-
-function ipv4InCidr(value: number, network: string, bits: number): boolean {
-  const octets = network.split('.').map(Number);
-  const base = (((octets[0] << 24) >>> 0) + (octets[1] << 16) + (octets[2] << 8) + octets[3]) >>> 0;
-  const mask = bits === 0 ? 0 : (0xffff_ffff << (32 - bits)) >>> 0;
-  return (value & mask) === (base & mask);
 }
 
 function formatAuthority(hostname: string, port: number, protocol: OutboundProtocol): string {

@@ -28,6 +28,8 @@ class DirectGatewayAccumulator implements LlmGatewayAccumulator {
           : { value: null, source: 'not_exposed' },
       servedProvider:
         provider !== null ? { value: provider, source: 'configured_route' } : { value: null, source: 'not_exposed' },
+      // The provider's own origin bills at its first-party list prices.
+      officialListPricing: provider !== null,
       qualityFlags: provider === null ? ['invalid_configured_provider_id'] : [],
     };
   }

@@ -7,7 +7,12 @@ RUN sh /tmp/install-docker-toolchain.sh /out
 FROM mcr.microsoft.com/devcontainers/universal:6.1.12-noble
 
 # Standard IronCurtain directory structure
-# The universal image uses 'codespace' as the non-root user (uid 1000).
+# The universal image uses 'codespace' as the non-root user (uid 1000) and
+# grants it passwordless sudo. That grant works only while the agent container
+# keeps SETUID/SETGID and runs without no-new-privileges, the default; with
+# `agentSudo: false` the host starts the container as UID 1000 under
+# no-new-privileges and without file-privilege capabilities, so sudo (and any
+# setuid binary) is inert. See src/docker/agent-privileges.ts.
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends socat sudo git-lfs && rm -rf /var/lib/apt/lists/*
 
@@ -37,7 +42,7 @@ RUN mkdir -p /workspace /etc/ironcurtain /run/ironcurtain && \
 
 RUN npm install -g node-gyp
 
-# Rust toolchain (rustc, cargo) + cargo-fuzz for the vuln-discovery workflow.
+# Rust build and test tooling (rustc, cargo, cargo-fuzz).
 # devcontainers/universal does NOT ship rustup (verified by an x86_64 build
 # failing with `rustup: not found`), so install it explicitly rather than
 # assuming it is present — same self-contained approach as
@@ -81,3 +86,6 @@ RUN rm -f /usr/local/bin/docker-compose && \
     ! command -v docker-compose && \
     ! command -v docker-buildx
 USER codespace
+
+# Keep the small transport asset after toolchain installation layers.
+COPY --chown=root:root --chmod=0444 mcp-bridge.mjs /usr/local/bin/ironcurtain-mcp-bridge.mjs

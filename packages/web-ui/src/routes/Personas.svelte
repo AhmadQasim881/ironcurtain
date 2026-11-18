@@ -1,7 +1,14 @@
 <script lang="ts">
-  import type { PersonaListItem, PersonaDetailDto, PersonaCompileOperationDto, RuleDeltaDto } from '$lib/types.js';
+  import type {
+    PersonaListItem,
+    PersonaDetailDto,
+    PersonaCompileOperationDto,
+    RuleDeltaDto,
+    FailedServerDto,
+  } from '$lib/types.js';
   import {
     listPersonas,
+    listPersonaServers,
     getPersonaDetail,
     startPersonaCompile,
     hydratePersonaCompiles,
@@ -24,12 +31,6 @@
   import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '$lib/components/ui/table/index.js';
   import { renderMarkdown } from '$lib/markdown.js';
   import { compileClearsStale } from './persona-helpers.js';
-
-  // Static set of MCP servers a new persona can be narrowed to. There is no
-  // `servers.list` RPC; this mirrors the servers referenced by the canned
-  // personas / the daemon's mcp-servers.json. "All servers (incl. future)" is
-  // modeled as the empty selection (servers omitted from the create payload).
-  const KNOWN_SERVERS = ['filesystem', 'git', 'github', 'web-search', 'google-workspace'];
 
   let personas = $state<PersonaListItem[]>([]);
   let loading = $state(true);
@@ -80,6 +81,11 @@
     activeCompile?.phase === 'done' ? (activeCompile.result?.ruleDelta ?? null) : null,
   );
 
+  // Servers left out of a written policy because they failed (a partial compile).
+  const failedServers = $derived<readonly FailedServerDto[]>(
+    activeCompile?.phase === 'done' ? (activeCompile.result?.failedServers ?? []) : [],
+  );
+
   const PHASE_LABELS: Record<string, string> = {
     cached: 'Cached',
     compiling: 'Compiling rules',
@@ -103,8 +109,9 @@
   let constitutionDraft = $state('');
   let constitutionDirty = $state(false);
   let savingConstitution = $state(false);
-  // True when the last edit reported the compiled policy is now stale, OR the
-  // local draft has unsaved/uncompiled changes.
+  // True when the daemon reports the compiled policy no longer matches the
+  // saved constitution (`detail.stale`, recomputed on every read) or the last
+  // edit reported it stale. The badge also shows while the draft is dirty.
   let constitutionStale = $state(false);
   let editError = $state<{ code: string; message: string } | null>(null);
 
@@ -125,9 +132,20 @@
   let formDescription = $state('');
   let formMemory = $state(true);
   let formConstitution = $state('');
-  // false = "All servers (incl. future)"; true = manually narrow to a subset.
+  // false = "All servers (incl. future)": the servers key is omitted from the
+  // create payload. true = manually narrow to a subset of the configured
+  // servers the daemon lists (`personas.listServers`), offered only once that
+  // list has loaded: without it there is nothing valid to narrow to.
   let formNarrowServers = $state(false);
   let formSelectedServers = $state<Set<string>>(new Set());
+  let serverChoices = $state<{ kind: 'loading' } | { kind: 'ready'; servers: readonly string[] } | { kind: 'failed' }>({
+    kind: 'loading',
+  });
+  // Bumped on every load, so a reply to an earlier opening of the form is ignored.
+  let serverChoicesRequest = 0;
+  const narrowing = $derived(formNarrowServers && serverChoices.kind === 'ready');
+  // Narrowing to no server would create an all-servers persona: not offered.
+  const narrowedToNothing = $derived(narrowing && formSelectedServers.size === 0);
   let creating = $state(false);
   let formError = $state<{ code: string; message: string } | null>(null);
 
@@ -182,6 +200,7 @@
       personas = await listPersonas();
       if (selectedName) {
         detail = await getPersonaDetail(selectedName);
+        constitutionStale = detail.stale !== undefined;
       }
     } catch {
       // Best-effort.
@@ -221,7 +240,7 @@
       detail = await getPersonaDetail(name);
       constitutionDraft = detail.constitution ?? '';
       constitutionDirty = false;
-      constitutionStale = false;
+      constitutionStale = detail.stale !== undefined;
     } catch (err) {
       detailError = err instanceof Error ? err.message : String(err);
     }
@@ -255,6 +274,8 @@
   async function refreshAfterCompile(name: string): Promise<void> {
     try {
       detail = await getPersonaDetail(name);
+      // The daemon's recomputed flag is authoritative once the compile landed.
+      constitutionStale = detail.stale !== undefined;
       personas = await listPersonas();
     } catch {
       // Best-effort refresh.
@@ -362,6 +383,18 @@
     formNarrowServers = false;
     formSelectedServers = new Set();
     formError = null;
+    void loadServerChoices();
+  }
+
+  async function loadServerChoices(): Promise<void> {
+    const request = ++serverChoicesRequest;
+    serverChoices = { kind: 'loading' };
+    try {
+      const servers = await listPersonaServers();
+      if (request === serverChoicesRequest) serverChoices = { kind: 'ready', servers };
+    } catch {
+      if (request === serverChoicesRequest) serverChoices = { kind: 'failed' };
+    }
   }
 
   function toggleFormServer(server: string): void {
@@ -375,7 +408,11 @@
     creating = true;
     formError = null;
     try {
-      const servers = formNarrowServers ? [...formSelectedServers] : undefined;
+      // In configuration order, whatever the order of the clicks.
+      const servers =
+        narrowing && serverChoices.kind === 'ready'
+          ? serverChoices.servers.filter((server) => formSelectedServers.has(server))
+          : undefined;
       await createPersona({
         name: formName.trim(),
         description: formDescription.trim(),
@@ -406,7 +443,9 @@
       case 'LIST_REQUIRES_MCP':
         return 'This policy needs live MCP servers to resolve dynamic lists, which are unavailable in this context.';
       case 'BROAD_POLICY_REJECTED':
-        return 'The compiled policy is broad (wildcard domains/lists or out-of-workspace paths). Enable "Allow broad policy" for this persona, then recompile.';
+        return 'The compiled policy is broad (wildcard domains/lists, out-of-workspace paths, or allow rules that leave arguments unconstrained). Enable "Allow broad policy" for this persona, then recompile.';
+      case 'POLICY_LINT_FAILED':
+        return 'The compiled policy failed the policy checks, so nothing was written and the previous policy stays in place. Address the findings below (in the constitution, or in a dynamic list\'s manual additions), then recompile. Broad domains need "Allow broad policy".';
       case 'PERSONA_EXISTS':
         return 'A persona with that name already exists. Choose a different name.';
       case 'PERSONA_NOT_FOUND':
@@ -515,7 +554,9 @@
                 />
                 <span>
                   Allow broad policy
-                  <span class="text-xs text-muted-foreground"> (wildcard domains/lists, out-of-workspace paths) </span>
+                  <span class="text-xs text-muted-foreground">
+                    (wildcard domains/lists, out-of-workspace paths, unconstrained allow rules)
+                  </span>
                 </span>
                 {#if broadPolicyBusy}<Spinner size="xs" />{/if}
               </label>
@@ -552,11 +593,33 @@
               {/if}
 
               {#if activeCompile?.phase === 'done' && activeCompile.result}
-                <span class="text-sm text-success" data-testid="compile-success">
-                  Compiled successfully ({activeCompile.result.ruleCount} rules)
-                </span>
+                {#if failedServers.length > 0}
+                  <span class="text-sm text-warning" data-testid="compile-partial">
+                    Compiled with failures ({activeCompile.result.ruleCount} rules, {failedServers.length} server(s) failed)
+                  </span>
+                {:else}
+                  <span class="text-sm text-success" data-testid="compile-success">
+                    Compiled successfully ({activeCompile.result.ruleCount} rules)
+                  </span>
+                {/if}
               {/if}
             </div>
+
+            {#if failedServers.length > 0}
+              <div data-testid="compile-failed-servers" class="mt-3">
+                <Alert variant="destructive">
+                  <span class="block">
+                    These servers failed to compile and have no rules, so their tools are denied. Recompile to retry.
+                  </span>
+                  {#each failedServers as failed (failed.serverName)}
+                    <span class="block mt-1 text-xs break-words" data-testid="compile-failed-server">
+                      <span class="font-mono">{failed.serverName}</span>
+                      ({PHASE_LABELS[failed.phase] ?? failed.phase}): {failed.reason}
+                    </span>
+                  {/each}
+                </Alert>
+              </div>
+            {/if}
 
             {#if ruleDelta}
               <div class="mt-3 text-sm" data-testid="rule-delta">
@@ -574,6 +637,16 @@
                 {#if ruleDelta.outOfWorkspacePaths.length > 0}
                   <p class="text-xs text-warning mt-1" data-testid="rule-delta-paths">
                     Out-of-workspace paths: {ruleDelta.outOfWorkspacePaths.join(', ')}
+                  </p>
+                {/if}
+                {#if ruleDelta.unconstrainedAllows.length > 0}
+                  <p class="text-xs text-warning mt-1" data-testid="rule-delta-unconstrained">
+                    Unconstrained allow rules: {ruleDelta.unconstrainedAllows.join('; ')}
+                  </p>
+                {/if}
+                {#if ruleDelta.escalateBreadth.length > 0}
+                  <p class="text-xs text-muted-foreground mt-1" data-testid="rule-delta-escalate">
+                    Broad escalations (approved per call): {ruleDelta.escalateBreadth.join('; ')}
                   </p>
                 {/if}
               </div>
@@ -602,6 +675,13 @@
                   <span class="block">
                     <span class="font-mono text-xs" data-testid="compile-error-code">{activeCompile.error.code}</span>
                     <span class="block mt-1">{errorAffordance(activeCompile.error.code)}</span>
+                    {#if activeCompile.error.code === 'BROAD_POLICY_REJECTED' || activeCompile.error.code === 'POLICY_LINT_FAILED'}
+                      <!-- The validator's message names the rules and values that made it broad; the
+                           policy lint's names its first findings (escaped and length-bounded by the daemon). -->
+                      <span class="block mt-1 text-xs break-words" data-testid="compile-error-detail"
+                        >{activeCompile.error.message}</span
+                      >
+                    {/if}
                   </span>
                 </Alert>
               </div>
@@ -671,7 +751,11 @@
         {#if deleteForce}
           This permanently removes the persona and revokes its compiled policy.
         {:else}
-          The persona is moved to trash; its policy is left inert and can be restored on disk.
+          <span data-testid="delete-soft-note">
+            The persona is moved to the trash, where its policy is inert. Restore it with
+            <span class="font-mono">ironcurtain persona trash restore {selectedName}</span> before it expires (after
+            <span class="font-mono">personas.trashRetentionDays</span>, 30 days by default).
+          </span>
         {/if}
       </p>
       <label class="flex items-center gap-3 text-sm">
@@ -750,9 +834,13 @@
               <TableCell class="font-medium font-mono text-xs">{persona.name}</TableCell>
               <TableCell class="text-sm text-muted-foreground max-w-xs truncate">{persona.description}</TableCell>
               <TableCell>
-                <Badge variant={persona.compiled ? 'success' : 'secondary'}>
-                  {persona.compiled ? 'Compiled' : 'Not compiled'}
-                </Badge>
+                {#if persona.compiled && persona.stale !== undefined}
+                  <Badge variant="warning" data-testid="persona-stale-{persona.name}">Stale — recompile</Badge>
+                {:else}
+                  <Badge variant={persona.compiled ? 'success' : 'secondary'}>
+                    {persona.compiled ? 'Compiled' : 'Not compiled'}
+                  </Badge>
+                {/if}
               </TableCell>
             </TableRow>
           {/each}
@@ -794,30 +882,45 @@
           />
           <span>All servers (incl. future)</span>
         </label>
-        <label class="flex items-center gap-2 text-sm mt-1">
-          <input
-            type="radio"
-            name="np-servers"
-            checked={formNarrowServers}
-            onchange={() => (formNarrowServers = true)}
-            data-testid="new-persona-narrow-servers"
-          />
-          <span>Narrow to specific servers</span>
-        </label>
-        {#if formNarrowServers}
-          <div class="flex flex-wrap gap-2 mt-2 pl-6">
-            {#each KNOWN_SERVERS as server (server)}
-              <label class="flex items-center gap-1.5 text-xs">
-                <input
-                  type="checkbox"
-                  checked={formSelectedServers.has(server)}
-                  onchange={() => toggleFormServer(server)}
-                  data-testid={`new-persona-server-${server}`}
-                />
-                <span>{server}</span>
-              </label>
-            {/each}
-          </div>
+        {#if serverChoices.kind === 'ready' && serverChoices.servers.length > 0}
+          <label class="flex items-center gap-2 text-sm mt-1">
+            <input
+              type="radio"
+              name="np-servers"
+              checked={formNarrowServers}
+              onchange={() => (formNarrowServers = true)}
+              data-testid="new-persona-narrow-servers"
+            />
+            <span>Narrow to specific servers</span>
+          </label>
+          {#if formNarrowServers}
+            <div class="flex flex-wrap gap-2 mt-2 pl-6">
+              {#each serverChoices.servers as server (server)}
+                <label class="flex items-center gap-1.5 text-xs">
+                  <input
+                    type="checkbox"
+                    checked={formSelectedServers.has(server)}
+                    onchange={() => toggleFormServer(server)}
+                    data-testid={`new-persona-server-${server}`}
+                  />
+                  <span class="font-mono">{server}</span>
+                </label>
+              {/each}
+            </div>
+            {#if narrowedToNothing}
+              <p class="text-xs text-muted-foreground mt-1 pl-6" data-testid="new-persona-servers-none-selected">
+                Select at least one server, or choose All servers.
+              </p>
+            {/if}
+          {/if}
+        {:else if serverChoices.kind === 'loading'}
+          <p class="text-xs text-muted-foreground mt-1" data-testid="new-persona-servers-loading">
+            Loading the configured servers...
+          </p>
+        {:else if serverChoices.kind === 'failed'}
+          <p class="text-xs text-muted-foreground mt-1" data-testid="new-persona-servers-unavailable">
+            The configured servers could not be listed, so this persona can only be given all servers.
+          </p>
         {/if}
       </div>
       <label class="flex items-center gap-3 text-sm">
@@ -853,7 +956,7 @@
           size="sm"
           onclick={submitForm}
           loading={creating}
-          disabled={creating || !formName.trim() || !formDescription.trim()}
+          disabled={creating || !formName.trim() || !formDescription.trim() || narrowedToNothing}
           data-testid="create-persona-button"
         >
           Create persona

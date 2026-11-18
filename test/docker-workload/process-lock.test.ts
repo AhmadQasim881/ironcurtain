@@ -1,21 +1,34 @@
+import { spawnSync } from 'node:child_process';
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   renameSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   acquireProcessLock,
+  getProcessStartIdentity,
+  inspectProcessLock,
   ProcessLockBusyError,
   type ProcessLockOwner,
+  type ProcessLockState,
 } from '../../src/docker-workload/process-lock.js';
+import { fifoSupported, makeFifo, startFifoUnblocker } from '../helpers/fifo.js';
+
+const processLockUrl = pathToFileURL(
+  resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'src', 'docker-workload', 'process-lock.ts'),
+).href;
+const hasDevZero = process.platform !== 'win32' && existsSync('/dev/zero');
 
 const temporaryDirectories: string[] = [];
 const SELF_IDENTITY = 'self-process-start-fixture';
@@ -228,5 +241,199 @@ describe('Docker-workload process lock', () => {
     rmSync(path);
 
     expect(() => held.release()).toThrow(/ownership was lost/u);
+  });
+});
+
+describe('inspectProcessLock', () => {
+  it('reports free, held and stale locks the way acquisition would adjudicate them', () => {
+    const path = lockPath();
+    expect(inspectProcessLock(path, { processIdentityForPid: identityForPid })).toEqual({ kind: 'free' });
+
+    const held = acquireProcessLock(path, { processIdentityForPid: identityForPid });
+    expect(inspectProcessLock(path, { processIdentityForPid: identityForPid })).toEqual({
+      kind: 'held',
+      ownerPid: process.pid,
+    });
+    held.release();
+
+    writeFileSync(path, `${JSON.stringify(owner({ pid: 4242, processIdentity: 'dead-process-start' }))}\n`, {
+      mode: 0o600,
+    });
+    expect(inspectProcessLock(path, { processIdentityForPid: identityForPid })).toEqual({
+      kind: 'stale',
+      ownerPid: 4242,
+    });
+    // Looking never modifies the lock.
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toMatchObject({ pid: 4242 });
+  });
+
+  it('fails closed: an owner it cannot adjudicate and a fresh partial record count as held', () => {
+    const path = lockPath();
+    writeFileSync(path, `${JSON.stringify(owner({ pid: 4242, processIdentity: 'unknown' }))}\n`, { mode: 0o600 });
+    expect(
+      inspectProcessLock(path, {
+        processIdentityForPid: () => {
+          throw new Error('process table unavailable');
+        },
+      }),
+    ).toEqual({ kind: 'held', ownerPid: 4242 });
+
+    writeFileSync(path, '', { mode: 0o600 });
+    expect(inspectProcessLock(path, { processIdentityForPid: identityForPid, malformedGraceMs: 5000 })).toEqual({
+      kind: 'held',
+      ownerPid: undefined,
+    });
+    expect(
+      inspectProcessLock(path, {
+        processIdentityForPid: identityForPid,
+        malformedGraceMs: 0,
+        now: () => Date.now() + 60_000,
+      }),
+    ).toEqual({ kind: 'stale', ownerPid: undefined });
+  });
+
+  it('uses the real process table by default', () => {
+    const path = lockPath();
+    const held = acquireProcessLock(path);
+    try {
+      expect(inspectProcessLock(path)).toEqual({ kind: 'held', ownerPid: process.pid });
+    } finally {
+      held.release();
+    }
+  });
+});
+
+interface ChildLockResult {
+  readonly inspected: string;
+  readonly acquired: string;
+  readonly ms: number;
+}
+
+/**
+ * Inspects and then tries to acquire each lock path in a separate Node process
+ * killed after a hard timeout, so a blocking open fails the test instead of
+ * freezing this worker. Put a FIFO first: a regressed (blocking) read then
+ * stalls there and never reaches a device it would read without end.
+ */
+function lockInChild(paths: readonly string[]): ChildLockResult[] {
+  const program = [
+    `import { acquireProcessLock, inspectProcessLock } from ${JSON.stringify(processLockUrl)};`,
+    'const results = [];',
+    'for (const path of JSON.parse(process.argv[1])) {',
+    '  const started = Date.now();',
+    '  const inspected = inspectProcessLock(path).kind;',
+    '  let acquired;',
+    '  try {',
+    '    acquireProcessLock(path).release();',
+    "    acquired = 'acquired';",
+    '  } catch (error) {',
+    '    acquired = error.name;',
+    '  }',
+    '  results.push({ inspected, acquired, ms: Date.now() - started });',
+    '}',
+    'process.stdout.write(JSON.stringify(results));',
+  ].join('\n');
+  const child = spawnSync(
+    process.execPath,
+    ['--import', 'tsx', '--input-type=module', '--eval', program, JSON.stringify(paths)],
+    { encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL' },
+  );
+  expect(child.error, 'the lock must be examined before the hard timeout').toBeUndefined();
+  expect(child.status, child.stderr).toBe(0);
+  return JSON.parse(child.stdout) as ChildLockResult[];
+}
+
+// A lock path can sit in a directory IronCurtain did not write (the run lock of
+// a run directory being imported, FU-07): what is there is never opened unless
+// it is a regular file, and never reclaimed.
+describe('special entries at a lock path', () => {
+  it.skipIf(!fifoSupported)('never opens a FIFO there: it counts as held and stays in place', () => {
+    const path = lockPath();
+    makeFifo(path);
+    // A regressed (blocking) read is released by the unblocker after 5 s and
+    // then fails the elapsed-time bound instead of hanging the worker.
+    const unblocker = startFifoUnblocker(path, 5);
+    const started = Date.now();
+    let inspected: ProcessLockState;
+    let acquireError: unknown;
+    try {
+      inspected = inspectProcessLock(path, { processIdentityForPid: identityForPid, malformedGraceMs: 0 });
+      acquireError = thrown(() =>
+        acquireProcessLock(path, { processIdentityForPid: identityForPid, malformedGraceMs: 0 }),
+      );
+    } finally {
+      unblocker.stop();
+    }
+    expect(Date.now() - started).toBeLessThan(4_000);
+    expect(inspected).toEqual({ kind: 'held', ownerPid: undefined });
+    expect(acquireError).toBeInstanceOf(ProcessLockBusyError);
+    expect(lstatSync(path).isFIFO()).toBe(true);
+  });
+
+  it('never follows a symlink there, even to the well-formed record of a dead owner', () => {
+    const directory = lockDirectory();
+    const path = join(directory, 'owner.lock');
+    const target = join(directory, 'elsewhere.json');
+    const record = `${JSON.stringify(owner({ pid: 4242, processIdentity: 'dead-process-start' }))}\n`;
+    writeFileSync(target, record, { mode: 0o600 });
+    symlinkSync(target, path);
+
+    const options = { processIdentityForPid: identityForPid, malformedGraceMs: 0 };
+    expect(inspectProcessLock(path, options)).toEqual({ kind: 'held', ownerPid: undefined });
+    expect(() => acquireProcessLock(path, options)).toThrow(ProcessLockBusyError);
+    expect(lstatSync(path).isSymbolicLink()).toBe(true);
+    expect(readFileSync(target, 'utf8')).toBe(record);
+    expect(entries(directory)).toEqual(['elsewhere.json', 'owner.lock']);
+
+    // A directory there was already never reclaimed; it still is not.
+    const dirPath = join(lockDirectory(), 'owner.lock');
+    mkdirSync(dirPath);
+    expect(inspectProcessLock(dirPath, options)).toEqual({ kind: 'held', ownerPid: undefined });
+    expect(() => acquireProcessLock(dirPath, options)).toThrow(ProcessLockBusyError);
+    expect(lstatSync(dirPath).isDirectory()).toBe(true);
+  });
+
+  it.skipIf(!fifoSupported || !hasDevZero)(
+    'refuses a FIFO, a link to one and a link to /dev/zero promptly, without reading them',
+    () => {
+      const directory = lockDirectory();
+      const fifo = join(directory, 'fifo.lock');
+      makeFifo(fifo);
+      symlinkSync(fifo, join(directory, 'fifo-link.lock'));
+      symlinkSync('/dev/zero', join(directory, 'zero.lock'));
+
+      const results = lockInChild([fifo, join(directory, 'fifo-link.lock'), join(directory, 'zero.lock')]);
+
+      expect(results).toHaveLength(3);
+      for (const result of results) {
+        expect(result).toMatchObject({ inspected: 'held', acquired: 'ProcessLockBusyError' });
+        expect(result.ms).toBeLessThan(2_000);
+      }
+      expect(lstatSync(fifo).isFIFO()).toBe(true);
+      expect(lstatSync(join(directory, 'zero.lock')).isSymbolicLink()).toBe(true);
+    },
+    40_000,
+  );
+});
+
+describe('process-start identity', () => {
+  // The non-Linux branch reads `ps -o lstart`, which procps also prints, so it
+  // runs wherever /bin/ps exists. Docker-workload leases persist this identity
+  // for hours, across host sleep and travel between time zones.
+  it.skipIf(!existsSync('/bin/ps'))('reads the ps start time independently of the observer time zone', () => {
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+    Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+    try {
+      vi.stubEnv('TZ', 'AAA+5');
+      const beforeTravel = getProcessStartIdentity(process.pid);
+      vi.stubEnv('TZ', 'BBB-9');
+      const afterTravel = getProcessStartIdentity(process.pid);
+
+      expect(beforeTravel).toMatch(/\d{2}:\d{2}:\d{2} \d{4}$/u);
+      expect(afterTravel).toBe(beforeTravel);
+    } finally {
+      vi.unstubAllEnvs();
+      if (platform !== undefined) Object.defineProperty(process, 'platform', platform);
+    }
   });
 });

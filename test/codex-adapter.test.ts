@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { parse as parseToml } from 'smol-toml';
 import { createCodexAdapter } from '../src/docker/adapters/codex.js';
 import { CONTAINER_WORKSPACE_DIR, type OrientationContext } from '../src/docker/agent-adapter.js';
 import { generateFakeKey } from '../src/docker/fake-keys.js';
@@ -34,9 +35,29 @@ describe('CodexAdapter', () => {
     expect(files[0].content).toContain('default_tools_approval_mode = "auto"');
   });
 
+  it('disables provider-hosted web search at the root of every generated config', () => {
+    const zaiProfile = {
+      type: 'zai',
+      apiKey: '',
+      model: 'glm-5.3',
+      plan: 'api',
+      modelMap: [{ match: '*', model: 'glm-5.3' }],
+      usesDefaultMap: false,
+      perAgent: { 'claude-code': undefined, codex: undefined, goose: undefined },
+    };
+    const configs = [{} as IronCurtainConfig, { activeProviderProfile: zaiProfile } as unknown as IronCurtainConfig];
+    for (const config of configs) {
+      const toml = adapter.generateMcpConfig('/run/ironcurtain/proxy.sock', config)[0].content;
+      // A root key: Codex would read it as a table field if it followed a table header.
+      expect(parseToml(toml).web_search).toBe('disabled');
+    }
+  });
+
   it('generates TCP MCP config for macOS bridge mode', () => {
     const files = adapter.generateMcpConfig('host.docker.internal:12345', {} as IronCurtainConfig);
-    expect(files[0].content).toContain('"TCP:host.docker.internal:12345"');
+    expect(files[0].content).toContain('command = "node"');
+    expect(files[0].content).toContain('"/usr/local/bin/ironcurtain-mcp-bridge.mjs", "host.docker.internal:12345"');
+    expect(files[0].content).toContain('env_vars = ["IRONCURTAIN_MCP_TCP_TOKEN"]');
   });
 
   it('passes the mounted PTY orientation as one inert Codex developer-instructions argument', () => {
@@ -189,6 +210,8 @@ writeFileSync(process.env.CAPTURE_FILE, JSON.stringify(process.argv.slice(2)));
     expect(generateFakeKey(providers[0].fakeKeyPrefix)).toMatch(/^[^.]+\.[^.]+\.[^.]+$/);
     expect(providers[0].allowedEndpoints).toContainEqual({ method: 'POST', path: '/codex-backend/agent-identity' });
     expect(providers[0].allowedEndpoints).toContainEqual({ method: 'GET', path: '/agent-identities/jwks' });
+    // Codex 0.157.1 runs workspace routing discovery before its first ChatGPT-mode turn.
+    expect(providers[0].allowedEndpoints).toContainEqual({ method: 'GET', path: '/backend-api/wham/accounts/check' });
   });
 
   it('builds env with fake Codex auth seeds and no raw provider credential env vars', () => {
@@ -227,11 +250,12 @@ writeFileSync(process.env.CAPTURE_FILE, JSON.stringify(process.argv.slice(2)));
   });
 
   it('flags quotaExhausted when a rate-limit error event appears on exit 0', () => {
+    // Codex renders an HTTP error as `unexpected status <code> <reason>: <body>`.
     const stdout = [
       JSON.stringify({ type: 'thread.started', thread_id: 'abc' }),
       JSON.stringify({
         type: 'turn.failed',
-        error: { message: 'Rate limit exceeded (429): usage limit reached, retry later' },
+        error: { message: 'unexpected status 429 Too Many Requests: Rate limit reached for requests, retry later' },
       }),
     ].join('\n');
 
@@ -242,7 +266,7 @@ writeFileSync(process.env.CAPTURE_FILE, JSON.stringify(process.argv.slice(2)));
     // No agent_message present, so the text describes the failure rather
     // than dumping a raw JSONL line.
     expect(response.text).toContain('Codex reported an error');
-    expect(response.text).toContain('Rate limit exceeded');
+    expect(response.text).toContain('Rate limit reached');
   });
 
   it('flags quotaExhausted when stderr reports a 429 on a non-zero exit', () => {
@@ -252,7 +276,10 @@ writeFileSync(process.env.CAPTURE_FILE, JSON.stringify(process.argv.slice(2)));
     expect(response.text).toContain('Codex exited with code 1');
   });
 
-  it('flags a generic error item as a transient failure (not quota) on exit 0', () => {
+  it('leaves an unrecognized error item unclassified on exit 0 (degenerate_response keeps its meaning)', () => {
+    // Formerly every error-shaped event became a transient degenerate_response,
+    // whose documented meaning is an empty completion (exit 0, no output
+    // tokens). An unrecognized error is now reported as text, with no signal.
     const stdout = [
       JSON.stringify({ type: 'thread.started', thread_id: 'abc' }),
       JSON.stringify({ type: 'item.completed', item: { type: 'error', message: 'upstream connection reset' } }),
@@ -260,8 +287,8 @@ writeFileSync(process.env.CAPTURE_FILE, JSON.stringify(process.argv.slice(2)));
 
     const response = adapter.extractResponse(0, stdout);
     expect(response.quotaExhausted).toBeUndefined();
-    expect(response.transientFailure?.kind).toBe('degenerate_response');
-    expect(response.transientFailure?.rawMessage).toContain('upstream connection reset');
+    expect(response.transientFailure).toBeUndefined();
+    expect(response.hardFailure).toBeUndefined();
     expect(response.text).toContain('upstream connection reset');
   });
 
@@ -291,9 +318,9 @@ writeFileSync(process.env.CAPTURE_FILE, JSON.stringify(process.argv.slice(2)));
         JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: 'real-codex-token' } }),
       );
 
-      const result = adapter.detectCredential!({} as IronCurtainConfig);
-      expect(result.kind).toBe('oauth');
-      if (result.kind !== 'oauth') throw new Error('expected oauth');
+      const result = adapter.detectCredential?.({} as IronCurtainConfig);
+      expect(result?.kind).toBe('oauth');
+      if (result?.kind !== 'oauth') throw new Error('expected oauth');
       expect(result.credentials.accessToken).toBe('real-codex-token');
     } finally {
       if (oldCodexHome === undefined) delete process.env.CODEX_HOME;
@@ -307,7 +334,7 @@ writeFileSync(process.env.CAPTURE_FILE, JSON.stringify(process.argv.slice(2)));
     const oldCodexHome = process.env.CODEX_HOME;
     try {
       process.env.CODEX_HOME = tmp;
-      expect(adapter.detectCredential!({} as IronCurtainConfig).kind).toBe('none');
+      expect(adapter.detectCredential?.({} as IronCurtainConfig)?.kind).toBe('none');
     } finally {
       if (oldCodexHome === undefined) delete process.env.CODEX_HOME;
       else process.env.CODEX_HOME = oldCodexHome;
@@ -320,5 +347,371 @@ writeFileSync(process.env.CAPTURE_FILE, JSON.stringify(process.argv.slice(2)));
     expect(config.hostDirName).toBe('codex-state');
     expect(config.containerMountPath).toBe('/home/codespace/.codex/');
     expect(config.seed.map((s) => s.path)).toContain('sessions/');
+    // Resumability is decided from rollouts, and a PTY resume goes by thread id.
+    expect(config.transcriptLayout).toBe('codex-rollouts');
+    expect(config.resumeFlags).toEqual([]);
   });
+});
+
+const THREAD_ID = '01a1b67b-5e92-7fb0-aa3e-ebe122186d0b';
+
+/** One `exec --json` JSONL stream. */
+function jsonl(...events: readonly unknown[]): string {
+  return events.map((event) => JSON.stringify(event)).join('\n');
+}
+
+describe('CodexAdapter conversation continuity', () => {
+  const adapter = createCodexAdapter();
+
+  it('reports the thread from thread.started on success and on failure', () => {
+    const success = adapter.extractResponse(
+      0,
+      jsonl(
+        { type: 'thread.started', thread_id: THREAD_ID },
+        { type: 'item.completed', item: { type: 'agent_message', text: 'done' } },
+        { type: 'turn.completed' },
+      ),
+    );
+    expect(success).toEqual({ text: 'done', agentThreadId: THREAD_ID });
+
+    const failed = adapter.extractResponse(
+      1,
+      jsonl({ type: 'thread.started', thread_id: THREAD_ID }, { type: 'turn.failed', error: { message: 'boom' } }),
+    );
+    expect(failed.agentThreadId).toBe(THREAD_ID);
+  });
+
+  it('normalizes the thread id and drops anything that is not a UUID', () => {
+    const upper = adapter.extractResponse(
+      0,
+      jsonl(
+        { type: 'thread.started', thread_id: THREAD_ID.toUpperCase() },
+        { type: 'item.completed', item: { type: 'agent_message', text: 'ok' } },
+      ),
+    );
+    expect(upper.agentThreadId).toBe(THREAD_ID);
+
+    for (const bogus of ['--last', '../../etc/passwd', '', 'abc', 42, `${THREAD_ID} --last`]) {
+      const response = adapter.extractResponse(
+        0,
+        jsonl(
+          { type: 'thread.started', thread_id: bogus },
+          { type: 'item.completed', item: { type: 'agent_message', text: 'ok' } },
+        ),
+      );
+      expect(response.agentThreadId).toBeUndefined();
+    }
+  });
+
+  it('starts a new thread on the first turn, with the system prompt', () => {
+    // A thread id offered on a first turn is ignored: only a continuing turn resumes.
+    const cmd = adapter.buildCommand('say hi', 'system prompt', {
+      sessionId: 'conversation-1',
+      firstTurn: true,
+      agentThreadId: THREAD_ID,
+    });
+    expect(cmd).not.toContain('resume');
+    expect(cmd).not.toContain(THREAD_ID);
+    expect(cmd.at(-1)).toContain('system prompt');
+    expect(cmd.at(-1)).toContain('say hi');
+  });
+
+  it('resumes the recorded thread on a later turn with exec resume <thread> and the message alone', () => {
+    const cmd = adapter.buildCommand('-next step', 'system prompt', {
+      sessionId: 'conversation-1',
+      firstTurn: false,
+      agentThreadId: THREAD_ID,
+      modelOverride: 'openai:gpt-5.5',
+    });
+    // Global and exec options precede the subcommand; `--` keeps a message
+    // that starts with `-` from being parsed as an option.
+    expect(cmd.slice(cmd.indexOf('exec'))).toEqual([
+      'exec',
+      '--json',
+      '--skip-git-repo-check',
+      '--cd',
+      '/workspace',
+      'resume',
+      '--',
+      THREAD_ID,
+      '-next step',
+    ]);
+    expect(cmd.indexOf('--model')).toBeLessThan(cmd.indexOf('exec'));
+    expect(cmd).not.toContain('--last');
+    expect(cmd.join('\n')).not.toContain('system prompt');
+  });
+
+  it('starts a new thread when a later turn has no valid recorded thread (never --last)', () => {
+    for (const agentThreadId of [undefined, '--last', 'not-a-thread']) {
+      const cmd = adapter.buildCommand('next step', 'system prompt', {
+        sessionId: 'conversation-1',
+        firstTurn: false,
+        ...(agentThreadId === undefined ? {} : { agentThreadId }),
+      });
+      expect(cmd).not.toContain('resume');
+      expect(cmd).not.toContain('--last');
+      expect(cmd.at(-1)).toContain('system prompt');
+    }
+  });
+});
+
+describe('CodexAdapter failure classification', () => {
+  const adapter = createCodexAdapter();
+
+  it('does not treat "429", "quota" or "rate limit" in the transcript as quota exhaustion', () => {
+    // The agent's own messages and command output are not failure events.
+    const stdout = jsonl(
+      { type: 'thread.started', thread_id: THREAD_ID },
+      {
+        type: 'item.completed',
+        item: { type: 'command_execution', command: 'ls', aggregated_output: '429 src/x.ts\nquota.ts\n' },
+      },
+      {
+        type: 'item.completed',
+        item: {
+          type: 'agent_message',
+          text: 'Fixed the rate limit and quota handling for HTTP 429 Too Many Requests.',
+        },
+      },
+    );
+    const response = adapter.extractResponse(137, stdout, '');
+    expect(response.quotaExhausted).toBeUndefined();
+    expect(response.transientFailure).toBeUndefined();
+    expect(response.hardFailure).toBeUndefined();
+    expect(response.text).toContain('Codex exited with code 137');
+  });
+
+  it('leaves an unrelated crash unclassified', () => {
+    const response = adapter.extractResponse(
+      101,
+      jsonl({ type: 'thread.started', thread_id: THREAD_ID }),
+      "thread 'main' panicked at core/src/codex.rs:12:5: index out of bounds",
+    );
+    expect(response.quotaExhausted).toBeUndefined();
+    expect(response.transientFailure).toBeUndefined();
+    expect(response.hardFailure).toBeUndefined();
+  });
+
+  it('sets hardFailure when Codex wrote nothing to stdout, whatever the exit code', () => {
+    const nonZero = adapter.extractResponse(1, '', 'Error: failed to start');
+    expect(nonZero.hardFailure).toBe(true);
+    expect(nonZero.quotaExhausted).toBeUndefined();
+    expect(nonZero.text).toContain('Codex exited with code 1');
+
+    const zero = adapter.extractResponse(0, '  \n', '');
+    expect(zero.hardFailure).toBe(true);
+    expect(zero.text).toContain('without producing output');
+  });
+
+  it('requires an explicit status or code: quota words alone in a failure event are not quota', () => {
+    const response = adapter.extractResponse(
+      1,
+      jsonl(
+        { type: 'thread.started', thread_id: THREAD_ID },
+        { type: 'turn.failed', error: { message: 'tool call failed: quota.json is not a rate limit config' } },
+      ),
+    );
+    expect(response.quotaExhausted).toBeUndefined();
+    expect(response.transientFailure).toBeUndefined();
+  });
+
+  it.each([
+    [
+      'a 400 response naming input[429]',
+      `unexpected status 400 Bad Request: {"error":{"message":"Invalid 'input[429].output': string too long.",` +
+        `"type":"invalid_request_error","param":"input[429].output","code":"string_above_max_length"}}`,
+      '',
+    ],
+    ['a token count', 'context window exceeded by 429 tokens: please start a new thread', ''],
+    [
+      'a file named in a stderr log line',
+      'tool call failed',
+      'ERROR codex_core::mcp: read_file failed: ENOENT 429.txt',
+    ],
+  ])('does not treat a bare 429 as an HTTP status (%s)', (_label, message, stderr) => {
+    // A failure event, and stderr, are classified, but a number is a status
+    // only where one is rendered as such ("status 429", "HTTP 429", ...).
+    const response = adapter.extractResponse(
+      1,
+      jsonl({ type: 'thread.started', thread_id: THREAD_ID }, { type: 'turn.failed', error: { message } }),
+      stderr,
+    );
+    expect(response.quotaExhausted).toBeUndefined();
+    expect(response.transientFailure).toBeUndefined();
+  });
+
+  it.each([
+    ['an HTTP 429 status', 'exceeded retry limit, last status: 429 Too Many Requests'],
+    ['an unexpected-status 429', 'unexpected status 429: slow down'],
+    ['an HTTP 429 from a gateway', 'upstream gateway returned HTTP 429'],
+    ['an error code 429', 'Error code: 429 - rate limited'],
+    ['a provider quota code', 'error code: insufficient_quota'],
+    ["Codex's usage-limit message", "You've hit your usage limit. Try again in 2 hours 13 minutes."],
+  ])('flags quotaExhausted from %s in turn.failed', (_label, message) => {
+    const response = adapter.extractResponse(
+      1,
+      jsonl({ type: 'thread.started', thread_id: THREAD_ID }, { type: 'turn.failed', error: { message } }),
+    );
+    expect(response.quotaExhausted?.rawMessage).toContain(message);
+    expect(response.transientFailure).toBeUndefined();
+    expect(response.hardFailure).toBeUndefined();
+  });
+
+  it('reads explicit status and code fields of a failure event', () => {
+    const byStatus = adapter.extractResponse(
+      1,
+      jsonl({ type: 'turn.failed', error: { message: 'request rejected', http_status_code: 429 } }),
+    );
+    expect(byStatus.quotaExhausted?.rawMessage).toBe('request rejected');
+
+    const byCode = adapter.extractResponse(
+      1,
+      jsonl({ type: 'error', message: 'stopped', codex_error_info: 'usage_limit_exceeded' }),
+    );
+    expect(byCode.quotaExhausted).toBeDefined();
+
+    const by5xx = adapter.extractResponse(
+      1,
+      jsonl({
+        type: 'turn.failed',
+        error: {
+          message: 'stopped',
+          codex_error_info: { response_too_many_failed_attempts: { http_status_code: 503 } },
+        },
+      }),
+    );
+    expect(by5xx.transientFailure?.kind).toBe('upstream_5xx');
+  });
+
+  it('classifies an explicit 5xx as upstream_5xx and a failed stream as upstream_api_error', () => {
+    const fiveXx = adapter.extractResponse(
+      1,
+      jsonl({ type: 'turn.failed', error: { message: 'unexpected status 500 Internal Server Error: oops' } }),
+    );
+    expect(fiveXx.transientFailure?.kind).toBe('upstream_5xx');
+    expect(fiveXx.quotaExhausted).toBeUndefined();
+
+    const stream = adapter.extractResponse(
+      1,
+      jsonl({
+        type: 'turn.failed',
+        error: { message: 'stream disconnected before completion: error decoding response body' },
+      }),
+    );
+    expect(stream.transientFailure?.kind).toBe('upstream_api_error');
+  });
+
+  it("decides from the turn's own failure, not from an earlier retry notice", () => {
+    const stdout = jsonl(
+      { type: 'thread.started', thread_id: THREAD_ID },
+      { type: 'error', message: 'Reconnecting... 1/5 (unexpected status 429 Too Many Requests)' },
+      { type: 'turn.failed', error: { message: 'context window exceeded: please start a new thread' } },
+    );
+    const response = adapter.extractResponse(1, stdout);
+    expect(response.quotaExhausted).toBeUndefined();
+    expect(response.transientFailure).toBeUndefined();
+  });
+
+  it('classifies retry notices and stderr when the turn reported no failure of its own', () => {
+    const response = adapter.extractResponse(
+      1,
+      jsonl(
+        { type: 'thread.started', thread_id: THREAD_ID },
+        { type: 'error', message: 'Reconnecting... 5/5 (stream disconnected before completion: timeout)' },
+      ),
+    );
+    expect(response.transientFailure?.kind).toBe('upstream_api_error');
+  });
+
+  it('ignores earlier failure notices once the turn produced its final message', () => {
+    const response = adapter.extractResponse(
+      0,
+      jsonl(
+        { type: 'error', message: 'Reconnecting... 1/5 (unexpected status 429 Too Many Requests)' },
+        { type: 'item.completed', item: { type: 'agent_message', text: 'all good' } },
+      ),
+    );
+    expect(response).toEqual({ text: 'all good' });
+  });
+});
+
+/** Runs start-codex.sh against a fake `codex` that records every invocation. */
+function runCodexStartScript(
+  env: Readonly<Record<string, string>>,
+  resumeExitCode = 0,
+): { readonly status: number | null; readonly invocations: string[][]; readonly stderr: string } {
+  const tempDir = mkdtempSync(join(tmpdir(), 'codex-pty-resume-'));
+  try {
+    const startScript = createCodexAdapter()
+      .generateOrientationFiles(sampleContext)
+      .find((file) => file.path === 'start-codex.sh');
+    if (!startScript) throw new Error('start-codex.sh missing');
+    const workspaceDir = join(tempDir, 'workspace');
+    mkdirSync(workspaceDir);
+    const scriptPath = join(tempDir, 'start-codex.sh');
+    writeFileSync(
+      scriptPath,
+      startScript.content.replace('\ncd /workspace\n', '\ncd "$IRONCURTAIN_TEST_WORKSPACE"\n'),
+      { mode: 0o755 },
+    );
+    const logPath = join(tempDir, 'invocations.jsonl');
+    writeFileSync(
+      join(tempDir, 'codex'),
+      `#!/usr/bin/env node
+const { appendFileSync } = require('node:fs');
+const args = process.argv.slice(2);
+appendFileSync(process.env.CAPTURE_FILE, JSON.stringify(args) + '\\n');
+process.exit(args.includes('resume') ? Number(process.env.RESUME_EXIT_CODE) : 0);
+`,
+      { mode: 0o755 },
+    );
+    const result = spawnSync('/bin/bash', [scriptPath], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        CAPTURE_FILE: logPath,
+        RESUME_EXIT_CODE: String(resumeExitCode),
+        IRONCURTAIN_MODEL: '',
+        IRONCURTAIN_SYSTEM_PROMPT: 'prompt',
+        IRONCURTAIN_TEST_WORKSPACE: workspaceDir,
+        PATH: `${tempDir}:${process.env.PATH ?? ''}`,
+        ...env,
+      },
+      timeout: 20_000,
+    });
+    const invocations = existsSync(logPath)
+      ? readFileSync(logPath, 'utf8')
+          .split('\n')
+          .filter((line) => line.length > 0)
+          .map((line) => JSON.parse(line) as string[])
+      : [];
+    return { status: result.status, invocations, stderr: result.stderr };
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+describe('start-codex.sh resume', () => {
+  it('starts a new conversation without a resume id', () => {
+    const run = runCodexStartScript({});
+    expect(run.status, run.stderr).toBe(0);
+    expect(run.invocations).toHaveLength(1);
+    expect(run.invocations[0]).not.toContain('resume');
+  }, 30_000);
+
+  it('continues the named thread with codex resume <id>', () => {
+    const run = runCodexStartScript({ IRONCURTAIN_RESUME_ID: THREAD_ID });
+    expect(run.status, run.stderr).toBe(0);
+    expect(run.invocations).toHaveLength(1);
+    expect(run.invocations[0].slice(-2)).toEqual(['resume', THREAD_ID]);
+    expect(run.invocations[0]).not.toContain('--last');
+  }, 30_000);
+
+  it('starts fresh when the thread cannot be resumed', () => {
+    const run = runCodexStartScript({ IRONCURTAIN_RESUME_ID: THREAD_ID }, 1);
+    expect(run.status, run.stderr).toBe(0);
+    expect(run.invocations).toHaveLength(2);
+    expect(run.invocations[0]).toContain('resume');
+    expect(run.invocations[1]).not.toContain('resume');
+  }, 30_000);
 });

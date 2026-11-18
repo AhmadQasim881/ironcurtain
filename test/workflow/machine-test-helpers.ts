@@ -5,6 +5,25 @@
 
 import type { AgentInvokeResult } from '../../src/workflow/machine-builder.js';
 import type { AgentConversationId } from '../../src/session/types.js';
+import type {
+  AgentStateDefinition,
+  DeterministicStateDefinition,
+  WorkflowDefinition,
+} from '../../src/workflow/types.js';
+
+/** `definition.states[name]`, which the test rewrites as an agent state. */
+export function agentStateOf(definition: WorkflowDefinition, name: string): AgentStateDefinition {
+  const state = definition.states[name];
+  if (state.type !== 'agent') throw new Error(`fixture state ${name} is ${state.type}, not agent`);
+  return state;
+}
+
+/** `definition.states[name]`, which the test rewrites as a deterministic state. */
+export function deterministicStateOf(definition: WorkflowDefinition, name: string): DeterministicStateDefinition {
+  const state = definition.states[name];
+  if (state.type !== 'deterministic') throw new Error(`fixture state ${name} is ${state.type}, not deterministic`);
+  return state;
+}
 
 export function makeAgentResult(overrides: Partial<AgentInvokeResult> = {}): AgentInvokeResult {
   return {

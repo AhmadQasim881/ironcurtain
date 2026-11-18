@@ -1,5 +1,7 @@
 # Design: Observe TUI ("Spectrograph")
 
+**Status (2026-11-14):** Implemented: `ironcurtain observe` switches to the TUI when stdout is a TTY (`src/observe/observe-tui.ts`).
+
 ## Overview
 
 `ironcurtain observe` currently streams plain text to stdout. This design adds a
@@ -43,6 +45,20 @@ its `buf.push()` + `term.noFormat(buf.join(''))` approach, but cutting out the
 
 No `chalk` dependency in the TUI modules either -- all color is via inline SGR
 sequences for zero-allocation rendering in the hot frame loop.
+
+**Untrusted text.** Every event field is model output or the agent's own tool
+results (the MITM copies `tool_result` blocks from the agent's outgoing
+requests), and lands on the user's terminal. The token-stream bus stays
+faithful (the `--json` and web consumers get the exact text); the views
+sanitize at the sink with the helpers in `observe-text.ts` (built on
+`terminal/display-sanitize.ts`): prose (text and thinking deltas, code lines)
+is split on line feeds first and each line loses its escape sequences and
+control characters, with bidi controls shown as escapes; tool names, tool
+input and results, error messages, event types, the model name, stop reasons
+and session-end reasons are shown on one line with every control as a visible
+escape; the rain draws only printable characters (`isDrawableRainChar`). The
+plain renderer does the same, and `--json` escapes every character a terminal
+could act on, C1 controls included, while still parsing to the same events.
 
 ## 2. Types and Layout (`observe-tui-types.ts`)
 

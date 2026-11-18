@@ -1,0 +1,36 @@
+{
+  "id": "msg_fallback_01",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-opus-4-8",
+  "content": [
+    { "type": "fallback", "from": { "model": "claude-fable-5-1" }, "to": { "model": "claude-opus-4-8" } },
+    { "type": "text", "text": "Served by the fallback model." }
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 1520,
+    "output_tokens": 310,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 2048,
+    "cache_creation": { "ephemeral_5m_input_tokens": 2048, "ephemeral_1h_input_tokens": 0 },
+    "server_tool_use": { "web_search_requests": 0 },
+    "iterations": [
+      {
+        "type": "message",
+        "model": "claude-fable-5-1",
+        "input_tokens": 1500,
+        "output_tokens": 120,
+        "cache_read_input_tokens": 2048,
+        "cache_creation_input_tokens": 0
+      },
+      {
+        "type": "fallback_message",
+        "model": "claude-opus-4-8",
+        "input_tokens": 1520,
+        "output_tokens": 310
+      }
+    ]
+  }
+}

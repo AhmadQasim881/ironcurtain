@@ -70,13 +70,14 @@ export interface HttpsResponse {
 /**
  * Performs a TLS handshake on an already-CONNECT'd socket, then sends an HTTP
  * request over it and collects the full response body (the fake upstream ends
- * the connection, so `end` fires once the body is complete).
+ * the connection, so `end` fires once the body is complete). A Buffer body is
+ * sent as-is (e.g. a compressed request body).
  */
 export function makeHttpsRequest(
   socket: import('node:net').Socket,
   ca: CertificateAuthority,
   host: string,
-  options: { method?: string; path?: string; headers?: Record<string, string>; body?: string },
+  options: { method?: string; path?: string; headers?: Record<string, string>; body?: string | Buffer },
 ): Promise<HttpsResponse> {
   return new Promise((resolve, reject) => {
     const tlsSocket = tls.connect({ socket, servername: host, ca: ca.certPem }, () => {
@@ -107,6 +108,57 @@ export function makeHttpsRequest(
           }
         }
         resolve({ statusCode, headers: responseHeaders, body: bodyParts.join('\r\n\r\n') });
+      });
+      tlsSocket.on('error', reject);
+    });
+    tlsSocket.on('error', reject);
+  });
+}
+
+export interface HttpsBufferResponse {
+  statusCode: number;
+  headers: http.IncomingHttpHeaders;
+  /** The response body exactly as received (no decoding, no string conversion). */
+  body: Buffer;
+}
+
+/**
+ * Like {@link makeHttpsRequest}, but keeps the response body as raw bytes, so
+ * a test can check that a compressed body was forwarded byte for byte. The
+ * body is everything after the header block, so the upstream must send a
+ * Content-Length (no chunked framing).
+ */
+export function makeHttpsRequestBuffer(
+  socket: import('node:net').Socket,
+  ca: CertificateAuthority,
+  host: string,
+  options: { method?: string; path?: string; headers?: Record<string, string>; body?: string | Buffer },
+): Promise<HttpsBufferResponse> {
+  return new Promise((resolve, reject) => {
+    const tlsSocket = tls.connect({ socket, servername: host, ca: ca.certPem }, () => {
+      const headers: Record<string, string> = { host, connection: 'close', ...options.headers };
+      if (options.body) headers['content-length'] = Buffer.byteLength(options.body).toString();
+      const headerLines = Object.entries(headers)
+        .map(([k, v]) => `${k}: ${v}`)
+        .join('\r\n');
+      tlsSocket.write(`${options.method ?? 'GET'} ${options.path ?? '/'} HTTP/1.1\r\n${headerLines}\r\n\r\n`);
+      if (options.body) tlsSocket.write(options.body);
+
+      const chunks: Buffer[] = [];
+      tlsSocket.on('data', (chunk: Buffer) => chunks.push(chunk));
+      tlsSocket.on('end', () => {
+        const raw = Buffer.concat(chunks);
+        const split = raw.indexOf('\r\n\r\n');
+        const headerSection = raw.subarray(0, split < 0 ? raw.length : split).toString('latin1');
+        const statusCode = parseInt(headerSection.split('\r\n')[0]?.split(' ')[1] ?? '', 10);
+        const responseHeaders: Record<string, string> = {};
+        for (const line of headerSection.split('\r\n').slice(1)) {
+          const colonIdx = line.indexOf(':');
+          if (colonIdx > 0) {
+            responseHeaders[line.substring(0, colonIdx).toLowerCase().trim()] = line.substring(colonIdx + 1).trim();
+          }
+        }
+        resolve({ statusCode, headers: responseHeaders, body: split < 0 ? Buffer.alloc(0) : raw.subarray(split + 4) });
       });
       tlsSocket.on('error', reject);
     });
@@ -154,7 +206,9 @@ export interface FakeUpstream {
 export type UpstreamResponder = (req: CapturedRequest) => {
   status?: number;
   contentType?: string;
-  body: string;
+  /** Sent as the `content-encoding` header; `body` must then already be encoded. */
+  contentEncoding?: string;
+  body: string | Buffer;
 };
 
 /** Parses a request body as JSON, returning `{}` for empty or invalid input. */
@@ -183,10 +237,15 @@ export async function createFakeUpstream(responder?: UpstreamResponder): Promise
         rawBody,
       };
       captured.push(record);
-      const reply = responder
+      const reply: ReturnType<UpstreamResponder> = responder
         ? responder(record)
         : { status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, echo: body }) };
-      res.writeHead(reply.status ?? 200, { 'Content-Type': reply.contentType ?? 'application/json' });
+      res.writeHead(reply.status ?? 200, {
+        'Content-Type': reply.contentType ?? 'application/json',
+        ...(reply.contentEncoding !== undefined
+          ? { 'Content-Encoding': reply.contentEncoding, 'Content-Length': String(Buffer.byteLength(reply.body)) }
+          : {}),
+      });
       res.end(reply.body);
     });
   });

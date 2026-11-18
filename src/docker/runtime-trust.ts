@@ -10,6 +10,7 @@ import { randomUUID } from 'node:crypto';
 import { chmodSync, lstatSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
 import { rootCertificates } from 'node:tls';
+import { writePrivateFileAtomicSync } from '../util/atomic-write.js';
 
 export const CONTAINER_RUNTIME_CA_CERT = '/etc/ironcurtain/ca-cert.pem';
 export const CONTAINER_RUNTIME_CA_BUNDLE = '/etc/ironcurtain/ca-bundle.pem';
@@ -50,12 +51,12 @@ export function renderAptProxyConfig(proxyUrl: string): string {
   try {
     parsed = new URL(proxyUrl);
   } catch {
-    throw new Error('apt proxy URL must be an uncredentialed fixed http://host:port endpoint');
+    throw new Error('apt proxy URL must be a fixed http://host:port endpoint');
   }
+  const authenticated = parsed.username === 'ironcurtain' && /^[A-Za-z0-9_-]{43}$/.test(parsed.password);
   if (
     parsed.protocol !== 'http:' ||
-    parsed.username !== '' ||
-    parsed.password !== '' ||
+    ((parsed.username !== '' || parsed.password !== '') && !authenticated) ||
     parsed.pathname !== '/' ||
     parsed.search !== '' ||
     parsed.hash !== '' ||
@@ -63,15 +64,24 @@ export function renderAptProxyConfig(proxyUrl: string): string {
     parsed.port === '' ||
     /[\r\n"]/u.test(proxyUrl)
   ) {
-    throw new Error('apt proxy URL must be an uncredentialed fixed http://host:port endpoint');
+    throw new Error('apt proxy URL must be a fixed http://host:port endpoint');
   }
-  const endpoint = `http://${parsed.host}`;
+  const endpoint = authenticated
+    ? `http://${parsed.username}:${parsed.password}@${parsed.host}`
+    : `http://${parsed.host}`;
   return [
     `Acquire::http::Proxy "${endpoint}";`,
     `Acquire::https::Proxy "${endpoint}";`,
     `Acquire::https::CaInfo "${CONTAINER_RUNTIME_CA_BUNDLE}";`,
     '',
   ].join('\n');
+}
+
+/** Authenticated apt configuration is a private host file, even inside orientation. */
+export function stageAptProxyConfig(path: string, proxyUrl: string): void {
+  const content = renderAptProxyConfig(proxyUrl);
+  if (new URL(proxyUrl).username !== '') writePrivateFileAtomicSync(path, content);
+  else writeFileSync(path, content);
 }
 
 function normalizeCertificate(pem: string, label: string): string {

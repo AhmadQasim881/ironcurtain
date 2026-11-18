@@ -36,11 +36,13 @@ export function buildSummaryPlaceholder(
 /**
  * Synthesize a `WorkflowSummaryDto` for a past-run row that isn't in the live
  * `appState.workflows` Map. The narrower `LiveWorkflowPhase` excludes
- * `'interrupted'`; coerce it to `'failed'` for the badge so the placeholder
- * type stays narrow until the real phase is re-fetched.
+ * `'interrupted'` and `'running_elsewhere'`; coerce them to `'failed'` and
+ * `'running'` for the badge so the placeholder type stays narrow until the
+ * real phase is re-fetched.
  */
 export function synthesizeSummaryFromPastRun(row: PastRunDto): WorkflowSummaryDto {
-  const livePhase: LiveWorkflowPhase = row.phase === 'interrupted' ? 'failed' : row.phase;
+  const livePhase: LiveWorkflowPhase =
+    row.phase === 'interrupted' ? 'failed' : row.phase === 'running_elsewhere' ? 'running' : row.phase;
   return buildSummaryPlaceholder({
     workflowId: row.workflowId,
     name: row.name,
@@ -150,7 +152,8 @@ export function phaseLabel(phase: string): string {
  * deliberately stamp `phase: 'aborted'` to keep the run resumable;
  * `'failed'` is included because the engine permits resume of error
  * targets so the user can pick the run back up after fixing the
- * underlying cause.
+ * underlying cause. `'running_elsewhere'` is excluded: the run is live in
+ * another process, and `resume()` refuses it until that process lets go.
  */
 const RESUMABLE_PHASES = new Set<PastRunPhase>([PHASE.WAITING_HUMAN, PHASE.INTERRUPTED, PHASE.ABORTED, PHASE.FAILED]);
 
@@ -159,7 +162,8 @@ export function isResumablePhase(phase: PastRunPhase): boolean {
 }
 
 /** Filter pill identifiers used by the Past-runs section. */
-export type PastRunFilter = 'all' | 'completed' | 'failed' | 'aborted' | 'interrupted' | 'waiting_human';
+export type PastRunFilter =
+  'all' | 'completed' | 'failed' | 'aborted' | 'interrupted' | 'waiting_human' | 'running_elsewhere';
 
 export const PAST_RUN_FILTERS: readonly { id: PastRunFilter; label: string }[] = [
   { id: 'all', label: 'All' },
@@ -168,6 +172,7 @@ export const PAST_RUN_FILTERS: readonly { id: PastRunFilter; label: string }[] =
   { id: 'aborted', label: 'Aborted' },
   { id: 'interrupted', label: 'Interrupted' },
   { id: 'waiting_human', label: 'Waiting-human' },
+  { id: 'running_elsewhere', label: 'Running elsewhere' },
 ];
 
 export function filterPastRuns(rows: readonly PastRunDto[], filter: PastRunFilter): PastRunDto[] {
@@ -184,6 +189,7 @@ export function countByPhase(rows: readonly PastRunDto[]): Record<PastRunFilter,
     aborted: 0,
     interrupted: 0,
     waiting_human: 0,
+    running_elsewhere: 0,
   };
   for (const r of rows) {
     if (r.phase in counts) counts[r.phase] += 1;

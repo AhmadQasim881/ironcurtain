@@ -69,6 +69,7 @@ export function prepareSession(
     serverListings,
     allowedDomains: extractAllowedDomains(config),
     networkMode: proxyAddress ? 'bridge' : 'none',
+    ...(config.readOnlyWorkspace === undefined ? {} : { workspaceReadOnly: true }),
     ...(nestedDocker === undefined ? {} : { nestedDocker }),
   };
 

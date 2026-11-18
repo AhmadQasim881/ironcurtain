@@ -26,11 +26,15 @@ const tsxBin = resolve(projectRoot, 'node_modules/.bin/tsx');
 
 /**
  * Writes a minimal compiled-policy + tool-annotations pair into a
- * directory so `loadGeneratedPolicy` can find both files.
+ * directory so `loadGeneratedPolicy` can find both files. The policy
+ * carries the metadata fields the runtime schema requires.
  */
 function writeFakePolicyDir(dir: string): void {
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, 'compiled-policy.json'), JSON.stringify({ version: 1, inputHash: 'test', rules: [] }));
+  writeFileSync(
+    join(dir, 'compiled-policy.json'),
+    JSON.stringify({ generatedAt: 'test', constitutionHash: 'test', inputHash: 'test', rules: [] }),
+  );
   writeFileSync(join(dir, 'tool-annotations.json'), JSON.stringify({ servers: {} }));
 }
 

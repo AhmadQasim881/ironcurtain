@@ -3,10 +3,27 @@
  */
 
 import type { PtyBridge } from '../pty/pty-bridge.js';
+import type { WhitelistScope } from '../trusted-process/approval-whitelist.js';
 
-/** Input mode for the mux. */
+/**
+ * Input mode for the mux. `message-panel` shows multi-line command output
+ * (`/sessions`, bulk resolve results) in a dismissible bottom panel instead of
+ * the one-row footer flash, which cannot hold more than one line.
+ * `escalation-approve-all` is the confirmation screen that `/approve all` and
+ * `/approve+ all` open: it lists every pending escalation and approves
+ * exactly that set (see escalation-picker-state.ts). `/approve group N`
+ * opens the same screen for the escalations sharing #N's whitelist pattern.
+ */
 export type InputMode =
-  'pty' | 'command' | 'picker' | 'resume-picker' | 'persona-picker' | 'provider-picker' | 'escalation-picker';
+  | 'pty'
+  | 'command'
+  | 'picker'
+  | 'resume-picker'
+  | 'persona-picker'
+  | 'provider-picker'
+  | 'escalation-picker'
+  | 'escalation-approve-all'
+  | 'message-panel';
 
 /** Whether the mode is any picker variant. */
 export function isPickerMode(mode: InputMode): boolean {
@@ -15,17 +32,41 @@ export function isPickerMode(mode: InputMode): boolean {
     mode === 'resume-picker' ||
     mode === 'persona-picker' ||
     mode === 'provider-picker' ||
-    mode === 'escalation-picker'
+    mode === 'escalation-picker' ||
+    mode === 'escalation-approve-all' ||
+    mode === 'message-panel'
   );
 }
 
 /**
  * Whether the mode is a bottom-panel picker that claims viewport rows.
- * The escalation picker is excluded -- it renders as a floating overlay
- * on top of the full PTY viewport.
+ * The escalation picker and the approve-all confirmation are excluded --
+ * they render as floating overlays on top of the full PTY viewport.
  */
 export function isBottomPanelPicker(mode: InputMode): boolean {
-  return mode === 'picker' || mode === 'resume-picker' || mode === 'persona-picker' || mode === 'provider-picker';
+  return (
+    mode === 'picker' ||
+    mode === 'resume-picker' ||
+    mode === 'persona-picker' ||
+    mode === 'provider-picker' ||
+    mode === 'message-panel'
+  );
+}
+
+/**
+ * A pending escalation as the mux UI refers to it: the display number the
+ * user sees and the request it stands for. Display numbers are never reused,
+ * and the escalation id binds a decision to the request that was on screen.
+ */
+export interface PendingRef {
+  readonly displayNumber: number;
+  readonly escalationId: string;
+  /**
+   * The whitelist-pattern group the request belongs to
+   * (`escalationGroupKey`), when it is groupable. Set by
+   * `MuxEscalationManager.pendingRefs()`; never part of a ref's identity.
+   */
+  readonly groupKey?: string;
 }
 
 /** A single tab in the mux. */
@@ -65,17 +106,41 @@ export type MuxAction =
   | { readonly kind: 'picker-cancel' }
   | { readonly kind: 'redraw-picker' }
   | { readonly kind: 'resume-spawn'; readonly sessionId: string; readonly agent: string }
-  | { readonly kind: 'persona-spawn'; readonly persona: string }
+  | { readonly kind: 'persona-spawn'; readonly persona: string; readonly taskScope?: string }
   | { readonly kind: 'escalation-open' }
   | { readonly kind: 'escalation-dismiss'; readonly targetMode?: 'command' }
   | { readonly kind: 'escalation-navigate'; readonly direction: 'next' | 'prev' }
   | {
       readonly kind: 'escalation-resolve';
       readonly displayNumber: number;
+      /**
+       * The escalation the picker showed under `displayNumber`. The manager
+       * refuses the decision when another request is pending under it.
+       */
+      readonly escalationId: string;
       readonly decision: 'approved' | 'denied';
-      readonly whitelist: boolean;
+      /**
+       * The whitelist pattern to add with an approval: `exact` (the first
+       * candidate, `w`) or `directory` (the directory-wide one, `W`);
+       * `false` for none.
+       */
+      readonly whitelist: false | WhitelistScope;
     }
-  | { readonly kind: 'escalation-resolve-all'; readonly decision: 'approved' | 'denied'; readonly whitelist: boolean }
+  | { readonly kind: 'escalation-deny-all' }
+  | {
+      /**
+       * `y` on the approve-all screen: approve exactly the escalations it
+       * listed. With `groupKey` the screen listed one group (`/approve
+       * group N`), and the approval is refused unless the listed set is
+       * still exactly that group.
+       */
+      readonly kind: 'escalation-approve-reviewed';
+      readonly reviewed: readonly PendingRef[];
+      readonly whitelist: boolean;
+      readonly groupKey?: string;
+    }
+  | { readonly kind: 'escalation-approve-all-cancel' }
+  | { readonly kind: 'message-panel-dismiss' }
   | { readonly kind: 'scroll-up'; readonly amount: number }
   | { readonly kind: 'scroll-down'; readonly amount: number }
   | { readonly kind: 'quit' };
@@ -124,8 +189,18 @@ const MAX_ESCALATION_PANEL_ROWS = 12;
  * @param inputLineRows - Number of input rows requested (default 1). Clamped
  *   between MIN_INPUT_LINE_ROWS and MAX_INPUT_LINE_ROWS, then further clamped
  *   by available viewport space.
+ * @param extraEscalationRows - Rows the escalation panel needs beyond
+ *   ESCALATION_ROWS_PER_ITEM per escalation (default 0): one for each pending
+ *   escalation that offers a directory-wide whitelist pattern, whose line the
+ *   panel reserves next to the exact pattern's.
  */
-export function calculateLayout(totalRows: number, mode: InputMode, pendingCount: number, inputLineRows = 1): Layout {
+export function calculateLayout(
+  totalRows: number,
+  mode: InputMode,
+  pendingCount: number,
+  inputLineRows = 1,
+  extraEscalationRows = 0,
+): Layout {
   // Ensure footer fits on screen; degrade gracefully on tiny terminals
   const footerRows = Math.min(FOOTER_ROWS, Math.max(0, totalRows - TAB_BAR_ROWS));
   const ptyViewportRows = Math.max(1, totalRows - TAB_BAR_ROWS - footerRows);
@@ -136,7 +211,10 @@ export function calculateLayout(totalRows: number, mode: InputMode, pendingCount
 
   if (mode === 'command') {
     if (pendingCount > 0) {
-      escalationPanelRows = Math.min(pendingCount * ESCALATION_ROWS_PER_ITEM, MAX_ESCALATION_PANEL_ROWS);
+      escalationPanelRows = Math.min(
+        pendingCount * ESCALATION_ROWS_PER_ITEM + Math.max(0, extraEscalationRows),
+        MAX_ESCALATION_PANEL_ROWS,
+      );
     }
     const actualInputRows = Math.min(Math.max(inputLineRows, MIN_INPUT_LINE_ROWS), MAX_INPUT_LINE_ROWS);
     // Ensure overlay fits at least the hint bar + 1 input row, even on tiny terminals.

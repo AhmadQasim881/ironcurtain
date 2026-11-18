@@ -11,6 +11,7 @@
 
 import chalk from 'chalk';
 import type { CompilationPhase, ServerProgressReporter } from './pipeline-shared.js';
+import { toDisplayText } from '../terminal/display-sanitize.js';
 
 // ---------------------------------------------------------------------------
 // Server state tracking
@@ -47,7 +48,7 @@ export class ParallelProgressDisplay {
   constructor(serverNames: string[]) {
     this.serverNames = serverNames;
     this.isTTY = process.stderr.isTTY;
-    this.maxNameLength = serverNames.length > 0 ? Math.max(...serverNames.map((n) => n.length)) : 0;
+    this.maxNameLength = serverNames.length > 0 ? Math.max(...serverNames.map((n) => toDisplayText(n).length)) : 0;
     this.states = new Map();
 
     const now = Date.now();
@@ -100,7 +101,9 @@ export class ParallelProgressDisplay {
     if (this.isTTY) {
       this.redrawServer(name);
     } else {
-      process.stderr.write(`  ${name.padEnd(this.maxNameLength)}  [FAILED]  ${error.message}\n`);
+      process.stderr.write(
+        `  ${toDisplayText(name).padEnd(this.maxNameLength)}  [FAILED]  ${toDisplayText(error.message)}\n`,
+      );
     }
   }
 
@@ -112,7 +115,7 @@ export class ParallelProgressDisplay {
     if (this.isTTY) {
       this.redrawServer(name);
     } else {
-      process.stderr.write(`  ${name.padEnd(this.maxNameLength)}  [done]  ${summary}\n`);
+      process.stderr.write(`  ${toDisplayText(name).padEnd(this.maxNameLength)}  [done]  ${toDisplayText(summary)}\n`);
     }
   }
 
@@ -136,16 +139,20 @@ export class ParallelProgressDisplay {
       const totalElapsed = ((Date.now() - state.startTime) / 1000).toFixed(1);
 
       if (state.phase === 'FAILED') {
-        process.stderr.write(`  ${chalk.red(name.padEnd(this.maxNameLength))}  FAILED  (${totalElapsed}s)\n`);
+        process.stderr.write(
+          `  ${chalk.red(toDisplayText(name).padEnd(this.maxNameLength))}  FAILED  (${totalElapsed}s)\n`,
+        );
       } else if (state.phase === 'done') {
         process.stderr.write(
-          `  ${chalk.green(name.padEnd(this.maxNameLength))}  ${state.summary ?? 'done'}  (${totalElapsed}s)\n`,
+          `  ${chalk.green(toDisplayText(name).padEnd(this.maxNameLength))}  ${toDisplayText(state.summary ?? 'done')}  (${totalElapsed}s)\n`,
         );
       } else if (state.phase === 'cached') {
-        process.stderr.write(`  ${chalk.green(name.padEnd(this.maxNameLength))}  cached  (${totalElapsed}s)\n`);
+        process.stderr.write(
+          `  ${chalk.green(toDisplayText(name).padEnd(this.maxNameLength))}  cached  (${totalElapsed}s)\n`,
+        );
       } else {
         process.stderr.write(
-          `  ${chalk.yellow(name.padEnd(this.maxNameLength))}  ${state.phase}  (${totalElapsed}s)\n`,
+          `  ${chalk.yellow(toDisplayText(name).padEnd(this.maxNameLength))}  ${state.phase}  (${totalElapsed}s)\n`,
         );
       }
     }
@@ -202,16 +209,16 @@ export class ParallelProgressDisplay {
 
   private formatServerLine(name: string): string {
     const state = this.getState(name);
-    const paddedName = name.padEnd(this.maxNameLength);
+    const paddedName = toDisplayText(name).padEnd(this.maxNameLength);
     const elapsed = ((Date.now() - state.phaseStartTime) / 1000).toFixed(0);
     const phaseText = formatPhaseTag(state.phase);
-    const detail = state.detail ? `  ${chalk.dim(state.detail)}` : '';
+    const detail = state.detail ? `  ${chalk.dim(toDisplayText(state.detail))}` : '';
 
     if (state.phase === 'done') {
-      return `  ${chalk.green(paddedName)}  ${phaseText}  ${chalk.dim(state.summary ?? '')}`;
+      return `  ${chalk.green(paddedName)}  ${phaseText}  ${chalk.dim(toDisplayText(state.summary ?? ''))}`;
     }
     if (state.phase === 'FAILED') {
-      return `  ${chalk.red(paddedName)}  ${phaseText}  ${chalk.dim(state.error?.message ?? '')}`;
+      return `  ${chalk.red(paddedName)}  ${phaseText}  ${chalk.dim(toDisplayText(state.error?.message ?? ''))}`;
     }
     if (state.phase === 'cached') {
       return `  ${chalk.green(paddedName)}  ${phaseText}`;
@@ -226,7 +233,7 @@ export class ParallelProgressDisplay {
 
   private logLineBasedUpdate(name: string, state: ServerState): void {
     const elapsed = ((Date.now() - state.startTime) / 1000).toFixed(1);
-    process.stderr.write(`  ${name.padEnd(this.maxNameLength)}  [${state.phase}]  (${elapsed}s)\n`);
+    process.stderr.write(`  ${toDisplayText(name).padEnd(this.maxNameLength)}  [${state.phase}]  (${elapsed}s)\n`);
   }
 
   // -------------------------------------------------------------------------
@@ -240,14 +247,14 @@ export class ParallelProgressDisplay {
       if (!hasOutput) continue;
 
       const statusLabel = state.phase === 'FAILED' ? 'FAILED' : `${state.warnings.length} warning(s)`;
-      process.stderr.write(`\n--- ${name} (${statusLabel}) ---\n`);
+      process.stderr.write(`\n--- ${toDisplayText(name)} (${statusLabel}) ---\n`);
 
       for (const warning of state.warnings) {
-        process.stderr.write(`${warning}\n`);
+        process.stderr.write(`${toDisplayText(warning, { multiline: true })}\n`);
       }
 
       if (state.error) {
-        process.stderr.write(`  ${chalk.red(state.error.message)}\n`);
+        process.stderr.write(`  ${chalk.red(toDisplayText(state.error.message, { multiline: true }))}\n`);
       }
     }
   }

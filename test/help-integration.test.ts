@@ -6,9 +6,11 @@ import { Sandbox, type HelpData } from '../src/sandbox/index.js';
 import { buildSystemPrompt } from '../src/session/prompts.js';
 import type { ServerListing } from '../src/types/server-listing.js';
 import type { IronCurtainConfig } from '../src/config/types.js';
-import type { CompiledPolicyFile, ToolAnnotationsFile } from '../src/pipeline/types.js';
+import type { CompiledPolicyFile, StoredToolAnnotationsFile } from '../src/pipeline/types.js';
 import { testCompiledPolicy, testToolAnnotations, REAL_TMP } from './fixtures/test-policy.js';
 import { isIsolatedVmAvailable } from './helpers/isolated-vm-available.js';
+import { packagedFilesystemServer } from './helpers/filesystem-server.js';
+import { testUserConfig } from './helpers/user-config.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(__dirname, '..');
@@ -20,7 +22,7 @@ const GENERATED_DIR = `${REAL_TMP}/ironcurtain-help-test-generated-${process.pid
 function writeTestArtifacts(
   dir: string,
   compiledPolicy: CompiledPolicyFile,
-  toolAnnotations: ToolAnnotationsFile,
+  toolAnnotations: StoredToolAnnotationsFile,
 ): void {
   mkdirSync(dir, { recursive: true });
   writeFileSync(resolve(dir, 'compiled-policy.json'), JSON.stringify(compiledPolicy));
@@ -36,8 +38,7 @@ describe.skipIf(!isIsolatedVmAvailable())('Help system integration', () => {
     mcpServers: {
       filesystem: {
         description: 'Read, write, search, and manage files and directories',
-        command: 'npx',
-        args: ['-y', '@modelcontextprotocol/server-filesystem', SANDBOX_DIR],
+        ...packagedFilesystemServer(SANDBOX_DIR),
         sandbox: false,
       },
     },
@@ -51,30 +52,7 @@ describe.skipIf(!isIsolatedVmAvailable())('Help system integration', () => {
     constitutionPath: resolve(projectRoot, 'src/config/constitution.md'),
     agentModelId: 'anthropic:claude-sonnet-4-6',
     escalationTimeoutSeconds: 300,
-    userConfig: {
-      agentModelId: 'anthropic:claude-sonnet-4-6',
-      policyModelId: 'anthropic:claude-sonnet-4-6',
-      anthropicApiKey: '',
-      googleApiKey: '',
-      openaiApiKey: '',
-      escalationTimeoutSeconds: 300,
-      resourceBudget: {
-        maxTotalTokens: 1_000_000,
-        maxSteps: 200,
-        maxSessionSeconds: 1800,
-        maxEstimatedCostUsd: 5.0,
-        warnThresholdPercent: 80,
-      },
-      autoCompact: {
-        enabled: false,
-        thresholdTokens: 80_000,
-        keepRecentMessages: 10,
-        summaryModelId: 'anthropic:claude-haiku-4-5',
-      },
-      autoApprove: { enabled: false, modelId: 'anthropic:claude-haiku-4-5' },
-      auditRedaction: { enabled: true },
-      serverCredentials: {},
-    },
+    userConfig: testUserConfig(),
   };
 
   beforeAll(async () => {

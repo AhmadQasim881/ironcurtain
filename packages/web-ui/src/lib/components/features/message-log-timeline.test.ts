@@ -3,6 +3,7 @@ import { render, screen, fireEvent } from '@testing-library/svelte';
 import MessageLogTimeline from './message-log-timeline.svelte';
 import type {
   MessageLogEntry,
+  MessageLogEntryDto,
   AgentSentEntry,
   AgentReceivedEntry,
   AgentRetryEntry,
@@ -11,6 +12,7 @@ import type {
   ErrorEntry,
   StateTransitionEntry,
   QuotaExhaustedEntry,
+  ToolCallEscalationEntry,
 } from '$lib/types.js';
 
 // ---------------------------------------------------------------------------
@@ -117,6 +119,21 @@ function agentRetry(overrides: Partial<AgentRetryEntry> = {}): AgentRetryEntry {
   };
 }
 
+function toolCallEscalation(overrides: Partial<ToolCallEscalationEntry> = {}): ToolCallEscalationEntry {
+  return {
+    type: 'tool_call_escalation',
+    ts: TS,
+    workflowId: 'wf-1',
+    state: 'implement',
+    escalationId: 'esc-1',
+    serverName: 'filesystem',
+    toolName: 'write_file',
+    reason: 'Writes outside the workspace require approval.',
+    outcome: 'raised',
+    ...overrides,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -179,6 +196,16 @@ describe('MessageLogTimeline', () => {
 
     expect(screen.getByText('Gate resolved')).toBeTruthy();
     expect(screen.getByText('APPROVE')).toBeTruthy();
+    // Legacy entries carry no channel; nothing is rendered for it.
+    expect(screen.queryByTestId('gate-resolved-by')).toBeNull();
+  });
+
+  it('renders the declared channel on gate_resolved when present', () => {
+    render(MessageLogTimeline, {
+      props: { entries: [gateResolved({ event: 'APPROVE', resolvedBy: 'cli' })], hasMore: false },
+    });
+
+    expect(screen.getByTestId('gate-resolved-by').textContent).toBe('cli');
   });
 
   it('renders error with destructive marker and full text', () => {
@@ -213,6 +240,34 @@ describe('MessageLogTimeline', () => {
     expect(screen.getByText('Retry')).toBeTruthy();
     expect(screen.getByText('invalid_verdict')).toBeTruthy();
     expect(screen.getByText('Verdict was off.')).toBeTruthy();
+  });
+
+  it('renders tool_call_escalation with the tool, outcome and reason', () => {
+    render(MessageLogTimeline, {
+      props: { entries: [toolCallEscalation({ outcome: 'expired' })], hasMore: false },
+    });
+
+    const entry = screen.getByTestId('message-log-entry');
+    expect(entry.getAttribute('data-entry-type')).toBe('tool_call_escalation');
+    expect(screen.getByText('Escalation')).toBeTruthy();
+    expect(screen.getByText('filesystem/write_file')).toBeTruthy();
+    expect(screen.getByText('expired')).toBeTruthy();
+    expect(screen.getByText('Writes outside the workspace require approval.')).toBeTruthy();
+  });
+
+  it('renders an entry type it does not know with a neutral badge instead of failing', () => {
+    // The daemon's log is append-only and can carry types newer than this UI
+    // build (fan-out joins, transient failures, ...): one must not take the
+    // whole timeline down.
+    const unknown = { type: 'fanout_join', ts: TS, workflowId: 'wf-1', state: 'join' } as unknown as MessageLogEntry;
+    render(MessageLogTimeline, {
+      props: { entries: [unknown, gateRaised({ ts: '2026-04-23T12:00:01.000Z' })], hasMore: false },
+    });
+
+    const items = screen.getAllByTestId('message-log-entry');
+    expect(items).toHaveLength(2);
+    expect(screen.getByText('fanout_join')).toBeTruthy();
+    expect(screen.getByText('Gate raised')).toBeTruthy();
   });
 
   it('renders all eight variants together without errors', () => {
@@ -338,6 +393,91 @@ describe('MessageLogTimeline', () => {
     await fireEvent.click(toggle);
     expect(screen.queryByTestId('agent-full')).toBeNull();
     expect(screen.getByTestId('agent-preview')).toBeTruthy();
+  });
+
+  // ── Truncated entries: full text on expand (WP-32) ───────────────────
+  //
+  // `workflows.messageLog` pages cut long string fields and mark the entry
+  // `truncated` with a `ref`. The timeline fetches the complete entry through
+  // `fetchFullEntry` only when a reviewer expands it.
+
+  it('fetches the complete entry when a truncated agent message is expanded', async () => {
+    const cut: MessageLogEntryDto = {
+      ...agentSent({ message: 'The beginning of a very long' }),
+      truncated: true,
+      ref: '120:9000',
+    };
+    const fetchFullEntry = vi
+      .fn()
+      .mockResolvedValue({ entry: agentSent({ message: 'The beginning of a very long **complete** message.' }) });
+
+    render(MessageLogTimeline, { props: { entries: [cut], hasMore: false, fetchFullEntry } });
+
+    expect(fetchFullEntry).not.toHaveBeenCalled();
+    await fireEvent.click(screen.getByTestId('agent-toggle'));
+
+    expect(fetchFullEntry).toHaveBeenCalledWith('120:9000');
+    const full = await screen.findByTestId('agent-full');
+    await vi.waitFor(() => {
+      expect(full.querySelector('strong')?.textContent).toBe('complete');
+    });
+    expect(screen.queryByTestId('agent-truncated')).toBeNull();
+  });
+
+  it('keeps the cut text and explains when the complete entry cannot be fetched', async () => {
+    const cut: MessageLogEntryDto = {
+      ...agentSent({ message: 'Partial text' }),
+      truncated: true,
+      ref: '0:5',
+    };
+    const fetchFullEntry = vi.fn().mockRejectedValue(new Error('Connection closed'));
+
+    render(MessageLogTimeline, { props: { entries: [cut], hasMore: false, fetchFullEntry } });
+    await fireEvent.click(screen.getByTestId('agent-toggle'));
+
+    await vi.waitFor(() => {
+      expect(screen.getByTestId('agent-truncated').textContent).toContain('Connection closed');
+    });
+    expect(screen.getByTestId('agent-full').textContent).toContain('Partial text');
+  });
+
+  it('marks a truncated agent message as partial when no fetcher is available', async () => {
+    const cut: MessageLogEntryDto = { ...agentSent({ message: 'Partial text' }), truncated: true, ref: '0:5' };
+
+    render(MessageLogTimeline, { props: { entries: [cut], hasMore: false } });
+    await fireEvent.click(screen.getByTestId('agent-toggle'));
+
+    expect(screen.getByTestId('agent-truncated').textContent).toContain('truncated');
+  });
+
+  it('offers "Show full text" for a truncated non-agent entry and loads it on click', async () => {
+    const cut: MessageLogEntryDto = { ...errorEntry({ error: 'Stack trace begins' }), truncated: true, ref: '42:7' };
+    const fetchFullEntry = vi
+      .fn()
+      .mockResolvedValue({ entry: errorEntry({ error: 'Stack trace begins here and goes on' }) });
+
+    render(MessageLogTimeline, { props: { entries: [cut], hasMore: false, fetchFullEntry } });
+
+    expect(screen.getByTestId('entry-truncated')).toBeTruthy();
+    await fireEvent.click(screen.getByTestId('load-full-entry'));
+
+    expect(fetchFullEntry).toHaveBeenCalledWith('42:7');
+    await vi.waitFor(() => {
+      expect(screen.getByText('Stack trace begins here and goes on')).toBeTruthy();
+    });
+    expect(screen.queryByTestId('entry-truncated')).toBeNull();
+  });
+
+  it('never calls fetchFullEntry for an entry that was not truncated', async () => {
+    const fetchFullEntry = vi.fn();
+    render(MessageLogTimeline, {
+      props: { entries: [agentSent({ message: 'Short and complete.' })], hasMore: false, fetchFullEntry },
+    });
+
+    await fireEvent.click(screen.getByTestId('agent-toggle'));
+
+    expect(fetchFullEntry).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('agent-truncated')).toBeNull();
   });
 
   // ── B3: expanded-state survives pagination append ───────────────────

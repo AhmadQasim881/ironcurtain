@@ -3,19 +3,22 @@
  */
 
 import type { SessionSource } from '../session/session-manager.js';
-import type { SessionStatus, DiagnosticEvent, ConversationTurn } from '../session/types.js';
+import type { BudgetCostSource, SessionStatus, DiagnosticEvent, ConversationTurn } from '../session/types.js';
 import type { JobDefinition, RunRecord } from '../cron/types.js';
 import type { WhitelistCandidateIpc } from '../trusted-process/approval-whitelist.js';
-import type { WorkflowId, HumanGateRequestDto } from '../workflow/types.js';
+import type { EscalationDisplayFields } from '../escalation/escalation-review.js';
+import type { WorkflowId, HumanGateRequestDto, WorkflowToolCallEscalation } from '../workflow/types.js';
 import type { MessageLogEntry } from '../workflow/message-log.js';
 import type { ResolvedResourceBudgetConfig } from '../config/user-config.js';
 import type { WorkflowBudget } from '../workflow/resource-budget.js';
+import type { WorkflowUsage } from '../workflow/workflow-usage.js';
 // TYPE-ONLY import of the 9-value pipeline phase union. The import-boundary
 // rule (test/pipeline-import-boundary.test.ts + ESLint no-restricted-imports)
 // forbids VALUE imports from pipeline/* on the live path; `import type` is the
 // sanctioned contract import and creates no runtime edge.
 import type { CompilationPhase } from '../pipeline/pipeline-shared.js';
 import type { DockerWorkloadNetworkAccess } from '../docker-workload/config.js';
+import type { PolicyStaleReason } from '../config/constitution-hash.js';
 
 // Re-export the phase union so the frontend mirror and event consumers can name
 // it without reaching into the pipeline package directly.
@@ -37,6 +40,8 @@ export type MethodName =
   | 'jobs.enable'
   | 'jobs.disable'
   | 'jobs.recompile'
+  // Re-resolves the job policy's dynamic lists (refresh-lists --job).
+  | 'jobs.refreshLists'
   | 'jobs.reload'
   | 'jobs.run'
   | 'jobs.logs'
@@ -64,6 +69,9 @@ export type MethodName =
   | 'sessions.ptyPrompt'
   | 'escalations.list'
   | 'escalations.resolve'
+  // Approves every member of one whitelist-pattern group, after the UI listed
+  // them for confirmation; refused unless the ids are exactly the group.
+  | 'escalations.approveGroup'
   | 'personas.list'
   | 'workflows.list'
   | 'workflows.get'
@@ -74,13 +82,16 @@ export type MethodName =
   | 'workflows.resume'
   | 'workflows.abort'
   | 'workflows.resolveGate'
+  | 'workflows.resolveEscalation'
   | 'workflows.inspect'
   | 'workflows.fileTree'
   | 'workflows.fileContent'
   | 'workflows.artifacts'
+  | 'workflows.artifactFile'
   | 'workflows.listDefinitions'
   | 'workflows.listResumable'
   | 'workflows.messageLog'
+  | 'workflows.messageLogEntry'
   | 'workflows.readme'
   | 'personas.get'
   // Phase 1b: streamed long-running compile (fire-and-return) + its read methods.
@@ -94,6 +105,16 @@ export type MethodName =
   | 'personas.setMemory'
   | 'personas.delete'
   | 'personas.setBroadPolicyOptIn'
+  // Persona lifecycle. clone / rename / restoreTrash / purgeTrash are
+  // mutations (gated like the CRUD methods above); listTrash is a read.
+  | 'personas.clone'
+  | 'personas.rename'
+  | 'personas.listTrash'
+  | 'personas.restoreTrash'
+  | 'personas.purgeTrash'
+  // The configured MCP servers a persona's allowlist may name (the create
+  // form's server picker). A read, ungated.
+  | 'personas.listServers'
   // Config reads are ungated; mutations are gated on the daemon's
   // `--allow-policy-mutation` kill switch (POLICY_MUTATION_FORBIDDEN).
   | 'config.getModelProviders'
@@ -144,21 +165,40 @@ export type ErrorCode =
   | 'SESSION_NOT_FOUND'
   | 'SESSION_NOT_RESUMABLE'
   | 'JOB_NOT_FOUND'
+  // `jobs.run` while a run of the job (scheduled, CLI or web) has not finished.
+  | 'JOB_ALREADY_RUNNING'
   | 'ESCALATION_NOT_FOUND'
   | 'ESCALATION_EXPIRED'
+  // `escalations.approveGroup`: the ids sent are not exactly the group's
+  // pending members any more (one arrived, expired or was resolved).
+  | 'ESCALATION_GROUP_CHANGED'
   | 'SESSION_BUSY'
   | 'WORKFLOW_NOT_FOUND'
   | 'WORKFLOW_CORRUPTED'
   | 'WORKFLOW_ALREADY_ACTIVE'
   | 'WORKFLOW_CHECKPOINT_NOT_FOUND'
+  // The checkpoint or definition copy was written by a newer IronCurtain.
+  | 'WORKFLOW_CHECKPOINT_TOO_NEW'
   | 'WORKFLOW_NOT_RESUMABLE'
+  // The run's recorded workspace no longer exists (resume never recreates it).
+  | 'WORKFLOW_WORKSPACE_MISSING'
+  // An imported run's definition runs host commands and `trust` was not given.
+  | 'WORKFLOW_IMPORT_UNTRUSTED'
   | 'WORKFLOW_NOT_AT_GATE'
+  // Gate-decision binding (`workflows.resolveGate`): the decision named a gate
+  // id other than the active raise, or an event the gate does not transition on.
+  | 'GATE_MISMATCH'
+  | 'EVENT_NOT_ACCEPTED'
   | 'ARTIFACT_NOT_FOUND'
   | 'README_NOT_FOUND'
   | 'PERSONA_NOT_FOUND'
   | 'FILE_TOO_LARGE'
   | 'INVALID_PARAMS'
   | 'RATE_LIMITED'
+  // The serialized reply exceeded the per-response cap or the connection's
+  // send buffer; the request failed but the socket stays open (see
+  // `WebUiServer.sendResponse`).
+  | 'RESPONSE_TOO_LARGE'
   | 'METHOD_NOT_FOUND'
   | 'LINT_FAILED'
   | 'INTERNAL_ERROR'
@@ -168,14 +208,28 @@ export type ErrorCode =
   | 'CREDENTIALS_MISSING'
   | 'LIST_REQUIRES_MCP'
   | 'POLICY_MUTATION_FORBIDDEN'
+  // The merged policy failed the deterministic policy lint (the pipeline's
+  // PolicyLintError), so nothing was written; the message names the first
+  // findings. Surfaced terminally via the `persona.compile.failed` event.
+  | 'POLICY_LINT_FAILED'
   // Phase 1c persona-CRUD error codes.
   // PERSONA_EXISTS: `personas.create` against an existing persona dir (after branding).
   // BROAD_POLICY_REJECTED: the broad-policy validator rejected a compiled policy
-  //   (`'*'` domain/list or out-of-workspace path) without `allowBroadPolicy`;
+  //   (an allow rule with a broad wildcard domain/list, an out-of-workspace
+  //   path, or an unconstrained resource argument) without `allowBroadPolicy`;
   //   surfaced terminally via the `persona.compile.failed` event.
   | 'PERSONA_EXISTS'
   | 'BROAD_POLICY_REJECTED'
-  | 'STATISTICS_UNAVAILABLE';
+  // PERSONA_INVALID: the persona's persona.json exists but cannot be used (not
+  //   JSON, a field of the wrong type or unknown, or a `name` other than its
+  //   directory's, as in a persona directory copied by hand; for
+  //   `personas.clone`, also a malformed agentModelId or resourceBudget).
+  | 'PERSONA_INVALID'
+  | 'STATISTICS_UNAVAILABLE'
+  // A well-formed statistics query asked for more than one request may
+  // compute (range, matched rows, groups, buckets, response size). `data`
+  // carries `{ limit, maximum }`; a shorter range or fewer groups succeeds.
+  | 'STATISTICS_LIMIT';
 
 // ---------------------------------------------------------------------------
 // DTO Types
@@ -199,6 +253,15 @@ export interface SessionDto {
    * kinds. Additive/optional — existing consumers ignore it.
    */
   readonly lastAttachedAt?: string;
+  /**
+   * One-line warning for a `web-pty` session when configured MCP servers
+   * that ask for an OS sandbox will not get one on the daemon host (they are
+   * refused under sandboxPolicy "enforce" or run unconfined under "warn").
+   * Computed by the daemon from its full server configuration when the
+   * session is created, so it may name a server this session's policy never
+   * starts. Absent when every such server is sandboxed. Additive/optional.
+   */
+  readonly osSandboxWarning?: string;
 }
 
 /** Persisted Docker-agent session that can be resumed into a new web PTY. */
@@ -213,11 +276,17 @@ export interface ResumableSessionDto {
   readonly providerProfileName?: string;
 }
 
+/**
+ * Session budget summary. Consumption fields are session totals (active
+ * seconds for `elapsedSeconds`); `limits` are the per-turn limits.
+ */
 export interface BudgetSummaryDto {
   readonly totalTokens: number;
   readonly stepCount: number;
   readonly elapsedSeconds: number;
   readonly estimatedCostUsd: number;
+  /** Where the cost comes from; `unknown` renders as "unknown", never $0.00. */
+  readonly costSource?: BudgetCostSource;
   readonly tokenTrackingAvailable: boolean;
   readonly tokenTrackingStatus?: 'complete' | 'partial' | 'unavailable';
   readonly observedExchanges?: number;
@@ -241,8 +310,16 @@ export interface SessionDetailDto extends SessionDto {
   readonly diagnosticLog: readonly DiagnosticEvent[];
 }
 
-/** Pending escalation for the escalation dashboard. */
-export interface EscalationDto {
+/**
+ * Pending escalation for the escalation dashboard. The reviewer-context
+ * fields (`EscalationDisplayFields`) carry the human's last message and the
+ * session's task (trusted) and the agent's justification (untrusted: the UI
+ * shows it set apart and labelled as the agent's); `groupKey` names the
+ * whitelist-pattern group the escalation belongs to, for "approve group".
+ */
+export interface EscalationDto extends EscalationDisplayFields {
+  /** Complete arguments were too large to show; browser approval is forbidden. */
+  readonly reviewUnavailable?: true;
   readonly escalationId: string;
   readonly sessionLabel: number;
   readonly sessionSource: SessionSource;
@@ -255,10 +332,20 @@ export interface EscalationDto {
   readonly receivedAt: string;
 }
 
+/**
+ * Result of `escalations.approveGroup`: the members approved, and those
+ * whose approval failed (expired meanwhile, session gone), with the reason.
+ */
+export interface EscalationGroupApprovalDto {
+  readonly approved: readonly string[];
+  readonly failed: readonly { readonly escalationId: string; readonly code: ErrorCode; readonly message: string }[];
+}
+
 /** Daemon status snapshot (JSON-serialized form). */
 export interface DaemonStatusDto {
   readonly uptimeSeconds: number;
-  readonly jobs: { total: number; enabled: number; running: number };
+  /** `failing`: jobs whose latest run ended in an error. */
+  readonly jobs: { total: number; enabled: number; running: number; failing: number };
   readonly signalConnected: boolean;
   readonly webUiListening: boolean;
   readonly activeSessions: number;
@@ -286,15 +373,23 @@ export interface JobListDto {
   readonly job: JobDefinition;
   readonly nextRun: string | null;
   readonly lastRun: RunRecord | null;
+  /** True from the moment a run is reserved (before its git sync and session start) until its record is written. */
   readonly isRunning: boolean;
+  /** Runs in a row, newest first, that ended in an error; 0 when the latest did not. */
+  readonly consecutiveFailures: number;
 }
 
 // ---------------------------------------------------------------------------
 // Workflow DTO Types
 // ---------------------------------------------------------------------------
 
-/** Phases that appear only on past-run records loaded from disk. */
-export type PastRunPhase = 'completed' | 'failed' | 'aborted' | 'waiting_human' | 'interrupted';
+/**
+ * Phases that appear only on past-run records loaded from disk.
+ * `running_elsewhere`: no live instance in this daemon, but the run's lock is
+ * held by another live IronCurtain process (a CLI `workflow start`, another
+ * daemon), so it is running there and cannot be resumed from here.
+ */
+export type PastRunPhase = 'completed' | 'failed' | 'aborted' | 'waiting_human' | 'interrupted' | 'running_elsewhere';
 
 /** Phases reported by the orchestrator for a workflow currently tracked in memory. */
 export type LiveWorkflowPhase = 'running' | 'waiting_human' | 'completed' | 'failed' | 'aborted';
@@ -347,16 +442,27 @@ export type WorkflowSummaryDto = WorkflowCardDto & {
  */
 export type WorkflowDetailDto = WorkflowCardDto & {
   readonly budget?: WorkflowBudgetDto;
+  /** Run-wide usage (tokens by kind, cost, running time, tracking status). */
+  readonly usage?: WorkflowUsage;
   readonly startedAt: string;
   readonly description: string;
   readonly stateGraph: StateGraphDto;
   readonly transitionHistory: readonly TransitionRecordDto[];
   readonly context: WorkflowContextDto;
   readonly gate?: HumanGateRequestDto;
+  /**
+   * Tool-call escalations waiting for a human decision. Present (non-empty)
+   * only on a live `running` workflow whose agent is blocked inside an
+   * escalated tool call; resolve one with `workflows.resolveEscalation`.
+   */
+  readonly escalations?: readonly WorkflowEscalationDto[];
   readonly workspacePath: string;
   /** True when the workflow's source package ships a `README.md` (lazily fetched via `workflows.readme`). */
   readonly hasReadme: boolean;
 };
+
+/** Wire form of a workflow tool-call escalation (already JSON-serializable). */
+export type WorkflowEscalationDto = WorkflowToolCallEscalation & { readonly reviewUnavailable?: true };
 
 /** Minimal representation of the state machine graph for frontend rendering. */
 export interface StateGraphDto {
@@ -409,12 +515,22 @@ export interface FileTreeEntryDto {
   readonly size?: number;
 }
 
-/** Response from `workflows.fileTree`. */
+/**
+ * Response from `workflows.fileTree`. A listing stops after 2,000 entries
+ * (directories and regular files only; symlinks, FIFOs, sockets and devices
+ * are never listed) and then reports `truncated: true`.
+ */
 export interface FileTreeResponseDto {
   readonly entries: readonly FileTreeEntryDto[];
+  readonly truncated?: boolean;
 }
 
-/** Response from `workflows.fileContent`. */
+/**
+ * Response from `workflows.fileContent` and `workflows.artifactFile`. Exactly
+ * one of `content`, `binary` or `error` is set: `error` carries a short
+ * display message such as "File too large to display (>1MB)" or "Not a
+ * regular file" (the path is a FIFO, socket, device or symlink).
+ */
 export interface FileContentResponseDto {
   readonly content?: string;
   readonly language?: string;
@@ -422,15 +538,22 @@ export interface FileContentResponseDto {
   readonly error?: string;
 }
 
-/** A single file in an artifact. */
+/** A single file in an artifact listing: its `/`-separated path below the artifact directory and its size in bytes. */
 export interface ArtifactFileDto {
   readonly path: string;
-  readonly content: string;
+  readonly size: number;
 }
 
-/** Response from `workflows.artifacts`. */
+/**
+ * Response from `workflows.artifacts`: the artifact's regular files (names and
+ * sizes only). File contents are fetched one at a time through
+ * `workflows.artifactFile`, so a reply never carries file bodies. The walk
+ * stops at 2,000 files, 8 directory levels or 1 MiB of listed paths and then
+ * reports `truncated: true`.
+ */
 export interface ArtifactContentDto {
   readonly files: readonly ArtifactFileDto[];
+  readonly truncated: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -441,9 +564,10 @@ export interface ArtifactContentDto {
  * Past-run record returned by `workflows.listResumable`.
  *
  * Covers terminal runs (completed/failed/aborted), runs paused at a human gate
- * (`waiting_human`), and runs whose checkpoint exists on disk with no live
+ * (`waiting_human`), runs whose checkpoint exists on disk with no live
  * orchestrator instance and no recorded `finalStatus` (`interrupted` — typically
- * a daemon crash mid-run; the phase is synthesized at the DTO boundary).
+ * a daemon crash mid-run; the phase is synthesized at the DTO boundary), and
+ * runs live in another process (`running_elsewhere`).
  */
 export type PastRunDto = WorkflowCardDto & {
   readonly phase: PastRunPhase;
@@ -460,17 +584,34 @@ export type PastRunDto = WorkflowCardDto & {
 export type ResumableWorkflowDto = PastRunDto;
 
 /**
- * Response from `workflows.messageLog`: a page of {@link MessageLogEntry}
+ * A {@link MessageLogEntry} as it appears in a `workflows.messageLog` page.
+ * String fields longer than 8,192 characters are cut to that length in the
+ * page and the entry carries `truncated: true` plus an opaque `ref` that
+ * `workflows.messageLogEntry` accepts to fetch the full entry.
+ */
+export type MessageLogEntryDto = MessageLogEntry & {
+  readonly truncated?: boolean;
+  readonly ref?: string;
+};
+
+/**
+ * Response from `workflows.messageLog`: a page of {@link MessageLogEntryDto}
  * records for a workflow, sorted newest-first by `ts`.
  *
  * Cursor pagination per design decision D5: callers fetch the next page by
  * passing the last entry's `ts` as the next request's `before` parameter.
  * `hasMore` is true iff the returned page is full *and* at least one strictly
- * older entry exists on disk; otherwise false.
+ * older entry exists on disk; otherwise false. A page is full at `limit`
+ * entries or at 1 MiB of log lines, whichever comes first.
  */
 export interface MessageLogResponseDto {
-  readonly entries: readonly MessageLogEntry[];
+  readonly entries: readonly MessageLogEntryDto[];
   readonly hasMore: boolean;
+}
+
+/** Response from `workflows.messageLogEntry`: one complete entry addressed by a page entry's `ref`. */
+export interface MessageLogEntryResponseDto {
+  readonly entry: MessageLogEntry;
 }
 
 /** Available workflow definition returned by `workflows.listDefinitions`. */
@@ -503,6 +644,14 @@ export interface PersonaDetailDto {
   readonly hasPolicy: boolean;
   readonly policyRuleCount?: number;
   /**
+   * Present when the compiled policy exists but no longer matches the
+   * persona's constitution (`'constitution'`), or was built for another
+   * policy-engine generation (`'engine'`, reserved). Recomputed from disk on
+   * every read. Sessions refuse a stale persona unless the user explicitly
+   * overrides on the CLI, so the UI must show it as needing a recompile.
+   */
+  readonly stale?: PolicyStaleReason;
+  /**
    * Whether persistent memory is enabled for this persona
    * (persona.memory?.enabled ?? true). Added in Phase 1a; additive and
    * backward-compatible — existing callers ignore unknown fields.
@@ -511,8 +660,10 @@ export interface PersonaDetailDto {
   /**
    * Whether this persona is authorized to compile a "broad" policy
    * (persona.allowBroadPolicy ?? false). When false, the broad-policy
-   * validator rejects compiled policies containing a `'*'` domain/list or an
-   * out-of-workspace `paths.within`. Set ONLY via the gated
+   * validator rejects compiled policies with an `allow` rule that has a broad
+   * wildcard domain/list (`'*'`, `'*.com'`, `'*.github.io'`), an
+   * out-of-workspace `paths.within`, or an unconstrained resource argument.
+   * Set ONLY via the gated
    * `personas.setBroadPolicyOptIn` method — never inferred from the
    * constitution. Added in Phase 1c. (Source: src/persona/types.ts
    * PersonaDefinition.allowBroadPolicy.)
@@ -530,7 +681,10 @@ export interface PersonaDetailDto {
 export interface PersonaListDto {
   readonly name: string;
   readonly description: string;
+  /** Whether a compiled policy exists (it may still be stale, see `stale`). */
   readonly compiled: boolean;
+  /** Same meaning as {@link PersonaDetailDto.stale}; absent when fresh or not compiled. */
+  readonly stale?: PolicyStaleReason;
   /**
    * Whether persistent memory is enabled for this persona
    * (persona.memory?.enabled ?? true). NOTE: the Phase-1a service does not yet
@@ -547,13 +701,56 @@ export interface PersonaEditResultDto {
 }
 
 /**
+ * One soft-deleted persona in `~/.ironcurtain/.persona-trash/`
+ * (`personas.listTrash`, newest first).
+ */
+export interface PersonaTrashEntryDto {
+  /** The entry's id (its directory name): the handle restore and purge take. */
+  readonly id: string;
+  /** The persona's name when it was deleted. */
+  readonly name: string;
+  /** ISO 8601 time of the deletion. */
+  readonly deletedAt: string;
+  /** The persona's description, when its persona.json is valid. */
+  readonly description?: string;
+  /** Why the entry's persona.json cannot be used; such an entry cannot be restored. */
+  readonly problem?: string;
+  /**
+   * ISO 8601 time from which the retention sweep purges the entry; absent
+   * when entries are kept until purged by hand (or the retention setting
+   * could not be read).
+   */
+  readonly expiresAt?: string;
+}
+
+/** Result of `personas.restoreTrash`. */
+export interface PersonaRestoreResultDto {
+  readonly persona: PersonaDetailDto;
+  /** The trash entry that was restored. */
+  readonly restored: string;
+  /** With `force`: the trash entry the persona it replaced was moved to. */
+  readonly replaced?: string;
+}
+
+/** Result of `personas.purgeTrash`: entries removed, and entries that could not be. */
+export interface PersonaTrashPurgeResultDto {
+  readonly purged: readonly string[];
+  readonly failed: ReadonlyArray<{ readonly id: string; readonly reason: string }>;
+}
+
+/**
  * Compile-time diff vs the persona's previous `compiled-policy.json`,
  * carried on a successful compile result (Phase 1c). Surfaced by the
  * `done` event/card so prompt-injected broadening is reviewable after the
- * fact. `broadenedDomains` / `outOfWorkspacePaths` enumerate the specific
- * `'*'`-domain and out-of-workspace `paths.within` values introduced (these
- * are only ever non-empty for an `allowBroadPolicy` persona, since otherwise
- * the broad-policy validator would have rejected the compile).
+ * fact. `broadenedDomains`, `outOfWorkspacePaths` and `unconstrainedAllows`
+ * enumerate the broad access of the new policy's `allow` rules: broad
+ * wildcard domains (`*`, `*.com`, `*.github.io`, judged with the Public Suffix
+ * List), out-of-workspace `paths.within`, and rules that leave a resource
+ * argument unconstrained (`<rule>: <role> on <server>/<tool>`). These are only
+ * ever non-empty for an `allowBroadPolicy` persona, since otherwise the
+ * broad-policy validator would have rejected the compile. `escalateBreadth` is
+ * informational: the same wildcard and path breadth on `escalate` rules, which
+ * a human approves call by call.
  */
 export interface RuleDeltaDto {
   readonly added: number;
@@ -561,20 +758,42 @@ export interface RuleDeltaDto {
   readonly removed: number;
   readonly broadenedDomains: readonly string[];
   readonly outOfWorkspacePaths: readonly string[];
+  readonly unconstrainedAllows: readonly string[];
+  readonly escalateBreadth: readonly string[];
 }
 
 /**
- * Success-only compile result carried by a `done` operation record / event.
+ * A server whose compile failed (LLM or network error, invalid rules, or
+ * verification still failing after every repair). It has no rules in the
+ * written policy, so every call to its tools is denied until a later compile
+ * succeeds. Mirrors the pipeline's `FailedServer`.
+ */
+export interface FailedServerDto {
+  readonly serverName: string;
+  /** The phase the server was in when it failed. */
+  readonly phase: Exclude<CompilationPhase, 'cached' | 'done'>;
+  /** Single-line, length-bounded failure reason. */
+  readonly reason: string;
+}
+
+/**
+ * Compile result carried by a `done` operation record / event: the policy was
+ * written.
  *
- * A terminal `done` record never represents failure — failures route through
+ * A terminal `done` record never represents a failed compile — when no policy
+ * is written (including when every server failed) the result routes through
  * the `persona.compile.failed` event and `PersonaCompileOperationDto.error`.
- * Phase 1c adds the optional `ruleDelta` (absent when there was no previous
- * compiled policy to diff against).
+ * A `done` result can still be partial: `failedServers` lists servers that
+ * failed and were left out of the written policy. Phase 1c adds the optional
+ * `ruleDelta` (absent when there was no previous compiled policy to diff
+ * against).
  */
 export interface PersonaCompileResultDto {
   readonly success: true;
   readonly ruleCount: number;
   readonly ruleDelta?: RuleDeltaDto;
+  /** Servers left out of the written policy because they failed. Absent when none failed. */
+  readonly failedServers?: readonly FailedServerDto[];
 }
 
 /**

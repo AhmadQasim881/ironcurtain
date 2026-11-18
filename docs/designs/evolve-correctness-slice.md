@@ -1,6 +1,8 @@
 # Evolve Native Workflow — Correctness Slice (run-spec stop conditions take effect + resume-safe durable record)
 
-Status: **Design — revised; ready to implement.** (This revision settles the doc against an independent critical review: the resume/idempotency half — Fix C — was verified sound and the failure mode real, and is preserved as-endorsed; the stop-signal half — Fixes A/B — had a real correctness bug, over-claimed tests, and a self-contradiction, all corrected here. Patience is ENFORCED, not advisory — the maintainer decision. The corrected scope adds two `preflight`-prompt edits, and the stop signals are now computed **post-record in `attach_analysis`**, not in `sample`.)
+**Status (2026-11-14):** Implemented (PR #313): run-spec stop conditions take effect, and the durable record is resume-safe.
+
+Original status (design phase): **Design — revised; ready to implement.** (This revision settles the doc against an independent critical review: the resume/idempotency half — Fix C — was verified sound and the failure mode real, and is preserved as-endorsed; the stop-signal half — Fixes A/B — had a real correctness bug, over-claimed tests, and a self-contradiction, all corrected here. Patience is ENFORCED, not advisory — the maintainer decision. The corrected scope adds two `preflight`-prompt edits, and the stop signals are now computed **post-record in `attach_analysis`**, not in `sample`.)
 
 Audience: IronCurtain workflow + docker-infrastructure engineer extending the merged `evolve` workflow package (all five prior increments — single/multi-round hub, human-surface gates, generic experiment harness — are on `master`).
 
@@ -146,6 +148,22 @@ Cited in detail in §2.3. The key seams for Fix C: `attach_analysis` resolves `s
 - **(b) Compute the stop signals DETERMINISTICALLY in the bridge.** A bridge step (which already reads `nodes.json` + `run_spec`, §3.2) computes `best_score`, `rounds_since_improvement`, `target_met`, `patience_exceeded`, and a single `stop_reason`, and either (b1) surfaces them into `current/` context for the orchestrator to route on, or (b2) routes a hard verdict directly. **Which bridge step is itself a correctness question** (§5.1): it must be `attach_analysis` (post-record), not `sample` (pre-record), or the signal is one round stale at the completion vantage.
   - **(b2) — a hard deterministic verdict** would mean the bridge itself emits a "stop" verdict and a new transition bypassing the orchestrator. This **breaks the hub model** (the orchestrator is the single router) and the human "run N more rounds" override (which lives in the orchestrator prompt, §3.1) — a plateau or target-met would stop even when the human asked for more. Rejected.
   - **(b1) — surface signals, orchestrator routes** keeps the hub intact: the bridge computes the numbers (deterministic, unit-testable), and the orchestrator routes `complete` on a pre-computed verdict rather than re-deriving it.
+
+> **Superseded routing (WP-77).** The shipped workflow now uses (b2): an LLM verdict
+> was the only thing standing between a confused or prompt-injected orchestrator and
+> the 200-visit backstop, so the round budget is enforced deterministically. After
+> every recorded round (`workers` and the in-place recovery `analysis_record` both
+> route `recorded` to it), a container `stop_check` state runs
+> `evolve_result.py stop_check`, which recomputes the signals over `nodes.json` +
+> `run_spec.yaml` with the same `_compute_stop_signals`, rewrites the canonical
+> `current/stop_signals.json`, and emits `stop` (→ `final_summary`) or `continue`
+> (→ `orchestrator`); a crash routes to `failed`. The objection above does not hold:
+> the human "run N more rounds" override still works, because a `final_review`
+> FORCE_REVISION returns to the orchestrator, which emits `design` for one round;
+> `stop_check` then decides again after that round records — one extra round per
+> human request, exactly as the prompt already promised. The computation sites below
+> (`attach_analysis` post-record, the barrier's `compute_stop_signals`) are unchanged.
+> Test: `test/workflow/evolve-deterministic-stop.test.ts`.
 
 ### Recommendation — the hybrid (b1), computed post-record in `attach_analysis`
 

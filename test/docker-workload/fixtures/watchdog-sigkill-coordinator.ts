@@ -2,8 +2,9 @@
  * Coordinator-role stub for the watchdog SIGKILL cross-process test.
  *
  * Plays the production coordinator faithfully: renders the per-session
- * watchdog policy, creates the bundle lease (bound to its own PID), records
- * one observed outer container resource, activates the lease, launches the
+ * Docker Desktop watchdog policy, creates the bundle lease (bound to its own
+ * PID), records the observed agent, nested-daemon sidecar, daemon volume,
+ * proxy, and network, activates the lease, launches the
  * detached watchdog supervisor via the production spawn path, then heartbeats
  * the lease until the test SIGKILLs it. It never exits on its own.
  *
@@ -32,6 +33,9 @@ interface SharedFixtureConfig {
   readonly containerName: string;
   readonly proxyContainerId: string;
   readonly proxyContainerName: string;
+  readonly daemonContainerId: string;
+  readonly daemonContainerName: string;
+  readonly volumeName: string;
   readonly networkId: string;
   readonly networkName: string;
   readonly labelKey: string;
@@ -51,13 +55,13 @@ try {
   const ironCurtainHome = process.env.IRONCURTAIN_HOME;
   if (ironCurtainHome === undefined) throw new Error('watchdog SIGKILL coordinator requires IRONCURTAIN_HOME');
   const stateRoot = join(ironCurtainHome, 'docker-workload', 'state', config.leaseId);
-  mkdirSync(join(stateRoot, 'daemon'), { recursive: true });
+  mkdirSync(join(stateRoot, 'staging'), { recursive: true });
   const leasePath = join(config.controlDir, 'lease.json');
   const policyPath = join(config.controlDir, 'policy.json');
   const statusPath = join(config.controlDir, 'status.json');
   const stopRequestPath = join(config.controlDir, 'stop.json');
 
-  const rendered = renderWatchdogPolicy(config.template, stateRoot, policyPath);
+  const rendered = renderWatchdogPolicy(config.template, 'docker', stateRoot, policyPath);
   createDockerWorkloadLease(leasePath, {
     leaseId: config.leaseId,
     bundleId: config.bundleId,
@@ -87,6 +91,22 @@ try {
   });
   observeDockerWorkloadOuterResource(leasePath, config.generation, 'agent-container-001', config.containerId);
   requestDockerWorkloadOuterResource(leasePath, config.generation, {
+    requestId: 'daemon-api-volume-001',
+    kind: 'volume',
+    role: 'daemon-api',
+    requestedName: config.volumeName,
+    ownershipLabelKey: config.labelKey,
+  });
+  observeDockerWorkloadOuterResource(leasePath, config.generation, 'daemon-api-volume-001', config.volumeName);
+  requestDockerWorkloadOuterResource(leasePath, config.generation, {
+    requestId: 'nested-daemon-001',
+    kind: 'container',
+    role: 'nested-daemon',
+    requestedName: config.daemonContainerName,
+    ownershipLabelKey: config.labelKey,
+  });
+  observeDockerWorkloadOuterResource(leasePath, config.generation, 'nested-daemon-001', config.daemonContainerId);
+  requestDockerWorkloadOuterResource(leasePath, config.generation, {
     requestId: 'transport-proxy-001',
     kind: 'container',
     role: 'proxy',
@@ -113,7 +133,7 @@ try {
     startupTimeoutMs: 30_000,
   });
 
-  writeResultAtomically({ coordinatorPid: process.pid, supervisorPid: launched.pid });
+  writeResultAtomically(resultPath, { coordinatorPid: process.pid, supervisorPid: launched.pid });
 
   // Heartbeat forever; only the test's SIGKILL ends this process. A terminal
   // lease would make heartbeats throw, but by then this process is dead.
@@ -126,13 +146,13 @@ try {
   }, 100);
 } catch (error) {
   const message = error instanceof Error ? (error.stack ?? error.message) : String(error);
-  writeResultAtomically({ error: message });
+  writeResultAtomically(resultPath, { error: message });
   process.exit(1);
 }
 
 /** Write-then-rename so the test never observes a partially written result file. */
-function writeResultAtomically(result: object): void {
-  const tempPath = `${resultPath}.tmp`;
+function writeResultAtomically(path: string, result: object): void {
+  const tempPath = `${path}.tmp`;
   writeFileSync(tempPath, `${JSON.stringify(result)}\n`, { mode: 0o600 });
-  renameSync(tempPath, resultPath);
+  renameSync(tempPath, path);
 }

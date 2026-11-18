@@ -1,6 +1,7 @@
 # Design: `memory_ingest` — LLM-backed fact decomposition tool
 
-**Status:** Design v2 (review-amended) — no implementation
+**Status (2026-11-14):** Implemented: the `memory_ingest` tool (`packages/memory-mcp-server/src/tools/ingest.ts`); see the "As implemented" notes.
+
 **Scope:** Builds **only** Question 3 / decomposition from
 [`docs/brainstorm/memory-inferred-metadata-proposal.md`](../brainstorm/memory-inferred-metadata-proposal.md).
 Question 1 (auto-inferred tags) and Question 2 (titles) are **explicitly deferred** — this doc does not design them.
@@ -206,6 +207,11 @@ This sits alongside the existing five tools under the same
 `/* eslint-disable @typescript-eslint/no-deprecated */` block (the package still uses the
 deprecated `server.tool()` API; match it — do not introduce `registerTool` for one tool).
 
+> **As implemented (WP-130).** All seven tools moved to `registerTool` together, with the same
+> Zod shapes as `inputSchema`, a title and tool annotations (`memory_ingest` is marked
+> destructive and not idempotent: it can merge into existing memories and starts maintenance).
+> The eslint-disable block is gone.
+
 `TOOL_DESCRIPTIONS.memory_ingest` is added to `prompts.ts` (one new entry; keep style
 consistent), e.g.:
 
@@ -408,6 +414,20 @@ N-char response"`); see §4.4.
   returns `null`. **No new retry loop** — the package has no retry anywhere and a single Haiku
   call is cheap; adding retries would be inconsistent over-engineering. Retry, when wanted, is
   the **driver's** job via `on_extraction_failure='error'`.
+
+  > **Update (WP-94).** The OpenAI SDK's defaults (600 s per attempt, two retries) let one call
+  > outlive the MCP request that made it. `llmComplete` now gives every call a deadline that
+  > covers its one SDK retry (`MEMORY_LLM_TIMEOUT_MS`, 60 s, for extraction and maintenance;
+  > `MEMORY_LLM_FORMAT_TIMEOUT_MS`, 20 s, for summary/answer recalls), aborts it when the MCP
+  > request is cancelled, and counts it against a per-process budget (`MEMORY_LLM_MAX_CALLS`,
+  > `MEMORY_LLM_MAX_TOKENS`). A call cut short returns `null` like any other failure. A retried
+  > ingest no longer writes duplicate segments: a segment row carries a hash of its content,
+  > source label and mode, and `materializeSegment` reuses an existing row with the same hash
+  > when only memories of the writer's own review group (WP-96 quarantine: reviewed memories,
+  > or one unattended scope's pending ones) link to it. A row another group's memories use, or
+  > that no memory uses any more, is not reused: one group's reject or forget would otherwise
+  > purge the other's source, and `segments_created` would reveal a source the caller may not
+  > read (`findSegmentByContent` in `storage/queries.ts`).
 - An **unparseable** response (no JSON array / invalid JSON / non-array) → `parseExtractedFacts`
   returns `null`, and `extractFacts` returns `null` → counted as a **chunk failure** for
   diagnostics. A successfully parsed **empty array** `[]` is **not** a failure: it is a clean
@@ -433,6 +453,17 @@ N-char response"`); see §4.4.
 ---
 
 ## 5. Write path
+
+> **As implemented (WP-67): trust model.** Before chunking, the engine removes secret values
+> (provider API keys and tokens, bearer tokens, private keys, passwords in URLs or written as
+> assignments, card numbers, SSNs) from the blob, so neither the extraction LLM, the stored
+> segments nor the facts see them; the result reports `redacted_secrets` and the reply says how
+> many were removed. The handler rejects `tags` or `source` that contain a secret. Seed and
+> per-fact importance are capped at 0.8 (`MAX_AGENT_IMPORTANCE`), in the dry-run preview too.
+> Every fact written is stamped with the host-set writer (`metadata.writer`, from
+> `MEMORY_WRITER_KIND` / `MEMORY_SESSION_ID`); the caller's `source` is a label, not provenance.
+> In IronCurtain an ingest of more than 10,000 characters (dry run included) escalates to a
+> human (`memory-large-ingest-escalate`, see memory-mcp-server-v2.md, Policy Treatment).
 
 ### 5.1 Flow per ingest call (engine `ingest`)
 
@@ -471,9 +502,17 @@ N-char response"`); see §4.4.
 
 `store` is called in a loop in-process; `better-sqlite3` is synchronous and each `store` is its
 own transaction (as today). No batching transaction is added — keeps the change minimal and
-each fact independently dedups. `maybeRunMaintenance` already fires inside `storeImmediate`
-every `maintenanceInterval` stores, so a large ingest naturally triggers a consolidation pass;
-no extra orchestration needed.
+each fact independently dedups.
+
+> **Update (WP-94).** Maintenance no longer runs inside `storeImmediate`. The ingest counts the
+> facts it created and calls `maybeRunMaintenance(db, config, created)` once, after its writes,
+> so a 200-fact ingest starts at most one pass (it used to await a full LLM-backed pass inside
+> every 50th write). `memory_store` does the same with a count of one. The pass runs in the
+> background: the tool call returns without waiting for it, since a pass makes up to dozens of
+> LLM calls without reporting progress and, with a slow endpoint, would outlive the caller's
+> deadline. Passes are serialized per connection and guarded across servers by a lease row
+> (`maintenance_lease:<namespace>` in `schema_meta`, renewed while the pass runs;
+> `storage/maintenance.ts`).
 
 > **Bulk-driver note (out of scope for tool code).** For a reproducible eval corpus the driver
 > may want a single, deterministic consolidation pass at the **end** of the bulk load instead of
@@ -510,9 +549,12 @@ export interface StoreOptions {
 Extracted facts may duplicate existing memories or each other. We rely entirely on the existing
 two-tier dedup:
 
-- **Within the same ingest:** two near-identical facts → the second hits exact-dedup
-  (`EXACT_DEDUP_DISTANCE`) in `storeImmediate` and is `merged_duplicate`, or lands in the
-  consolidation band and is resolved on the next maintenance pass.
+- **Within the same ingest:** two identical facts → the second hits exact-dedup in
+  `storeImmediate` and is `merged_duplicate`; anything merely close lands in the consolidation
+  band and is resolved on the next maintenance pass. (Exact-dedup means a neighbour within
+  `EXACT_DEDUP_DISTANCE` whose normalized text is equal: the same fact in the same words. Facts
+  that differ by one word, e.g. production vs staging, can measure under that distance, so
+  distance alone no longer merges.)
 - **Against prior memories:** identical — `storeImmediate`'s `vectorSearch` + consolidation
   catch it.
 
@@ -560,8 +602,9 @@ updated_at        = local row-mutation time (when this row was last written), NO
 
 `created_at` (true first-seen) and `last_accessed_at` (historical recency) are the
 order-independent reconciled values. `updated_at` is **not** a historical max: it is the row's
-last-mutation time. The exact-dedup merge first calls `updateMemoryContent`, which unconditionally
-stamps `updated_at = Date.now()`; the subsequent `updateMemoryTimestampsOnMerge` then runs
+last-mutation time. The exact-dedup merge first calls `mergeMemoryMetadata` (originally
+`updateMemoryContent`), which unconditionally stamps `updated_at = Date.now()`; the subsequent
+`updateMemoryTimestampsOnMerge` then runs
 `updated_at = MAX(updated_at, as_of)`, and for a backdated (past) `as_of` that `MAX` is the
 just-written `now`. So a historical backfill leaves `updated_at` at the local mutation time — by
 design, `updated_at` tracks when the row was last written while `last_accessed_at` carries the
@@ -569,8 +612,10 @@ recency signal.
 
 Implementation:
 
-- The exact-dedup merge branch in `storeImmediate` calls `updateMemoryContent` (content/embedding/
-  tags/importance) **and then**, only when `opts.createdAt` is set, a small new query
+- The exact-dedup merge branch in `storeImmediate` calls `mergeMemoryMetadata` (tags/importance/
+  source; the stored text and vector are kept, since exact-dedup now requires the same text) — it
+  originally called `updateMemoryContent`, which overwrote the text — **and then**, only when
+  `opts.createdAt` is set, a small new query
   `updateMemoryTimestampsOnMerge(db, namespace, id, asOf)` that runs:
   ```sql
   UPDATE memories
@@ -604,6 +649,14 @@ Handler-side normalization: `as_of` may be epoch ms (number) or ISO 8601 (string
 `validateIngestInput` resolves it to epoch ms via `Date.parse` for strings, rejects
 non-finite/negative results with a clear error, and passes a `number` to the engine. The engine
 never sees the string form (keeps the engine contract numeric and simple).
+
+**Future bound.** `as_of` may lie at most five minutes in the future (`MAX_AS_OF_FUTURE_SKEW_MS`,
+clock skew between caller and server); anything later is rejected by the handler and, for direct
+engine callers, again by `ingest`/`store` before any LLM call or write. A far-future timestamp
+sorted first in every "recent" view, never decayed, dominated composite ranking, and (beyond the
+Date range, e.g. `1e20`) made `memory_context` throw `Invalid time value` for every later session.
+Rows already stored with such a timestamp render as `unknown date`, and recency/decay ages clamp
+at zero.
 
 ---
 
@@ -639,6 +692,14 @@ Conversations can exceed the model context. Strategy:
   during extraction.
 - **Bound:** cap total chunks (e.g. `MAX_INGEST_CHUNKS = 50`) and total facts
   (`MAX_FACTS_PER_INGEST`) to keep a hostile or enormous blob from fanning out unboundedly.
+
+  > **Update (WP-94).** As first built, `MAX_FACTS_PER_INGEST` was applied per model response
+  > (`parseExtractedFacts`), so one ingest could keep 50 × 200 facts, and content past the 50th
+  > chunk was dropped silently. Now: the content is capped at 200 KB (UTF-8 bytes) and `source`
+  > at 256 characters before any LLM call (`assertIngestSize`, in the handler and again in
+  > `ingestBlob`); `extractAllFacts` (`extraction.ts`) caps the union of facts at 200 across
+  > chunks and stops calling the LLM once it is full, dry runs included; and the result reports
+  > `truncated: true` and `dropped_chunks` whenever part of the content was not extracted.
 
 Chunking lives in `extraction.ts` (`chunkBlob(blob): string[]`, with the ~10–15% overlap of
 A5 baked in) — pure, unit-testable.
@@ -691,6 +752,14 @@ not happen.
 ---
 
 ## 10. Auto-save seam (note only — no change now)
+
+> **As implemented (WP-96).** `src/memory/auto-save.ts` now asks the agent for one `memory.ingest` call in
+> `mode: 'document'` with a summary of the session (plain sentences, one point per line, at most 2,000
+> characters, `source: 'session-summary'`), so the summary is decomposed into atomic facts linked to it as
+> their segment. The tool name is the Code Mode `memory.ingest` in every session, Docker included: Docker
+> agents reach the memory server only through the `ironcurtain` MCP server's `execute_code`, so the raw
+> `memory_ingest` name the note below assumed for Docker does not exist there. A cron job's auto-save gate
+> also honours the opt-out of the persona the job runs as.
 
 Proposal §5 wants `src/memory/auto-save.ts` (in the **IronCurtain runtime**, not this package)
 to eventually route session summaries through `ingest` instead of asking the agent to call
@@ -825,7 +894,8 @@ File: extend `test/server.test.ts` and add `test/ingest-tool.test.ts` (mirrors `
   every fact; no inference, no vocabulary convergence.
 - **Inferred titles (Question 2):** not designed here. No `title` column, no migration.
 - **`store` accepting `content: string | string[]`:** out of scope; a separate proposal item.
-- **Routing `auto-save.ts` through ingest:** noted as a seam (§10); not changed in this work.
+- **Routing `auto-save.ts` through ingest:** noted as a seam (§10); not changed in this work (done
+  later, in WP-96).
 - **The historical-export / eval-corpus driver is a SEPARATE script**, not part of this tool.
   `memory_ingest` provides the **insert-time** primitives the driver needs — per-fact importance
   (A2), order-independent merge timestamps (A1), `on_extraction_failure` (A3), durability prompts

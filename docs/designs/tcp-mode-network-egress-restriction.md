@@ -1,6 +1,6 @@
 # TCP Mode: Network Egress Restriction via `--internal` Docker Network + Socat Sidecar
 
-**Status:** Implemented (PR #32)
+**Status (2026-11-14):** Implemented (PR #32). The socat sidecar image is now built locally from `docker/transport-sidecar/Dockerfile` instead of being pulled by name, and the container is created from its immutable image ID and runs read-only, as an unprivileged user, with every capability dropped (`src/docker/transport-sidecar-image.ts`).
 
 ## Problem
 
@@ -82,26 +82,69 @@ docker network create --internal \
   --subnet 172.30.0.0/24 --gateway 172.30.0.1 \
   ironcurtain-internal
 
-# 2. Create and start socat sidecar on default bridge
+# 2. Build the sidecar image from the vendored Dockerfile (only when the
+#    cached image's build-hash label differs) and resolve it to its
+#    immutable ID
+docker build --label ironcurtain.build-hash=${BUILD_HASH} \
+  --label ironcurtain.component=transport-sidecar \
+  -t ironcurtain-transport-sidecar:latest docker/transport-sidecar
+SIDECAR_IMAGE=$(docker image inspect -f '{{.Id}}' ironcurtain-transport-sidecar:latest)
+
+# 3. Create and start the socat sidecar on default bridge: read-only,
+#    unprivileged, every capability dropped, no new privileges
 docker create --name ironcurtain-sidecar-${ID} \
-  --network bridge --entrypoint /bin/sh alpine/socat \
+  --network bridge --init --cap-drop=ALL --read-only \
+  --security-opt no-new-privileges:true --user 65534:65534 \
+  --entrypoint /bin/sh ${SIDECAR_IMAGE} \
   -c "socat TCP-LISTEN:${MCP_PORT},fork,reuseaddr TCP:host.docker.internal:${MCP_PORT} & \
       socat TCP-LISTEN:${MITM_PORT},fork,reuseaddr TCP:host.docker.internal:${MITM_PORT}"
 docker start ironcurtain-sidecar-${ID}
 
-# 3. Connect sidecar to internal network
+# 4. Connect sidecar to internal network
 docker network connect ironcurtain-internal ironcurtain-sidecar-${ID}
 
-# 4. Get sidecar's IP on internal network
+# 5. Get sidecar's IP on internal network
 SIDECAR_IP=$(docker inspect -f '{{json .NetworkSettings.Networks}}' \
   ironcurtain-sidecar-${ID} | jq -r '.["ironcurtain-internal"].IPAddress')
 
-# 5. Create app container on internal network, pointing at sidecar
+# 6. Create app container on internal network, pointing at sidecar
 docker create --network ironcurtain-internal \
   --add-host=host.docker.internal:${SIDECAR_IP} \
   -e HTTPS_PROXY=http://host.docker.internal:${MITM_PORT} \
   ...
 ```
+
+### Sidecar image
+
+The sidecar relays plaintext MCP JSON-RPC and the agent's CONNECT streams (and,
+in PTY mode, the terminal), so its image is part of the isolation boundary.
+It used to be `alpine/socat`, a community Docker Hub repository pulled by
+name (so `:latest`) and trusted by name whenever an image with that name was
+present. `src/docker/transport-sidecar-image.ts` is now the only place that
+resolves it:
+
+- the image is built locally from the vendored
+  `docker/transport-sidecar/Dockerfile`: the Docker Official `alpine` image
+  plus Alpine's `socat` package, whose signature apk verifies against the
+  keys the base image ships. Nothing is pulled from a third-party namespace;
+- `ensureTransportSidecarImage` goes through the build-hash-labelled image
+  cache like the other locally built images (`ironcurtain.build-hash` over
+  the build inputs, plus `ironcurtain.component=transport-sidecar`): it
+  rebuilds when the Dockerfile changed, then inspects the tag and returns the
+  immutable image ID only when both labels name this build. The sidecar is
+  created from that ID, so a local image that merely carries the tag is
+  never run;
+- `hardenTransportSidecarCreate` runs it with a read-only root filesystem, as
+  `65534:65534` (nobody, also the image's default user), with
+  `no-new-privileges` on top of the unconditional `--cap-drop=ALL` and the
+  Docker Desktop transport resource share. socat needs no privilege and no
+  writable path: every relayed port is unprivileged.
+
+The first TCP-mode session on a host builds the image, which needs network
+access for the base image and the package (as pulling `alpine/socat` did); a
+failed build fails the session closed with the build error. The base image is
+named by tag, as for the other locally built images; pinning it by digest is
+a reviewed follow-up.
 
 ### Connectivity validation
 
@@ -130,7 +173,10 @@ getContainerIp(containerId: string, network: string): Promise<string>;
 ```
 
 The `DockerContainerConfig` also gained an `entrypoint` field to override
-the `alpine/socat` image's `ENTRYPOINT ["socat"]`.
+the sidecar image's `ENTRYPOINT ["socat"]` (the sidecar runs `/bin/sh -c` to
+start one socat per relayed port), and the sidecar uses the `user` and
+`trustedCreateOptions` (`readOnlyRootfs`, `securityOptions`) fields for its
+hardening.
 
 ## Manual Testing on macOS
 

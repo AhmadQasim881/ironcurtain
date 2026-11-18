@@ -16,6 +16,8 @@ import {
   type DockerWorkloadLease,
 } from './bundle-lease.js';
 import { revokeDockerWorkloadOuterResources, type DockerWorkloadRevocationResult } from './bundle-revocation.js';
+import { releaseDockerWorkloadEmergencyReserve } from './emergency-reserve.js';
+import { incidentDetailFromError, preserveOriginalFailure } from './incident-detail.js';
 import {
   acquireProcessLock,
   ProcessLockBusyError,
@@ -98,8 +100,21 @@ export interface SerializedDockerWorkloadCleanupOptions {
   readonly waitForOwner: boolean;
   readonly timeoutMs?: number;
   readonly processIdentityForPid?: ProcessIdentityResolver;
+  /**
+   * A lifecycle claim the caller already holds (the supervisor's sampling
+   * claim at a trip). Cleanup adopts and finally releases it instead of
+   * writing a new lock record, which a full disk could refuse.
+   */
+  readonly claim?: DockerWorkloadLifecycleClaimHandle;
   /** Recheck a stale observation after ownership is acquired, before mutation or runtime I/O. */
   readonly revalidate?: (lease: DockerWorkloadLease) => void;
+  /**
+   * Runs after ownership and revalidation, before the emergency reserve is
+   * freed and before the first lease write. The supervisor stops and removes
+   * exact containers here, so revocation does not wait on (or fail with) a
+   * durable write.
+   */
+  readonly beforeLeaseMutation?: () => Promise<void>;
   /** Synchronous audit hook after the durable transition and before runtime I/O. */
   readonly onRevoking?: (from: 'admitting' | 'active' | 'incident') => void;
   /** Deterministic concurrency seam after stale revalidation and before revocation. */
@@ -138,14 +153,16 @@ export async function performSerializedDockerWorkloadCleanup(
       throw new Error(`Docker-workload cleanup exceeded the ${timeoutMs}ms cooperative bound`);
     }
   };
-  const claim = await acquireLifecycleClaim({
-    leasePath: options.leasePath,
-    clock: options.clock,
-    sleep: options.sleep,
-    wait: options.waitForOwner,
-    timeoutMs: options.timeoutMs,
-    processIdentityForPid: options.processIdentityForPid,
-  });
+  const claim =
+    options.claim ??
+    (await acquireLifecycleClaim({
+      leasePath: options.leasePath,
+      clock: options.clock,
+      sleep: options.sleep,
+      wait: options.waitForOwner,
+      timeoutMs: options.timeoutMs,
+      processIdentityForPid: options.processIdentityForPid,
+    }));
 
   try {
     const current = loadDockerWorkloadLease(options.leasePath);
@@ -157,6 +174,14 @@ export async function performSerializedDockerWorkloadCleanup(
     assertBudget();
     options.revalidate?.(current);
     options.afterRevalidate?.();
+    // A caller's write-free revocation stops the bundle first. Only then is
+    // the preallocated reserve freed, before the first lease write, so a disk
+    // the bundle filled still has room for the proof and a bundle that is
+    // still writing cannot take that room. A revalidation refusal above
+    // leaves a live lease its reserve.
+    await options.beforeLeaseMutation?.();
+    releaseDockerWorkloadEmergencyReserve(dirname(options.leasePath));
+    assertBudget();
 
     try {
       for (;;) {
@@ -202,31 +227,59 @@ export async function performSerializedDockerWorkloadCleanup(
         }
       }
     } catch (error) {
-      const failed = loadDockerWorkloadLease(options.leasePath);
-      const detail = error instanceof Error ? error.message : String(error);
-      if (failed.incident !== null && failed.status === 'revoking') {
-        returnDockerWorkloadLeaseRecoveryToIncident(options.leasePath, options.generation, options.clock());
-      } else if (failed.status !== 'closed' && failed.status !== 'incident') {
-        recordDockerWorkloadLeaseIncident(
-          options.leasePath,
-          options.generation,
-          {
-            code: 'docker-workload-cleanup-failed',
-            detail,
-          },
-          options.clock(),
-        );
-      }
-      throw error;
+      // Recording the failure must never replace it: a lease that cannot be
+      // read or updated right now stays revoking, which reconciliation retries.
+      throw preserveOriginalFailure(error, recordCleanupFailure(options, error));
     }
   } finally {
     claim.release();
   }
 }
 
-/** Supervisor/reconciler use this to defer rather than report a lifecycle-claim collision as a sample/cleanup error. */
+/**
+ * Durably mark a failed cleanup: a first failure records the bounded incident,
+ * a failed incident recovery returns to its original incident. Returns the
+ * recording failures instead of throwing them.
+ */
+function recordCleanupFailure(options: SerializedDockerWorkloadCleanupOptions, error: unknown): readonly unknown[] {
+  try {
+    const failed = loadDockerWorkloadLease(options.leasePath);
+    if (failed.incident !== null && failed.status === 'revoking') {
+      returnDockerWorkloadLeaseRecoveryToIncident(options.leasePath, options.generation, options.clock());
+    } else if (failed.status !== 'closed' && failed.status !== 'incident') {
+      recordDockerWorkloadLeaseIncident(
+        options.leasePath,
+        options.generation,
+        { code: 'docker-workload-cleanup-failed', detail: incidentDetailFromError(error) },
+        options.clock(),
+      );
+    }
+    return [];
+  } catch (recordingError) {
+    return [recordingError];
+  }
+}
+
+/**
+ * A bounded wait for another lifecycle owner (cleanup, a create, sampling)
+ * ran out. Nothing was done to the lease; the owner still holds it.
+ */
+export class DockerWorkloadLifecycleClaimTimeoutError extends Error {
+  readonly code = 'DOCKER_WORKLOAD_LIFECYCLE_CLAIM_TIMEOUT';
+
+  constructor(cause: unknown) {
+    super('timed out waiting for Docker-workload lifecycle owner', { cause });
+    this.name = 'DockerWorkloadLifecycleClaimTimeoutError';
+  }
+}
+
+/**
+ * Supervisor/reconciler use this to defer rather than report a lifecycle-claim
+ * collision (or a bounded wait that another owner outlasted) as a
+ * sample/cleanup error.
+ */
 export function isDockerWorkloadLifecycleClaimBusy(error: unknown): boolean {
-  return error instanceof ProcessLockBusyError;
+  return error instanceof ProcessLockBusyError || error instanceof DockerWorkloadLifecycleClaimTimeoutError;
 }
 
 function isLeaseMutationBusy(error: unknown): boolean {
@@ -243,9 +296,7 @@ async function acquireLifecycleClaim(options: DockerWorkloadLifecycleClaimOption
       });
     } catch (error) {
       if (!(error instanceof ProcessLockBusyError) || !options.wait) throw error;
-      if (options.clock().getTime() >= deadline) {
-        throw new Error('timed out waiting for Docker-workload lifecycle owner', { cause: error });
-      }
+      if (options.clock().getTime() >= deadline) throw new DockerWorkloadLifecycleClaimTimeoutError(error);
       await options.sleep(CLEANUP_LOCK_POLL_MS);
     }
   }

@@ -1,8 +1,9 @@
 # Design: General-Purpose Memory MCP Server
 
-**Status:** Implemented (migration from `memory.md` complete; `memory.md` is fully deprecated and no longer created)
+**Status (2026-11-14):** Implemented (`packages/memory-mcp-server/`); the migration from the per-persona memory.md file is complete, and that file is no longer created. The default model pins are still placeholders, so until they are recorded the server refuses its models and `memory_store` and `memory_recall` fail with `MODEL_UNPINNED` (see Model Provenance and Storage).
+
 **Date:** 2026-03-11
-**Supersedes:** `memory-mcp-server.md` (original design using `@modelcontextprotocol/server-memory`)
+**Supersedes:** [`archive/memory-mcp-server.md`](./archive/memory-mcp-server.md) (original design using `@modelcontextprotocol/server-memory`)
 **See also:** `per-persona-memory-optin.md` for the per-persona / per-job opt-in gate that controls whether the memory MCP server is mounted for a given session.
 
 ## 1. Problem Statement
@@ -333,7 +334,7 @@ Five tools. Each has a clear, distinct purpose.
 4. Composite scoring: similarity + recency + importance + access patterns
 5. Token-budget selection: greedily pack by score until budget filled
 6. Format per requested format
-7. Update `last_accessed_at` and `access_count` for returned memories (reinforcement)
+7. Update `last_accessed_at` and `access_count` for returned memories (reinforcement). Only an explicit `memory_recall` counts: a memory shown in a `memory_context` briefing is not counted as accessed (WP-67), so a note that once made the briefing cannot keep itself alive and ranked by being shown at the start of every session.
 
 ### 5.3 `memory_context` — Session-start briefing
 
@@ -423,6 +424,19 @@ This is the most impactful single tool — it gives the agent continuity across 
 
 `dry_run` mode lets the agent preview deletions before committing — a safety mechanism against irreversible data loss.
 
+**Selection semantics (as implemented).** The criteria are an **intersection**: a memory is forgotten only when it matches every criterion supplied (`ids` AND `tags` AND `before` AND `query`), so adding a criterion only ever narrows a deletion. Empty arrays count as not supplied, and a call with no effective criterion is refused rather than selecting the whole namespace.
+
+- `tags` — the memory has all of the listed tags.
+- `before` — the memory was created strictly before the timestamp.
+- `query` — the memory lies within cosine distance 0.35 of the (query-prefixed) query embedding (with the default BGE model, memories that state what the query names measure about 0.18–0.36 and unrelated ones 0.39 and up). Of the memories that match every criterion, at most the 10 closest are forgotten per call; weak matches are never forgotten. The distance cut-off and the other criteria are applied in one exact selection, so a tagged match is found even behind many closer untagged memories. The match is topical rather than exact ("the user lives in Lisbon" also matches "The user lives in Berlin", 0.25), which is why `dry_run` comes first.
+- A selection is capped (10 for a query, 1000 otherwise); the reply then says it was truncated, which means more memories match, and the caller runs the call again.
+
+**Confirmation.** `dry_run: true` deletes nothing and never needs `confirm`. Deleting by any bulk criterion (`tags`, `query` or `before`) needs `confirm: true`, even when `ids` are also given; deleting by `ids` alone does not. The tool handler answers an unconfirmed bulk call with guidance, and the engine refuses it as well.
+
+**Deletion.** Rows, their vectors and their FTS entries are deleted in one transaction. vec0 accepts only one `IN (...)` constraint on its key column per statement, so the vector delete scopes the ids through a single subquery (`memory_id IN (SELECT id FROM memories WHERE namespace = ? AND id IN (...))`).
+
+**Forgetting removes the text, not just the row (WP-93).** In the same transaction (`forgetMemoryRows`), the source segments a forgotten `memory_ingest` fact was extracted from are deleted, even when other facts of those sources still reference them: a segment is the raw chunk, the forgotten fact's text included, and that text cannot be cut out of it (facts are paraphrases, not spans). A memory links to one segment (`segment_id`), but the same fact can come from several chunks (an edited document ingested again, or two documents stating it) and be merged into one memory; every merge (the store-time merge of an ingested fact and consolidation's merges) records the other chunks in the survivor's `metadata.source_segments`, and they are deleted with it. Their other facts are unlinked and keep their own text; they lose only the source context (`memory_expand` reports the segment as not found and recall no longer expands it). A compaction summary holds the text of the memories it replaced: forgetting the summary deletes them, and forgetting one of them deletes the summary (its other memories are released, still decayed, for the next compaction pass to summarize again). Entries holding a forgotten memory's text (compared as store-time dedup compares texts) are also removed from other memories' superseded histories. Before, a forgotten fact's source stayed on disk and a default recall returned it through the fact's siblings.
+
 ### 5.5 `memory_inspect` — View stats and memories
 
 ```typescript
@@ -509,6 +523,16 @@ function reciprocalRankFusion(
     .map(([id, score]) => ({ ...memoriesById.get(id)!, rrfScore: score }));
 }
 ```
+
+> **As implemented (WP-93): candidate generation** (`vectorSearch` and `ftsSearch` in `storage/queries.ts`).
+>
+> - **Live memories only.** Both channels return only memories with `importance > 0 AND is_compacted = 0`. A decayed memory (importance 0) or a compacted original stays in the table for compaction and `memory_inspect`, but never reaches recall, store-time dedup, consolidation's pairing or source expansion. Before, decayed memories still came back through keyword search, and compacted originals that kept a vector came back through both channels. Because importance 0 now means "decayed" and nothing else, the write path stores an agent's importance 0 as 0.01 (`MIN_STORED_IMPORTANCE`).
+> - **KNN, not a full scan.** The vector channel (and store-time dedup, and consolidation's pairing) uses a sqlite-vec KNN query (`embedding MATCH ? AND k = ?`) instead of computing `vec_distance_cosine` for every row through a join and sorting: at 50,000 memories about 25–45 ms instead of 0.3–0.6 s per query. vec0 measures L2 distance; the stored embeddings are L2-normalized, so the L2 order is the cosine order and the cosine distance is L2²/2, and the callers' thresholds keep their meaning. There is no schema change.
+> - **Exact despite the filter.** `vec_memories` holds every namespace's vectors and nothing else, so the KNN picks its k neighbours before the namespace and liveness (or, for consolidation, `consolidated = 1`) conditions apply. When fewer than the requested number pass, the query is repeated with a four times larger k until enough pass or every vector has been returned; past sqlite-vec's limit of k = 4096 it falls back to the exact scan. A matching memory outside the k nearest vectors is farther than all of them, so the result equals filter-then-limit.
+> - **Tag scope inside the search.** `memory_recall`'s `tags` are applied inside both channels, before their limits, with one `json_each` condition per tag (a JSON array's string elements, as `parseTags` reads them). The vector channel then scans exactly the tagged memories (`vec_distance_cosine` over that subset). Before, `tags` filtered the top 50 candidates of each channel afterwards, so a tagged memory behind 50 closer untagged ones was never found.
+> - Maintenance keeps the KNN index to live memories: decay and compaction remove a memory's vector, and each maintenance pass removes any vector a non-live memory still has (rows written before this change).
+
+> **As implemented (WP-130): the keyword query in any script** (`sanitizeFtsQuery` in `storage/queries.ts`). The query is NFKC-normalized; letters of every script, combining marks, digits and `_` make up its words, and everything else separates them. Each word, and each pair of neighbouring words as a phrase, is quoted, so no word is read as an FTS5 operator. Before, an ASCII-only `\w` filter turned 'café' into 'caf', 'Zürich' into 'Z' OR 'rich' (which matched an unrelated note) and '東京' into nothing, so names and places outside English lost the keyword channel and fell back to the English-only embedding model. The `porter unicode61` tokenizer is unchanged (changing its options would mean rebuilding the index): it folds case and diacritics in the index and in the query alike, so 'café' and 'cafe' find each other. It does not fold compatibility forms, so a word NFKC changes (full-width letters and digits, ligatures) is searched as typed too. It splits text only at separators, so CJK text written without spaces is one token per run; finding a word inside such a run needs a trigram index (not done).
 
 ### Stage 2: Composite Scoring
 
@@ -638,6 +662,13 @@ function formatAsSummaryExtractive(memories: ScoredMemory[]): string {
 **`raw` format:** JSON array of full memory objects for programmatic use.
 
 ## 7. Duplicate Detection and Contradiction Resolution on Store
+
+> **As implemented.** The store path never calls the LLM, and the original three-tier design below was replaced by a store-time merge plus a deferred, batched consolidation pass (`storage/consolidation.ts`):
+>
+> - **Store time.** A new memory is merged into an existing one only when both state the same fact in the same words: a neighbour within cosine distance 0.05 whose normalized text (Unicode NFC, case-folded, whitespace collapsed, trailing full stops and exclamation marks dropped; word order and all other characters kept) equals the new text. NFC rather than NFKC: compatibility folding changes meaning (NFKC turns "10⁶" into "106", and two long sentences differing only there measure 0.046). The stored text and vector are kept; tags are unioned, importance takes the maximum, a missing source is filled in, and `as_of` timestamps and the ingest segment are reconciled. Embedding distance alone is not enough: with the default model, "The production database password rotates every 30 days" vs the same sentence about staging (0.0498) and "prefers TypeScript over Python" vs its reverse (0.0095) measure under 0.05. Every other pair is stored as a new, unconsolidated memory.
+> - **Consolidation.** Each unconsolidated memory is paired with its five nearest **consolidated** memories (filtered in SQL before the limit, so the batch itself cannot crowd an older fact out) within distance 0.3, and with close memories of the same batch. Near-identical pairs are judged too. The LLM's judgments are applied in pair order (a pair answered inconsistently counts as distinct). A survivor map records which row absorbed each deleted row, so a pair whose existing row was already merged away is applied to the row it now lives in; pairs whose new row is gone, or whose sides resolve to one row, are skipped, and both rows are re-read before each change; a pair is skipped unless both rows are still live and still hold the texts that were judged (or, for a survivor, the text this pass last wrote), so a row another writer changed while the LLM was judging is left alone. Because every pair was judged against the existing text as it was before any change, a judgment is applied only while the survivor still states that fact (the row itself, or a row that absorbed it as a duplicate): after a correction replaced a survivor's text, older judgments about that text are skipped rather than, for example, deleting a "duplicate" of a text that is gone. A duplicate keeps the survivor's text and merges tags, source, segment, importance and timestamps into it. A contradiction keeps the newest fact: when the new row is at least as recent as the fact the survivor states, its text, vector, source, segment and first-seen time (`created_at`) replace the survivor's, so a later pass still knows how recent the current text is; when it is older (for example backdated with `as_of`), the survivor keeps its text. Either way the losing text is appended to `metadata.superseded`, a chronological array of at most five `{content, at}` entries, and tags are unioned. Only changes actually written are counted.
+>
+> The rest of this section is the original design and is kept for context.
 
 When storing a new memory, the server performs a three-tier similarity check to prevent duplicates and resolve contradictions:
 
@@ -874,6 +905,8 @@ function extractiveCompact(memories: MemoryRow[]): string {
 
 The key property: **information is never truly lost at compaction time.** The decayed source memories remain in the database (with `is_compacted = 1`) but are excluded from vector search. The compacted summary takes their place in retrieval. If the original details are ever needed, they can be recovered via `memory_inspect` with specific IDs (stored in `compacted_from`).
 
+> **As implemented (WP-93).** The design above could never compact anything: decay deleted the vectors that compaction then clustered on, so every decayed memory formed a cluster of one and was skipped. Decay still removes the vector (the KNN index holds live memories only), and `runCompaction` embeds the decayed texts itself (at most 200 per pass; an in-process cache, keyed by a hash of the model, its precision and the text, keeps later passes from embedding again the decayed memories that joined no cluster). **(FU-05)** The 200 are not always the oldest: each pass reads the 200 after the position where the previous pass of the namespace stopped (a `(created_at, id)` cursor in `schema_meta`, `compaction_cursor:<namespace>`), and goes on from the oldest when fewer remain. Reading only the oldest 200 stalled compaction for good once they were memories that never cluster (they stay decayed and uncompacted), and newer decayed memories, which recall no longer returns, were never summarized. A cluster's summary is inserted and the cluster marked compacted in one transaction, and only while every memory of the cluster is unchanged (still there, still decayed and not compacted, same text): a memory forgotten while the LLM wrote the summary must not live on in it, and an overlapping maintenance pass must not summarize the cluster twice. Compacted originals lose any vector they still had and are excluded from keyword search as well (see Stage 1). After compaction, each maintenance pass removes the vectors of memories that are not live and deletes the `memory_ingest` source segments that no live memory references any more (their facts were merged away, decayed or compacted), unlinking decayed and compacted memories from them first. Forgetting keeps a summary and its originals together (§5.4 Deletion): forgetting the summary deletes the originals it lists in `compacted_from`, and forgetting an original deletes its summary and releases the summary's other originals (`is_compacted = 0`, still decayed), so the next pass summarizes them again without the forgotten text.
+
 ### Vitality Computation
 
 ```typescript
@@ -895,6 +928,8 @@ function computeVitality(memory: MemoryRow, now: number): number {
   return Math.min(1.0, baseDecay + reinforcement * accessRecency);
 }
 ```
+
+As implemented, both ages are clamped at zero (`Math.max(0, now - …)`), here and in the recall composite score: a future timestamp (clock skew, or a row stored before `as_of` was bounded to at most five minutes ahead) counts as "now" rather than as a negative age that would never decay and would outrank every current memory.
 
 ### Explicit Maintenance via `memory_inspect`
 
@@ -948,6 +983,15 @@ async function embed(text: string): Promise<Float32Array> {
 }
 ```
 
+### Model Provenance and Storage
+
+The snippet above is the original design. The server now loads its models (the embedding model, `Xenova/bge-base-en-v1.5`, and the re-ranking cross-encoder, `Xenova/ms-marco-MiniLM-L-6-v2`, both `q8`) only through a verified model store (`src/models/`):
+
+- **Pins.** `PINNED_MODELS` (`src/models/manifest.ts`) names, for each model and dtype, a full 40-character commit SHA of its Hugging Face repository and the SHA-256 and size of every file the server reads (`config.json`, `tokenizer.json`, `tokenizer_config.json`, `onnx/model_quantized.onnx`). A model or dtype without a complete pin is never downloaded or loaded (`MODEL_UNPINNED`). Until the pins are recorded (`scripts/pin-models.ts`, which needs network access) the entries carry the placeholder `UNVERIFIED`, which fails safe. `MEMORY_MODEL_MANIFEST` (an absolute path to `{ "models": [ ... ] }`) adds or replaces pins per model, for standalone users who pin another model.
+- **Store.** Files live in `<modelsDir>/<owner>/<name>/<revision>/<path>`, outside `node_modules`: `MEMORY_MODELS_DIR` (IronCurtain passes `~/.ironcurtain/models`), else `$XDG_CACHE_HOME/memory-mcp/models`. A download streams from `https://huggingface.co/<repo>/resolve/<revision>/<path>` into a temporary file, is capped at the pinned size, aborted when it stalls, hashed as it streams and renamed into place (read-only) only when size and SHA-256 match.
+- **Every load.** Before transformers.js (and its native ONNX runtime) is imported, each pinned file is checked again: a regular file (not a symlink) inside the store, of the pinned size and SHA-256. A mismatch is refused (`MODEL_INTEGRITY`) and not replaced silently; `--prefetch-models` is the explicit repair. transformers.js then loads the verified directory by path with remote loading off, its file cache off, its cache and local-model paths pointed at the store and a fetch that refuses every request (`src/models/transformers-env.ts`).
+- **Offline.** `MEMORY_MODELS_OFFLINE=true` (IronCurtain: `memory.offlineModels`) forbids downloads; a missing model is `MODEL_NOT_CACHED`, with an error that says how to prefetch. `memory-mcp-server --prefetch-models` downloads and verifies the configured models (ignoring the offline flag) and `--verify-models` checks them without network access; both print a JSON report (IronCurtain: `ironcurtain memory prefetch`, and the Memory section of `ironcurtain doctor`).
+
 ### Embedding Model Upgrade Path
 
 Embeddings are tied to the model that produced them. If the model changes, existing vectors become incompatible. The schema stores the model identifier:
@@ -962,6 +1006,8 @@ CREATE TABLE schema_meta (
 
 On startup, if the configured model differs from the stored model, the server logs a warning. A `memory_inspect` operation with `view: "stats"` reports the mismatch. Re-embedding can be triggered via an explicit management operation (deferred to v2).
 
+> **As implemented (WP-94):** a warning was not enough (a model of another size broke every insert, one of the same size silently mixed vector spaces), so the server now refuses to open a database whose stored vectors come from another model or have another size (`initDatabase` in `storage/database.ts`; two names of one model, such as `Xenova/` and `BAAI/bge-base-en-v1.5`, count as the same). A database without vectors is switched to the configured model. The vector index is sized from the model (`embedding/models.ts`, or `MEMORY_EMBEDDING_DIMENSIONS`), and the embedder rejects vectors of another size. Re-embedding is still not implemented.
+
 ### Scalability
 
 | Memory count | Vector search (384-dim, brute-force) | Total DB size estimate |
@@ -972,6 +1018,8 @@ On startup, if the configured model differs from the stored model, the server lo
 | 100,000 | ~50ms | ~250 MB |
 
 At realistic accumulation rates (10-50 memories/day), reaching 100K takes 5-25 years. Brute-force vector search is viable for the foreseeable future. If needed, sqlite-vec supports binary quantization for 32x storage reduction and ~10x search speedup.
+
+As implemented (WP-93), with the shipped 768-dimension model a brute-force vec0 KNN query takes about 25–45 ms at 50,000 memories (it reads every vector, about 150 MB); the join-and-sort scan it replaced took 0.3–0.6 s. Store-time dedup, recall and consolidation's pairing each run one per memory or query.
 
 ## 10. Configuration
 
@@ -985,6 +1033,10 @@ All configuration via environment variables (MCP convention):
 | **Embeddings** | | |
 | `MEMORY_EMBEDDING_MODEL` | `Xenova/all-MiniLM-L6-v2` | HuggingFace model ID |
 | `MEMORY_EMBEDDING_DTYPE` | `q8` | Quantization level |
+| **Model store** (§9, Model Provenance and Storage) | | |
+| `MEMORY_MODELS_DIR` | `$XDG_CACHE_HOME/memory-mcp/models` | Absolute directory of the verified model files |
+| `MEMORY_MODELS_OFFLINE` | `false` | Never download models; a missing model is an error |
+| `MEMORY_MODEL_MANIFEST` | (none) | Absolute path of a manifest that adds or replaces model pins |
 | **LLM** | | |
 | `MEMORY_LLM_BASE_URL` | `https://api.anthropic.com/v1/` | OpenAI-compatible API endpoint |
 | `MEMORY_LLM_API_KEY` | (none) | API key for the LLM endpoint |
@@ -1070,7 +1122,6 @@ if (config.userConfig.memory?.enabled !== false) {
   // Pass through LLM config if available (from user config or env)
   const llmKey = config.userConfig.memory?.llmApiKey ?? process.env.ANTHROPIC_API_KEY;
   if (llmKey) {
-    memoryEnv.MEMORY_LLM_API_KEY = llmKey;
     memoryEnv.MEMORY_LLM_BASE_URL = config.userConfig.memory?.llmBaseUrl
       ?? 'https://api.anthropic.com/v1/';
     memoryEnv.MEMORY_LLM_MODEL = config.userConfig.memory?.llmModel
@@ -1084,8 +1135,33 @@ if (config.userConfig.memory?.enabled !== false) {
     description: 'Persistent memory with semantic search',
     sandbox: false,
   };
+
+  // The key itself is a per-server credential, not part of the config:
+  // the config is serialized into the memory relay's MCP_SERVERS_CONFIG,
+  // while SERVER_CREDENTIALS reaches that relay alone, which scrubs it and
+  // sets MEMORY_LLM_API_KEY in the memory server's environment only.
+  if (llmKey) {
+    sessionConfig.userConfig = {
+      ...sessionConfig.userConfig,
+      serverCredentials: { ...sessionConfig.userConfig.serverCredentials, memory: { MEMORY_LLM_API_KEY: llmKey } },
+    };
+  }
 }
 ```
+
+As implemented (`buildMemoryServerConfig()` and `buildMemoryServerCredentials()` in `src/memory/memory-annotations.ts`), the key never appears in the memory server's config, so no other relay or backend can read it.
+
+> **As implemented (WP-67): which key goes where** (`src/memory/memory-llm.ts`). The memory server sends its key as a bearer token to whatever base URL it has, so a key reaches only the service it belongs to:
+>
+> - `memory.llmApiKey` goes to `memory.llmBaseUrl`, or, without one, to the Anthropic route below (no longer to the OpenAI client's default `api.openai.com`).
+> - Without `memory.llmApiKey`, the Anthropic API key is used only on the Anthropic route: `https://api.anthropic.com/v1/`, or, when an Anthropic base URL is configured (`ANTHROPIC_BASE_URL` / `anthropicBaseUrl`, e.g. a LiteLLM gateway whose virtual key is the "Anthropic key"), the `/v1/` endpoint under that root (an explicit `/v1` root is kept). The default memory URL is derived the same way. A `memory.llmBaseUrl` on any other origin gets no key (a local Ollama needs none; another provider needs `memory.llmApiKey`), and the session log says the key was withheld. With a gateway configured, the key is not sent to `api.anthropic.com` either: it belongs to the gateway.
+> - `memory.llmBaseUrl` must be `https://`, or `http://` to this machine only (`localhost`, `127.0.0.0/8`, `[::1]`); the user config schema rejects anything else when the config is loaded, and the builder refuses to put a key on a plain-http connection to another host.
+>
+> The server is also told who it writes for: `MEMORY_WRITER_KIND` (`interactive` for a session a person drives, `cron` for a scheduled job, `workflow` for a workflow state) and `MEMORY_SESSION_ID` (IronCurtain's session id). See "Trust model" below.
+>
+> **As implemented (WP-96).** An unattended writer is also given its review scope, `MEMORY_WRITER_SCOPE`: `job:<id>` for a cron job, `workflow:<run id>` for a workflow state (`cronMemoryScope` / `workflowMemoryScope` in `memory-annotations.ts`). `buildMemoryServerConfig` refuses a cron or workflow writer without one and an interactive writer with one. The server falls back to `session:<id>` (or the kind) when a host gives none. See "Review quarantine" below.
+>
+> **As implemented (FU-05).** The quarantine is the memory server's work, so `buildMemoryServerConfig` also refuses a cron or workflow writer when the installed `@provos/memory-mcp-server` predates it, instead of starting a server that would ignore `MEMORY_WRITER_SCOPE` and file the run's memories among the ones interactive sessions read (the published 0.2.1, or a checkout whose workspace package was not rebuilt). It tells by resolving the package's `./admin` export, which shipped with the quarantine (`memoryServerHasReviewQuarantine` in `src/memory/memory-server-exports.ts`), and its error says to update or rebuild the server. Interactive writers are not affected; `ironcurtain doctor` reports the condition under Memory (`Memory review quarantine`).
 
 ### Namespace Resolution
 
@@ -1136,28 +1212,50 @@ To find specific memories during the session:
 
 When a cron job runs under a persona, it uses the **persona's** memory namespace (not a separate job namespace). The persona is the persistent identity; the cron job is just a trigger. Job-specific ephemeral state uses `workspace/last-run.md` as before.
 
+Because unattended runs share the namespace with sessions a person drives, every memory records who wrote it (WP-67): the server stamps `metadata.writer = { kind, session_id }` from `MEMORY_WRITER_KIND` / `MEMORY_SESSION_ID` on every row it inserts (store and ingest). The values come from IronCurtain's environment, never from tool arguments (`source` stays the caller's own label). There is no schema change: the existing `metadata` JSON column holds it, and rows written before have no writer. When consolidation replaces a row's text with a newer contradicting fact, the writer moves with the text, and the replaced text keeps its own writer in `metadata.superseded`. `memory_inspect` lists show the writer; raw recalls include it. An unattended writer's record also carries its review scope (`scope`, WP-96).
+
+#### Review quarantine (WP-96)
+
+What an unattended run (cron job, workflow state) writes waits for review before sessions a person drives see it (`packages/memory-mcp-server/src/utils/review.ts`):
+
+- **Marking.** A row an unattended writer inserts gets `metadata.pending_review = <writer scope>` (store, ingest, and a compaction summary of pending rows). No schema change.
+- **Visibility.** Every read an agent's tool call reaches (briefing, recall in every format, `memory_expand`, every `memory_inspect` view including counts and tags, the `memory_forget` selection and preview) sees the reviewed rows and only the pending rows of the server's own scope. So a cron job's later runs see what its earlier runs wrote; interactive sessions, other jobs and workflows do not. The filter is applied inside the candidate searches, before their limits, in the KNN and in the exact scan of a tag-scoped recall alike (`SearchOptions.scope` in `queries.ts`). A segment is readable only through a row the reader may see that is also live (`getLiveSegmentsByIds` with the reader's scope): a decayed visible row and a live hidden one do not make it readable. A malformed marker hides the row from every reader.
+- **No merging across groups, and pending rows frozen (FU-05).** A pending row is never merged into, nor merged into another row, until it is approved. The full review payload is bound to an approval receipt; the admin API checks that receipt under its write transaction before release. Before, a later run of the same scope could change a listed row in between: store-time dedup merged an identical fact into it (unioning tags, repointing it to a richer source passage), and consolidation's contradiction outcome replaced its text, vector and writer with a newer row's. So store-time dedup merges only a reviewed writer's fact, and only into reviewed rows (an unattended writer's identical fact becomes a new pending row), and consolidation pairs reviewed rows only (`vectorSearchConsolidated` returns reviewed rows, and the rows are re-checked before a judgment is applied): pending rows are marked consolidated without being judged, so a pending memory's text never reaches the judge's prompt either, where it could steer the judgments of reviewed pairs. Compaction clusters stay within one group and write a new row (the summary of pending rows waits for review under their scope); it never changes a row's text. An ingest reuses an existing source segment of the same text (WP-94's content-hash reuse for retried ingests) only when memories of its own group alone link to it, so one group's review reject or forget never purges another group's source, and `segments_created` reveals nothing about sources the writer may not read. So an unattended run can neither change a reviewed memory nor hide its text in one.
+- **Approval.** `ironcurtain memory <persona|job> review` and `show <id>` display the complete releasable payload as terminal-safe JSON: text, tags, source label, metadata and the entire source segment. Strings are quoted and escaped, so literal backslashes remain distinguishable from control characters; no field is truncated. Each pending row gets an `<id>@<digest>` receipt, bound to its namespace and full payload. `review approve <id>@<digest>...` re-reads those exact snapshots in one IMMEDIATE transaction and refuses changed rows before removing their markers, recording `metadata.reviewed_at` and resetting `consolidated`. The next maintenance pass then judges approved rows against the reviewed memories. Bare ids and `approve --all` are refused; batching requires the explicitly displayed receipts, so unseen rows do not join an approval. `review reject <id>...` still deletes pending rows after the forget snapshot. JSON review/show views include the full snapshot and receipt too. Rows written before WP-96 carry no marker and stay visible.
+
 ### Server Allowlist
 
 The `"memory"` server is always included when memory is enabled, regardless of persona server allowlist — same treatment as `"filesystem"`.
 
 ### Policy Treatment
 
-Hardcoded annotations (all args `none` role, all operations `allow`):
+> **As implemented (WP-67).** The memory server is a *trusted server* (`buildTrustedServerSet`, verified by its exact command line): it has no annotations and no compiled rules, and the policy engine judges its calls per tool instead (`src/trusted-process/trusted-server-policy.ts`), on the raw arguments the server receives:
+>
+> | Call | Decision |
+> | --- | --- |
+> | `memory_store`, `memory_recall`, `memory_context`, `memory_expand`, `memory_inspect` | allow (`trusted-server`) |
+> | `memory_forget` with `dry_run: true`, or with `ids` only (at most 10) | allow |
+> | `memory_forget` that deletes by `tags`, `query` or `before`, or names more than 10 `ids` (`MEMORY_FORGET_ESCALATE_IDS`; an `ids` that is not a list counts too) | escalate, human-only (`memory-bulk-forget-escalate`) |
+> | `memory_ingest` with more than 10,000 characters of content (also for `dry_run`, which still sends the blob to the LLM) | escalate, human-only (`memory-large-ingest-escalate`) |
+> | any other tool | deny (`trusted-server-unknown-tool`) |
+>
+> The escalations are human-only: the auto-approver and the approval whitelist anchor on resource arguments, and these calls have none, so only a person reading the arguments can judge them; an unattended run with no escalation route is denied. In the pipeline a trusted server's escalation uses an empty annotation (no paths to capture or expose as roots).
+>
+> The id bound exists because `memory_inspect` lists every id and a deletion by ids needs no `confirm`: without it one call could delete 100 memories (the server maximum) and a handful of calls a whole namespace, with no human asked. The policy judges only own properties of the arguments, as JSON serialization sends only those to the server.
+>
+> The server adds its own guard: before a bulk deletion removes anything, and before the first deletion of each server run (one per session, ids included), it writes a private (0600) `VACUUM INTO` snapshot next to the database (`<db>.forget-snapshot-<timestamp>.db`, the 5 newest kept per database) and names it in its reply; if the snapshot cannot be written, nothing is deleted. A run of small id deletions (each within the bound) is therefore still allowed call by call, but the session's first snapshot holds every memory that existed before it, and later id deletions of the same run take no further snapshot, so they cannot rotate older ones out. Two servers sharing a database claim snapshot names with an exclusive create, so neither writes or removes the other's file. A snapshot keeps the forgotten memories until it is deleted.
 
-```typescript
-const MEMORY_TOOL_ANNOTATIONS = {
-  memory_store: { sideEffects: true, args: { content: 'none', tags: 'none', importance: 'none' } },
-  memory_recall: { sideEffects: false, args: { query: 'none', token_budget: 'none', tags: 'none', format: 'none' } },
-  memory_context: { sideEffects: false, args: { task: 'none', token_budget: 'none' } },
-  memory_forget: { sideEffects: true, args: { ids: 'none', tags: 'none', query: 'none', before: 'none', confirm: 'none', dry_run: 'none' } },
-  memory_inspect: { sideEffects: false, args: { view: 'none', ids: 'none', limit: 'none' } },
-};
-```
+The original plan (superseded) was hardcoded annotations with all args `none` and a blanket `allow-memory-operations` rule.
 
-Blanket allow rule in compiled policy:
-```json
-{ "name": "allow-memory-operations", "conditions": { "server": "memory" }, "then": "allow" }
-```
+### Trust model (WP-67)
+
+Memory carries text from earlier sessions into later ones, and some of those sessions run unattended or read untrusted content, so one injected session could otherwise plant a note that every later session of the persona loads as context. Besides provenance (Cron Job Memory) and the per-tool policy above:
+
+- **Framing.** Every tool result that carries stored text (`memory_context`, `memory_recall` in every format, `memory_expand`, `memory_inspect`, the `memory_forget` dry-run preview) is wrapped in a notice that the notes were written by earlier agent sessions and are data, not instructions, inside `<memory_notes>` tags; tag openers (and look-alikes) in stored text are escaped so a note cannot close the frame, also when zero-width characters or combining marks follow the `<` or the slash. `raw` recalls stay JSON: `{ "notice": ..., "memories": [...] }`. Every prompt of the memory LLM that shows it several stored memories at once (recall summary and answer, the consolidation judge, compaction) says the same and escapes the stored text inside its tags, so one planted memory cannot steer what the model does with the others; compaction records an instruction found in a memory only as a stored note. This is a prompt-level mitigation only.
+- **Prompts.** The system prompt and the Docker `CLAUDE.md` seed load the briefing once at session start (no longer "MANDATORY", no longer before every user message), say that memories are data that cannot override the user or grant permissions, no longer tell the agent to keep the memory system from the user, and forbid storing secrets.
+- **Ranking.** Agent-chosen importance (and importance an extraction model gives a fact) is capped at 0.8, and a briefing does not count as an access (Section 5.2).
+- **Secrets.** `memory_store` rejects content or tags that look like a secret value (provider API keys and tokens, bearer tokens, private keys, passwords in URLs or written as assignments, card numbers, SSNs); `memory_ingest` removes them from the blob before extraction, and the engine removes any that reach its write path. The auto-save prompt masks secrets in the conversation it replays.
+- **Quarantine and review (WP-96).** What unattended runs write waits for review and reaches interactive sessions only once approved (see "Review quarantine" under Cron Job Memory); `ironcurtain memory <persona|job> list|search|show|forget|export|import|stats|review` lets the user read, curate, back up and approve the store without an agent. It works in the namespace the target's sessions use: a persona's name, or the `memoryNamespace` its persona.json records after `persona rename` (or a trash restore under another name), so a renamed persona's memories are reviewed and imported where its sessions read them; a persona whose persona.json cannot be used is refused. It shares the command with `ironcurtain memory prefetch` (WP-95): `prefetch` in the place of the persona or job always means that command, and a persona or job of that name is written `persona:prefetch` / `job:prefetch`.
 
 ## 12. Package Structure and Monorepo Strategy
 
@@ -1320,6 +1418,8 @@ The server supports importing from the JSONL format:
 
 This provides a migration path both into and out of the system. No lock-in.
 
+> **As implemented (WP-96).** The complete export is host-side: `ironcurtain memory <persona|job> export [--output <file>]` (the package's `./admin` export, `src/admin.ts`) writes a header line, every source segment, then every memory of the namespace (decayed and compacted ones included) with its metadata and its vector (base64 float32, when it has one), read with keyset paging from one read transaction. `import <file>` loads such a file into a persona or job (all or nothing; existing ids are kept; vectors are reused when the file's embedding model is the database's and they have the size of its vector index, otherwise the memory is embedded for the database's model and vector size (WP-94) with the model a memory server would load: from the verified store in `~/.ironcurtain/models`, never downloaded under `memory.offlineModels` (`ImportOptions.modelStore`); secret values are removed as on every write). The admin API opens an existing database without DDL and refuses another schema version instead of upgrading it (a memory server migrates it in place first, WP-94), writes imported segments with the content hash ingests find them by, never runs maintenance, and deletes (`forget`, `review reject`) after the forget snapshot through `forgetMemoryRows`, the path `memory_forget` takes: the source segments, compaction's copies and the superseded copies of the text go with the rows. The agent's `memory_inspect` export view now returns at most `limit` memories (default 100), oldest first, decayed and compacted ones included, and only those the reader may see.
+
 ## 14. What Beats the Baseline
 
 The baseline is Claude Code's flat markdown files with keyword search. This design beats it by:
@@ -1338,14 +1438,14 @@ The baseline is Claude Code's flat markdown files with keyword search. This desi
 |------|-----------|
 | Local embedding quality insufficient for short fragments | FTS5 hybrid search compensates; configurable model allows upgrades |
 | `sqlite-vec` or `better-sqlite3` native compilation fails | Provide prebuilt binaries; fallback to `node:sqlite` (Node 22+) when available |
-| ONNX model download on first run (~23MB) | Cache in `~/.cache/huggingface/`; document in README |
+| ONNX model download on first run (~135 MB for both models) | Pinned commits and SHA-256-verified files in a store outside `node_modules` (`~/.ironcurtain/models` under IronCurtain); `--prefetch-models` ahead of time; offline mode refuses downloads (§9, Model Provenance and Storage) |
 | Embedding model lock-in (re-embedding on upgrade) | Store model ID in metadata; re-embedding as v2 management operation |
 | LLM summarization hallucination (fabricated facts in summaries) | Original memories preserved in DB; compacted sources tracked in `compacted_from`; extractive fallback always available |
-| LLM API unavailability or latency spikes | All LLM calls are non-blocking with fallbacks; server never fails due to LLM issues |
-| LLM cost accumulation | Haiku is cheap (~$0.01/day at normal usage); calls are few and small; no LLM on hot paths without user intent |
+| LLM API unavailability or latency spikes | All LLM calls are non-blocking with fallbacks; server never fails due to LLM issues. As implemented (WP-94): every call has a deadline covering its single retry (60 s for extraction and maintenance, 20 s for summary/answer recalls, which then fall back to extractive or list output) and is aborted when its MCP request is cancelled |
+| LLM cost accumulation | Haiku is cheap (~$0.01/day at normal usage); calls are few and small; no LLM on hot paths without user intent. As implemented (WP-94): the calls bypass IronCurtain's metering, so each server process has its own call and token budget (`MEMORY_LLM_MAX_CALLS`, `MEMORY_LLM_MAX_TOKENS`), an ingest is capped at 200 KB and 200 facts, and summary/answer completions at 2,000 tokens |
 | Contradiction detection false positives | Default to `'distinct'` when uncertain; superseded content archived in metadata (reversible) |
 | Premature decay of important memories | High importance = long half-life; access reinforcement; dry_run on forget; compaction preserves summaries |
-| Concurrent writes from multiple sessions | SQLite WAL mode handles this; single-writer per MCP instance is the norm |
+| Concurrent writes from multiple sessions | SQLite WAL mode handles this; single-writer per MCP instance is the norm. As implemented (WP-94): every session of a persona runs its own server on the persona's database, so schema upgrades run under `BEGIN IMMEDIATE` after a backup (one server upgrades, the others find it done), and maintenance passes take a lease row in `schema_meta` (renewed while the pass runs), run in the background rather than inside the tool call that triggered them, and skip the startup pass when another server ran one in the last 10 minutes |
 
 ## 16. Future Extensions (v2+)
 

@@ -1,7 +1,8 @@
 # Google Workspace MCP Server Integration Design
 
+**Status (2026-11-14):** Implemented: the google-workspace server with the credential-file rendezvous (`src/trusted-process/gworkspace-credentials.ts`) and proactive token refresh (`src/trusted-process/token-file-refresher.ts`).
+
 **Date:** 2026-03-16
-**Status:** Design
 **Depends on:** [Third-Party OAuth Onboarding](third-party-oauth.md) (Phases 1-3)
 
 ## Overview
@@ -32,8 +33,8 @@ The central architectural decision is to use a **credential-file rendezvous** pa
               |  ~/.ironcurtain/             |  dir write        +---------------------------+
               |  oauth/google.json           |                            |
               v                              v                            |  googleapis
-                                   /tmp/.../gws-creds/                   |  HTTP calls
-                                   .gworkspace-credentials.json          |
+                     <tmp>/ironcurtain-<uid>/srt-XXXX/                   |  HTTP calls
+                     google-workspace-creds/.gworkspace-credentials.json |
                                                                          v
                                                                *.googleapis.com
                                                                (through sandbox
@@ -189,8 +190,8 @@ Critically, we **omit** the `refresh_token` field. The MCP server's `loadCredent
 ```typescript
 // src/trusted-process/gworkspace-credentials.ts
 
-import { writeFileSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync } from 'node:fs';
+import { writeFileNoFollowAtomic } from '../hardened-fs.js';
 
 /**
  * Writes a Google Workspace credential file in the format expected
@@ -202,8 +203,10 @@ import { join } from 'node:path';
  * environments. IronCurtain's OAuthTokenProvider is the sole token
  * authority.
  *
- * The file is written atomically (write to .tmp, rename) to prevent
- * the MCP server from reading a partial file during a refresh cycle.
+ * The file is replaced atomically (a fresh temporary file, then a
+ * rename) so the MCP server never reads a partial file during a
+ * refresh cycle, and never through an entry the sandboxed server
+ * planted in the directory it may write (see below).
  */
 export function writeGWorkspaceCredentialFile(
   credsDir: string,
@@ -211,7 +214,7 @@ export function writeGWorkspaceCredentialFile(
   expiresAt: number,
   scopes: readonly string[],
 ): void {
-  mkdirSync(credsDir, { recursive: true });
+  mkdirSync(credsDir, { recursive: true, mode: 0o700 });
 
   const credential = {
     access_token: accessToken,
@@ -222,12 +225,11 @@ export function writeGWorkspaceCredentialFile(
     // See design doc: docs/designs/google-workspace-integration.md
   };
 
-  const filePath = join(credsDir, '.gworkspace-credentials.json');
-  const tmpPath = filePath + '.tmp';
-  writeFileSync(tmpPath, JSON.stringify(credential, null, 2), { mode: 0o600 });
-  renameSync(tmpPath, filePath);
+  writeFileNoFollowAtomic(credsDir, '.gworkspace-credentials.json', JSON.stringify(credential, null, 2), 0o600);
 }
 ```
+
+The credential directory is writable by the srt-sandboxed server, while the writer is the unsandboxed relay. An earlier version wrote a fixed `<credsDir>/.gworkspace-credentials.json.tmp` with `writeFileSync`, which follows a symlink: a compromised server could plant `.tmp` as a link and have the next refresh overwrite any file the user can write, outside its sandbox, with the token JSON (and turn the credential file into a link to it). `writeFileNoFollowAtomic` (`src/hardened-fs.ts`) creates a randomly named temporary file exclusively (`O_CREAT | O_EXCL | O_NOFOLLOW`), sets mode 0600, fsyncs it and renames it over the credential file, so a symlink at the credential name is replaced rather than followed, and one left at the old `.tmp` name is never opened. `credsDir` must be a real directory: a symlink there is refused (`NOT_DIRECTORY`), as is a directory planted at the credential name (`NOT_REGULAR_FILE`); the startup write then skips the server and the refresher logs the failure and retries.
 
 ### 4. Concurrency Model
 
@@ -261,12 +263,14 @@ The re-read-before-refresh pattern handles the common case. For the rare race wh
 - If the grace period expires, the `OAuthTokenProvider` throws `OAuthTokenExpiredError`, and the user must re-authorize.
 - This is the same behavior as any other Google API client sharing a refresh token across processes. The risk is low in practice because token refresh is infrequent (once per hour) and the grace period is generous.
 
-**Per-session credential files** ensure MCP server processes never contend on the same file:
+**Per-session credential files** ensure MCP server processes never contend on the same file. Each relay writes its server's file (mode 0600, in a 0700 directory) next to its srt settings, inside the per-user scratch root (`src/trusted-process/spawn-cwd.ts`, `ensurePrivateScratchRoot()`):
 
 ```
-~/.ironcurtain/sessions/{sessionA}/gws-creds/.gworkspace-credentials.json
-~/.ironcurtain/sessions/{sessionB}/gws-creds/.gworkspace-credentials.json
+<os.tmpdir()>/ironcurtain-<uid>/srt-XXXX/google-workspace-creds/.gworkspace-credentials.json   (session A's relay)
+<os.tmpdir()>/ironcurtain-<uid>/srt-YYYY/google-workspace-creds/.gworkspace-credentials.json   (session B's relay)
 ```
+
+The scratch root is created mode 0700 and refused unless this user owns it, so other local users cannot reach the files through a shared `/tmp`; and it is in every sandboxed server's srt `denyRead` baseline, with only each server's own working directory and credential directory re-exposed, so no other sandboxed server (the git server, another session's google-workspace server) can read an access token that is not its own. The server receives the directory through `GWORKSPACE_CREDS_DIR` in an allowlisted environment (`child-env.ts`) that carries none of the host's or the relay's other variables.
 
 Each proxy writes only its own credential file. The shared resource is `~/.ironcurtain/oauth/google.json` (the canonical token store), protected by the re-read-before-refresh pattern.
 
@@ -303,9 +307,9 @@ Key sandbox decisions:
 
 **Network**: The server must reach `*.googleapis.com` for API calls. We also allow `accounts.google.com` and `oauth2.googleapis.com` because the `googleapis` library may make discovery requests. The `npmjs.org` domains are needed for the `npx -y` install step (first run only); after installation, they are not used.
 
-**Filesystem**: The server needs read access to its credential file (in the per-session creds directory, which is within the session sandbox and thus implicitly allowed). Write access is restricted to the session sandbox directory (automatically injected by `resolveSandboxConfig`). The server's `writeFileSync` call to save refreshed credentials (auth.ts line 131) will silently fail or throw EPERM -- but since we never provide a refresh token, this code path is never reached.
+**Filesystem**: The server needs read access to its credential file. Its per-session creds directory sits inside the relays' per-user scratch root, which every sandboxed server has in `denyRead`; the relay re-exposes this one directory (and the server's own working directory) to this server alone through `allowRead` and `allowWrite`. Write access is restricted to the session sandbox directory (automatically injected by `resolveSandboxConfig`). The server's `writeFileSync` call to save refreshed credentials (auth.ts line 131) will silently fail or throw EPERM -- but since we never provide a refresh token, this code path is never reached.
 
-**Token store isolation**: `~/.ironcurtain/oauth` is explicitly in `denyRead`. Even if the server somehow tried to read the canonical token store (which contains the refresh token), the sandbox blocks it.
+**Token store isolation**: `~/.ironcurtain/oauth` is explicitly in `denyRead`. Even if the server somehow tried to read the canonical token store (which contains the refresh token), the sandbox blocks it. The explicit entry is belt-and-braces: `resolveSandboxConfig` unions every sandboxed server's `denyRead` with a baseline that denies the whole IronCurtain home (`getIronCurtainHome()`, so a relocated `IRONCURTAIN_HOME` is covered too, including the client secret in `oauth/google-credentials.json` and the API keys in `config.json`) plus the user's other credential stores and shell startup files. Among them is `~/.config/gcloud`, whose application-default credentials hold a Google refresh token this server could otherwise use, or send out, over the googleapis.com domains it may reach. The session sandbox is re-exposed through `allowRead` so the server can still use it on macOS, and no configuration can re-open the rest of the home.
 
 **npx caching**: The `npx -y` command downloads and caches the package. The npm cache directory needs write access during the first invocation. The srt sandbox allows writes to the session sandbox dir. For npm cache, we rely on npm's `--cache` flag or `npm_config_cache` env var to redirect the cache to a writable location within the session directory.
 
@@ -388,15 +392,16 @@ const oauthProvider = getProviderForServer(serverName);
 if (oauthProvider && oauthProvider.id === 'google') {
   const clientCreds = loadClientCredentials(oauthProvider);
   if (!clientCreds) {
-    logToSessionFile(sessionLogPath,
-      `[proxy] Skipping ${serverName}: no OAuth credentials. Run 'ironcurtain auth import google <file>'`);
+    logToSessionFile(
+      sessionLogPath,
+      `[proxy] Skipping ${serverName}: no OAuth credentials. Run 'ironcurtain auth import google <file>'`,
+    );
     continue;
   }
 
   const tokenProvider = new OAuthTokenProvider(oauthProvider, clientCreds);
   if (!tokenProvider.isAuthorized()) {
-    logToSessionFile(sessionLogPath,
-      `[proxy] Skipping ${serverName}: not authorized. Run 'ironcurtain auth google'`);
+    logToSessionFile(sessionLogPath, `[proxy] Skipping ${serverName}: not authorized. Run 'ironcurtain auth google'`);
     continue;
   }
 
@@ -414,24 +419,29 @@ if (oauthProvider && oauthProvider.id === 'google') {
     serverEnv.CLIENT_SECRET = clientCreds.clientSecret;
 
     // Start proactive token refresh
-    const refresher = new TokenFileRefresher({
-      providerId: oauthProvider.id,
-      credentialFilePath: join(credsDir, '.gworkspace-credentials.json'),
-      getAccessToken: async () => {
-        const token = await tokenProvider.getValidAccessToken();
-        const stored = loadOAuthToken(oauthProvider.id)!;
-        return { accessToken: token, expiresAt: stored.expiresAt };
+    const refresher = new TokenFileRefresher(
+      {
+        providerId: oauthProvider.id,
+        credentialFilePath: join(credsDir, '.gworkspace-credentials.json'),
+        getAccessToken: async () => {
+          const token = await tokenProvider.getValidAccessToken();
+          const stored = loadOAuthToken(oauthProvider.id)!;
+          return { accessToken: token, expiresAt: stored.expiresAt };
+        },
+        writeCredentialFile: (token, expiry) => {
+          writeGWorkspaceCredentialFile(credsDir, token, expiry, storedToken.scopes);
+        },
       },
-      writeCredentialFile: (token, expiry) => {
-        writeGWorkspaceCredentialFile(credsDir, token, expiry, storedToken.scopes);
-      },
-    }, storedToken.expiresAt);
+      storedToken.expiresAt,
+    );
     refresher.start();
     // Store refresher handle for cleanup on proxy shutdown
     tokenRefreshers.set(serverName, refresher);
   } catch (err) {
-    logToSessionFile(sessionLogPath,
-      `[proxy] Skipping ${serverName}: token refresh failed. Run 'ironcurtain auth google'`);
+    logToSessionFile(
+      sessionLogPath,
+      `[proxy] Skipping ${serverName}: token refresh failed. Run 'ironcurtain auth google'`,
+    );
     continue;
   }
 }
@@ -439,18 +449,19 @@ if (oauthProvider && oauthProvider.id === 'google') {
 
 ### 9. Failure Modes
 
-| Failure | Detection | Behavior | User Action |
-|---------|-----------|----------|-------------|
-| No OAuth credentials file | `loadClientCredentials()` returns null | Server skipped with warning | `ironcurtain auth import google <file>` |
-| Not authorized (no token) | `tokenProvider.isAuthorized()` false | Server skipped with warning | `ironcurtain auth google` |
-| Token expired, refresh fails | `OAuthTokenExpiredError` thrown | Server skipped with warning | `ironcurtain auth google` |
-| Access token expires mid-session, refresher works | `TokenFileRefresher` refreshes proactively | Transparent to user | None |
-| Access token expires mid-session, refresher fails | MCP server gets 401 from Google | Tool call returns error | Check token status; may need `ironcurtain auth google` |
-| Credential file corrupt/deleted mid-session | `loadCredentialsQuietly()` fails or returns stale data | MCP server crashes or tool calls fail with auth error; `TokenFileRefresher` rewrites on next interval (≤5 min) | Automatic recovery on next refresher tick; if server crashed, session restart needed |
-| Testing mode: refresh token expired (7-day limit) | Refresh returns `invalid_grant` | `OAuthTokenExpiredError` | `ironcurtain auth google` (weekly) |
-| Two sessions refresh simultaneously | Re-read-before-refresh pattern | Usually transparent; rare case: one session fails | Retry or re-authorize |
-| Sandbox blocks credential file write | EPERM on the write path | Never reached (no refresh_token = no write attempt) | N/A |
-| npm cache write blocked by sandbox | `npx -y` fails on first run | Server fails to start | Pre-install the package, or run without sandbox once |
+| Failure                                           | Detection                                              | Behavior                                                                                                       | User Action                                                                          |
+| ------------------------------------------------- | ------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| No OAuth credentials file                         | `loadClientCredentials()` returns null                 | Server skipped with warning                                                                                    | `ironcurtain auth import google <file>`                                              |
+| Malformed OAuth credentials file                  | `loadClientCredentials()` throws                       | Server skipped with warning; the relay's other servers keep running                                            | `ironcurtain auth import google <file>`                                              |
+| Not authorized (no token)                         | `tokenProvider.isAuthorized()` false                   | Server skipped with warning                                                                                    | `ironcurtain auth google`                                                            |
+| Token expired, refresh fails                      | `OAuthTokenExpiredError` thrown                        | Server skipped with warning                                                                                    | `ironcurtain auth google`                                                            |
+| Access token expires mid-session, refresher works | `TokenFileRefresher` refreshes proactively             | Transparent to user                                                                                            | None                                                                                 |
+| Access token expires mid-session, refresher fails | MCP server gets 401 from Google                        | Tool call returns error                                                                                        | Check token status; may need `ironcurtain auth google`                               |
+| Credential file corrupt/deleted mid-session       | `loadCredentialsQuietly()` fails or returns stale data | MCP server crashes or tool calls fail with auth error; `TokenFileRefresher` rewrites on next interval (≤5 min) | Automatic recovery on next refresher tick; if server crashed, session restart needed |
+| Testing mode: refresh token expired (7-day limit) | Refresh returns `invalid_grant`                        | `OAuthTokenExpiredError`                                                                                       | `ironcurtain auth google` (weekly)                                                   |
+| Two sessions refresh simultaneously               | Re-read-before-refresh pattern                         | Usually transparent; rare case: one session fails                                                              | Retry or re-authorize                                                                |
+| Sandbox blocks credential file write              | EPERM on the write path                                | Never reached (no refresh_token = no write attempt)                                                            | N/A                                                                                  |
+| npm cache write blocked by sandbox                | `npx -y` fails on first run                            | Server fails to start                                                                                          | Pre-install the package, or run without sandbox once                                 |
 
 ### 10. `npx` First-Run Problem
 
@@ -525,7 +536,7 @@ The refresh token is the crown jewel -- it provides ongoing access to the user's
 
 2. **Never in env vars**: Unlike the earlier third-party-oauth.md design (which proposed injecting `GOOGLE_REFRESH_TOKEN` as an env var), this design does NOT pass the refresh token to the MCP server process at all. The `OAuthTokenProvider` runs in the proxy process, which is trusted.
 
-3. **Sandbox filesystem isolation**: `~/.ironcurtain/oauth/` is in `denyRead`. Even if the MCP server code tried to read the canonical token store, the sandbox blocks it.
+3. **Sandbox filesystem isolation**: `~/.ironcurtain/oauth/` is in `denyRead`. Even if the MCP server code tried to read the canonical token store, the sandbox blocks it. The read-containment baseline in `sandbox-integration.ts` denies the entire IronCurtain home to every sandboxed server whatever its own `denyRead` lists, so the guarantee does not depend on this server's config entry.
 
 4. **CLIENT_SECRET exposure**: The `CLIENT_ID` and `CLIENT_SECRET` are passed as env vars because the MCP server's `auth.ts` creates `new google.auth.OAuth2(process.env.CLIENT_ID, process.env.CLIENT_SECRET)`. However, Google Desktop app client secrets are not truly confidential (Google documents this). They are needed for the OAuth2Client constructor but cannot be used to refresh tokens without the refresh token. This is an acceptable exposure.
 
@@ -555,7 +566,11 @@ Detailed in Section 4 (Concurrency Model). The re-read-before-refresh pattern in
 
 Between the MCP server reading the credential file and using the token, the `TokenFileRefresher` might overwrite it. This is benign: the server holds the token in memory (on the `OAuth2Client` object) after reading. The file write and read are not contending on the same in-memory state.
 
-The atomic write pattern (write to `.tmp`, rename) prevents partial reads.
+The atomic write pattern (a fresh, exclusively created temporary file, then a rename) prevents partial reads.
+
+### Threat: Planted Links in the Credential Directory
+
+The sandboxed server may write its credential directory, and the unsandboxed relay rewrites the credential file there at every refresh. A symlink the server plants at the credential name or at the name of a temporary file must not redirect that write outside the sandbox. The relay therefore never opens an existing entry there: `writeGWorkspaceCredentialFile` writes through `writeFileNoFollowAtomic`, which renames a randomly named, exclusively created file over the credential name and refuses a credential directory that is itself a symlink (Component Design, section 3).
 
 ## Trade-offs and Alternatives Considered
 
@@ -574,6 +589,7 @@ The credential-file-rendezvous pattern (this design) avoids all three problems b
 Route all MCP server HTTP traffic through a local proxy that injects fresh Bearer tokens. This would make the server fully network-isolated (no direct Google API access).
 
 Rejected because:
+
 - The `googleapis` library uses HTTP/2 by default; proxying HTTP/2 adds significant complexity
 - The server uses the Google SDK's built-in HTTP client, which would need to be configured to use a proxy (env var `HTTPS_PROXY`)
 - SSL certificate verification would need custom CA injection
@@ -584,6 +600,7 @@ Rejected because:
 Modify `auth.ts` to accept access tokens from env vars directly, bypassing the credential file mechanism entirely.
 
 Rejected because:
+
 - Maintenance burden: must track upstream changes
 - The credential-file-rendezvous pattern works without modifications to the server
 - The `loadCredentialsQuietly()` function already supports the file-based pattern
@@ -602,56 +619,56 @@ Kept as a fallback if the credential-file-rendezvous pattern proves insufficient
 
 ### New Files
 
-| File | Purpose |
-|------|---------|
+| File                                            | Purpose                                                                                     |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------- |
 | `src/trusted-process/gworkspace-credentials.ts` | `writeGWorkspaceCredentialFile()` -- writes credential file in MCP server's expected format |
-| `src/trusted-process/token-file-refresher.ts` | `TokenFileRefresher` class -- proactive credential file refresh |
-| `test/token-file-refresher.test.ts` | Unit tests for TokenFileRefresher |
-| `test/gworkspace-credentials.test.ts` | Unit tests for credential file writing |
+| `src/trusted-process/token-file-refresher.ts`   | `TokenFileRefresher` class -- proactive credential file refresh                             |
+| `test/token-file-refresher.test.ts`             | Unit tests for TokenFileRefresher                                                           |
+| `test/gworkspace-credentials.test.ts`           | Unit tests for credential file writing                                                      |
 
 ### Modified Files
 
-| File | Change |
-|------|--------|
-| `src/config/mcp-servers.json` | Add `google-workspace` server entry |
-| `src/trusted-process/mcp-proxy-server.ts` | OAuth token injection in server spawn loop; TokenFileRefresher lifecycle |
-| `src/config/constitution.md` (or `constitution-user-base.md`) | Add principles for Google Workspace tools |
-| `src/pipeline/handwritten-scenarios.ts` | Ground-truth policy scenarios for Workspace tools |
-| `test/fixtures/test-policy.ts` | Test tool annotations and rules for Workspace tools |
-| `test/policy-engine.test.ts` | Policy engine tests for Workspace tool decisions |
+| File                                                          | Change                                                                   |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `src/config/mcp-servers.json`                                 | Add `google-workspace` server entry                                      |
+| `src/trusted-process/mcp-proxy-server.ts`                     | OAuth token injection in server spawn loop; TokenFileRefresher lifecycle |
+| `src/config/constitution.md` (or `constitution-user-base.md`) | Add principles for Google Workspace tools                                |
+| `src/pipeline/handwritten-scenarios.ts`                       | Ground-truth policy scenarios for Workspace tools                        |
+| `test/fixtures/test-policy.ts`                                | Test tool annotations and rules for Workspace tools                      |
+| `test/policy-engine.test.ts`                                  | Policy engine tests for Workspace tool decisions                         |
 
 ### Depends On (from third-party-oauth.md)
 
 These files must exist before this integration can be built:
 
-| File | Source |
-|------|--------|
-| `src/auth/oauth-provider.ts` | Phase 1 of third-party-oauth.md (already implemented) |
-| `src/auth/oauth-token-provider.ts` | Phase 1 (already implemented) |
-| `src/auth/oauth-token-store.ts` | Phase 1 (already implemented) |
-| `src/auth/providers/google.ts` | Phase 1 (already implemented) |
-| `src/auth/oauth-registry.ts` | Phase 1 (already implemented) |
-| `src/auth/oauth-flow.ts` | Phase 1 (already implemented) |
-| `src/auth/auth-command.ts` | Phase 2 (CLI: `ironcurtain auth import/google`) |
+| File                               | Source                                                |
+| ---------------------------------- | ----------------------------------------------------- |
+| `src/auth/oauth-provider.ts`       | Phase 1 of third-party-oauth.md (already implemented) |
+| `src/auth/oauth-token-provider.ts` | Phase 1 (already implemented)                         |
+| `src/auth/oauth-token-store.ts`    | Phase 1 (already implemented)                         |
+| `src/auth/providers/google.ts`     | Phase 1 (already implemented)                         |
+| `src/auth/oauth-registry.ts`       | Phase 1 (already implemented)                         |
+| `src/auth/oauth-flow.ts`           | Phase 1 (already implemented)                         |
+| `src/auth/auth-command.ts`         | Phase 2 (CLI: `ironcurtain auth import/google`)       |
 
 ## Required OAuth Scopes
 
 The MCP server's 141 tools span six Google Workspace services. The scope picker in `google-scopes.ts` must offer all scopes the server may need. The default scopes (read-only for Gmail, Calendar, Drive) are sufficient for basic read operations. For full tool coverage, the user must grant additional scopes:
 
-| Service | Required Scope | Short Name | Default? |
-|---------|---------------|------------|----------|
-| Gmail | `gmail.readonly` | `gmail.readonly` | Yes |
-| Gmail | `gmail.modify` | `gmail.modify` | No |
-| Gmail | `gmail.send` | `gmail.send` | No |
-| Gmail | `gmail.compose` | `gmail.compose` | No |
-| Gmail | `gmail.labels` | `gmail.labels` | No |
-| Calendar | `calendar.readonly` | `calendar.readonly` | Yes |
-| Calendar | `calendar.events` | `calendar.events` | No |
-| Drive | `drive.readonly` | `drive.readonly` | Yes |
-| Drive | `drive.file` | `drive.file` | No |
-| Docs | `documents` | `documents` | No |
-| Sheets | `spreadsheets` | `spreadsheets` | No |
-| Slides | `presentations` | `presentations` | No |
+| Service  | Required Scope      | Short Name          | Default? |
+| -------- | ------------------- | ------------------- | -------- |
+| Gmail    | `gmail.readonly`    | `gmail.readonly`    | Yes      |
+| Gmail    | `gmail.modify`      | `gmail.modify`      | No       |
+| Gmail    | `gmail.send`        | `gmail.send`        | No       |
+| Gmail    | `gmail.compose`     | `gmail.compose`     | No       |
+| Gmail    | `gmail.labels`      | `gmail.labels`      | No       |
+| Calendar | `calendar.readonly` | `calendar.readonly` | Yes      |
+| Calendar | `calendar.events`   | `calendar.events`   | No       |
+| Drive    | `drive.readonly`    | `drive.readonly`    | Yes      |
+| Drive    | `drive.file`        | `drive.file`        | No       |
+| Docs     | `documents`         | `documents`         | No       |
+| Sheets   | `spreadsheets`      | `spreadsheets`      | No       |
+| Slides   | `presentations`     | `presentations`     | No       |
 
 When the agent attempts a tool that requires a scope not yet granted, the MCP server will receive a 403 from Google. The user can then run `ironcurtain auth google --scopes` to grant the additional scope via incremental consent (Google's `include_granted_scopes=true` parameter preserves previously granted scopes).
 
@@ -665,15 +682,18 @@ Add to `constitution-user-base.md` (or a separate Google Workspace section):
 ## Google Workspace
 
 ### Principle: Read-First, Write-with-Approval
+
 - Reading emails, calendar events, drive files, docs, and sheets is generally safe.
 - Sending emails, creating/modifying calendar events, and editing documents require human approval.
 - Deleting emails, calendar events, or Drive files is a destructive operation requiring explicit approval.
 
 ### Principle: No Bulk Operations Without Oversight
+
 - Batch operations (e.g., batch_modify_labels, batch email operations) affect many items simultaneously.
 - These should be escalated regardless of the individual operation's safety level.
 
 ### Principle: Respect Privacy Boundaries
+
 - The agent should not read private calendar details or email content without clear task relevance.
 - Sharing permissions on Drive files (drive_share_file) must always be escalated.
 ```
@@ -682,12 +702,12 @@ Add to `constitution-user-base.md` (or a separate Google Workspace section):
 
 New argument roles may be needed for Google Workspace tool arguments:
 
-| Role | Category | Example Tools | Normalization |
-|------|----------|---------------|---------------|
+| Role                 | Category | Example Tools                                             | Normalization            |
+| -------------------- | -------- | --------------------------------------------------------- | ------------------------ |
 | `google-resource-id` | `opaque` | `gmail_get_message(messageId)`, `drive_read_file(fileId)` | None (opaque identifier) |
-| `email-address` | `opaque` | `gmail_send_message(to)`, `drive_share_file(email)` | Lowercase, trim |
-| `email-body` | `opaque` | `gmail_send_message(body)`, `gmail_draft_message(body)` | None |
-| `calendar-datetime` | `opaque` | `calendar_create_event(start, end)` | None |
+| `email-address`      | `opaque` | `gmail_send_message(to)`, `drive_share_file(email)`       | Lowercase, trim          |
+| `email-body`         | `opaque` | `gmail_send_message(body)`, `gmail_draft_message(body)`   | None                     |
+| `calendar-datetime`  | `opaque` | `calendar_create_event(start, end)`                       | None                     |
 
 These are all `opaque` category because they are not filesystem paths or URLs -- they are Google-specific identifiers. The policy engine's structural invariants (path containment, domain allowlist) do not apply. Policy decisions rely entirely on compiled declarative rules matching tool names and roles.
 

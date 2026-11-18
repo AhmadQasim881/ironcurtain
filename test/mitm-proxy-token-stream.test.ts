@@ -1,9 +1,16 @@
 import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import * as http from 'node:http';
 import * as tls from 'node:tls';
+import * as zlib from 'node:zlib';
 import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import {
+  createFakeUpstream,
+  makeHttpsRequestBuffer,
+  type HttpsBufferResponse,
+  type UpstreamResponder,
+} from './helpers/mitm-tls-harness.js';
 import { loadOrCreateCA, type CertificateAuthority } from '../src/docker/ca.js';
 import {
   createMitmProxy,
@@ -703,5 +710,212 @@ describe('MitmProxy.setTokenSessionId dynamic routing', () => {
     } finally {
       upstream.close();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Token stream as a decoding ResponseObservationHub consumer (MITM-9)
+// ---------------------------------------------------------------------------
+//
+// The extractor used to sit in the forwarding pipe and parse the raw upstream
+// bytes as UTF-8 text: a gzip or br response (Anthropic's default for
+// /v1/messages SSE) yielded no events at all, and a multibyte character split
+// across chunks was corrupted. It is now a consumer of the same observation
+// hub as LLM metrics: the hub decodes once and frames once, and the forwarded
+// bytes never pass through the extractor.
+
+describe('MitmProxy token stream: a decoding hub consumer, off the forwarding path', () => {
+  let proxy: MitmProxy | undefined;
+  let upstreamServer: http.Server | undefined;
+  let tempDir: string;
+  let ca: CertificateAuthority;
+  let socketPath: string;
+
+  const SESSION = 'test-session-encoded' as SessionId;
+  const ANTHROPIC_SSE = [
+    'event: message_start',
+    'data: {"type":"message_start","message":{"id":"msg_gz","model":"claude-sonnet-4-6"}}',
+    '',
+    'event: content_block_delta',
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}',
+    '',
+    'event: message_delta',
+    'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}',
+    '',
+    'event: message_stop',
+    'data: {"type":"message_stop"}',
+    '',
+    '',
+  ].join('\n');
+  const ANTHROPIC_JSON = JSON.stringify({
+    model: 'claude-sonnet-4-6',
+    content: [{ type: 'text', text: 'Hello from JSON' }],
+    stop_reason: 'end_turn',
+    usage: { input_tokens: 100, output_tokens: 50 },
+  });
+
+  function encode(encoding: 'gzip' | 'br', body: string): Buffer {
+    const bytes = Buffer.from(body, 'utf-8');
+    return encoding === 'gzip' ? zlib.gzipSync(bytes) : zlib.brotliCompressSync(bytes);
+  }
+
+  beforeEach(() => {
+    resetTokenStreamBus();
+    tempDir = mkdtempSync(join(tmpdir(), 'mitm-token-stream-encoded-'));
+    ca = loadOrCreateCA(join(tempDir, 'ca'));
+    socketPath = join(tempDir, 'mitm-proxy.sock');
+  });
+
+  afterEach(async () => {
+    if (proxy) {
+      await proxy.stop();
+      proxy = undefined;
+    }
+    upstreamServer?.close();
+    upstreamServer = undefined;
+    if (existsSync(tempDir)) rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  async function startProxy(port: number): Promise<void> {
+    proxy = createMitmProxy({
+      socketPath,
+      ca,
+      providers: [
+        {
+          config: {
+            host: 'api.anthropic.com',
+            displayName: 'Anthropic (test)',
+            allowedEndpoints: [{ method: 'POST', path: '/v1/messages' }],
+            keyInjection: { type: 'header', headerName: 'x-api-key' },
+            fakeKeyPrefix: 'sk-ant-test-',
+            upstreamTarget: { hostname: '127.0.0.1', port, pathPrefix: '', useTls: false },
+          },
+          fakeKey: 'sk-ant-test-fake-key',
+          realKey: 'sk-ant-test-real-key',
+        },
+      ],
+      dnsLookup: localhostDnsLookup,
+      allowPrivateDestinationsForTests: true,
+      initialTokenSessionId: SESSION,
+    });
+    await proxy.start();
+  }
+
+  async function startUpstream(responder: UpstreamResponder): Promise<void> {
+    const upstream = await createFakeUpstream(responder);
+    upstreamServer = upstream.server;
+    await startProxy(upstream.port);
+  }
+
+  async function postMessages(): Promise<HttpsBufferResponse> {
+    const { socket } = await sendConnect(socketPath, 'api.anthropic.com', 443);
+    expect(socket).not.toBeNull();
+    return makeHttpsRequestBuffer(socket as import('node:net').Socket, ca, 'api.anthropic.com', {
+      method: 'POST',
+      path: '/v1/messages',
+      headers: { 'x-api-key': 'sk-ant-test-fake-key', 'content-type': 'application/json' },
+      body: '{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}',
+    });
+  }
+
+  function collect(): TokenStreamEvent[] {
+    const events: TokenStreamEvent[] = [];
+    getTokenStreamBus().subscribe(SESSION, (_sid, event) => events.push(event));
+    return events;
+  }
+
+  for (const encoding of ['gzip', 'br'] as const) {
+    it(`extracts token events from a ${encoding} SSE stream and forwards the compressed bytes unchanged`, async () => {
+      const wire = encode(encoding, ANTHROPIC_SSE);
+      await startUpstream(() => ({ contentType: 'text/event-stream', contentEncoding: encoding, body: wire }));
+      const events = collect();
+
+      const response = await postMessages();
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-encoding']).toBe(encoding);
+      expect(response.body.equals(wire)).toBe(true);
+      await expect.poll(() => eventsOfKind(events, 'message_end').length).toBe(1);
+      expect(eventsOfKind(events, 'message_start')[0]?.model).toBe('claude-sonnet-4-6');
+      expect(eventsOfKind(events, 'text_delta').map((e) => e.text)).toEqual(['Hello']);
+      expect(eventsOfKind(events, 'message_end')[0]).toMatchObject({ stopReason: 'end_turn', outputTokens: 42 });
+    });
+
+    it(`extracts token events from a ${encoding} non-streaming JSON response`, async () => {
+      const wire = encode(encoding, ANTHROPIC_JSON);
+      await startUpstream(() => ({ contentType: 'application/json', contentEncoding: encoding, body: wire }));
+      const events = collect();
+
+      const response = await postMessages();
+
+      expect(response.body.equals(wire)).toBe(true);
+      await expect.poll(() => eventsOfKind(events, 'message_end').length).toBe(1);
+      expect(eventsOfKind(events, 'message_start')[0]?.model).toBe('claude-sonnet-4-6');
+      expect(eventsOfKind(events, 'text_delta').map((e) => e.text)).toEqual(['Hello from JSON']);
+      expect(eventsOfKind(events, 'message_end')[0]).toMatchObject({ inputTokens: 100, outputTokens: 50 });
+    });
+  }
+
+  it('feeds a workflow-style output-token sum (subscribeAll + message_end) from a compressed stream', async () => {
+    // The workflow orchestrator's ctx.totalTokens counter sums
+    // message_end.outputTokens from a global subscription; a gzip stream used
+    // to contribute nothing.
+    await startUpstream(() => ({
+      contentType: 'text/event-stream',
+      contentEncoding: 'gzip',
+      body: encode('gzip', ANTHROPIC_SSE),
+    }));
+    let outputTokens = 0;
+    getTokenStreamBus().subscribeAll((sessionId, event) => {
+      if (sessionId === SESSION && event.kind === 'message_end') outputTokens += event.outputTokens;
+    });
+
+    await postMessages();
+    await postMessages();
+
+    await expect.poll(() => outputTokens).toBe(84);
+  });
+
+  it('decodes a multibyte character split across upstream chunks', async () => {
+    const text = 'héllo wörld 🌍';
+    const sse = Buffer.from(
+      `event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"${text}"}}\n\n`,
+    );
+    // Split inside the 4-byte emoji, and send the halves as separate writes.
+    const splitAt = sse.indexOf(Buffer.from('🌍')) + 2;
+    upstreamServer = http.createServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Content-Length': String(sse.length) });
+      res.write(sse.subarray(0, splitAt));
+      setTimeout(() => res.end(sse.subarray(splitAt)), 30);
+    });
+    const port = await new Promise<number>((resolvePort) => {
+      upstreamServer?.listen(0, '127.0.0.1', () => {
+        resolvePort((upstreamServer?.address() as import('node:net').AddressInfo).port);
+      });
+    });
+    await startProxy(port);
+    const events = collect();
+
+    const response = await postMessages();
+
+    expect(response.body.equals(sse)).toBe(true);
+    await expect.poll(() => eventsOfKind(events, 'text_delta').length).toBe(1);
+    expect(eventsOfKind(events, 'text_delta')[0]?.text).toBe(text);
+  });
+
+  it('forwards the response intact when a token-stream listener throws', async () => {
+    const wire = encode('gzip', ANTHROPIC_SSE);
+    await startUpstream(() => ({ contentType: 'text/event-stream', contentEncoding: 'gzip', body: wire }));
+    let calls = 0;
+    getTokenStreamBus().subscribe(SESSION, () => {
+      calls += 1;
+      throw new Error('listener exploded');
+    });
+
+    const response = await postMessages();
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body.equals(wire)).toBe(true);
+    await expect.poll(() => calls).toBeGreaterThanOrEqual(3);
   });
 });

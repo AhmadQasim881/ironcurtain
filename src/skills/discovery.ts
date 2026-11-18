@@ -1,7 +1,8 @@
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { lstatSync, readdirSync, realpathSync, statSync, type Stats } from 'node:fs';
 import { resolve } from 'node:path';
 import YAML from 'yaml';
 import { getUserSkillsDir } from '../config/paths.js';
+import { readRegularFileFollowingLinks, readUntrustedRegularFileBelow, UntrustedFileError } from '../hardened-fs.js';
 import * as logger from '../logger.js';
 import { getPersonaSkillsDir } from '../persona/resolve.js';
 import { createPersonaName } from '../persona/types.js';
@@ -61,12 +62,50 @@ export interface DiscoverSkillsResult {
   readonly errors: SkillDiscoveryError[];
 }
 
+const SKILL_MANIFEST = 'SKILL.md';
+
+/**
+ * Bytes of a SKILL.md read by discovery. Only the frontmatter at its top is
+ * parsed here (the body reaches the agent through the staged copy), so a
+ * longer file is read this far and no further.
+ */
+export const SKILL_MANIFEST_READ_BYTES = 1024 * 1024;
+
+/**
+ * Reads the start of `<skillsRoot>/<entry>/SKILL.md` without ever blocking:
+ * only a regular file is read, at most {@link SKILL_MANIFEST_READ_BYTES} of
+ * it, and a FIFO, socket, device or directory there (or a link to one, such
+ * as `/dev/zero`) is refused without being opened for a blocking read. A
+ * missing manifest throws an `UntrustedFileError` with code `NOT_FOUND`.
+ *
+ * Workflow skills (`source: 'workflow'`: a package's `skills/`, or the copy
+ * staged into a run directory, which an imported run brings from outside this
+ * home) are read as untrusted, never through a link: the skill directory must
+ * resolve inside the skills root and SKILL.md must not be a symlink. (A link
+ * staged into a run would point at a host path anyway, which the agent's
+ * container cannot see.) User and persona skills are the user's own files,
+ * where a linked skill is legitimate, so their links are followed.
+ */
+function readSkillManifest(skillsRoot: string, entry: string, source: SkillSource): string {
+  const options = { maxBytes: SKILL_MANIFEST_READ_BYTES, oversize: 'truncate' } as const;
+  const { bytes } =
+    source === 'workflow'
+      ? readUntrustedRegularFileBelow(skillsRoot, `${entry}/${SKILL_MANIFEST}`, { ...options, canonicalRoot: true })
+      : readRegularFileFollowingLinks(resolve(skillsRoot, entry, SKILL_MANIFEST), options);
+  return bytes.toString('utf8');
+}
+
 /**
  * Walks `<skillsRoot>/<dir>/SKILL.md` and returns one entry per valid
  * skill plus a structured error per offending directory. Always
  * tolerates I/O failures so one bad skill doesn't break the rest of
  * the layer; the `errors` array lets callers (runtime sessions, lint)
  * decide how loudly to complain.
+ *
+ * A manifest that cannot be read safely is reported `unreadable`, never
+ * waited on: see `readSkillManifest` for the special files refused and for
+ * why a workflow skills tree is not followed through links (a symlinked
+ * skill directory there is reported too, not entered).
  *
  * Iteration order is the lexicographic sort of `readdirSync` output so
  * identical input produces identical output across filesystems and
@@ -76,13 +115,32 @@ export interface DiscoverSkillsResult {
  * `duplicate-name` discovery error so the collision is surfaced
  * instead of silently swallowed by last-write-wins layering.
  */
-export function discoverSkillsWithErrors(skillsRoot: string, source: SkillSource): DiscoverSkillsResult {
+export function discoverSkillsWithErrors(
+  skillsRoot: string,
+  source: SkillSource,
+  options: { readonly canonicalRoot?: boolean } = {},
+): DiscoverSkillsResult {
   const skills: ResolvedSkill[] = [];
   const errors: SkillDiscoveryError[] = [];
+  let root = resolve(skillsRoot);
+  if (source === 'workflow') {
+    try {
+      if (!lstatSync(root).isDirectory()) throw new Error('Workflow skill root must be a real directory');
+      const canonical = realpathSync(root);
+      if (options.canonicalRoot === true && canonical !== root) {
+        throw new Error('Workflow skill root must remain realpath-canonical');
+      }
+      root = canonical;
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return { skills, errors };
+      errors.push({ skillDir: root, reason: 'unreadable', detail: errorMessage(error) });
+      return { skills, errors };
+    }
+  }
 
   let entries: string[];
   try {
-    entries = readdirSync(skillsRoot);
+    entries = readdirSync(root);
   } catch {
     // The root is missing or unreadable — treat as empty rather than throwing.
     // No per-entry detail to report; this is a coarse "skills layer
@@ -101,12 +159,14 @@ export function discoverSkillsWithErrors(skillsRoot: string, source: SkillSource
   // lexicographically-first directory and wins; later occurrences are
   // reported as `duplicate-name` and dropped from the result.
   const claimedNames = new Map<string, string>();
+  // Workflow skills are never followed through a link (see readSkillManifest).
+  const followLinks = source !== 'workflow';
 
   for (const entry of entries) {
-    const skillDir = resolve(skillsRoot, entry);
-    let stats;
+    const skillDir = resolve(root, entry);
+    let stats: Stats;
     try {
-      stats = statSync(skillDir);
+      stats = followLinks ? statSync(skillDir) : lstatSync(skillDir);
     } catch (err) {
       errors.push({
         skillDir,
@@ -115,14 +175,32 @@ export function discoverSkillsWithErrors(skillsRoot: string, source: SkillSource
       });
       continue;
     }
+    if (stats.isSymbolicLink()) {
+      // Only a link to a directory stands for a skill, and that one is refused.
+      // A link to anything else is skipped like any loose file at the root, and
+      // a dangling one is reported as before. stat opens nothing.
+      let target: Stats;
+      try {
+        target = statSync(skillDir);
+      } catch (err) {
+        errors.push({ skillDir, reason: 'unreadable', detail: errorMessage(err) });
+        continue;
+      }
+      if (!target.isDirectory()) continue;
+      errors.push({
+        skillDir,
+        reason: 'unreadable',
+        detail: 'a symbolic link (workflow skills are not read through links)',
+      });
+      continue;
+    }
     if (!stats.isDirectory()) continue;
 
-    const skillFile = resolve(skillDir, 'SKILL.md');
     let content: string;
     try {
-      content = readFileSync(skillFile, 'utf-8');
+      content = readSkillManifest(root, entry, source);
     } catch (err) {
-      if (err && typeof err === 'object' && 'code' in err && err.code === 'ENOENT') {
+      if (err instanceof UntrustedFileError && err.code === 'NOT_FOUND') {
         errors.push({ skillDir, reason: 'missing-manifest' });
       } else {
         errors.push({ skillDir, reason: 'unreadable', detail: errorMessage(err) });
@@ -182,8 +260,12 @@ export const ACTIONABLE_DISCOVERY_REASONS: ReadonlySet<SkillDiscoveryErrorReason
  * sites. Use the underlying function directly when structured access
  * to discovery errors is required (e.g., the lint surface).
  */
-export function discoverSkills(skillsRoot: string, source: SkillSource): ResolvedSkill[] {
-  const { skills, errors } = discoverSkillsWithErrors(skillsRoot, source);
+export function discoverSkills(
+  skillsRoot: string,
+  source: SkillSource,
+  options: { readonly canonicalRoot?: boolean } = {},
+): ResolvedSkill[] {
+  const { skills, errors } = discoverSkillsWithErrors(skillsRoot, source, options);
   for (const err of errors) {
     if (!ACTIONABLE_DISCOVERY_REASONS.has(err.reason)) continue;
     const detail = err.detail ? `: ${err.detail}` : '';
@@ -246,7 +328,9 @@ export function resolveSkillsForSession(opts: ResolveSkillsOptions): ResolvedSki
     }
   }
 
-  let workflowSkills = opts.workflowSkillsDir ? discoverSkills(opts.workflowSkillsDir, 'workflow') : [];
+  let workflowSkills = opts.workflowSkillsDir
+    ? discoverSkills(opts.workflowSkillsDir, 'workflow', { canonicalRoot: true })
+    : [];
   const filter = opts.workflowSkillFilter;
   if (filter !== undefined) {
     workflowSkills = workflowSkills.filter((s) => filter.has(s.name));

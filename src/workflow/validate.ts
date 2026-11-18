@@ -5,17 +5,35 @@ import { discoverSkills } from '../skills/discovery.js';
 import { errorMessage } from '../utils/error-message.js';
 import type {
   WorkflowDefinition,
+  WorkflowSettings,
   WorkflowStateDefinition,
   HumanGateStateDefinition,
+  DeterministicStateDefinition,
   AgentOutput,
   AgentTransitionDefinition,
   HumanGateTransitionDefinition,
 } from './types.js';
-import { AGENT_OUTPUT_FIELDS, CONFIDENCE_VALUES, SKILLS_NONE } from './types.js';
-import { DEFAULT_EVOLVE_LANE_DIR, DEFAULT_EVOLVE_LANE_RELATIVE_DIR, resolveFanOutWorkers } from './lane-template.js';
+import {
+  AGENT_OUTPUT_FIELDS,
+  CONFIDENCE_VALUES,
+  DEFAULT_CONTAINER_SCOPE,
+  MAX_DETERMINISTIC_TIMEOUT_MS,
+  MAX_GATE_IDLE_TIMEOUT_MINUTES,
+  SKILLS_NONE,
+  WORKSPACE_ACCESS_VALUES,
+} from './types.js';
+import { isPlainRelativePath } from '../types/read-only-workspace.js';
+import { isReadOnlyAgentState } from './workspace-access.js';
+import {
+  DEFAULT_EVOLVE_LANE_DIR,
+  DEFAULT_EVOLVE_LANE_RELATIVE_DIR,
+  MAX_FAN_OUT_LANES,
+  resolveFanOutWorkers,
+} from './lane-template.js';
 import { REGISTERED_GUARDS } from './guards.js';
-import { resourceBudgetFieldsSchema, looseModelId } from '../config/user-config.js';
+import { DOCKER_AGENTS, resourceBudgetFieldsSchema, looseModelId } from '../config/user-config.js';
 import { isPlainObject } from '../utils/is-plain-object.js';
+import { collectScopeDockerAgents, describeScopeDockerAgents } from './agent-harness.js';
 
 // ---------------------------------------------------------------------------
 // Zod schemas
@@ -52,8 +70,22 @@ const humanGateTransitionSchema = z.object({
  */
 const CONTAINER_SCOPE_PATTERN = /^[a-zA-Z0-9_-]+$/;
 
+/**
+ * A lane count (`settings.workers`, numeric `fanOut.count`), bounded by
+ * {@link MAX_FAN_OUT_LANES}: every lane is a concurrent agent, and in a
+ * shared container they all share one container's CPU and memory.
+ */
+const laneCountSchema = z
+  .number()
+  .int()
+  .positive()
+  .max(
+    MAX_FAN_OUT_LANES,
+    `at most ${MAX_FAN_OUT_LANES} concurrent fan-out lanes are supported; cap workers to the container's CPU and RAM budget`,
+  );
+
 const fanOutSchema = z.object({
-  count: z.union([z.literal('workers'), z.number().int().positive()]),
+  count: z.union([z.literal('workers'), laneCountSchema]),
   // Literal, not z.string(): only barrier joins are supported, and the
   // literal makes a non-barrier join a parse-time rejection (matching the
   // FanOutDefinition.join type). Async joins are a future, reviewed extension.
@@ -75,6 +107,17 @@ const artifactHandoffSchema = z.object({
   requiredFiles: z.array(z.string().min(1)).min(1),
 });
 
+/**
+ * Agent harness names (`settings.dockerAgent`, `states.<id>.dockerAgent`).
+ * Checked against the static `DOCKER_AGENTS` list rather than the adapter
+ * registry, which is filled lazily and is still empty at validation time, so
+ * a misspelt harness fails when the workflow loads instead of when its first
+ * container starts.
+ */
+const dockerAgentSchema = z.enum(DOCKER_AGENTS, {
+  message: `dockerAgent must be one of ${DOCKER_AGENTS.join(', ')}`,
+});
+
 const agentStateSchema = z.object({
   type: z.literal('agent'),
   description: z.string().min(1),
@@ -91,9 +134,11 @@ const agentStateSchema = z.object({
   schedule: scheduleSchema.optional(),
   freshSession: z.boolean().optional(),
   model: looseModelId.optional(),
+  dockerAgent: dockerAgentSchema.optional(),
   maxVisits: z.number().int().positive().optional(),
   containerScope: z.string().regex(CONTAINER_SCOPE_PATTERN).optional(),
   skills: z.union([z.array(z.string()), z.literal(SKILLS_NONE)]).optional(),
+  workspaceAccess: z.enum(WORKSPACE_ACCESS_VALUES).optional(),
 });
 
 const humanGateStateSchema = z.object({
@@ -109,8 +154,9 @@ const deterministicStateSchema = z.object({
   description: z.string().min(1),
   run: z.array(z.array(z.string())),
   container: z.boolean().optional(),
+  host: z.boolean().optional(),
   containerScope: z.string().regex(CONTAINER_SCOPE_PATTERN).optional(),
-  timeoutMs: z.number().int().positive().optional(),
+  timeoutMs: z.number().int().positive().max(MAX_DETERMINISTIC_TIMEOUT_MS).optional(),
   resultFile: z.string().min(1).optional(),
   fanOut: fanOutSchema.optional(),
   segment: z.array(z.string()).min(1).optional(),
@@ -133,21 +179,42 @@ const stateDefinitionSchema = z.discriminatedUnion('type', [
   terminalStateSchema,
 ]);
 
+/**
+ * `settings.workflowBudget`, the run-wide ceiling (see `WorkflowBudgetSettings`).
+ * Strict, so a misspelled limit fails validation instead of silently setting
+ * no ceiling; null states "no ceiling" explicitly.
+ */
+const workflowBudgetSchema = z
+  .object({
+    maxTotalTokens: z.number().int().positive().nullable().optional(),
+    maxEstimatedCostUsd: z.number().positive().nullable().optional(),
+    maxWallClockSeconds: z.number().positive().nullable().optional(),
+  })
+  .strict();
+
 const workflowSettingsSchema = z
   .object({
     mode: z.enum(['docker', 'builtin']).optional(),
-    dockerAgent: z.string().optional(),
+    dockerAgent: dockerAgentSchema.optional(),
     maxRounds: z.number().int().positive().optional(),
     gitRepoPath: z.string().optional(),
-    workers: z.number().int().positive().optional(),
+    workers: laneCountSchema.optional(),
     systemPrompt: z.string().optional(),
     maxSessionSeconds: z.number().positive().nullable().optional(),
     resourceBudget: resourceBudgetFieldsSchema.strict().optional(),
+    workflowBudget: workflowBudgetSchema.optional(),
     unversionedArtifacts: z.array(z.string()).optional(),
     model: looseModelId.optional(),
     sharedContainer: z.boolean().optional(),
+    allowMixedPersonas: z.boolean().optional(),
     snapshotOnStop: z.boolean().optional(),
+    gateIdleTimeoutMinutes: z.number().positive().max(MAX_GATE_IDLE_TIMEOUT_MINUTES).nullable().optional(),
   })
+  // Unknown keys fail instead of being stripped: a setting this version does
+  // not know (a newer release's budget cap, say, or a typo) would otherwise be
+  // dropped silently and the run would execute with looser limits than its
+  // author set.
+  .strict()
   .refine(
     (settings) =>
       settings.maxSessionSeconds === undefined ||
@@ -174,7 +241,11 @@ const workflowDefinitionSchema = z.object({
  * dotted-path state-node semantics (e.g., `xstate.done.actor.<stateId>`). */
 const STATE_ID_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-const AGENT_ONLY_STATE_FIELDS = ['maxVisits', 'artifactHandoff'] as const;
+// Zod strips unknown keys, so an agent-only field on another state type would
+// otherwise be dropped without a word (a `dockerAgent` on a deterministic
+// state does not choose the container its commands run in, and a
+// `workspaceAccess: read-only` on one would not make it read-only).
+const AGENT_ONLY_STATE_FIELDS = ['maxVisits', 'artifactHandoff', 'dockerAgent', 'workspaceAccess'] as const;
 
 /**
  * Validates raw-level invariants that would otherwise be lost by Zod's default
@@ -210,6 +281,14 @@ function validateRawInput(raw: unknown): string[] {
     if ('resultFile' in stateValue && stateType !== 'deterministic') {
       issues.push(
         `State "${stateId}" (type: ${stateType}) has "resultFile" but that field is only valid on deterministic states.`,
+      );
+    }
+
+    // Zod would strip it silently, and an author who writes `host: true` on
+    // an agent state may believe it changes where that state runs.
+    if ('host' in stateValue && stateType !== 'deterministic') {
+      issues.push(
+        `State "${stateId}" (type: ${stateType}) has "host" but that field is only valid on deterministic states.`,
       );
     }
 
@@ -267,6 +346,19 @@ export function isExecutableState(state: WorkflowStateDefinition): state is Exec
   return state.type === 'agent' || state.type === 'deterministic';
 }
 
+/**
+ * True when a workflow actually runs in shared-container mode: an explicit
+ * `settings.sharedContainer: true` opt-in on a Docker-backed workflow.
+ * Builtin mode ignores the flag. Single source of truth for the
+ * orchestrator's `shouldUseSharedContainer` and for the validator rules
+ * that must mirror it (fan-out persona homogeneity, container scopes), so
+ * the two cannot drift.
+ */
+export function usesSharedContainer(settings: WorkflowSettings | undefined): boolean {
+  if (settings?.sharedContainer !== true) return false;
+  return settings.mode !== 'builtin';
+}
+
 export function collectTransitionTargets(state: WorkflowStateDefinition): string[] {
   switch (state.type) {
     case 'agent':
@@ -286,6 +378,23 @@ export function collectTransitionTargets(state: WorkflowStateDefinition): string
  */
 export function usesVerdictEdges(transitions: readonly AgentTransitionDefinition[]): boolean {
   return transitions.some((t) => t.when !== undefined && 'verdict' in t.when);
+}
+
+/**
+ * True when a deterministic state runs commands on the host: it is not
+ * `container: true`, its `run` executes, and at least one of its commands is
+ * non-empty (empty ones are skipped). Shared by the validation rule that
+ * demands the `host: true` acknowledgement and the WF015 lint.
+ *
+ * A fan-out driver's own `run` never executes where it drives a batch (its
+ * segment members do the work). A driver that is also a segment member
+ * (`fanOutMember: true`, which every member must declare) is different: the
+ * lane machine strips its fan-out markers and runs it as a plain
+ * deterministic state, so its `run` does execute, in every lane.
+ */
+export function runsCommandsOnHost(state: DeterministicStateDefinition): boolean {
+  const runExecutes = state.fanOut === undefined || state.fanOutMember === true;
+  return state.container !== true && runExecutes && state.run.some((command) => command.length > 0);
 }
 
 /**
@@ -574,6 +683,112 @@ function validateFanOutState(
       issues.push(`State "${stateId}" fanOut segment member "${memberId}" must declare fanOutMember: true.`);
     }
   }
+
+  validateFanOutLaneConcurrency(definition, stateId, state, segment, issues);
+}
+
+/**
+ * Rules about what N lanes running the SAME segment at the same time would
+ * share. Everything here is gated on THIS state's effective lane count
+ * (`resolveFanOutWorkers`, exactly as `orchestrator.runFanOutSegment`
+ * resolves it): a numeric `fanOut.count` override runs multiple lanes even
+ * at `settings.workers: 1`, and a `count: 'workers'` state at `workers: 1`
+ * runs its lanes serially, where none of this applies.
+ *
+ * Shared-container execution (`usesSharedContainer`, mirroring the
+ * orchestrator's `shouldUseSharedContainer`) additionally gates the two
+ * container-bound rules:
+ *
+ * - **One scope per segment.** `preMintFanOutScopeBundle` mints exactly one
+ *   bundle for the whole segment before any lane starts and refuses a
+ *   segment spanning several scopes; reject it statically so authors learn
+ *   at lint time rather than from a `result_file_error` verdict at runtime.
+ * - **One persona per multi-lane segment (security).** Every lane borrows
+ *   that one bundle's single coordinator, and `cyclePolicy` hot-swaps the
+ *   coordinator's one active policy per persona. With agent members of
+ *   different personas, lane 0 entering its second member would swap the
+ *   policy out from under lane 1's still-running first member: tool calls
+ *   evaluated and audited under the wrong persona — a silent policy bypass
+ *   in one direction, spurious denials in the other. In per-state-container
+ *   Docker mode and in builtin mode each session has its own coordinator,
+ *   so mixed personas are safe there and are not rejected.
+ *
+ * Two rules apply in every mode once lanes are concurrent, because the
+ * state they touch is per-run, not per-container:
+ *
+ * - **`freshSession: false`.** Lane contexts are shallow copies of the
+ *   parent context, so every lane would `--resume` the one conversation id
+ *   recorded for the member (concurrent writers to one transcript), and
+ *   the join's last-writer-wins merge would keep an arbitrary lane's id.
+ * - **Non-empty `outputs`.** Agent outputs are artifact NAMES under the
+ *   run's single `.workflow/` dir (not paths, so `{laneRelDir}` templating
+ *   cannot scope them): N lanes would write the same directories, one
+ *   lane's files could satisfy another lane's missing-artifact check, and
+ *   re-visit versioning would race.
+ */
+function validateFanOutLaneConcurrency(
+  definition: WorkflowDefinition,
+  stateId: string,
+  state: ExecutableState,
+  segment: readonly string[],
+  issues: string[],
+): void {
+  const workers = state.fanOut === undefined ? 1 : resolveFanOutWorkers(state.fanOut, definition.settings);
+  const agentMembers: Array<{ memberId: string; member: Extract<WorkflowStateDefinition, { type: 'agent' }> }> = [];
+  const scopes = new Set<string>();
+  for (const memberId of segment) {
+    const member = definition.states[memberId] as WorkflowStateDefinition | undefined;
+    if (member?.type === 'agent') {
+      agentMembers.push({ memberId, member });
+      scopes.add(member.containerScope ?? DEFAULT_CONTAINER_SCOPE);
+    } else if (member?.type === 'deterministic' && member.container === true) {
+      scopes.add(member.containerScope ?? DEFAULT_CONTAINER_SCOPE);
+    }
+  }
+
+  if (usesSharedContainer(definition.settings)) {
+    if (scopes.size > 1) {
+      issues.push(
+        `State "${stateId}" fanOut segment spans multiple container scopes (${[...scopes].sort().join(', ')}); ` +
+          `a fan-out segment must run entirely within one containerScope — the orchestrator mints exactly one ` +
+          `bundle per segment before any lane starts.`,
+      );
+    }
+
+    if (workers > 1) {
+      const personas = new Set(agentMembers.map(({ member }) => member.persona));
+      if (personas.size > 1) {
+        const described = agentMembers.map(({ memberId, member }) => `${memberId}: ${member.persona}`).join(', ');
+        issues.push(
+          `State "${stateId}" fanOut segment runs ${workers} concurrent lanes in a shared container, but its agent ` +
+            `members use different personas (${described}). Every lane borrows the one coordinator for the segment's ` +
+            `container scope, and that coordinator holds a single active policy that is hot-swapped per persona, so ` +
+            `concurrent lanes would evaluate (and audit) tool calls under each other's policies. Use one persona for ` +
+            `every agent member of the segment, or run the segment with a single lane.`,
+        );
+      }
+    }
+  }
+
+  if (workers > 1) {
+    for (const { memberId, member } of agentMembers) {
+      if (member.freshSession === false) {
+        issues.push(
+          `State "${stateId}" fanOut segment member "${memberId}" sets freshSession: false, but ${workers} concurrent ` +
+            `lanes start from the same parent context and would all resume the one agent conversation recorded for ` +
+            `"${memberId}". Fan-out agent members must use fresh sessions (omit freshSession or set it to true).`,
+        );
+      }
+      if (member.outputs.length > 0) {
+        issues.push(
+          `State "${stateId}" fanOut segment member "${memberId}" declares outputs [${member.outputs.join(', ')}], but ` +
+            `artifact outputs are not lane-scoped: ${workers} concurrent lanes would write the same .workflow/<name> ` +
+            `directories and one lane's files could satisfy another lane's artifact check. Fan-out agent members must ` +
+            `declare outputs: [] (write lane results under the lane's result directory instead).`,
+        );
+      }
+    }
+  }
 }
 
 // The `lane_${laneId}` PLACEHOLDER path segment (e.g. current/lane_${laneId}/
@@ -686,7 +901,7 @@ function declaresGreedySamplerArgv(argv: readonly string[]): boolean {
   return false;
 }
 
-function validateSemantics(definition: WorkflowDefinition): void {
+function validateSemantics(definition: WorkflowDefinition, options: ValidateDefinitionOptions): void {
   const issues: string[] = [];
   const stateNames = new Set(Object.keys(definition.states));
 
@@ -748,13 +963,103 @@ function validateSemantics(definition: WorkflowDefinition): void {
   // containerScope usage: gated on sharedContainer + charset.
   validateContainerScopes(definition, issues);
 
+  // Per-state agent harness: builtin mode has none; one harness per shared scope.
+  validateDockerAgents(definition, issues);
+
+  // Host deterministic commands: explicit host: true acknowledgement.
+  validateHostDeterministicStates(definition, issues, options.allowUnacknowledgedHostStates === true);
+
+  // One persona per container scope unless the author opts in to treating
+  // the scope as a single trust domain (settings.allowMixedPersonas).
+  validateScopePersonaIsolation(definition, issues, options.allowMixedPersonaScopes === true);
+
+  // workspaceAccess: read-only — where it is allowed, and one access per scope.
+  validateReadOnlyStates(definition, issues);
+
   // Fan-out scaffold usage: schema-only fields are parsed now so later phases
   // can consume them without silent stripping.
   validateFanOutScaffolding(definition, issues);
 
+  // Every executable state must be able to leave once its invoke settles.
+  validateTransitionFallbacks(definition, issues);
+
   if (issues.length > 0) {
     throw new WorkflowValidationError(issues);
   }
+}
+
+/**
+ * Requires an unconditional fallback transition wherever nothing else
+ * guarantees that some transition matches once the state's invoke settles.
+ *
+ * XState evaluates `onDone` transitions in order and takes the first whose
+ * guard / `when` clause holds. If none holds, the done event is simply
+ * dropped and the state sits on its already-settled invoke forever: no
+ * error, no gate, no terminal, the run stays in `listActive`, and resume
+ * replays the same state into the same hang. The machine builder appends
+ * an implicit fallback to the error target as a runtime safety net
+ * (`buildOnDoneTransitions`); this rule surfaces the problem at lint time.
+ *
+ * - Deterministic states: a result-file verdict is NOT checked against the
+ *   transition table (any string routes), and `isPassed` may simply be
+ *   false, so an unconditional fallback is required.
+ * - Fan-out parents, of EITHER type: the verdict is the barrier join's
+ *   (`recorded`, `escalate`, `result_file_error`, ...), not an agent turn,
+ *   so nothing reprompts it into the table; an agent-typed parent is built
+ *   as a fan-out invoke, not an agent turn. An unconditional fallback is
+ *   required.
+ * - Agent states that route on `when: { verdict }`: exhaustive already —
+ *   the orchestrator reprompts until the agent commits one of the declared
+ *   verdicts (`getValidVerdicts` in status-parser.ts) — so the fallback is
+ *   optional. Shipped workflows rely on this (e.g. review states that
+ *   route only on approved/rejected plus a visit-cap guard).
+ * - Agent states with guard-only routing (no `when` clause anywhere):
+ *   nothing validates that any guard holds, so an unconditional fallback
+ *   is required.
+ */
+function validateTransitionFallbacks(definition: WorkflowDefinition, issues: string[]): void {
+  for (const [stateId, state] of Object.entries(definition.states)) {
+    if (!isExecutableState(state)) continue;
+    const hasUnconditional = state.transitions.some((t) => t.guard === undefined && t.when === undefined);
+    if (hasUnconditional) continue;
+
+    const described = summarizeTransitions(state.transitions);
+    if (state.fanOut !== undefined) {
+      issues.push(
+        `State "${stateId}" is a fan-out state whose transitions are all conditional (${described}); ` +
+          `the batch verdict comes from the barrier join and is not validated against the transition table, so a ` +
+          `batch matching no transition (e.g. result_file_error after a failed lane) would leave the workflow stuck ` +
+          `forever. Add an unconditional fallback transition (plain "to:") as the last entry.`,
+      );
+      continue;
+    }
+    if (state.type === 'deterministic') {
+      issues.push(
+        `State "${stateId}" is a deterministic state whose transitions are all conditional (${described}); ` +
+          `deterministic results are not validated against the transition table, so a result matching no transition ` +
+          `would leave the workflow stuck forever. Add an unconditional fallback transition (plain "to:") as the last entry.`,
+      );
+      continue;
+    }
+
+    const routesOnVerdict = state.transitions.some((t) => t.when !== undefined);
+    if (routesOnVerdict) continue;
+    issues.push(
+      `State "${stateId}" is an agent state that routes only on guards (${described}) with no unconditional fallback; ` +
+        `guard-only routing is not validated against the agent's output, so a turn matching no guard would leave the ` +
+        `workflow stuck forever. Add an unconditional fallback transition (plain "to:") as the last entry.`,
+    );
+  }
+}
+
+function summarizeTransitions(transitions: readonly AgentTransitionDefinition[]): string {
+  return transitions
+    .map((t) => {
+      if (t.guard !== undefined) return `guard ${t.guard} -> ${t.to}`;
+      if (t.when !== undefined) return `when ${JSON.stringify(t.when)} -> ${t.to}`;
+      return `-> ${t.to}`;
+    })
+    .join('; ');
 }
 
 function validateArtifactHandoff(
@@ -802,10 +1107,14 @@ function validateArtifactHandoff(
  * `CONTAINER_SCOPE_PATTERN`).
  *
  * Note: scope governs container lifecycle (which bundle a state runs
- * in); persona governs the active policy. They are orthogonal —
- * `cyclePolicy` hot-swaps the coordinator's active policy on each
- * agent-state entry, so states sharing a scope may use different
- * personas without issue.
+ * in); persona governs the active policy. A scope is also one trust
+ * domain, so states of different personas may share it only with
+ * `settings.allowMixedPersonas: true` (see
+ * {@link validateScopePersonaIsolation}). Even then the lanes of a
+ * multi-lane fan-out segment, which run concurrently against the one
+ * coordinator, must share a persona, enforced by
+ * `validateFanOutLaneConcurrency` (statically) and by the orchestrator's
+ * `preMintFanOutScopeBundle` (at runtime).
  */
 function validateContainerScopes(definition: WorkflowDefinition, issues: string[]): void {
   const sharedContainer = definition.settings?.sharedContainer === true;
@@ -847,12 +1156,257 @@ function validateContainerScopes(definition: WorkflowDefinition, issues: string[
         `State "${stateId}" has resultFile "${state.resultFile}" — must be a workspace-relative path (no leading "/", no "..").`,
       );
     }
+    // container: true execs into the scope's long-lived shared bundle, which
+    // only exists in shared-container mode: without it each agent state owns
+    // a container that is gone before the next state starts, so there is
+    // nothing to exec into (see validateHostDeterministicStates).
     if (state.container === true && !sharedContainer) {
       issues.push(`State "${stateId}" has container: true but the workflow does not have sharedContainer: true.`);
     }
     if (state.container === true && mode !== 'docker') {
       issues.push(`State "${stateId}" has container: true but settings.mode is not "docker".`);
     }
+  }
+}
+
+/**
+ * Validates per-state `dockerAgent` (agent harness) overrides. The names
+ * themselves are checked by the Zod schema (`DOCKER_AGENTS`).
+ *
+ * - Builtin mode runs no container, so a state-level harness would be a
+ *   silent no-op: rejected. (`settings.dockerAgent` stays allowed there;
+ *   `workflow run-state --mode docker` reads it.)
+ * - Shared-container mode builds each scope's one container from one
+ *   harness image (`resolveScopeDockerAgent`), so the agent states of a
+ *   scope must resolve to the same harness. Mixed harnesses are rejected
+ *   with the remedy: a separate `containerScope` per harness. Fan-out
+ *   segments already run in one scope, so this covers them too.
+ * - Per-state-container Docker mode gives every state its own container,
+ *   so any mix of harnesses is fine there.
+ */
+function validateDockerAgents(definition: WorkflowDefinition, issues: string[]): void {
+  if (definition.settings?.mode === 'builtin') {
+    for (const [stateId, state] of Object.entries(definition.states)) {
+      if (state.type === 'agent' && state.dockerAgent !== undefined) {
+        issues.push(
+          `State "${stateId}" sets dockerAgent "${state.dockerAgent}" but settings.mode is "builtin", which runs ` +
+            'no agent container; the harness would be silently ignored. Remove it or use mode: docker.',
+        );
+      }
+    }
+    return;
+  }
+  if (!usesSharedContainer(definition.settings)) return;
+
+  const scopes = new Set<string>();
+  for (const state of Object.values(definition.states)) {
+    if (state.type === 'agent') scopes.add(state.containerScope ?? DEFAULT_CONTAINER_SCOPE);
+  }
+  for (const scope of [...scopes].sort()) {
+    const byAgent = collectScopeDockerAgents(definition, scope);
+    if (byAgent.size <= 1) continue;
+    issues.push(
+      `Container scope "${scope}" mixes agent harnesses: ${describeScopeDockerAgents(byAgent)}. Under ` +
+        'sharedContainer: true every state in a scope runs in one container built from one harness image. ' +
+        'Give the states that use a different dockerAgent their own containerScope.',
+    );
+  }
+}
+
+/**
+ * Host deterministic commands need an explicit per-state `host: true`.
+ *
+ * Without `container: true` a deterministic state's commands run on the host
+ * as the user running IronCurtain, with full network access and the
+ * orchestrator's environment, outside the container and the policy engine,
+ * in the run workspace. Agents can write that workspace, and the toolchains
+ * such states typically run (npm, pytest, make, cargo, git) execute code and
+ * configuration from it, so a prompt-injected agent could turn the state into
+ * host code execution. The acknowledgement makes that choice explicit; the
+ * runtime refuses an unacknowledged host state as well (orchestrator).
+ *
+ * Container execution is the alternative only in Docker shared-container mode
+ * (`validateContainerScopes`). A non-shared Docker workflow keeps no container
+ * between states, and running deterministic commands there would need a
+ * bundle of their own (container, proxies, teardown) that does not exist yet;
+ * such a workflow sets `sharedContainer: true` to use `container: true`.
+ * Builtin mode has no container at all.
+ *
+ * `allowUnacknowledged` skips only the acknowledgement requirement, for the
+ * display-only load of a past run (see `ValidateDefinitionOptions`); the
+ * contradiction check still applies.
+ */
+function validateHostDeterministicStates(
+  definition: WorkflowDefinition,
+  issues: string[],
+  allowUnacknowledged: boolean,
+): void {
+  const mode = definition.settings?.mode ?? 'docker';
+  const sharedContainer = definition.settings?.sharedContainer === true;
+
+  for (const [stateId, state] of Object.entries(definition.states)) {
+    if (state.type !== 'deterministic') continue;
+    if (state.host === true && state.container === true) {
+      issues.push(
+        `State "${stateId}" sets both host: true and container: true; a deterministic state runs either on the host or in the container. Remove one of them.`,
+      );
+      continue;
+    }
+    if (allowUnacknowledged || state.host === true || !runsCommandsOnHost(state)) continue;
+
+    const remedy =
+      mode === 'builtin'
+        ? 'Builtin mode has no container to run them in: add host: true to the state to acknowledge host execution, or move the workflow to mode: docker with settings.sharedContainer: true and set container: true.'
+        : sharedContainer
+          ? "Set container: true to run them in the workflow's shared container, or add host: true to the state to acknowledge host execution."
+          : "Set container: true (which needs settings.sharedContainer: true) to run them in the workflow's shared container, or add host: true to the state to acknowledge host execution.";
+    issues.push(
+      `State "${stateId}" runs its commands on the host but does not set host: true. ` +
+        'Host deterministic commands run as your user with full network access and the environment IronCurtain runs with, ' +
+        'outside the container and the policy engine, in the run workspace, which agents can write; toolchains such as ' +
+        'npm, pytest, make, cargo and git execute code and configuration from it (package.json scripts, conftest.py, ' +
+        `Makefiles, .git/config and hooks). ${remedy}`,
+    );
+  }
+}
+
+/**
+ * A shared-container scope is one trust domain: the agent states sharing it
+ * run in the same container, one after another, with nothing reset between
+ * them. `cyclePolicy` only hot-swaps the coordinator's active policy. A
+ * background process or detached tool an earlier state left running keeps
+ * running; the read-write agent-CLI state mount (`~/.claude`, `~/.codex`)
+ * keeps any settings or hooks it wrote; `/workspace` is pre-trusted, so
+ * `.claude/settings.json` hooks planted there run in every later state; and
+ * any process in the container can reach the scope's MCP proxy socket, whose
+ * calls the coordinator evaluates (and audits) under whichever persona is
+ * loaded at that moment. A low-privilege persona that reads untrusted content
+ * could therefore act under a later, more privileged persona's policy, and
+ * the audit log would attribute those calls to the later persona.
+ *
+ * So the agent states of one scope must share a persona unless the workflow
+ * sets `settings.allowMixedPersonas: true`, which declares the scope a single
+ * trust domain (effectively the union of its personas' policies). Authors
+ * who want the personas' containers kept apart (processes, agent-CLI state,
+ * proxy socket) give each its own `containerScope`. The workspace is shared
+ * by every state in every mode, so what one state writes there, including
+ * agent-CLI project settings, still reaches later states; separate scopes do
+ * not change that. The opt-in is rejected wherever it would be a silent no-op
+ * (no effective shared container), matching how `containerScope` itself is
+ * validated.
+ *
+ * Per-state-container Docker mode (no `sharedContainer`) and builtin mode do
+ * not share a container between states, so this rule does not apply there.
+ *
+ * `allowMixed` skips only the one-persona requirement, for the display-only
+ * load of a past run (see `ValidateDefinitionOptions`); a misplaced
+ * `allowMixedPersonas` is still rejected.
+ */
+function validateScopePersonaIsolation(definition: WorkflowDefinition, issues: string[], allowMixed: boolean): void {
+  const settings = definition.settings;
+  if (!usesSharedContainer(settings)) {
+    if (settings?.allowMixedPersonas !== undefined) {
+      issues.push(
+        'settings.allowMixedPersonas is only valid when the workflow runs in a shared container ' +
+          '(sharedContainer: true and mode: docker); without one, states never share a container.',
+      );
+    }
+    return;
+  }
+  if (allowMixed || settings?.allowMixedPersonas === true) return;
+
+  const statesByScopeAndPersona = new Map<string, Map<string, string[]>>();
+  for (const [stateId, state] of Object.entries(definition.states)) {
+    if (state.type !== 'agent') continue;
+    const scope = state.containerScope ?? DEFAULT_CONTAINER_SCOPE;
+    let personas = statesByScopeAndPersona.get(scope);
+    if (personas === undefined) {
+      personas = new Map();
+      statesByScopeAndPersona.set(scope, personas);
+    }
+    const stateIds = personas.get(state.persona) ?? [];
+    stateIds.push(stateId);
+    personas.set(state.persona, stateIds);
+  }
+
+  for (const [scope, personas] of statesByScopeAndPersona) {
+    if (personas.size < 2) continue;
+    const described = [...personas].map(([persona, stateIds]) => `${persona} (${stateIds.join(', ')})`).join('; ');
+    issues.push(
+      `containerScope "${scope}" mixes personas: ${described}. The states of a scope share one container, so ` +
+        `processes, agent-CLI settings and workspace hooks left by an earlier state run on under a later ` +
+        `persona's policy, and its tool calls are audited as that persona. Give each persona its own ` +
+        `containerScope, or set settings.allowMixedPersonas: true to accept the scope as one trust domain.`,
+    );
+  }
+}
+
+/**
+ * `workspaceAccess: read-only` (see `AgentStateDefinition.workspaceAccess`):
+ *
+ * - Not on fan-out states: a driver's own prompt never runs, and the lanes
+ *   of a segment would each need their own writable outputs.
+ * - Every output name must be a plain relative path: its `.workflow/<output>`
+ *   directory is the only place the state may write, and the policy engine
+ *   and the orchestrator join it below the workspace.
+ * - In shared-container mode the agent states of one `containerScope` must
+ *   all have the same access: they share one container, whose `/workspace` is
+ *   either mounted read-only or not, and one coordinator, which either
+ *   confines changes or not. Read-only states get their own scope.
+ * - A containerized deterministic state that runs in a read-only scope cannot
+ *   declare a `resultFile`: its commands run in that container, so they could
+ *   not write it.
+ */
+function validateReadOnlyStates(definition: WorkflowDefinition, issues: string[]): void {
+  const shared = usesSharedContainer(definition.settings);
+  const accessByScope = new Map<string, { readonly readOnly: string[]; readonly readWrite: string[] }>();
+
+  for (const [stateId, state] of Object.entries(definition.states)) {
+    if (state.type !== 'agent') continue;
+    const readOnly = isReadOnlyAgentState(state);
+    if (readOnly) {
+      if (state.fanOut !== undefined || state.fanOutMember === true) {
+        issues.push(
+          `State "${stateId}" sets workspaceAccess: read-only but is a fan-out ${state.fanOut !== undefined ? 'state' : 'segment member'}; ` +
+            'read-only access is only supported on ordinary agent states.',
+        );
+      }
+      for (const output of state.outputs) {
+        if (!isPlainRelativePath(output)) {
+          issues.push(
+            `State "${stateId}" sets workspaceAccess: read-only but its output "${output}" is not a plain relative path ` +
+              '(no empty, "." or ".." components, no backslash); its .workflow/<output> directory is the only place the state may write.',
+          );
+        }
+      }
+    }
+    if (!shared) continue;
+    const scope = state.containerScope ?? DEFAULT_CONTAINER_SCOPE;
+    let access = accessByScope.get(scope);
+    if (access === undefined) {
+      access = { readOnly: [], readWrite: [] };
+      accessByScope.set(scope, access);
+    }
+    (readOnly ? access.readOnly : access.readWrite).push(stateId);
+  }
+
+  for (const [scope, access] of accessByScope) {
+    if (access.readOnly.length === 0 || access.readWrite.length === 0) continue;
+    issues.push(
+      `containerScope "${scope}" mixes read-only states (${access.readOnly.join(', ')}) and read-write states ` +
+        `(${access.readWrite.join(', ')}). The states of a scope share one container, whose /workspace is mounted ` +
+        'read-only or not. Give the read-only states their own containerScope.',
+    );
+  }
+
+  for (const [stateId, state] of Object.entries(definition.states)) {
+    if (state.type !== 'deterministic' || state.container !== true || state.resultFile === undefined) continue;
+    const scope = state.containerScope ?? DEFAULT_CONTAINER_SCOPE;
+    if ((accessByScope.get(scope)?.readOnly.length ?? 0) === 0) continue;
+    issues.push(
+      `State "${stateId}" declares resultFile but runs in containerScope "${scope}", whose agent states are read-only: ` +
+        'its commands could not write the result file there. Run it in a read-write scope.',
+    );
   }
 }
 
@@ -957,6 +1511,29 @@ export function validateWorkflowSkillReferences(definition: WorkflowDefinition, 
   }
 }
 
+/** Options for {@link validateDefinition}. */
+export interface ValidateDefinitionOptions {
+  /**
+   * Accept deterministic states that would run commands on the host without
+   * `host: true`. Only for loading a past run's recorded definition in order
+   * to display or check it (`workflow inspect`, the web UI's past runs and
+   * message logs, an import and its host-command trust check; see
+   * `RECORDED_DEFINITION_ALLOWANCES`): a run recorded before the
+   * acknowledgement existed is still worth showing, and showing it runs
+   * nothing. Starting and resuming a run never pass this, and the
+   * orchestrator refuses an unacknowledged host state at runtime regardless.
+   */
+  readonly allowUnacknowledgedHostStates?: boolean;
+  /**
+   * Accept agent states of different personas in one shared-container scope
+   * without `settings.allowMixedPersonas: true`. Display-only, exactly like
+   * `allowUnacknowledgedHostStates`: a run recorded before the one persona
+   * per scope rule existed is still worth showing, and showing it runs
+   * nothing. Starting and resuming a run never pass this.
+   */
+  readonly allowMixedPersonaScopes?: boolean;
+}
+
 /**
  * Validates a parsed object as a WorkflowDefinition.
  * Performs structural parsing (Zod) then semantic checks.
@@ -964,7 +1541,7 @@ export function validateWorkflowSkillReferences(definition: WorkflowDefinition, 
  *
  * @throws {WorkflowValidationError} with structured list of issues
  */
-export function validateDefinition(raw: unknown): WorkflowDefinition {
+export function validateDefinition(raw: unknown, options: ValidateDefinitionOptions = {}): WorkflowDefinition {
   // Raw-level checks run first so that fields Zod would strip (e.g.,
   // `maxVisits` on non-agent states) and malformed state IDs produce
   // clear, targeted errors instead of being silently dropped.
@@ -983,6 +1560,6 @@ export function validateDefinition(raw: unknown): WorkflowDefinition {
     }
     throw err;
   }
-  validateSemantics(parsed);
+  validateSemantics(parsed, options);
   return parsed;
 }

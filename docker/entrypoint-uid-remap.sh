@@ -25,6 +25,10 @@
 # root) can renumber the codespace account to match the host before
 # dropping privileges. On macOS, Docker Desktop's VirtioFS translates UIDs
 # transparently and the env vars are not set, so this block is skipped.
+# Containers with agent sudo disabled (`agentSudo: false`, see
+# src/docker/agent-privileges.ts) start directly as the agent UID with
+# no-new-privileges and no file-privilege capabilities, so it is skipped for
+# them too: renumbering needs root, which such a container never has.
 if [ "$(id -u)" = "0" ] && [ -n "$IRONCURTAIN_AGENT_UID" ] && [ -n "$IRONCURTAIN_AGENT_GID" ]; then
   if [ "$IRONCURTAIN_AGENT_UID" != "1000" ] || [ "$IRONCURTAIN_AGENT_GID" != "1000" ]; then
     # Renumber the codespace user/group to the host UID/GID, then fix
@@ -113,16 +117,23 @@ fi
 # system trust store. The image remains CA-neutral: the certificate arrives
 # through the read-only /etc/ironcurtain orientation mount. This block lives in
 # the already-shared bootstrap helper so Claude, Codex, and Goose cannot drift.
+#
+# With agent sudo disabled (IRONCURTAIN_AGENT_SUDO=disabled, `agentSudo: false`
+# in the host config) the container runs as the agent UID from the start, under
+# no-new-privileges and without file-privilege capabilities, so nothing here can
+# write the root-owned trust store. Tools then trust the session CA through the
+# runtime trust environment the host sets (SSL_CERT_FILE, NODE_EXTRA_CA_CERTS,
+# CURL_CA_BUNDLE, GIT_SSL_CAINFO, PIP_CERT, REQUESTS_CA_BUNDLE).
 IRONCURTAIN_RUNTIME_CA=/etc/ironcurtain/ca-cert.pem
 IRONCURTAIN_SYSTEM_CA=/usr/local/share/ca-certificates/ironcurtain-session-ca.crt
 
 if [ -f "$IRONCURTAIN_RUNTIME_CA" ]; then
-  if ! command -v update-ca-certificates >/dev/null 2>&1; then
+  if [ "${IRONCURTAIN_AGENT_SUDO:-}" = 'disabled' ] && [ "$(id -u)" != '0' ]; then
+    : # No root step exists; the environment-based trust above applies.
+  elif ! command -v update-ca-certificates >/dev/null 2>&1; then
     echo '[ironcurtain] cannot install runtime trust: update-ca-certificates is unavailable' >&2
     exit 1
-  fi
-
-  if [ "$(id -u)" = '0' ]; then
+  elif [ "$(id -u)" = '0' ]; then
     install -m 0444 "$IRONCURTAIN_RUNTIME_CA" "$IRONCURTAIN_SYSTEM_CA" || exit 1
     update-ca-certificates >/dev/null || exit 1
   else

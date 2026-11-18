@@ -38,17 +38,21 @@ export default tseslint.config(
   // Layering boundary: live-runtime modules must not statically VALUE-import
   // from src/pipeline (offline tooling). Type-only imports are allowed
   // (allowTypeImports), and value imports must go through the sanctioned
-  // dynamic-import seam (compile-persona-policy.ts / compile-task-policy.ts,
-  // which are deliberately NOT in this files list). Scoped to the WS dispatch
-  // layer and the not-yet-existing persona-service modules so future phases
-  // inherit the guard without breaking the existing sanctioned importers.
+  // dynamic-import seam (compile-persona-policy.ts / compile-task-policy.ts).
+  // Covers the tool-call mediation layers (session, sandbox, trusted-process,
+  // docker, workflow, memory), the web UI, and every persona module except
+  // its two sanctioned pipeline modules: the compile seam itself and
+  // persona-customizer.ts (the customize-policy flow, which IS a pipeline
+  // invocation). test/pipeline-import-boundary.test.ts checks the same scope
+  // for transitive static reach and for dynamic imports, which this rule does
+  // not see, and plants an import to prove this rule fires.
   {
     files: [
+      'src/{session,sandbox,trusted-process,docker,workflow,memory}/**/*.ts',
       'src/web-ui/**/*.ts',
-      'src/persona/persona-service.ts',
-      'src/persona/persona-compile-orchestrator.ts',
-      'src/persona/event-bus-progress-reporter.ts',
+      'src/persona/**/*.ts',
     ],
+    ignores: ['src/persona/compile-persona-policy.ts', 'src/persona/persona-customizer.ts'],
     rules: {
       '@typescript-eslint/no-restricted-imports': [
         'error',
@@ -70,7 +74,7 @@ export default tseslint.config(
   // the tsconfig.eslint project — lint them with the untyped ruleset rather
   // than skipping them entirely.
   {
-    files: ['src/**/*.mjs', 'docker/*.mjs'],
+    files: ['src/**/*.mjs', 'docker/*.mjs', 'docker/signal-bridge/*.mjs'],
     extends: [tseslint.configs.disableTypeChecked],
     languageOptions: {
       parserOptions: { project: null, projectService: false },

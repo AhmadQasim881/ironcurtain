@@ -35,7 +35,17 @@ and the outer network policy enforce egress.
 The fixed diagnostic leaf under `/tmp` stores only one bounded reviewed failure code. Clear/read
 commands and failure diagnostics are non-authoritative and cannot change admission or cleanup.
 
-`node build.mjs --write` cross-compiles both packages and generates the common protocol/layout metadata.
-Release packaging runs this command. `--check` compiles both architectures and compares protocol
-values; it deliberately does not require identical compiler output bytes. Standard OCI descriptor
-hashes remain the image transport format, not a separately maintained executable pin.
+`node build.mjs --write` cross-compiles both packages, generates the common protocol/layout metadata
+and records the Go release in `manifest.json`. Release packaging runs this command and fails if it
+changes the committed binaries. `--check` compiles both architectures with the release
+`manifest.json` records and requires the committed binaries to be byte-identical to that build, and
+the protocol values to match: the build is reproducible, so a difference means a committed binary is
+stale or was replaced. Both modes build in a pinned Go environment (the `go` installation found on
+`PATH`, without `GOROOT`, `GOFLAGS`, a `go.env` or `go.work` file, and with Go's default `GOAMD64`,
+`GOARM64`, experiments and FIPS module), so settings exported by the caller cannot change the bytes
+while `go version` still names the recorded release. Another Go release may produce other bytes from
+the same source, so with any other `go` `--check` fails with a toolchain mismatch. CI and release
+install the recorded release (`scripts/check-go-toolchain.ts` keeps those pins in step); to move to
+another release, rebuild with `--write` and update the pins in the same change. This is a build-time
+reproducibility check, not an executable pin: staging checks only format and architecture. Standard
+OCI descriptor hashes remain the image transport format, not a separately maintained executable pin.

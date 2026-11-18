@@ -1,19 +1,28 @@
 name: CI
 
+# Skipped only for documentation: top-level Markdown, docs/, agent notes and
+# instruction files. Markdown elsewhere can be runtime input (the
+# constitutions under src/config, workflow SKILL.md files) and runs CI.
 on:
   push:
     branches: [master]
     paths:
       - '**'
-      - '!**/*.md'
+      - '!*.md'
       - '!docs/**'
+      - '!.claude/**'
+      - '!**/CLAUDE.md'
+      - '!**/GEMINI.md'
       - '!LICENSE'
   pull_request:
     branches: [master]
     paths:
       - '**'
-      - '!**/*.md'
+      - '!*.md'
       - '!docs/**'
+      - '!.claude/**'
+      - '!**/CLAUDE.md'
+      - '!**/GEMINI.md'
       - '!LICENSE'
   workflow_dispatch:
 
@@ -21,19 +30,44 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# CI only reads the repository. Without this the GITHUB_TOKEN gets the
+# repository's default permissions, which may include write access.
+permissions:
+  contents: read
+
 jobs:
   build-trust-runtime:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # The release docker/build-trust-runtime/manifest.json records: --check
+      # rebuilds the committed binaries with it and requires identical bytes.
+      # scripts/check-go-toolchain.ts keeps this pin and the manifest in step.
       - uses: actions/setup-go@v7
         with:
-          go-version: 1.26.1
+          go-version: 1.26.11
           cache-dependency-path: docker/build-trust-runtime/go.mod
       - uses: actions/setup-node@v7
         with:
           node-version: 24
       - run: npm run check:build-trust-runtime
+
+  # The fixed-target relay injects the per-bundle Proxy-Authorization and
+  # enforces the source CIDR; its Go tests run nowhere else.
+  nested-relay:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docker/nested-relay
+    steps:
+      - uses: actions/checkout@v7
+      # go.mod names the exact release the relay image is built with.
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: docker/nested-relay/go.mod
+          cache-dependency-path: docker/nested-relay/go.mod
+      - run: go vet ./...
+      - run: go test ./...
 
   ci:
     runs-on: ${{ matrix.os }}
@@ -50,10 +84,12 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
-      # Retried: some deps run postinstall scripts that download native binaries
-      # from a CDN (e.g. onnxruntime-node via @huggingface/transformers), which
+      # Retried: install scripts reach the network (node-gyp fetches Node
+      # headers to compile node-pty, which has no Linux prebuild), which
       # intermittently ETIMEDOUT/ENETUNREACH on runners and fails `npm ci`. Retry
-      # the whole install a couple times before giving up.
+      # the whole install a couple times before giving up. package.json's
+      # allowScripts decides which install scripts run; onnxruntime-node's CUDA
+      # download is denied.
       - name: Install dependencies (retry on transient network failure)
         run: |
           for attempt in 1 2 3; do
@@ -78,4 +114,209 @@ jobs:
       - run: npm run check:cycles
       - run: npm run build
       - name: Run tests
+        if: ${{ !(matrix.os == 'ubuntu-latest' && matrix.node-version == 24) }}
         run: npm test
+      # One leg measures coverage instead: `test:coverage` fails when the
+      # trusted process, the sandbox bridge or the MITM proxy drop below the
+      # thresholds in vitest.config.ts. The web UI suite still runs after it.
+      - name: Run tests with coverage thresholds
+        if: ${{ matrix.os == 'ubuntu-latest' && matrix.node-version == 24 }}
+        run: |
+          npm run test:coverage
+          npm run test:web-ui
+
+  # npm audit of the production dependency tree, workspaces included (BLD-9).
+  # Fails on a high or critical advisory that .github/npm-audit-allowlist.json
+  # does not accept, or whose acceptance expired or was reviewed at a lower
+  # severity; see docs/designs/dependency-hygiene.md. Advisories also appear
+  # without any commit, so scheduled-checks.yml runs the same gate weekly.
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      # The gate needs only tsx; npm audit itself reads package-lock.json.
+      - run: npm ci --ignore-scripts
+      - run: npm run check:audit
+
+  # test/network-isolation.integration.test.ts against a real Docker Engine:
+  # a --network=none container must reach the host only through the UDS MITM
+  # proxy, which allows the provider host and refuses everything else. Only
+  # the Linux runners have Docker. The suite needs just the few tools it
+  # drives, so it uses a small image instead of the full agent base image.
+  network-isolation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install dependencies (retry on transient network failure)
+        run: |
+          for attempt in 1 2 3; do
+            if npm ci --foreground-scripts; then exit 0; fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::npm ci attempt $attempt failed; cleaning and retrying in 15s"
+              rm -rf node_modules
+              sleep 15
+            fi
+          done
+          echo "::error::npm ci failed after 3 attempts"
+          exit 1
+      # The container runs as the runner's uid: the suite bind-mounts a 0700
+      # temp directory and drops every capability, so root could not use it.
+      - name: Build the test image
+        run: docker build --build-arg TEST_UID="$(id -u)" -t ironcurtain-network-isolation-test:ci test/fixtures/network-isolation
+      - name: Run the network isolation suite
+        env:
+          INTEGRATION_TEST: '1'
+          NETWORK_ISOLATION_TEST_IMAGE: ironcurtain-network-isolation-test:ci
+        run: |
+          npx vitest run test/network-isolation.integration.test.ts --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/network-isolation.json"
+          # A suite that skipped (a missing gate or image) must not pass as green.
+          node -e '
+            const r = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+            if (r.numPassedTests === 0 || r.numPendingTests + r.numTodoTests > 0) {
+              console.error(`network isolation suite did not run: ${r.numPassedTests} passed, ${r.numPendingTests} skipped`);
+              process.exit(1);
+            }
+          ' "$RUNNER_TEMP/network-isolation.json"
+
+  # What the root lint, format:check, build and tests leave out: the web UI's
+  # type check (vite build does not type-check), lint and format; the memory
+  # server's lint, format and tests (otherwise run only when it is released);
+  # and the type checks of scripts/ and the test suite. Nothing here depends on
+  # the OS or Node version, so it runs once.
+  workspaces:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      # Retried as in the ci job: some postinstall scripts download from a CDN.
+      - name: Install dependencies (retry on transient network failure)
+        run: |
+          for attempt in 1 2 3; do
+            if npm ci --foreground-scripts; then exit 0; fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::npm ci attempt $attempt failed; cleaning and retrying in 15s"
+              rm -rf node_modules
+              sleep 15
+            fi
+          done
+          echo "::error::npm ci failed after 3 attempts"
+          exit 1
+      - name: Type-check the web UI (svelte-check)
+        run: npm run check -w packages/web-ui
+      - run: npm run lint -w packages/web-ui
+      - run: npm run format:check -w packages/web-ui
+      - run: npm run typecheck:scripts
+      - run: npm run typecheck:tests
+      - run: npm run lint -w packages/memory-mcp-server
+      - run: npm run format:check -w packages/memory-mcp-server
+      - run: npm run build -w packages/memory-mcp-server
+      # The memory server's tests load real embedding and reranker models from
+      # Hugging Face. transformers.js keeps downloads in a cache inside its own
+      # package directory, which npm ci recreates, so ask it for that directory
+      # and restore the cache only after the install.
+      - name: Locate the transformers.js model cache
+        id: models
+        working-directory: packages/memory-mcp-server
+        run: |
+          node --input-type=module >> "$GITHUB_OUTPUT" <<'EOF'
+          const { env } = await import('@huggingface/transformers');
+          if (!env.cacheDir) throw new Error('transformers.js has no file-system model cache');
+          console.log(`dir=${env.cacheDir}`);
+          console.log(`version=${env.version}`);
+          EOF
+      - uses: actions/cache@v4
+        with:
+          path: ${{ steps.models.outputs.dir }}
+          key: memory-models-${{ runner.os }}-transformers-${{ steps.models.outputs.version }}-${{ hashFiles('packages/memory-mcp-server/src/config.ts') }}
+          restore-keys: |
+            memory-models-${{ runner.os }}-transformers-${{ steps.models.outputs.version }}-
+      - name: Test the memory server
+        run: npm test -w packages/memory-mcp-server
+
+  # What users get: the packed tarball, installed globally (dependency install
+  # scripts included) on each supported Node major and run from outside the
+  # checkout, so nothing resolves from the repository's node_modules.
+  package-smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [24, 26]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - name: Install dependencies (retry on transient network failure)
+        run: |
+          for attempt in 1 2 3; do
+            if npm ci --foreground-scripts; then exit 0; fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::npm ci attempt $attempt failed; cleaning and retrying in 15s"
+              rm -rf node_modules
+              sleep 15
+            fi
+          done
+          echo "::error::npm ci failed after 3 attempts"
+          exit 1
+      - run: npm run build --workspace=packages/memory-mcp-server
+      - run: npm run build
+      - name: Pack the npm tarball
+        id: pack
+        run: |
+          dest="$RUNNER_TEMP/npm-package"
+          mkdir -p "$dest"
+          npm pack --ignore-scripts --pack-destination "$dest"
+          set -- "$dest"/*.tgz
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo "::error::expected exactly one tarball in $dest"
+            exit 1
+          fi
+          echo "tarball=$1" >> "$GITHUB_OUTPUT"
+      - name: Install the tarball globally (retry on transient network failure)
+        env:
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: |
+          for attempt in 1 2 3; do
+            if npm install --global --prefix "$RUNNER_TEMP/global" --foreground-scripts "$TARBALL"; then exit 0; fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::global install attempt $attempt failed; cleaning and retrying in 15s"
+              rm -rf "$RUNNER_TEMP/global"
+              sleep 15
+            fi
+          done
+          echo "::error::global install failed after 3 attempts"
+          exit 1
+      - name: Run the installed CLI
+        env:
+          FORCE_COLOR: '0'
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          cli="$RUNNER_TEMP/global/bin/ironcurtain"
+          expected="$(node -p 'require(process.argv[1]).version' "$GITHUB_WORKSPACE/package.json")"
+          actual="$("$cli" --version)"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::ironcurtain --version printed '$actual', expected '$expected'"
+            exit 1
+          fi
+          # Loads the isolated-vm native addon and the packaged workflow definitions.
+          "$cli" workflow list | tee workflow-list.txt
+          if ! grep -Eq '^design-and-code[[:space:]]+bundled' workflow-list.txt; then
+            echo "::error::ironcurtain workflow list does not show the bundled design-and-code workflow"
+            exit 1
+          fi

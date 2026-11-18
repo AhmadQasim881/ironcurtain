@@ -9,8 +9,8 @@
  * newest-first ordering.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 
@@ -153,6 +153,68 @@ describe('checkpoint-selection', () => {
       for (let i = 1; i < result.length; i++) {
         expect(result[i - 1].checkpoint.timestamp > result[i].checkpoint.timestamp).toBe(true);
       }
+    });
+  });
+
+  describe('damaged and misplaced runs', () => {
+    it('skips a run whose checkpoint fails to load instead of failing the whole scan', () => {
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      try {
+        store.save('good-run' as WorkflowId, makeCheckpoint({ finalStatus: { phase: 'aborted', reason: 'x' } }));
+        mkdirSync(resolve(baseDir, 'corrupt-run'));
+        writeFileSync(resolve(baseDir, 'corrupt-run', 'checkpoint.json'), '{"truncated":');
+        mkdirSync(resolve(baseDir, 'newer-run'));
+        writeFileSync(
+          resolve(baseDir, 'newer-run', 'checkpoint.json'),
+          JSON.stringify({ ...makeCheckpoint(), schemaVersion: 99 }),
+        );
+
+        const result = findResumableCheckpoints(baseDir, store);
+        expect(result.map((r) => r.workflowId)).toEqual(['good-run']);
+        const warned = stderr.mock.calls.map(([chunk]) => String(chunk)).join('');
+        expect(warned).toContain('Skipping corrupt-run');
+        expect(warned).toContain('Skipping newer-run');
+      } finally {
+        stderr.mockRestore();
+      }
+    });
+
+    it('renders a skipped run reason safe for a terminal', () => {
+      // V8 quotes the damaged input in a JSON parse error; a scanned
+      // directory may come from anywhere, escape sequences included.
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      try {
+        mkdirSync(resolve(baseDir, 'hostile-run'));
+        writeFileSync(resolve(baseDir, 'hostile-run', 'checkpoint.json'), '{"a": \u001b]0;owned\u0007 x}');
+        expect(findResumableCheckpoints(baseDir, store)).toEqual([]);
+        const warned = stderr.mock.calls.map(([chunk]) => String(chunk)).join('');
+        expect(warned).toContain('Skipping hostile-run');
+        expect(warned).not.toContain('\u001b');
+        expect(warned).not.toContain('\u0007');
+      } finally {
+        stderr.mockRestore();
+      }
+    });
+
+    it('refuses a run directory given as the base directory', () => {
+      // `<baseDir>/<id>` passed where `<baseDir>` belongs: its workspace is
+      // agent-writable, so a checkpoint planted there must never look like a run.
+      const runDir = resolve(baseDir, 'some-run');
+      store.save('some-run' as WorkflowId, makeCheckpoint());
+      mkdirSync(resolve(runDir, 'workspace'), { recursive: true });
+      writeFileSync(resolve(runDir, 'workspace', 'checkpoint.json'), JSON.stringify(makeCheckpoint()));
+
+      expect(() => findResumableCheckpoints(runDir, new FileCheckpointStore(runDir))).toThrow(
+        expect.objectContaining({ code: 'WORKFLOW_INVALID_BASE_DIR' }),
+      );
+    });
+
+    it('never offers entries named like a run directory part or that are not run ids', () => {
+      for (const name of ['workspace', 'containers', 'workflow-skills', 'has space']) {
+        mkdirSync(resolve(baseDir, name), { recursive: true });
+        writeFileSync(resolve(baseDir, name, 'checkpoint.json'), JSON.stringify(makeCheckpoint()));
+      }
+      expect(findResumableCheckpoints(baseDir, store)).toEqual([]);
     });
   });
 

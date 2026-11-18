@@ -33,7 +33,8 @@ import { fileURLToPath } from 'node:url';
 import { v4 as uuidv4 } from 'uuid';
 import { ToolCallCoordinator } from '../src/trusted-process/tool-call-coordinator.js';
 import { MCPClientManager } from '../src/trusted-process/mcp-client-manager.js';
-import type { CompiledPolicyFile, ToolAnnotationsFile } from '../src/pipeline/types.js';
+import type { CompiledPolicyFile, StoredToolAnnotationsFile } from '../src/pipeline/types.js';
+import { withInputSchemas } from './fixtures/test-policy.js';
 import type { ToolCallRequest } from '../src/types/mcp.js';
 import type { MCPServerConfig } from '../src/config/types.js';
 
@@ -46,7 +47,7 @@ const tsxBin = resolve(projectRoot, 'node_modules/.bin/tsx');
 function writePolicyArtifacts(
   dir: string,
   compiledPolicy: CompiledPolicyFile,
-  toolAnnotations: ToolAnnotationsFile,
+  toolAnnotations: StoredToolAnnotationsFile,
 ): void {
   mkdirSync(dir, { recursive: true });
   writeFileSync(resolve(dir, 'compiled-policy.json'), JSON.stringify(compiledPolicy));
@@ -98,7 +99,7 @@ describe('Roots expansion bridges across the relay subprocess', () => {
       ],
     };
 
-    const toolAnnotations: ToolAnnotationsFile = {
+    const toolAnnotations = withInputSchemas({
       generatedAt: 'test-fixture',
       servers: {
         filesystem: {
@@ -113,7 +114,7 @@ describe('Roots expansion bridges across the relay subprocess', () => {
           ],
         },
       },
-    };
+    });
 
     writePolicyArtifacts(POLICY_DIR, compiledPolicy, toolAnnotations);
 

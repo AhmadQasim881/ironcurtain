@@ -1,5 +1,7 @@
 # Memory MCP Server: Competitive Landscape Analysis
 
+**Status (2026-11-14):** Historical: the build-versus-use survey (2026-03-11) behind `memory-mcp-server-v2.md`.
+
 **Date:** 2026-03-11
 **Purpose:** Informed build-vs-use decision for `@ironcurtain/memory-mcp-server`
 

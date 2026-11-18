@@ -39,6 +39,23 @@ describe('FileTree', () => {
 
     expect(await screen.findByText('src/')).toBeTruthy();
     expect(screen.getByText('README.md')).toBeTruthy();
+    expect(screen.queryByTestId('file-tree-truncated')).toBeNull();
+  });
+
+  it('shows a truncation notice for a directory the daemon stopped listing early', async () => {
+    // The daemon lists at most 2,000 entries per directory and reports `truncated`.
+    const fetchFileTree = vi.fn(async (_workflowId: string, path?: string): Promise<FileTreeResponseDto> => {
+      if (path === 'big') return { entries: [{ name: 'f0.txt', type: 'file', size: 1 }], truncated: true };
+      return { entries: [{ name: 'big', type: 'directory' }], truncated: true };
+    });
+    render(FileTree, { props: { workflowId: 'wf-1', onFileSelect: vi.fn(), fetchFileTree } });
+
+    expect(await screen.findByText('big/')).toBeTruthy();
+    expect(screen.getByTestId('file-tree-truncated').textContent).toContain('first 1 entries');
+
+    await expandDir('big/');
+    expect(await screen.findByText('f0.txt')).toBeTruthy();
+    expect(screen.getAllByTestId('file-tree-truncated')).toHaveLength(2);
   });
 
   it('surfaces a newly created top-level file on a refreshKey change', async () => {

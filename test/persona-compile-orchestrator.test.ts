@@ -14,6 +14,10 @@
  *  - CREDENTIALS_MISSING preflight;
  *  - the compileStream gate (POLICY_MUTATION_FORBIDDEN) lives in the dispatch
  *    test below.
+ *
+ * The lock, validator, wall-clock cap and audit record come from the shared
+ * compile path (persona-compile-service.ts); CLI compiles are covered in
+ * test/persona-compile-service.test.ts.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -21,9 +25,10 @@ import { mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node
 import { resolve } from 'node:path';
 
 import { PersonaCompileOrchestrator, CompileOrchestratorError } from '../src/persona/persona-compile-orchestrator.js';
+import { classifyPersonaCompileError } from '../src/persona/persona-compile-service.js';
 import { WebEventBus, type WebEventMap } from '../src/web-ui/web-event-bus.js';
 import { createPersonaName, type PersonaName } from '../src/persona/types.js';
-import type { CompiledPolicyFile } from '../src/pipeline/types.js';
+import type { CompiledPolicyFile, StoredToolAnnotationsFile } from '../src/pipeline/types.js';
 import type { CompilePersonaOptions } from '../src/persona/compile-persona-policy.js';
 
 const TEST_HOME = resolve(`/tmp/ironcurtain-orch-test-${process.pid}`);
@@ -140,17 +145,60 @@ describe('happy path', () => {
 
 describe('broad-policy validator + ruleDelta wiring', () => {
   /**
+   * Stored annotations handed to the hook, as the real pipeline does: the
+   * filesystem and git tools here take no resource arguments, while fetch's
+   * http_fetch takes a URL.
+   */
+  const ANNOTATIONS: StoredToolAnnotationsFile = {
+    generatedAt: '',
+    servers: {
+      filesystem: {
+        inputHash: 'h',
+        tools: [
+          { toolName: 'list_allowed_directories', serverName: 'filesystem', comment: '', args: {}, inputSchema: {} },
+        ],
+      },
+      git: {
+        inputHash: 'h',
+        tools: [{ toolName: 'git_version', serverName: 'git', comment: '', args: {}, inputSchema: {} }],
+      },
+      fetch: {
+        inputHash: 'h',
+        tools: [
+          {
+            toolName: 'http_fetch',
+            serverName: 'fetch',
+            comment: '',
+            args: { url: ['fetch-url'], max_length: ['none'] },
+            inputSchema: {},
+          },
+        ],
+      },
+    },
+  };
+
+  /**
    * A compile impl that returns the given policy AND invokes the orchestrator's
    * validateCompiled hook on it (the real pipeline runs this hook before any
-   * write; the fake must mirror that so the broad-policy gate is exercised).
+   * write, with the resolved lists and the stored annotations; the fake must
+   * mirror that so the broad-policy gate is exercised).
    */
   function validatingCompile(
     policy: CompiledPolicyFile,
   ): (name: PersonaName, opts: CompilePersonaOptions) => Promise<CompiledPolicyFile> {
     return async (_name, opts) => {
-      opts.validateCompiled?.(policy);
+      opts.validateCompiled?.(policy, undefined, ANNOTATIONS);
       return policy;
     };
+  }
+
+  function readAuditRecords(): Array<{ method: string; persona: string; details: Record<string, unknown> }> {
+    const path = resolve(TEST_HOME, 'audit', 'policy-mutation.jsonl');
+    if (!existsSync(path)) return [];
+    return readFileSync(path, 'utf-8')
+      .split('\n')
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as { method: string; persona: string; details: Record<string, unknown> });
   }
 
   function makePolicy(rules: CompiledPolicyFile['rules']): CompiledPolicyFile {
@@ -169,7 +217,14 @@ describe('broad-policy validator + ruleDelta wiring', () => {
     const bus = new WebEventBus();
     const { events } = captureEvents(bus);
     const broadPolicy = makePolicy([
-      { name: 'r1', description: 'd', if: { domains: { roles: [], allowed: ['*'] } }, then: 'allow', reason: 'r' },
+      {
+        name: 'r1',
+        description: 'd',
+        principle: 'p',
+        if: { domains: { roles: [], allowed: ['*'] } },
+        then: 'allow',
+        reason: 'r',
+      },
     ]);
     const orch = new PersonaCompileOrchestrator({ compileImpl: validatingCompile(broadPolicy) });
 
@@ -180,6 +235,13 @@ describe('broad-policy validator + ruleDelta wiring', () => {
       ?.payload as WebEventMap['persona.compile.failed'];
     expect(failed.code).toBe('BROAD_POLICY_REJECTED');
     expect(orch.getCompile(ack.operationId)?.phase).toBe('failed');
+    // The refused compile is audited too, not only written ones.
+    const record = readAuditRecords().find((r) => r.method === 'compilePersonaPolicy' && r.persona === 'narrow');
+    expect(record?.details).toMatchObject({
+      outcome: 'rejected',
+      errorCode: 'BROAD_POLICY_REJECTED',
+      operationId: ack.operationId,
+    });
   });
 
   it('allows a broad compile when the persona is opted in (allowBroadPolicy:true)', async () => {
@@ -188,7 +250,14 @@ describe('broad-policy validator + ruleDelta wiring', () => {
     const bus = new WebEventBus();
     const { events } = captureEvents(bus);
     const broadPolicy = makePolicy([
-      { name: 'r1', description: 'd', if: { domains: { roles: [], allowed: ['*'] } }, then: 'allow', reason: 'r' },
+      {
+        name: 'r1',
+        description: 'd',
+        principle: 'p',
+        if: { domains: { roles: [], allowed: ['*'] } },
+        then: 'allow',
+        reason: 'r',
+      },
     ]);
     const orch = new PersonaCompileOrchestrator({ compileImpl: validatingCompile(broadPolicy) });
 
@@ -198,12 +267,92 @@ describe('broad-policy validator + ruleDelta wiring', () => {
     expect(done.result.success).toBe(true);
   });
 
+  /** The compilePersonaPolicy records in the policy-mutation log, oldest first. */
+  function compileRecords(): Array<{ persona: string; details: { broadened?: boolean } }> {
+    const path = resolve(TEST_HOME, 'audit', 'policy-mutation.jsonl');
+    if (!existsSync(path)) return [];
+    return readFileSync(path, 'utf-8')
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as { method: string; persona: string; details: { broadened?: boolean } })
+      .filter((r) => r.method === 'compilePersonaPolicy');
+  }
+
+  it('audits a broad FIRST compile of an opted-in persona as broadened', async () => {
+    // There is no previous policy, so no ruleDelta: breadth must still be
+    // computed from the new policy itself.
+    const name = makePersonaDir('broad-first');
+    writePersonaJson('broad-first', { allowBroadPolicy: true });
+    const bus = new WebEventBus();
+    const { events } = captureEvents(bus);
+    const broadPolicy = makePolicy([
+      {
+        name: 'r1',
+        description: 'd',
+        principle: 'p',
+        if: { domains: { roles: [], allowed: ['*.com'] } },
+        then: 'allow',
+        reason: 'r',
+      },
+    ]);
+    new PersonaCompileOrchestrator({ compileImpl: validatingCompile(broadPolicy) }).startCompile(name, 'cli', bus);
+    await waitFor(() => events.some((e) => e.name === 'persona.compile.done'));
+
+    const done = events.find((e) => e.name === 'persona.compile.done')?.payload as WebEventMap['persona.compile.done'];
+    expect(done.result.ruleDelta).toBeUndefined();
+    expect(compileRecords()).toMatchObject([{ persona: 'broad-first', details: { broadened: true } }]);
+  });
+
+  it('audits breadth reached through a dynamic list as broadened', async () => {
+    const name = makePersonaDir('broad-list');
+    writePersonaJson('broad-list', { allowBroadPolicy: true });
+    const bus = new WebEventBus();
+    const { events } = captureEvents(bus);
+    const listPolicy = makePolicy([
+      {
+        name: 'r1',
+        description: 'd',
+        principle: 'p',
+        if: { domains: { roles: [], allowed: ['@news'] } },
+        then: 'allow',
+        reason: 'r',
+      },
+    ]);
+    const lists = {
+      generatedAt: '',
+      lists: {
+        news: { values: ['*.com'], manualAdditions: [], manualRemovals: [], resolvedAt: '', inputHash: 'i' },
+      },
+    };
+    const compileImpl = async (_n: PersonaName, opts: CompilePersonaOptions): Promise<CompiledPolicyFile> => {
+      opts.validateCompiled?.(listPolicy, lists, ANNOTATIONS);
+      return listPolicy;
+    };
+    new PersonaCompileOrchestrator({ compileImpl }).startCompile(name, 'cli', bus);
+    await waitFor(() => events.some((e) => e.name === 'persona.compile.done'));
+    expect(compileRecords()).toMatchObject([{ persona: 'broad-list', details: { broadened: true } }]);
+  });
+
+  it('audits a narrow compile as not broadened', async () => {
+    const name = makePersonaDir('narrow-first');
+    const bus = new WebEventBus();
+    const { events } = captureEvents(bus);
+    const narrowPolicy = makePolicy([
+      { name: 'a', description: 'd', principle: 'p', if: { server: ['filesystem'] }, then: 'allow', reason: 'r' },
+    ]);
+    new PersonaCompileOrchestrator({ compileImpl: validatingCompile(narrowPolicy) }).startCompile(name, 'cli', bus);
+    await waitFor(() => events.some((e) => e.name === 'persona.compile.done'));
+    expect(compileRecords()).toMatchObject([{ persona: 'narrow-first', details: { broadened: false } }]);
+  });
+
   it('omits ruleDelta on the first compile and includes it once a prior policy exists', async () => {
     const name = makePersonaDir('coder');
     const bus1 = new WebEventBus();
     const { events: e1 } = captureEvents(bus1);
+    // A complete rule (principle included): the previous policy is diffed only
+    // when it is one sessions would load.
     const p1 = makePolicy([
-      { name: 'a', description: 'd', if: { server: ['filesystem'] }, then: 'allow', reason: 'r' },
+      { name: 'a', description: 'd', principle: 'p', if: { server: ['filesystem'] }, then: 'allow', reason: 'r' },
     ]);
     const orch = new PersonaCompileOrchestrator({ compileImpl: validatingCompile(p1) });
     orch.startCompile(name, 'cli', bus1);
@@ -217,8 +366,8 @@ describe('broad-policy validator + ruleDelta wiring', () => {
     const bus2 = new WebEventBus();
     const { events: e2 } = captureEvents(bus2);
     const p2 = makePolicy([
-      { name: 'a', description: 'd', if: { server: ['filesystem'] }, then: 'allow', reason: 'r' },
-      { name: 'b', description: 'd', if: { server: ['git'] }, then: 'allow', reason: 'r' },
+      { name: 'a', description: 'd', principle: 'p', if: { server: ['filesystem'] }, then: 'allow', reason: 'r' },
+      { name: 'b', description: 'd', principle: 'p', if: { server: ['git'] }, then: 'allow', reason: 'r' },
     ]);
     const orch2 = new PersonaCompileOrchestrator({ compileImpl: validatingCompile(p2) });
     orch2.startCompile(name, 'cli', bus2);
@@ -226,6 +375,114 @@ describe('broad-policy validator + ruleDelta wiring', () => {
     const done2 = e2.find((e) => e.name === 'persona.compile.done')?.payload as WebEventMap['persona.compile.done'];
     expect(done2.result.ruleDelta).toBeDefined();
     expect(done2.result.ruleDelta?.added).toBe(1);
+    expect(done2.result.ruleDelta?.unconstrainedAllows).toEqual([]);
+  });
+
+  it('rejects an allow rule that leaves fetch URLs unconstrained (BROAD_POLICY_REJECTED)', async () => {
+    const name = makePersonaDir('fetcher');
+    const bus = new WebEventBus();
+    const { events } = captureEvents(bus);
+    const unconstrained = makePolicy([
+      {
+        name: 'allow-any-fetch',
+        description: 'd',
+        principle: 'p',
+        if: { server: ['fetch'] },
+        then: 'allow',
+        reason: 'r',
+      },
+    ]);
+    const orch = new PersonaCompileOrchestrator({ compileImpl: validatingCompile(unconstrained) });
+
+    orch.startCompile(name, 'cli', bus);
+    await waitFor(() => events.some((e) => e.name === 'persona.compile.failed'));
+    const failed = events.find((e) => e.name === 'persona.compile.failed')
+      ?.payload as WebEventMap['persona.compile.failed'];
+    expect(failed.code).toBe('BROAD_POLICY_REJECTED');
+    expect(failed.error).toContain('allow-any-fetch: fetch-url on fetch/http_fetch');
+  });
+
+  it('reports unconstrained allows and escalate breadth in ruleDelta and audits the compile as broadened', async () => {
+    const name = makePersonaDir('opted');
+    writePersonaJson('opted', { allowBroadPolicy: true });
+    writeFileSync(resolve(personaGeneratedDir('opted'), 'compiled-policy.json'), JSON.stringify(makePolicy([])));
+    const bus = new WebEventBus();
+    const { events } = captureEvents(bus);
+    const broad = makePolicy([
+      {
+        name: 'allow-any-fetch',
+        description: 'd',
+        principle: 'p',
+        if: { server: ['fetch'] },
+        then: 'allow',
+        reason: 'r',
+      },
+      {
+        name: 'escalate-other-urls',
+        description: 'd',
+        principle: 'p',
+        if: { server: ['fetch'], domains: { roles: ['fetch-url'], allowed: ['*'] } },
+        then: 'escalate',
+        reason: 'r',
+      },
+    ]);
+    const orch = new PersonaCompileOrchestrator({ compileImpl: validatingCompile(broad) });
+
+    orch.startCompile(name, 'cli', bus);
+    await waitFor(() => events.some((e) => e.name === 'persona.compile.done'));
+    const done = events.find((e) => e.name === 'persona.compile.done')?.payload as WebEventMap['persona.compile.done'];
+    expect(done.result.ruleDelta?.unconstrainedAllows).toEqual(['allow-any-fetch: fetch-url on fetch/http_fetch']);
+    expect(done.result.ruleDelta?.escalateBreadth).toEqual(['escalate-other-urls: *']);
+    // The escalate '*' is not broad access: only the allow rule counts.
+    expect(done.result.ruleDelta?.broadenedDomains).toEqual([]);
+
+    const record = readAuditRecords().find((r) => r.method === 'compilePersonaPolicy' && r.persona === 'opted');
+    expect(record?.details.broadened).toBe(true);
+  });
+
+  it('audits the first compile by the policy it wrote: broad for an opted-in broad policy, not for a narrow one', async () => {
+    // No previous compiled-policy.json, so there is no rule delta to read the
+    // flag from; the audit still has to say whether the new policy is broad.
+    const broadName = makePersonaDir('first-broad');
+    writePersonaJson('first-broad', { allowBroadPolicy: true });
+    const narrowName = makePersonaDir('first-narrow');
+    const broad = makePolicy([
+      {
+        name: 'allow-any-fetch',
+        description: 'd',
+        principle: 'p',
+        if: { server: ['fetch'] },
+        then: 'allow',
+        reason: 'r',
+      },
+    ]);
+    const narrow = makePolicy([
+      {
+        name: 'allow-docs',
+        description: 'd',
+        principle: 'p',
+        if: { server: ['fetch'], domains: { roles: ['fetch-url'], allowed: ['docs.python.org'] } },
+        then: 'allow',
+        reason: 'r',
+      },
+    ]);
+
+    for (const [name, policy] of [
+      [broadName, broad],
+      [narrowName, narrow],
+    ] as const) {
+      const bus = new WebEventBus();
+      const { events } = captureEvents(bus);
+      new PersonaCompileOrchestrator({ compileImpl: validatingCompile(policy) }).startCompile(name, 'cli', bus);
+      await waitFor(() => events.some((e) => e.name === 'persona.compile.done'));
+      const done = events.find((e) => e.name === 'persona.compile.done')
+        ?.payload as WebEventMap['persona.compile.done'];
+      expect(done.result.ruleDelta).toBeUndefined();
+    }
+
+    const records = readAuditRecords().filter((r) => r.method === 'compilePersonaPolicy');
+    expect(records.find((r) => r.persona === 'first-broad')?.details.broadened).toBe(true);
+    expect(records.find((r) => r.persona === 'first-narrow')?.details.broadened).toBe(false);
   });
 });
 
@@ -386,6 +643,41 @@ describe('globalLimit queueing + COMPILE_QUEUE_FULL', () => {
     release();
     await waitFor(() => orch.listCompiles().active.length === 0, 4000);
   });
+
+  it("re-stamps a queued compile's lock when it starts, so the lock ages with the run, not the wait", async () => {
+    const bus = new WebEventBus();
+    let releaseRunning!: () => void;
+    const running = new Promise<void>((r) => (releaseRunning = r));
+    let releaseQueued!: () => void;
+    const queued = new Promise<void>((r) => (releaseQueued = r));
+    const a = makePersonaDir('a');
+    const b = makePersonaDir('b');
+    const c = makePersonaDir('c');
+    const orch = new PersonaCompileOrchestrator({
+      compileImpl: async (name) => {
+        await (name === c ? queued : running);
+        return fakeCompile(1)(name, {});
+      },
+    });
+    orch.startCompile(a, 'cli', bus);
+    orch.startCompile(b, 'cli', bus);
+    await waitFor(() => orch.listCompiles().active.length === 2);
+    expect(orch.startCompile(c, 'cli', bus).queued).toBe(true);
+    const lockedAt = (JSON.parse(readFileSync(lockPath('c'), 'utf-8')) as { startedAt: string }).startedAt;
+    await new Promise((r) => setTimeout(r, 15));
+
+    releaseRunning();
+    await waitFor(
+      () => (JSON.parse(readFileSync(lockPath('c'), 'utf-8')) as { startedAt: string }).startedAt !== lockedAt,
+    );
+    expect(
+      Date.parse((JSON.parse(readFileSync(lockPath('c'), 'utf-8')) as { startedAt: string }).startedAt),
+    ).toBeGreaterThan(Date.parse(lockedAt));
+
+    releaseQueued();
+    await waitFor(() => orch.listCompiles().active.length === 0, 4000);
+    expect(existsSync(lockPath('c'))).toBe(false);
+  });
 });
 
 describe('wall-clock-cap abort', () => {
@@ -426,6 +718,38 @@ describe('CREDENTIALS_MISSING preflight', () => {
     // Lock released — a later compile (with creds) is not blocked.
     expect(existsSync(lockPath('coder'))).toBe(false);
   });
+
+  it("also checks a separate verifier model's provider credential (policyVerifierModelId)", async () => {
+    const savedOpenAi = process.env['OPENAI_API_KEY'];
+    delete process.env['OPENAI_API_KEY'];
+    try {
+      const name = makePersonaDir('coder');
+      writeFileSync(
+        resolve(TEST_HOME, 'config.json'),
+        JSON.stringify({ policyModelId: 'anthropic:claude-sonnet-4-6', policyVerifierModelId: 'openai:gpt-5' }),
+      );
+      const orch = new PersonaCompileOrchestrator({ compileImpl: fakeCompile(1) });
+
+      let error: unknown;
+      try {
+        orch.startCompile(name, 'cli', new WebEventBus());
+      } catch (err) {
+        error = err;
+      }
+      expect((error as CompileOrchestratorError | undefined)?.code).toBe('CREDENTIALS_MISSING');
+      expect((error as Error).message).toContain('OPENAI_API_KEY');
+      expect(existsSync(lockPath('coder'))).toBe(false);
+
+      process.env['OPENAI_API_KEY'] = 'sk-test';
+      const bus = new WebEventBus();
+      const { events } = captureEvents(bus);
+      expect(() => orch.startCompile(name, 'cli', bus)).not.toThrow();
+      await waitFor(() => events.some((e) => e.name === 'persona.compile.done'));
+    } finally {
+      if (savedOpenAi === undefined) delete process.env['OPENAI_API_KEY'];
+      else process.env['OPENAI_API_KEY'] = savedOpenAi;
+    }
+  });
 });
 
 describe('LIST_REQUIRES_MCP classification', () => {
@@ -440,6 +764,62 @@ describe('LIST_REQUIRES_MCP classification', () => {
     await waitFor(() => events.some((e) => e.name === 'persona.compile.failed'));
     const op = orch.getCompile(ack.operationId);
     expect(op?.error?.code).toBe('LIST_REQUIRES_MCP');
+  });
+});
+
+// The merged policy failed the policy lint (pipeline PolicyLintError, code
+// POLICY_LINT_FAILED): nothing was written, and the findings say what to change.
+describe('POLICY_LINT_FAILED classification', () => {
+  it('maps a lint failure to its own code, with the findings in the message', () => {
+    const result = classifyPersonaCompileError({ code: 'POLICY_LINT_FAILED', errors: ['rule r: broad domain *.com'] });
+
+    expect(result.code).toBe('POLICY_LINT_FAILED');
+    expect(result.message).toContain('rule r: broad domain *.com');
+    expect(result.message).not.toBe('Persona compilation failed.');
+  });
+
+  it('names the first three findings, escapes control characters and bounds the length', () => {
+    const findings = [
+      'Rule "a" allows *.com \u001b[2J',
+      `Rule "b" ${'x'.repeat(5_000)}`,
+      'Rule "c" allows every tool of server(s) "fetch"',
+      'Rule "d" is the fourth finding',
+      'Rule "e" is the fifth finding',
+    ];
+
+    const { message } = classifyPersonaCompileError(
+      Object.assign(new Error('The compiled policy failed the policy checks'), {
+        code: 'POLICY_LINT_FAILED',
+        errors: findings,
+      }),
+    );
+
+    expect(message).toContain('Rule "a" allows *.com \\u001b[2J');
+    expect(message).not.toContain('\u001b');
+    expect(message).toContain('Rule "c" allows every tool');
+    expect(message).not.toContain('fourth finding');
+    expect(message).toContain('2 more');
+    expect(message.length).toBeLessThan(2_000);
+  });
+
+  it('reports a lint failure on the failed event and the operation record', async () => {
+    const name = makePersonaDir('coder');
+    const bus = new WebEventBus();
+    const { events } = captureEvents(bus);
+    const lintErr = Object.assign(new Error('The compiled policy failed the policy checks; nothing was written'), {
+      code: 'POLICY_LINT_FAILED',
+      errors: ['Rule "allow-all": broad domain *.com'],
+    });
+    const orch = new PersonaCompileOrchestrator({ compileImpl: fakeCompile(1, { throwErr: lintErr }) });
+
+    const ack = orch.startCompile(name, 'cli', bus);
+    await waitFor(() => events.some((e) => e.name === 'persona.compile.failed'));
+
+    const failed = events.find((e) => e.name === 'persona.compile.failed')
+      ?.payload as WebEventMap['persona.compile.failed'];
+    expect(failed.code).toBe('POLICY_LINT_FAILED');
+    expect(failed.error).toContain('Rule "allow-all": broad domain *.com');
+    expect(orch.getCompile(ack.operationId)?.error?.code).toBe('POLICY_LINT_FAILED');
   });
 });
 
@@ -477,5 +857,83 @@ describe('lock file content', () => {
 
     release();
     await waitFor(() => !existsSync(lockPath('coder')));
+  });
+});
+
+// WP-15: partial and total per-server failures are visible on the WS path.
+describe('failed servers', () => {
+  const failedFs = {
+    serverName: 'fs',
+    phase: 'verifying' as const,
+    reason: 'Verification still failing after 3 repair attempt(s).',
+  };
+
+  function partialPolicy(): CompiledPolicyFile {
+    return {
+      generatedAt: '',
+      constitutionHash: 'h',
+      inputHash: 'i',
+      rules: [
+        { name: 'allow-news', description: 'd', principle: 'p', if: { server: ['news'] }, then: 'allow', reason: 'r' },
+      ],
+      failedServers: [failedFs],
+    };
+  }
+
+  it('carries failedServers on the done result and event of a partial compile', async () => {
+    const name = makePersonaDir('coder');
+    const bus = new WebEventBus();
+    const { events } = captureEvents(bus);
+    const orch = new PersonaCompileOrchestrator({ compileImpl: () => Promise.resolve(partialPolicy()) });
+
+    const ack = orch.startCompile(name, 'cli', bus);
+    await waitFor(() => events.some((e) => e.name === 'persona.compile.done'));
+
+    const done = events.find((e) => e.name === 'persona.compile.done')?.payload as WebEventMap['persona.compile.done'];
+    expect(done.result).toEqual({ success: true, ruleCount: 1, failedServers: [failedFs] });
+    expect(orch.getCompile(ack.operationId)?.result?.failedServers).toEqual([failedFs]);
+  });
+
+  it('names the failed servers when every server failed', async () => {
+    const name = makePersonaDir('coder');
+    const bus = new WebEventBus();
+    const { events } = captureEvents(bus);
+    const allFailed = Object.assign(new Error('All 1 server(s) failed compilation'), {
+      code: 'ALL_SERVERS_FAILED',
+      failedServers: [failedFs],
+    });
+    const orch = new PersonaCompileOrchestrator({ compileImpl: fakeCompile(1, { throwErr: allFailed }) });
+
+    orch.startCompile(name, 'cli', bus);
+    await waitFor(() => events.some((e) => e.name === 'persona.compile.failed'));
+
+    const failed = events.find((e) => e.name === 'persona.compile.failed')
+      ?.payload as WebEventMap['persona.compile.failed'];
+    expect(failed.code).toBe('INTERNAL_ERROR');
+    expect(failed.error).toContain('fs (verifying)');
+    // The raw reason stays out of the operator-facing message.
+    expect(failed.error).not.toContain('repair attempt');
+  });
+
+  it("reports a server's failure as a progress event", async () => {
+    const name = makePersonaDir('coder');
+    const bus = new WebEventBus();
+    const { events } = captureEvents(bus);
+    const orch = new PersonaCompileOrchestrator({
+      compileImpl: (_n, opts) => {
+        opts.reporterFactory?.('fs').fail('verifying', new Error('judge rejected\nthe rules'));
+        return Promise.resolve(partialPolicy());
+      },
+    });
+
+    orch.startCompile(name, 'cli', bus);
+    await waitFor(() => events.some((e) => e.name === 'persona.compile.done'));
+
+    const progress = events
+      .filter((e) => e.name === 'persona.compile.progress')
+      .map((e) => e.payload as WebEventMap['persona.compile.progress']);
+    expect(progress).toContainEqual(
+      expect.objectContaining({ serverName: 'fs', phase: 'verifying', detail: 'Failed: judge rejected\\nthe rules' }),
+    );
   });
 });

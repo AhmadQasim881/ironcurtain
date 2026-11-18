@@ -1,5 +1,7 @@
 # Named Z.AI profiles and host model roles
 
+**Status (2026-11-14):** Implemented (`src/config/zai.ts`, `src/docker/zai.ts`).
+
 This change adds Z.AI to the existing named-provider registry and adds independent named-profile routing for host models in the same PR. Native routing is preserved. OpenRouter keeps its effective defaults and constraints while chained model maps now apply once. Workflow benchmark changes are outside this PR.
 
 ## Provider contract
@@ -34,7 +36,9 @@ A test-only compatible definition exercises all three harness config generators 
 
 ## Host roles
 
-`hostModelProfiles` optionally binds `agent`, `policy`, `prefilter`, `summary`, and `autoApprove` to registry names. Unbound roles retain native resolution independently of `modelProviders.default`. Existing role model fields remain authoritative inputs to mapping. Both native and gateway-only credential preflights resolve by role.
+`hostModelProfiles` optionally binds `agent`, `policy`, `prefilter`, `summary`, `autoApprove`, and `contentAssessment` (the optional intelligibility check of the outbound content assessment) to registry names. Unbound roles retain native resolution independently of `modelProviders.default`. Existing role model fields remain authoritative inputs to mapping. Both native and gateway-only credential preflights resolve by role.
+
+A host role sends its own model ID through the bound profile's model map only (no per-agent setting applies). OpenRouter routes only `vendor/model` IDs (`modelIdFormat: 'vendor/model'` in its gateway definition), so an ID that no map rule replaces and that has no `/` (`openai:gpt-5` sent as `gpt-5`, or the default Anthropic IDs under `modelMap: []`) would fail at the provider mid-session. `describeGatewayModelIdProblem` (provider-definitions.ts) detects this offline; it is a warning, not a load error, because bare IDs are normal for Z.AI and an ID the check cannot judge may still be valid. `ironcurtain config` warns when a role is bound to such a profile and again after a save, and `ironcurtain doctor` reports it as a "Host model routing" warning. `doctor --check-api` round-trips every configured role (summary first; roles whose feature is off are skipped), each with its own model field and its bound profile, sharing one request among roles that resolve to the same model through the same profile.
 
 Builtin agent budget estimates use the effective mapped host model, including session model overrides. The SDK receives the original requested identity, so chained maps still apply once. Pricing uses the existing approximate table and unknown-model fallback; this does not qualify provider/account-plan billing rates.
 

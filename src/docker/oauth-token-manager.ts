@@ -7,14 +7,17 @@
  * before attempting a refresh to avoid using a stale refresh token.
  *
  * For file-sourced credentials, refreshed tokens are saved back to the
- * credentials file. For Keychain-sourced credentials (macOS), refreshed
- * tokens are written back to the Keychain via the writeToKeychain dep.
+ * credentials file atomically. The write-back re-reads the file after the
+ * refresh grant returned and keeps a token the host stored in the meantime
+ * (later expiry, or a rotated refresh token); the manager then adopts that
+ * token. For Keychain-sourced credentials (macOS), refreshed tokens are
+ * written back to the Keychain via the writeToKeychain dep.
  *
  * A single in-flight refresh promise is shared across concurrent callers
  * to prevent duplicate refresh requests.
  */
 
-import type { OAuthClientKind, OAuthCredentials } from './oauth-credentials.js';
+import type { CredentialWriteBackOptions, OAuthClientKind, OAuthCredentials } from './oauth-credentials.js';
 import {
   isTokenExpired,
   loadCredentialsFromFile,
@@ -31,7 +34,16 @@ export interface TokenManagerDeps {
   loadCredentials: (filePath: string) => OAuthCredentials | null;
   loadFromKeychain: () => OAuthCredentials | null;
   refreshToken: (refreshToken: string, clientKind?: OAuthClientKind) => Promise<OAuthCredentials | null>;
-  saveCredentials: (credentials: OAuthCredentials, filePath?: string) => void;
+  /**
+   * Refresh write-back to the credentials file. It re-reads the file and keeps
+   * newer credentials stored there (rotation race with the host CLI); it
+   * returns the credentials in effect afterwards (undefined = the ones passed).
+   */
+  saveCredentials: (
+    credentials: OAuthCredentials,
+    filePath?: string,
+    options?: CredentialWriteBackOptions,
+  ) => OAuthCredentials | undefined;
   credentialsFilePath: string;
   /** When set, refreshed credentials are written to the Keychain instead of the file. */
   writeToKeychain?: (credentials: OAuthCredentials, serviceName: string) => void;
@@ -170,18 +182,25 @@ export class OAuthTokenManager {
 
     if (newCreds) {
       logger.info('[oauth-token-manager] Token refresh successful');
+      let effective = newCreds;
       try {
         if (this.deps.keychainServiceName && this.deps.writeToKeychain) {
           this.deps.writeToKeychain(newCreds, this.deps.keychainServiceName);
         } else {
-          this.deps.saveCredentials(newCreds, this.deps.credentialsFilePath);
+          // The host may have refreshed (rotating the refresh token) while our
+          // POST was in flight. The save re-reads the file and keeps a newer
+          // token found there; use whatever ends up in effect.
+          effective =
+            this.deps.saveCredentials(newCreds, this.deps.credentialsFilePath, {
+              refreshedFrom: refreshSource.refreshToken,
+            }) ?? newCreds;
         }
       } catch (err) {
         logger.warn(
           `[oauth-token-manager] Failed to save refreshed credentials: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
-      this.credentials = newCreds;
+      this.credentials = effective;
       return this.credentials.accessToken;
     }
 

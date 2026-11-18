@@ -1,6 +1,8 @@
 # Evolve Native Workflow — Human-Surface Slice (preflight_review + human_escalation + final_summary/final_review + aborted)
 
-Status: **Implemented & merged in #303 (2026-06-16).** Shipped as designed: three `human_gate` states (`preflight_review`/`human_escalation`/`final_review`), a `final_summary` agent state producing `final_report`, and a distinct `aborted` terminal, with `escalate`/`evaluator_blocked → human_escalation` and `complete → final_summary` retargets. The sections below are the **as-shipped record** — the design narrative is preserved, with as-shipped annotations marked **[SHIPPED]** where the implementation clarifies or deviates from the original plan (notably the §4.2/§5.2 `buildGateRequest` runtime change, which the design predicted would not be needed). All three maintainer decisions (§13) shipped exactly as decided. Note: the human-surface FSM described here is rooted at `preflight`; a later PR (#309) prepended a `provision`/`provision_review` stage as the new `initial:` state, so the live `workflow.yaml` now begins one state earlier — that stage is out of scope for this slice and does not change any human-surface edge documented below.
+**Status (2026-11-14):** Implemented (PR #303, 2026-06-16).
+
+Implementation record: **Implemented & merged in #303 (2026-06-16).** Shipped as designed: three `human_gate` states (`preflight_review`/`human_escalation`/`final_review`), a `final_summary` agent state producing `final_report`, and a distinct `aborted` terminal, with `escalate`/`evaluator_blocked → human_escalation` and `complete → final_summary` retargets. The sections below are the **as-shipped record** — the design narrative is preserved, with as-shipped annotations marked **[SHIPPED]** where the implementation clarifies or deviates from the original plan (notably the §4.2/§5.2 `buildGateRequest` runtime change, which the design predicted would not be needed). All three maintainer decisions (§13) shipped exactly as decided. Note: the human-surface FSM described here is rooted at `preflight`; a later PR (#309) prepended a `provision`/`provision_review` stage as the new `initial:` state, so the live `workflow.yaml` now begins one state earlier — that stage is out of scope for this slice and does not change any human-surface edge documented below.
 
 Original status (design phase, retained for history): _Design — ready to implement (3 maintainer decisions signed off 2026-06-16, §13). Independent critical review incorporated (2026-06-16): the human-gate machinery claims were verified correct; this revision owns the one intentional behavior change (`evaluator_blocked → human_escalation`, which retargets a previously-terminal edge and breaks two shipped integration tests — §12), strikes the WF004-violating gate `present:` rows from §4.5, specifies the §12 mock-harness `final_summary` branch, and resolves the budget-extension question (§8.3 / §13). All three residual maintainer decisions are now signed off (§13): `final_summary` = agent state; objective-change = conservative ABORT-to-restart; `evaluator_blocked` = reroute to `human_escalation`._
 Audience: IronCurtain workflow engineer extending the merged multi-round `evolve` workflow package.
@@ -10,7 +12,7 @@ Predecessors (merged / designed, build ON — do not redesign):
 
 - **Multi-round slice** — `docs/designs/evolve-multi-round-slice.md` (PR #302). Ships the live hub-and-spoke FSM at `src/workflow/workflows/evolve/workflow.yaml`: `preflight → orchestrator` (agent hub) with `sample`/`researcher`/`evaluate`/`analyzer`/`analysis_record` spokes, `isRoundLimitReached` backstop (`settings.maxRounds: 200`), and the determinism fixes in the `evolve_result.py` bridge. The multi-round FSM is **deliberately a strict subgraph** of the parent design — the human surfaces were explicitly deferred (multi-round §11, §15 #3, §16 #2). This slice adds **only** that deferred surface.
 - **Parent design** — `docs/designs/asi-evolve-native-workflow.md`: the full FSM including `preflight_review`, `human_escalation`, `final_summary`, `final_review` human gates.
-- **Human-gate machinery** (verified, cited inline below): `src/workflow/types.ts`, `validate.ts`, `lint.ts`, `machine-builder.ts`, `orchestrator.ts`, `cli-support.ts`, `workflow-command.ts`, and the direct precedent in `src/workflow/workflows/vuln-discovery/workflow.yaml`.
+- **Human-gate machinery** (verified, cited inline below): `src/workflow/types.ts`, `validate.ts`, `lint.ts`, `machine-builder.ts`, `orchestrator.ts`, `cli-support.ts`, `workflow-command.ts`, and the direct precedent in `src/workflow/workflows/design-and-code/workflow.yaml`.
 
 ---
 
@@ -87,7 +89,7 @@ The multi-round slice proved hub + sampling + cognition + analyzer + determinism
 | Operator stop                   | none (every stop is `failed` or `done`)                     | distinct `aborted` terminal (§4.4, §7)                                                                    |
 | Round-limit wedge backstop      | `guard: isRoundLimitReached → failed`                       | **unchanged** (still `→ failed`; a wedge is a genuine error, not an operator action)                      |
 
-No workflow-**runtime** change is required. The human-gate machinery (`human_gate` state type, `acceptedEvents`, `present:`, `resolveGate`, `handleGateEntry`, the `waiting_human` phase, the `aborted` phase, WF004/WF001/`validateHumanGate` lint) is **already merged and exercised by `vuln-discovery`** (§3). This slice is, again, pure workflow-package + test — it adds gate/agent/terminal blocks to one YAML and one new integration test, and (maintainer decision §13, decision 1) at most one `evolve_result.py` helper or `final_summary` prompt to materialize the report.
+No workflow-**runtime** change is required. The human-gate machinery (`human_gate` state type, `acceptedEvents`, `present:`, `resolveGate`, `handleGateEntry`, the `waiting_human` phase, the `aborted` phase, WF004/WF001/`validateHumanGate` lint) is **already merged and exercised by `design-and-code`** (§3). This slice is, again, pure workflow-package + test — it adds gate/agent/terminal blocks to one YAML and one new integration test, and (maintainer decision §13, decision 1) at most one `evolve_result.py` helper or `final_summary` prompt to materialize the report.
 
 > **[SHIPPED — deviation]** This "no workflow-runtime change is required" prediction was **not** quite borne out: PR #303 shipped one small, reviewed-as-necessary runtime change in `orchestrator.ts` (`buildGateRequest`). When `human_escalation` is reached via `evaluate ─evaluator_blocked`, the `evaluate` deterministic state resolves with `passed: false` and leaves `context.lastError` **null**, so the existing `lastError`-only summary logic surfaced no reason for the escalation. `buildGateRequest` was extended to fall back to the previous deterministic state's verdict (`context.lastDeterministicResult.verdict`) and suffix the gate summary with `(verdict: evaluator_blocked)` when there is no `lastError`. The human-gate _machinery_ was indeed already merged; the one new line of runtime is purely about making the deterministic escalation reason visible in the gate summary. The §12 Scenario C assertion `escalationGate.summary` contains `'evaluator_blocked'` is the proof. See the [SHIPPED] notes in §4.2 and §5.2 for the exact code.
 
@@ -105,7 +107,7 @@ Every fact below is verified in the current tree. The implementer should rely on
 
 ### 3.2 Event vocabulary (exactly four, all-caps)
 
-`HumanGateEventType` is exactly `APPROVE | FORCE_REVISION | REPLAN | ABORT` (`types.ts:362`; the Zod enum is `validate.ts:70-76`). `resolveGate` maps the chosen event to an XState event `HUMAN_<EVENT>` (`machine-builder.ts:309-329`). **`FORCE_REVISION` and `REPLAN` require a non-empty feedback `prompt`** (`orchestrator.ts:1566-1604`); that feedback is injected into the next agent's prompt as `context.humanPrompt`. This slice uses only `APPROVE`, `FORCE_REVISION`, and `ABORT` (no `REPLAN`) — matching the `vuln-discovery` precedent.
+`HumanGateEventType` is exactly `APPROVE | FORCE_REVISION | REPLAN | ABORT` (`types.ts:362`; the Zod enum is `validate.ts:70-76`). `resolveGate` maps the chosen event to an XState event `HUMAN_<EVENT>` (`machine-builder.ts:309-329`). **`FORCE_REVISION` and `REPLAN` require a non-empty feedback `prompt`** (`orchestrator.ts:1566-1604`); that feedback is injected into the next agent's prompt as `context.humanPrompt`. This slice uses only `APPROVE`, `FORCE_REVISION`, and `ABORT` (no `REPLAN`) — matching the `plan_review` gate in `design-and-code`.
 
 ### 3.3 Default and per-transition gate actions
 
@@ -117,7 +119,7 @@ When a gate resolves, the default gate actions run first: `storeHumanPrompt` (wr
 
 ### 3.5 Lint rules a gate touches
 
-- **WF004** (`lint.ts:255-281`): every artifact named in a reachable gate's `present:` **must be produced by a reachable state**, else an error ("the human will approve without seeing it"). The `produced` set is computed by `collectReachableAgentOutputs` (`lint.ts:149-157`), which collects the `outputs:` lists of **reachable `agent` states only** — terminal `outputs:` do not count (they are arrival declarations, not production). **Consequence for this slice:** `final_review`'s `present: [final_report]` is only clean if a reachable **agent** state lists `final_report` in its `outputs:`. That state is `final_summary` (§6). The current evolve agent states use `outputs: []`; `final_summary` is the first to declare a non-empty `outputs:`, exactly as `vuln-discovery`'s `harness_design` declares `outputs: [harness_design]` (`vuln-discovery/workflow.yaml:352-353`).
+- **WF004** (`lint.ts:255-281`): every artifact named in a reachable gate's `present:` **must be produced by a reachable state**, else an error ("the human will approve without seeing it"). The `produced` set is computed by `collectReachableAgentOutputs` (`lint.ts:149-157`), which collects the `outputs:` lists of **reachable `agent` states only** — terminal `outputs:` do not count (they are arrival declarations, not production). **Consequence for this slice:** `final_review`'s `present: [final_report]` is only clean if a reachable **agent** state lists `final_report` in its `outputs:`. That state is `final_summary` (§6). The current evolve agent states use `outputs: []`; `final_summary` is the first to declare a non-empty `outputs:`, just as the `plan` state in `design-and-code` declares `plan` as its output.
 - **WF001** (`lint.ts:168-196`): every reachable non-terminal state must have a path to **some** terminal. Each new gate has an `ABORT → aborted` edge, so each reaches the new `aborted` terminal; `final_summary → final_review → done` reaches `done`. All clean.
 
 ### 3.6 Phase / status surfacing
@@ -130,31 +132,9 @@ When a gate resolves, the default gate actions run first: `storeHumanPrompt` (wr
 - **Resume entry**: `ironcurtain workflow resume <baseDir> [--state <name>]` (`workflow-command.ts:67`) re-enters a checkpointed run, including one paused at a gate.
 - **GUI surface**: the daemon / web-ui escalations view is the graphical gate surface (`--web-ui`).
 
-### 3.8 Direct precedent — mirror `vuln-discovery`
+### 3.8 Plan review in the bundled design workflow
 
-`vuln-discovery` already ships exactly the shape this slice needs (`src/workflow/workflows/vuln-discovery/workflow.yaml:296-313`):
-
-```yaml
-human_escalation:
-  type: human_gate
-  description: Human review when investigation is stuck
-  acceptedEvents: [APPROVE, FORCE_REVISION, ABORT]
-  present: [journal, analysis, discoveries?]
-  transitions:
-    - { to: orchestrator, event: APPROVE }
-    - { to: orchestrator, event: FORCE_REVISION }
-    - { to: aborted, event: ABORT }
-```
-
-and a distinct `aborted` terminal (`vuln-discovery/workflow.yaml:923-925`):
-
-```yaml
-aborted:
-  type: terminal
-  description: Investigation aborted
-```
-
-This slice replicates both shapes (gate blocks and the `aborted` terminal) for `evolve`. The only differences are the `present:` artifact names (evolve's durable run-state files), the `human_escalation` `FORCE_REVISION → preflight` target, and the addition of `preflight_review`/`final_review`/`final_summary`.
+The `plan_review` gate in `src/workflow/workflows/design-and-code/workflow.yaml` presents the `plan` artifact. Approval advances to design, a revision request returns to planning with the reviewer’s feedback, and abort ends the run at the `aborted` terminal. Evolve uses the same gate and terminal types with its own artifacts and transition targets.
 
 ---
 
@@ -279,7 +259,7 @@ The principle: **agent-judgment and evaluator-blocked stops are human-mediated; 
 
 > **[SHIPPED]** Both retargets above are the live edges (`orchestrator`/`evaluate` transitions, `workflow.yaml`). The `evaluator_blocked → human_escalation` edge required the one runtime change in the slice: `buildGateRequest` in `orchestrator.ts` now surfaces the deterministic `evaluator_blocked` verdict into the gate `summary` (the `evaluate` state leaves `context.lastError` null, so the prior summary logic showed no reason). See the §5 [SHIPPED] correction and §13 decision 3. The shipped `human_escalation` gate `description` is slightly richer than the verbatim block below — it states the objective-change conservative contract inline ("force a revision back to preflight for evaluator/spec repair that preserves existing node validity, or abort and start a fresh run if the objective must change"), per §13 decision 2.
 
-**New gate state** (insert after `analysis_record`, mirroring `vuln-discovery/workflow.yaml:296-313`):
+**New gate state** (insert after `analysis_record`):
 
 ```yaml
 human_escalation:
@@ -396,7 +376,7 @@ failed:
   description: Preflight blocked, sampling failed, evaluator failed, record failed, or round-limit wedge.
 ```
 
-**Edit** — keep both, add `aborted` (mirroring `vuln-discovery/workflow.yaml:923-925`):
+**Edit** — keep both, add `aborted`:
 
 ```yaml
 done:
@@ -833,7 +813,7 @@ These are settled enough to implement on the recommended default; listed for vis
 
 ### Still-open verification (low risk)
 
-- **Resume → gate re-surfacing (§8.1).** The doc asserts `workflow resume` re-surfaces the same `HumanGateRequest` for a still-pending gate. **[SHIPPED — partially exercised]** The four §12 scenarios drive each gate **in-process** via `waitForGate` + `orchestrator.resolveGate` (the gate-pause / `phase: 'waiting_human'` path is proven, including the FORCE_REVISION re-entry loops), but they do **not** exercise the cross-process `workflow resume <baseDir>` re-raise path — that remains identical to the already-shipped `vuln-discovery` gate-resume behavior and was not separately retested in #303.
+- **Resume → gate re-surfacing (§8.1).** The doc asserts `workflow resume` re-surfaces the same `HumanGateRequest` for a still-pending gate. **[SHIPPED — partially exercised]** The four §12 scenarios drive each gate **in-process** via `waitForGate` + `orchestrator.resolveGate` (the gate-pause / `phase: 'waiting_human'` path is proven, including the FORCE_REVISION re-entry loops), but they do **not** exercise the cross-process `workflow resume <baseDir>` re-raise path — that remains identical to the shared gate-resume behavior and was not separately retested in #303.
 
 ### Risks
 

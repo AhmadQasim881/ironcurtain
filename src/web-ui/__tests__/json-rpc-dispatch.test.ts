@@ -22,7 +22,8 @@ import { SessionManager, type ManagedSession, type PendingEscalationData } from 
 import type { ControlRequestHandler, DaemonStatus } from '../../daemon/control-socket.js';
 import type { Session, SessionInfo, BudgetStatus, ConversationTurn, DiagnosticEvent } from '../../session/types.js';
 import type { Transport } from '../../session/transport.js';
-import type { JobDefinition, JobId, RunRecord } from '../../cron/types.js';
+import { EscalationExpiredError } from '../../types/errors.js';
+import { JobNotFoundError, type JobDefinition, type JobId, type RunRecord } from '../../cron/types.js';
 
 // ---------------------------------------------------------------------------
 // Mock external modules that dispatch() calls directly
@@ -57,15 +58,24 @@ vi.mock('../../memory/auto-save.js', () => ({
 // Test data factories
 // ---------------------------------------------------------------------------
 
+/** An idle builtin session: the per-turn fields are reset, totals live in `cumulative`. */
 function createMockBudgetStatus(): BudgetStatus {
   return {
-    totalInputTokens: 5000,
-    totalOutputTokens: 2000,
-    totalTokens: 7000,
-    stepCount: 10,
-    elapsedSeconds: 120,
-    estimatedCostUsd: 0.15,
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+    totalTokens: 0,
+    stepCount: 0,
+    elapsedSeconds: 0,
+    estimatedCostUsd: 0,
     tokenTrackingAvailable: true,
+    lastTurn: {
+      totalInputTokens: 1500,
+      totalOutputTokens: 500,
+      totalTokens: 2000,
+      stepCount: 3,
+      elapsedSeconds: 40,
+      estimatedCostUsd: 0.05,
+    },
     limits: {
       maxTotalTokens: 1_000_000,
       maxSteps: 200,
@@ -116,7 +126,7 @@ function createMockSession(overrides?: { info?: Partial<SessionInfo>; budgetStat
       ] satisfies DiagnosticEvent[]),
     sendMessage: vi.fn().mockResolvedValue('response'),
     resolveEscalation: vi.fn().mockResolvedValue(undefined),
-    getPendingEscalation: vi.fn().mockReturnValue(undefined),
+    getPendingEscalations: vi.fn().mockReturnValue([]),
     close: vi.fn().mockResolvedValue(undefined),
   };
 }
@@ -151,8 +161,10 @@ function createMockManagedSession(overrides?: {
     transport: createMockTransport(),
     source,
     messageInFlight: overrides?.messageInFlight ?? false,
-    pendingEscalation: overrides?.pendingEscalation ?? null,
-    escalationResolving: false,
+    pendingEscalations: new Map(
+      overrides?.pendingEscalation ? [[overrides.pendingEscalation.escalationId, overrides.pendingEscalation]] : [],
+    ),
+    escalationsResolving: new Set(),
     runPromise: null,
   };
 }
@@ -160,31 +172,40 @@ function createMockManagedSession(overrides?: {
 function createMockDaemonStatus(): DaemonStatus {
   return {
     uptimeSeconds: 300,
-    jobs: { total: 2, enabled: 2, running: 1 },
+    jobs: { total: 2, enabled: 2, running: 1, failing: 1 },
+    failingJobs: [{ jobId: 'flaky-job', name: 'Flaky Job', consecutiveFailures: 2 }],
     signalConnected: true,
     nextFireTime: new Date('2026-01-15T12:00:00.000Z'),
   };
 }
 
+const MOCK_RUN_RECORD: RunRecord = {
+  startedAt: '2026-01-15T10:00:00.000Z',
+  completedAt: '2026-01-15T10:05:00.000Z',
+  outcome: { kind: 'success' },
+  budget: { totalTokens: 5000, stepCount: 10, elapsedSeconds: 300, estimatedCostUsd: 0.1 },
+  summary: 'Job completed successfully',
+  escalationsEncountered: 0,
+  escalationsApproved: 0,
+  discardedChanges: null,
+};
+
 function createMockHandler(overrides?: Partial<ControlRequestHandler>): ControlRequestHandler {
   return {
     getStatus: vi.fn().mockReturnValue(createMockDaemonStatus()),
-    addJob: vi.fn().mockResolvedValue(undefined),
     removeJob: vi.fn().mockResolvedValue(undefined),
     enableJob: vi.fn().mockResolvedValue(undefined),
     disableJob: vi.fn().mockResolvedValue(undefined),
     recompileJob: vi.fn().mockResolvedValue(undefined),
+    refreshLists: vi.fn().mockResolvedValue({
+      target: 'job "daily-review"',
+      outputDir: '/jobs/daily-review/generated',
+      refreshed: ['repos'],
+      skipped: [],
+    }),
     reloadJob: vi.fn().mockResolvedValue(undefined),
-    runJobNow: vi.fn().mockResolvedValue({
-      startedAt: '2026-01-15T10:00:00.000Z',
-      completedAt: '2026-01-15T10:05:00.000Z',
-      outcome: { kind: 'success' },
-      budget: { totalTokens: 5000, stepCount: 10, elapsedSeconds: 300, estimatedCostUsd: 0.1 },
-      summary: 'Job completed successfully',
-      escalationsEncountered: 0,
-      escalationsApproved: 0,
-      discardedChanges: null,
-    } satisfies RunRecord),
+    startJobRun: vi.fn(() => ({ completion: Promise.resolve(MOCK_RUN_RECORD) })),
+    runJobNow: vi.fn().mockResolvedValue(MOCK_RUN_RECORD),
     listJobs: vi.fn().mockReturnValue([
       {
         job: {
@@ -200,6 +221,7 @@ function createMockHandler(overrides?: Partial<ControlRequestHandler>): ControlR
         nextRun: new Date('2026-01-16T09:00:00.000Z'),
         lastRun: undefined,
         isRunning: false,
+        consecutiveFailures: 0,
       },
       {
         job: {
@@ -224,6 +246,7 @@ function createMockHandler(overrides?: Partial<ControlRequestHandler>): ControlR
           discardedChanges: null,
         } satisfies RunRecord,
         isRunning: false,
+        consecutiveFailures: 0,
       },
     ]),
     ...overrides,
@@ -430,13 +453,59 @@ describe('dispatch()', () => {
       expect(emitSpy).toHaveBeenCalledWith('job.list_changed', {});
     });
 
-    it('jobs.recompile calls handler.recompileJob without emitting', async () => {
+    it('jobs.recompile calls handler.recompileJob and emits job.list_changed', async () => {
+      // A recompile also reloads the job, so a job whose policy never compiled
+      // gets scheduled and the list's next-run column changes.
       const ctx = createMockContext();
       const emitSpy = vi.spyOn(ctx.eventBus, 'emit');
 
       await dispatch(ctx, 'jobs.recompile', { jobId: 'daily-review' });
       expect(vi.mocked(ctx.handler.recompileJob)).toHaveBeenCalledWith('daily-review');
-      expect(emitSpy).not.toHaveBeenCalled();
+      expect(emitSpy).toHaveBeenCalledWith('job.list_changed', {});
+    });
+
+    it.each(['jobs.remove', 'jobs.enable', 'jobs.disable', 'jobs.recompile', 'jobs.reload'] as const)(
+      '%s reports an unknown job as JOB_NOT_FOUND and emits nothing',
+      async (method) => {
+        const ctx = createMockContext();
+        for (const fn of ['removeJob', 'enableJob', 'disableJob', 'recompileJob', 'reloadJob'] as const) {
+          vi.mocked(ctx.handler[fn]).mockRejectedValue(new JobNotFoundError('no-such-job'));
+        }
+        const emitSpy = vi.spyOn(ctx.eventBus, 'emit');
+
+        const error = await dispatch(ctx, method, { jobId: 'no-such-job' }).catch((err: unknown) => err);
+        expect(error).toBeInstanceOf(RpcError);
+        expect((error as RpcError).code).toBe('JOB_NOT_FOUND');
+        expect((error as RpcError).message).toBe('Job not found: no-such-job');
+        expect(emitSpy).not.toHaveBeenCalled();
+      },
+    );
+
+    it('jobs.refreshLists asks the daemon to refresh that job policy and returns its result', async () => {
+      const ctx = createMockContext();
+
+      const result = await dispatch(ctx, 'jobs.refreshLists', { jobId: 'daily-review', list: 'repos', withMcp: false });
+      expect(vi.mocked(ctx.handler.refreshLists)).toHaveBeenCalledWith({
+        target: { kind: 'job', name: 'daily-review' },
+        list: 'repos',
+        withMcp: false,
+      });
+      expect(result).toEqual(expect.objectContaining({ refreshed: ['repos'] }));
+    });
+
+    it('jobs.refreshLists rejects a request without a job id', async () => {
+      const ctx = createMockContext();
+      await expect(dispatch(ctx, 'jobs.refreshLists', { list: 'repos' })).rejects.toThrow();
+      expect(vi.mocked(ctx.handler.refreshLists)).not.toHaveBeenCalled();
+    });
+
+    it('jobs.refreshLists reports an unknown job as JOB_NOT_FOUND', async () => {
+      const ctx = createMockContext();
+      vi.mocked(ctx.handler.refreshLists).mockRejectedValue(new JobNotFoundError('no-such-job'));
+
+      const error = await dispatch(ctx, 'jobs.refreshLists', { jobId: 'no-such-job' }).catch((err: unknown) => err);
+      expect(error).toBeInstanceOf(RpcError);
+      expect((error as RpcError).code).toBe('JOB_NOT_FOUND');
     });
 
     it('jobs.reload calls handler.reloadJob and emits job.list_changed', async () => {
@@ -699,6 +768,37 @@ describe('dispatch()', () => {
       }
     });
 
+    it('escalations.resolve reports a late response as ESCALATION_EXPIRED and announces the expiry', async () => {
+      const sessionManager = new SessionManager();
+      const session = createMockSession();
+      vi.mocked(session.resolveEscalation).mockRejectedValue(new EscalationExpiredError('esc-late'));
+      const label = sessionManager.register(session, createMockTransport(), { kind: 'web' });
+      sessionManager.setPendingEscalation(label, {
+        escalationId: 'esc-late',
+        sessionLabel: label,
+        toolName: 'write_file',
+        serverName: 'filesystem',
+        arguments: {},
+        reason: 'test',
+        receivedAt: new Date().toISOString(),
+      });
+      const ctx = createMockContext({ sessionManager });
+      const expired: unknown[] = [];
+      ctx.eventBus.subscribe((event, payload) => {
+        if (event === 'escalation.expired') expired.push(payload);
+      });
+
+      const error = await dispatch(ctx, 'escalations.resolve', { escalationId: 'esc-late', decision: 'approved' }).then(
+        () => undefined,
+        (err: unknown) => err,
+      );
+
+      expect(error).toBeInstanceOf(RpcError);
+      expect((error as RpcError).code).toBe('ESCALATION_EXPIRED');
+      expect(expired).toEqual([{ escalationId: 'esc-late', sessionLabel: label }]);
+      expect(sessionManager.get(label)?.pendingEscalations.size).toBe(0);
+    });
+
     it('escalations.resolve when already resolving returns SESSION_BUSY', async () => {
       const sessionManager = new SessionManager();
       const session = createMockSession();
@@ -796,7 +896,7 @@ describe('dispatch()', () => {
   });
 
   describe('toBudgetDto()', () => {
-    it('returns all budget fields', () => {
+    it('returns the session totals, not the per-turn fields that are zero between turns', () => {
       const managed = createMockManagedSession();
       const dto = toBudgetDto(managed);
       expect(dto.totalTokens).toBe(7000);
@@ -823,7 +923,7 @@ describe('dispatch()', () => {
       const ctx = createMockContext();
       const dto = buildStatusDto(ctx);
       expect(dto.uptimeSeconds).toBe(300);
-      expect(dto.jobs).toEqual({ total: 2, enabled: 2, running: 1 });
+      expect(dto.jobs).toEqual({ total: 2, enabled: 2, running: 1, failing: 1 });
       expect(dto.signalConnected).toBe(true);
       expect(dto.webUiListening).toBe(true);
       expect(dto.activeSessions).toBe(ctx.sessionManager.size);
@@ -835,7 +935,8 @@ describe('dispatch()', () => {
       const handler = createMockHandler({
         getStatus: vi.fn().mockReturnValue({
           uptimeSeconds: 10,
-          jobs: { total: 0, enabled: 0, running: 0 },
+          jobs: { total: 0, enabled: 0, running: 0, failing: 0 },
+          failingJobs: [],
           signalConnected: false,
           nextFireTime: null,
         }),

@@ -2,10 +2,11 @@ import { describe, it, expect, vi } from 'vitest';
 import type { MemoryEngine } from '../src/engine.js';
 import { validateStoreInput, handleStore, formatStoreResult } from '../src/tools/store.js';
 import { validateRecallInput, handleRecall } from '../src/tools/recall.js';
-import { validateExpandInput, handleExpand } from '../src/tools/expand.js';
+import { validateExpandInput, handleExpand, passageRangeNote } from '../src/tools/expand.js';
 import { validateContextInput, handleContext } from '../src/tools/context.js';
 import { validateForgetInput, handleForget } from '../src/tools/forget.js';
 import { validateInspectInput, handleInspect } from '../src/tools/inspect.js';
+import { MEMORY_NOTES_NOTICE, frameMemoryNotes } from '../src/utils/framing.js';
 
 function createMockEngine(overrides: Partial<MemoryEngine> = {}): MemoryEngine {
   return {
@@ -36,6 +37,7 @@ function createMockEngine(overrides: Partial<MemoryEngine> = {}): MemoryEngine {
     expand: vi.fn().mockResolvedValue({
       segment_id: 'seg-1',
       passages: ['Source passage one.', 'Source passage two.'],
+      total_passages: 2,
       found: true,
     }),
     close: vi.fn(),
@@ -87,6 +89,18 @@ describe('memory_store', () => {
 
     it('rejects tags with non-string elements', () => {
       expect(() => validateStoreInput({ content: 'ok', tags: [1, 2] })).toThrow('tags must be an array of strings');
+    });
+
+    it('stores importance above 0.8 as 0.8', () => {
+      expect(validateStoreInput({ content: 'ok', importance: 1 }).importance).toBe(0.8);
+      expect(validateStoreInput({ content: 'ok', importance: 0.95 }).importance).toBe(0.8);
+      expect(validateStoreInput({ content: 'ok', importance: 0.3 }).importance).toBe(0.3);
+    });
+
+    it('rejects content that contains a secret value', () => {
+      expect(() => validateStoreInput({ content: 'Token ghp_abcdefghijklmnopqrstuvwxyz0123456789' })).toThrow(
+        'content appears to contain an API key or token',
+      );
     });
 
     it('rejects importance out of range', () => {
@@ -223,14 +237,18 @@ describe('memory_recall', () => {
     it('calls engine.recall with correct args', async () => {
       const engine = createMockEngine();
       await handleRecall(engine, { query: 'test', format: 'raw' });
-      expect(engine.recall).toHaveBeenCalledWith({
-        query: 'test',
-        token_budget: undefined,
-        tags: undefined,
-        format: 'raw',
-        expand: 'auto',
-        max_expand_passages: undefined,
-      });
+      // The second argument is the call controls (none when called outside an MCP request).
+      expect(engine.recall).toHaveBeenCalledWith(
+        {
+          query: 'test',
+          token_budget: undefined,
+          tags: undefined,
+          format: 'raw',
+          expand: 'auto',
+          max_expand_passages: undefined,
+        },
+        undefined,
+      );
     });
 
     it('returns no-match message when empty', async () => {
@@ -248,10 +266,25 @@ describe('memory_recall', () => {
       expect(result.expanded_segment_ids).toEqual([]);
     });
 
-    it('returns content when memories found', async () => {
+    it('returns content when memories found, framed as notes from earlier sessions', async () => {
       const engine = createMockEngine();
       const result = await handleRecall(engine, { query: 'test' });
-      expect(result.text).toBe('Recalled content');
+      expect(result.text).toBe(frameMemoryNotes('Recalled content'));
+    });
+
+    it('wraps raw JSON output in an object that leads with the notice', async () => {
+      const engine = createMockEngine({
+        recall: vi.fn().mockResolvedValue({
+          content: JSON.stringify([{ id: 'a', content: 'A fact' }]),
+          memories_used: 1,
+          total_matches: 1,
+        }),
+      });
+      const result = await handleRecall(engine, { query: 'test', format: 'raw' });
+      expect(JSON.parse(result.text)).toEqual({
+        notice: MEMORY_NOTES_NOTICE,
+        memories: [{ id: 'a', content: 'A fact' }],
+      });
     });
 
     it('surfaces expansion metadata from the engine', async () => {
@@ -273,14 +306,24 @@ describe('memory_recall', () => {
     it('threads expand and max_expand_passages through to the engine', async () => {
       const engine = createMockEngine();
       await handleRecall(engine, { query: 'test', expand: 'parent', max_expand_passages: 3 });
-      expect(engine.recall).toHaveBeenCalledWith({
-        query: 'test',
-        token_budget: undefined,
-        tags: undefined,
-        format: undefined,
-        expand: 'parent',
-        max_expand_passages: 3,
-      });
+      expect(engine.recall).toHaveBeenCalledWith(
+        {
+          query: 'test',
+          token_budget: undefined,
+          tags: undefined,
+          format: undefined,
+          expand: 'parent',
+          max_expand_passages: 3,
+        },
+        undefined,
+      );
+    });
+
+    it('passes the call controls (cancellation signal) through to the engine', async () => {
+      const engine = createMockEngine();
+      const controls = { signal: new AbortController().signal };
+      await handleRecall(engine, { query: 'test' }, controls);
+      expect(engine.recall).toHaveBeenCalledWith(expect.objectContaining({ query: 'test' }), controls);
     });
   });
 });
@@ -298,33 +341,90 @@ describe('memory_expand', () => {
       expect(result.query).toBe('cap clause');
     });
 
+    it('reads a blank query as no query (the start of the source)', () => {
+      expect(validateExpandInput({ segment_id: 'seg-1', query: '   ' }).query).toBeUndefined();
+      expect(validateExpandInput({ segment_id: 'seg-1', query: '' }).query).toBeUndefined();
+    });
+
     it('rejects a missing/empty segment_id', () => {
       expect(() => validateExpandInput({})).toThrow('segment_id is required');
       expect(() => validateExpandInput({ segment_id: '  ' })).toThrow('segment_id is required');
     });
+
+    it('accepts max_passages from 1 to 20 and rejects anything else', () => {
+      expect(validateExpandInput({ segment_id: 'seg-1', max_passages: 1 }).max_passages).toBe(1);
+      expect(validateExpandInput({ segment_id: 'seg-1', max_passages: 20 }).max_passages).toBe(20);
+      expect(validateExpandInput({ segment_id: 'seg-1' }).max_passages).toBeUndefined();
+      for (const bad of [0, -1, 2.5, '3', null]) {
+        expect(() => validateExpandInput({ segment_id: 'seg-1', max_passages: bad })).toThrow(
+          'max_passages must be a positive integer',
+        );
+      }
+      expect(() => validateExpandInput({ segment_id: 'seg-1', max_passages: 21 })).toThrow(
+        'max_passages exceeds maximum of 20',
+      );
+    });
   });
 
   describe('handleExpand', () => {
-    it("returns the parent's ranked passages joined", async () => {
+    it("returns the parent's ranked passages joined, then which of the source's passages they are", async () => {
       const engine = createMockEngine({
         expand: vi.fn().mockResolvedValue({
           segment_id: 'seg-1',
           passages: ['Cap clause: $250k.', 'IP clause: reverts.'],
+          total_passages: 7,
           found: true,
         }),
       });
-      const result = await handleExpand(engine, { segment_id: 'seg-1', query: 'cap' });
-      expect(engine.expand).toHaveBeenCalledWith('seg-1', 'cap');
+      const result = await handleExpand(engine, { segment_id: 'seg-1', query: 'cap', max_passages: 2 });
+      expect(engine.expand).toHaveBeenCalledWith('seg-1', 'cap', 2);
       expect(result).toContain('$250k');
       expect(result).toContain('reverts');
+      // The range note follows the framed passages: it is the server's, not stored text.
+      expect(result.endsWith(`</memory_notes>\n${passageRangeNote(2, 7, true)}`)).toBe(true);
+      expect(result).toContain('[passages 1-2 of 7 of this source, most relevant to the query first;');
+    });
+
+    it('passes no query and no passage count when the call gives none', async () => {
+      const engine = createMockEngine();
+      const result = await handleExpand(engine, { segment_id: 'seg-1', query: ' ' });
+      expect(engine.expand).toHaveBeenCalledWith('seg-1', undefined, undefined);
+      expect(result).toContain('[passages 1-2 of 2: the whole source, in source order]');
     });
 
     it('reports not-found for an unknown segment id', async () => {
       const engine = createMockEngine({
-        expand: vi.fn().mockResolvedValue({ segment_id: 'nope', passages: [], found: false }),
+        expand: vi.fn().mockResolvedValue({ segment_id: 'nope', passages: [], total_passages: 0, found: false }),
       });
       const result = await handleExpand(engine, { segment_id: 'nope' });
       expect(result).toContain('No source segment found');
+    });
+  });
+
+  describe('passageRangeNote', () => {
+    it('says which passages of how many were shown, in what order, and how to get the rest', () => {
+      expect(passageRangeNote(3, 20, false)).toBe(
+        '[passages 1-3 of 20 of this source, in source order; pass a query to get the passages most relevant ' +
+          'to it, or raise max_passages (at most 20) to read further]',
+      );
+      expect(passageRangeNote(3, 20, true)).toBe(
+        '[passages 1-3 of 20 of this source, most relevant to the query first; raise max_passages (at most 20) ' +
+          'to see more]',
+      );
+    });
+
+    it('says when the whole source was shown', () => {
+      expect(passageRangeNote(4, 4, false)).toBe('[passages 1-4 of 4: the whole source, in source order]');
+      expect(passageRangeNote(1, 1, true)).toBe('[passage 1 of 1: the whole source, most relevant to the query first]');
+    });
+
+    it('does not offer a larger max_passages when the most was already shown', () => {
+      expect(passageRangeNote(20, 26, false)).toBe(
+        '[passages 1-20 of 26 of this source, in source order; pass a query to get the passages most relevant to it]',
+      );
+      expect(passageRangeNote(20, 26, true)).toBe(
+        '[passages 1-20 of 26 of this source, most relevant to the query first]',
+      );
     });
   });
 });
@@ -362,10 +462,13 @@ describe('memory_context', () => {
     it('calls engine.context', async () => {
       const engine = createMockEngine();
       await handleContext(engine, { task: 'test' });
-      expect(engine.context).toHaveBeenCalledWith({
-        task: 'test',
-        token_budget: undefined,
-      });
+      expect(engine.context).toHaveBeenCalledWith(
+        {
+          task: 'test',
+          token_budget: undefined,
+        },
+        undefined,
+      );
     });
 
     it('returns fresh session message when empty', async () => {
@@ -415,6 +518,16 @@ describe('memory_forget', () => {
     it('rejects non-array ids', () => {
       expect(() => validateForgetInput({ ids: 'single' })).toThrow('ids must be an array');
     });
+
+    // With intersection semantics a dropped criterion would widen the deletion.
+    it('rejects a whitespace-only query instead of ignoring it', () => {
+      expect(() => validateForgetInput({ tags: ['old'], query: '   ' })).toThrow('query must be a non-empty string');
+    });
+
+    it('treats empty arrays as not provided', () => {
+      expect(() => validateForgetInput({ ids: [], tags: [] })).toThrow('At least one of ids, tags, query, or before');
+      expect(validateForgetInput({ ids: [], tags: ['old'] })).toMatchObject({ ids: undefined, tags: ['old'] });
+    });
   });
 
   describe('handleForget', () => {
@@ -423,6 +536,25 @@ describe('memory_forget', () => {
       const result = await handleForget(engine, { tags: ['old'] });
       expect(result).toContain('confirm=true');
       expect(engine.forget).not.toHaveBeenCalled();
+    });
+
+    it.each([{ tags: ['old'] }, { query: 'old notes' }, { before: '2025-01-01T00:00:00Z' }])(
+      'requires confirmation for a bulk criterion even when ids are given (%o)',
+      async (criterion) => {
+        const engine = createMockEngine();
+        const result = await handleForget(engine, { ids: ['abc'], ...criterion });
+        expect(result).toContain('confirm=true');
+        expect(engine.forget).not.toHaveBeenCalled();
+      },
+    );
+
+    it('previews a bulk dry_run without confirm', async () => {
+      const engine = createMockEngine({
+        forget: vi.fn().mockResolvedValue({ forgotten: 1, memories: [{ id: 'a', content: 'Old memory' }] }),
+      });
+      const result = await handleForget(engine, { tags: ['old'], dry_run: true });
+      expect(result).toBe(`Would forget 1 memories:\n${frameMemoryNotes('- a: Old memory')}`);
+      expect(engine.forget).toHaveBeenCalledWith(expect.objectContaining({ tags: ['old'], dry_run: true }));
     });
 
     it('allows id-based deletion without confirm', async () => {
@@ -536,12 +668,12 @@ describe('memory_inspect', () => {
       expect(result).toBe('No memories found.');
     });
 
-    it('returns export string as-is', async () => {
+    it('returns the export inside the notes frame', async () => {
       const engine = createMockEngine({
         inspect: vi.fn().mockResolvedValue('{"id":"a","content":"test"}\n'),
       });
       const result = await handleInspect(engine, { view: 'export' });
-      expect(result).toBe('{"id":"a","content":"test"}\n');
+      expect(result).toBe(frameMemoryNotes('{"id":"a","content":"test"}\n'));
     });
   });
 });

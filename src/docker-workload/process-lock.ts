@@ -12,6 +12,12 @@
  * racer's freshly published lock is restored instead of removed. Release is the
  * mirror image: it unlinks only while the published path is still the exact
  * inode this process installed.
+ *
+ * A lock path can sit in a directory IronCurtain did not write (the run lock of
+ * a workflow run directory being imported or resumed from elsewhere), so an
+ * owner record is read like untrusted input: only a regular file, never through
+ * a symlink, never by a blocking open, and never more than the record's size
+ * limit. Anything else at the path counts as held and is never reclaimed.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -29,6 +35,8 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { resolve } from 'node:path';
+import { readUntrustedRegularFile, UntrustedFileError } from '../hardened-fs.js';
 
 const PROCESS_LOCK_SCHEMA_VERSION = 1;
 const MAX_OWNER_BYTES = 4096;
@@ -97,10 +105,7 @@ export function acquireProcessLock(path: string, options: AcquireProcessLockOpti
   }
   const now = options.now ?? Date.now;
   const identityForPid = options.processIdentityForPid ?? getProcessStartIdentity;
-  const processIdentity =
-    options.processIdentityForPid === undefined
-      ? (cachedSelfProcessIdentity ??= getProcessStartIdentity(process.pid))
-      : identityForPid(process.pid);
+  const processIdentity = getSelfProcessStartIdentity(options.processIdentityForPid);
   if (processIdentity === undefined) {
     throw new Error('could not determine current process start identity for lock ownership');
   }
@@ -143,6 +148,59 @@ export function acquireProcessLock(path: string, options: AcquireProcessLockOpti
     reclaimObservedLock(path, observed);
   }
   throw new ProcessLockBusyError(path, lastOwnerPid);
+}
+
+/**
+ * What a non-mutating look at a lock path found: no lock (`free`), a lock whose
+ * owner is alive or cannot be adjudicated (`held`), or a lock a contender would
+ * reclaim (`stale`: the owner PID is gone or was reused).
+ */
+export type ProcessLockState =
+  | { readonly kind: 'free' }
+  | { readonly kind: 'held'; readonly ownerPid: number | undefined }
+  | { readonly kind: 'stale'; readonly ownerPid: number | undefined };
+
+export interface InspectProcessLockOptions {
+  readonly malformedGraceMs?: number;
+  readonly now?: () => number;
+  /** Test seam; production queries the OS process table. */
+  readonly processIdentityForPid?: ProcessIdentityResolver;
+}
+
+/**
+ * Reports whether `path` is held by a live process without taking, reclaiming
+ * or modifying it. It applies the same adjudication {@link acquireProcessLock}
+ * does, so a lock reported `held` is one acquisition would refuse. Like
+ * acquisition it fails closed: an owner whose liveness cannot be checked, an
+ * unreadable entry, an entry that is not a regular file (a symlink, FIFO,
+ * socket, device or directory, which is never opened), and a fresh incomplete
+ * record all count as held. The answer is a snapshot; only
+ * {@link acquireProcessLock} is authoritative.
+ */
+export function inspectProcessLock(path: string, options: InspectProcessLockOptions = {}): ProcessLockState {
+  const now = options.now ?? Date.now;
+  const malformedGraceMs = options.malformedGraceMs ?? DEFAULT_MALFORMED_GRACE_MS;
+  const identityForPid = options.processIdentityForPid ?? getProcessStartIdentity;
+  let observed: LockObservation | undefined;
+  try {
+    observed = observeLock(path);
+  } catch {
+    return { kind: 'held', ownerPid: undefined };
+  }
+  if (observed === undefined) return { kind: 'free' };
+  if (observed.owner === undefined) {
+    return now() - observed.mtimeMs <= malformedGraceMs
+      ? { kind: 'held', ownerPid: undefined }
+      : { kind: 'stale', ownerPid: undefined };
+  }
+  const ownerPid = observed.owner.pid;
+  let currentIdentity: string | undefined;
+  try {
+    currentIdentity = identityForPid(ownerPid);
+  } catch {
+    return { kind: 'held', ownerPid };
+  }
+  return currentIdentity === observed.owner.processIdentity ? { kind: 'held', ownerPid } : { kind: 'stale', ownerPid };
 }
 
 function tryPublishOwner(path: string, owner: ProcessLockOwner): number | undefined {
@@ -267,14 +325,24 @@ function observeLock(path: string): LockObservation | undefined {
     throw error;
   }
   const base = { ...identityFromStat(stat), mtimeMs: stat.mtimeMs };
+  // Locks are only ever published as regular files. A FIFO there would block
+  // the read (and the event loop) and a symlink to /dev/zero never end, so any
+  // other entry is not opened; it may stand for an unknown live owner, so it is
+  // never reclaimed either (see the module comment).
+  if (!stat.isFile()) throw new ProcessLockBusyError(path);
   if (stat.size > MAX_OWNER_BYTES) return { ...base, owner: undefined };
 
   let raw: string;
   try {
-    raw = readFileSync(path, 'utf8');
+    raw = readUntrustedRegularFile(resolve(path), { maxBytes: MAX_OWNER_BYTES }).bytes.toString('utf8');
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-    // An unreadable entry may still belong to a live owner; never reclaim it.
+    if (error instanceof UntrustedFileError) {
+      if (error.code === 'NOT_FOUND') return undefined;
+      // Grew past the limit since the lstat: as malformed as an oversized record.
+      if (error.code === 'TOO_LARGE') return { ...base, owner: undefined };
+    }
+    // An unreadable entry (or one swapped for a link or special file since the
+    // lstat) may still belong to a live owner; never reclaim it.
     throw new ProcessLockBusyError(path);
   }
   return { ...base, owner: parseOwner(raw) };
@@ -341,12 +409,49 @@ function unlinkIfPresent(path: string): void {
 }
 
 /**
+ * This process's start identity. The OS-derived value cannot change for the
+ * life of the process, so it is cached; a test resolver is asked every time.
+ */
+export function getSelfProcessStartIdentity(processIdentityForPid?: ProcessIdentityResolver): string | undefined {
+  return processIdentityForPid === undefined
+    ? (cachedSelfProcessIdentity ??= getProcessStartIdentity(process.pid))
+    : processIdentityForPid(process.pid);
+}
+
+/**
+ * How {@link getProcessStartIdentity} measures a process on each platform:
+ *
+ * - `linux-boot-ticks`: `<kernel boot ID>:<start ticks>` from procfs.
+ * - `ps-lstart-utc`: `ps -o lstart` under the C locale and UTC (macOS and
+ *   every other platform).
+ *
+ * A record that persists an identity also stores its kind, so an identity
+ * measured another way (by an older version, say) is recognized as
+ * incomparable instead of being mistaken for PID reuse.
+ */
+export const PROCESS_START_IDENTITY_KINDS = ['linux-boot-ticks', 'ps-lstart-utc'] as const;
+
+export type ProcessStartIdentityKind = (typeof PROCESS_START_IDENTITY_KINDS)[number];
+
+/** The kind of identity {@link getProcessStartIdentity} reports on this host. */
+export function processStartIdentityKind(): ProcessStartIdentityKind {
+  return process.platform === 'linux' ? 'linux-boot-ticks' : 'ps-lstart-utc';
+}
+
+/**
  * Stable process-start identity from the host process table. Linux binds the
- * kernel boot ID to `/proc/<pid>/stat` start ticks; macOS uses `/bin/ps` under a
- * fixed locale. A different identity for the same PID means PID reuse.
+ * kernel boot ID to `/proc/<pid>/stat` start ticks, which count from boot and
+ * are never touched by a wall-clock step. Linux must not use `ps -o lstart`:
+ * procps prints it as the wall-clock boot time (`btime` in /proc/stat) plus
+ * those ticks, and btime moves whenever the clock is stepped (NTP after a
+ * suspend, a VM or WSL clock jump, `date -s`). macOS uses `/bin/ps`, whose
+ * start time is fixed at fork, under a fixed locale and time zone (`lstart` is
+ * printed in local time, so a laptop that changes time zone would otherwise
+ * see every live process as reused). A different identity for the same PID
+ * means PID reuse. The format is named by {@link processStartIdentityKind}.
  */
 export function getProcessStartIdentity(pid: number): string | undefined {
-  if (process.platform === 'linux') {
+  if (processStartIdentityKind() === 'linux-boot-ticks') {
     try {
       const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
       const closeParen = stat.lastIndexOf(') ');
@@ -373,7 +478,7 @@ export function getProcessStartIdentity(pid: number): string | undefined {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 1000,
-      env: { ...process.env, LANG: 'C', LC_ALL: 'C' },
+      env: { ...process.env, LANG: 'C', LC_ALL: 'C', TZ: 'UTC0' },
     });
     const normalized = output.trim().replace(/\s+/gu, ' ');
     return normalized === '' ? undefined : normalized;

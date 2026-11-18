@@ -1,5 +1,7 @@
 # Docker Agent Broker Design Specification
 
+**Status (2026-11-14):** Implemented: Docker Agent Mode (`src/docker/`) with adapters for Claude Code, Codex and Goose (`src/docker/adapters/`). OpenCode, named in the phase plan, was not built. Much of the mechanics changed since; `src/docker/CLAUDE.md` describes the current code.
+
 ## 1. Overview
 
 IronCurtain currently runs a built-in agent loop (Vercel AI SDK + UTCP Code Mode) that generates tool calls mediated by the MCP proxy's policy engine. This design extends IronCurtain to act as a **broker for external coding agents** -- Claude Code, Goose, OpenCode, Codex, and others -- running inside heavily restricted Docker containers.
@@ -212,7 +214,7 @@ a comprehensive development environment used by GitHub Codespaces:
 
 - **Languages**: Node.js, Python, Java, Go, Ruby, PHP, .NET, Rust, C++
 - **Tools**: git, curl, wget, socat, build-essential, docker CLI, kubectl, terraform
-- **Non-root user**: `codespace` (pre-configured with sudo access)
+- **Non-root user**: `codespace` (pre-configured with sudo access; as implemented, IronCurtain keeps that passwordless sudo unless `agentSudo` is false, so by default the agent can become root inside its container, see §10)
 - **Size**: ~6-8GB (one-time download, cached by Docker)
 
 This avoids "missing tool X" surprises — the agent has access to the same development
@@ -279,11 +281,20 @@ exec sleep infinity
 FROM ironcurtain-base:latest
 
 USER root
+# As shipped (2026-11), the CLI is pinned: ARG CODEX_VERSION=0.157.1 and
+# RUN npm install -g "@openai/codex@${CODEX_VERSION}" (see docker/Dockerfile.codex
+# and agent-image-build-identity.md).
 RUN npm install -g @openai/codex
 USER codespace
 
 RUN mkdir -p /home/codespace/.config/codex
 ```
+
+### Host parsing and terminal diagnostics
+
+The socket transport uses fixed pages and a persistent scan cursor, so fragmented frames are copied and searched linearly. Code Mode caps unread input at 1 MiB for both Unix and TCP listeners; general MCP listeners retain their 10 MiB default. Overflow closes only the offending connection. Malformed lines count against the same event-loop yield budget as valid messages, and send-queue backpressure remains in force.
+
+Batch response parsing rejects combined stdout/stderr above 4 MiB before any adapter runs. Goose uses the shared linear sequence scanner. Container storage and dependency-provisioning errors are bounded and escaped before terminal display; workflow error/progress stderr uses the same display boundary. These are host parsing/display bounds, not a claim that all output capture or host CPU use is quota limited.
 
 ### Image Build and Caching
 
@@ -452,34 +463,39 @@ The existing MCP proxy server (`mcp-proxy-server.ts`) uses `StdioServerTransport
 
 For Docker agent sessions, the proxy needs to listen on a Unix domain socket that is bind-mounted into the container. Unix domain sockets work on both Docker for Linux and Docker for Mac, making them the natural choice. No TCP fallback is provided — UDS is the only supported transport for Docker sessions.
 
-The MCP SDK does not ship a UDS transport — only `StdioServerTransport`, `SSEServerTransport`, and `StreamableHTTPServerTransport`. We need to implement a custom `UdsServerTransport` that wraps a `net.Server` listening on a Unix socket and bridges each connection to the MCP SDK's `Transport` interface (JSON-RPC over a bidirectional stream). This is straightforward — the SDK's `Transport` interface is small (a readable/writable pair with `start()`, `send()`, `close()`).
+The MCP SDK does not ship a UDS transport — only `StdioServerTransport`, `SSEServerTransport`, and `StreamableHTTPServerTransport`. IronCurtain implements its own socket transports in `src/trusted-process/`:
+
+- `socket-connection-transport.ts` — `SocketConnectionTransport`: one accepted socket bridged to the SDK's `Transport` interface with the stdio NDJSON framing. Each connection has its own `ReadBuffer`. The hardening mirrors the SDK's `StdioServerTransport`: a malformed frame (invalid JSON, or JSON that is not a JSON-RPC message) is routed to `onerror` and the connection keeps going (the bad line is consumed before it is parsed, so the read loop cannot spin); a frame over the 10 MiB `ReadBuffer` cap is routed to `onerror` and destroys that socket only (the buffer is already emptied, so the rest of the line would arrive as garbage); an exception thrown by `onmessage` is routed to `onerror` as well. Nothing an agent sends can escape a socket event handler. This matters because the proxy runs inside the host process: under `ironcurtain daemon` one bad line from any agent would otherwise take down every workflow, cron job and Signal session. The send side is bounded per connection too, which `StdioServerTransport` does not do: every reply stays in host memory until the agent reads it, and an agent can stream requests (pings cost it nothing) without ever reading a reply. A queued reply costs far more than its bytes, because the MCP SDK keeps the request it answers (abort controller, handler context, promise chain) until the write completes: about 2 KiB per reply, so 4 MiB of 40-byte ping replies would pin some 230 MiB of heap. The queue is therefore bounded in messages as well as bytes. Once more than 1,024 messages or 4 MiB are queued for the peer (`sendHighWaterMessages`, `sendHighWaterMark`), the connection stops reading: the socket is paused, so kernel flow control holds the agent's further requests, and frames already received wait unparsed. Reading resumes once the agent has taken everything queued (the last pending write completes; this does not wait for `'drain'`, which never follows a queue smaller than the socket's own `writableHighWaterMark`), starting with those frames. Because the SDK answers a request only after its frame has been delivered, reading also yields to the event loop once every 256 frames (`SOCKET_TRANSPORT_FRAMES_BETWEEN_YIELDS`), so the replies to the frames parsed so far are counted before more are parsed. Replies to requests read before the pause still arrive, so past 16,384 messages or 32 MiB queued (`maxSendBufferMessages`, `maxSendBufferSize`) the connection is reported through `onerror` and destroyed, that connection only. A legitimate reply is far smaller (an `execute_code` reply is bounded by the 100 KB result budget), so a slow reader is throttled, not dropped. A connection that floods pings without reading ends up holding about 1,300 queued replies, some 3 MiB of heap.
+- `uds-server-transport.ts` — `UdsServerTransport`: a `net.Server` on the socket path (created on `start()`, unlinked on `close()`).
+- `tcp-server-transport.ts` — `TcpServerTransport`: the macOS Docker Desktop equivalent (VirtioFS cannot bind-mount UDS). The first bytes of a connection classify it: the sidecar's `IRONCURTAIN_HEALTH/1` probe is answered locally and never becomes an MCP connection, and its socket is closed as soon as the answer is flushed (a peer that keeps its side open must hold neither a connection slot nor `close()`); anything else is MCP traffic. Several connections may be unclassified at once (parallel lanes connect together), each bounded by a first-byte timeout. `close()` destroys every socket it accepted, whatever became of it.
+
+Both listeners wrap every accepted connection in a `SocketConnectionTransport` and support two modes:
+
+- **Multi-client** (`onconnection` set): each connection is handed to the callback, and `CodeModeProxy` connects a fresh MCP `Server` to it over the one shared `Sandbox` and `ToolCallCoordinator` (whose call mutex serializes the tool calls). Every client therefore has its own JSON-RPC id space, and a newcomer never evicts an existing client. This is what lets N agent processes share one container — parallel workflow fan-out lanes under `sharedContainer`, a nested CLI, a stray background process — each opening its own `socat STDIO UNIX-CONNECT:/run/ironcurtain/proxy.sock`.
+- **Single-client** (`onconnection` unset): the listener itself is the `Transport` passed to `Server.connect()`. The first connection is served and further connections are refused while it is open; the served client is never evicted. Only `mcp-proxy-server`'s legacy `PROXY_SOCKET_PATH` / `PROXY_TCP_PORT` modes use this.
+
+Simultaneously open connections are capped per listener (`maxConnections`, default 64); connections beyond the cap are dropped on accept and reported through `onerror`. The 10 MiB limit applies per frame, so a single `execute_code` request larger than that drops that connection instead of crashing the host. Every per-connection bound multiplies by that cap: an agent holding all 64 connections can still pin up to 64 x 10 MiB of partial frames and, with replies it leaves unread, 64 x 4 MiB of queued bytes or 64 x about 1,300 queued replies (some 3 MiB of heap each). A request near the 10 MiB frame cap whose reply echoes it (a huge JSON-RPC id) also keeps the request and its reply until the agent reads, a few times the frame cap per connection. No budget is shared across a listener's connections yet.
+
+Concurrent `execute_code` requests are bounded too, because every script runs in its own V8 isolate inside the host process (`src/sandbox/chain-limits.ts`). The proxy's sandbox runs at most `CODE_MODE_PROXY_MAX_CONCURRENT_CHAINS` (4) scripts at once, more than a builtin session's 2 because several agent processes may share one proxy; up to 16 more wait in a FIFO queue, and further requests are refused at once. Every sandbox in the process also draws on one isolate memory budget (six default-size isolates, counting isolated-vm's documented 3x overshoot of `memoryLimit`). Each script's console output is counted on the host side and the script is stopped past 1 MiB or 10,000 calls ("console output limit exceeded"); the strings isolated-vm copies out of an isolate are host memory that neither the isolate's limit nor the container's memory cap covers. For the same reason the script can reach no isolated-vm `Reference`: its non-blocking `apply`/`applyIgnored` would queue copies into host memory faster than any host-side limit could refuse them, so the console and result bridges are blocking `ivm.Callback`s and the tool bridge's one Reference is captured in a setup closure whose global is deleted before the script runs. The handler passes the request's MCP `extra.signal` to the sandbox, so a request the agent cancels, or whose connection closes, disposes its isolate and withdraws its pending escalations instead of holding them until the chain timeout. The reply is bounded as well: the `[logs]` section and the return value share the 100 KB result budget (`formatExecutionOutput`).
+
+The proxy logs what the transports and per-connection servers report, but never straight to the logger: an agent decides how often these warnings fire (one per two-byte garbage line) and much of their text (a response with an unknown id is quoted back whole, and JSON syntax errors quote raw input bytes, escape sequences included), while each warning is a synchronous append to the host's session log. `src/docker/agent-warning-log.ts` therefore keeps at most 300 characters of that text per warning, escapes every control character with `toDisplayText`, and writes at most 20 warnings per minute per proxy, counting the rest into one summary line.
 
 ```typescript
-// src/trusted-process/uds-proxy-transport.ts
+// src/docker/code-mode-proxy.ts -- one MCP Server per accepted connection
 
-import { Server as McpServer } from '@modelcontextprotocol/sdk/server/index.js';
-import { createServer, type Socket } from 'node:net';
-
-/**
- * Creates a Unix domain socket transport for the MCP proxy server.
- *
- * Listens on the given socket path. When a client connects, it creates
- * an MCP server session for that connection. Only one concurrent client
- * connection is expected (the agent in the container).
- *
- * The socket file is created on listen() and removed on close().
- */
-export interface UdsProxyTransportOptions {
-  /** Absolute path to the Unix domain socket file. */
-  readonly socketPath: string;
-
-  /**
-   * Factory that creates and configures the MCP server for each connection.
-   * Called once per client connection. The returned server handles the
-   * full MCP lifecycle (tools/list, tools/call, etc.).
-   */
-  readonly createServer: () => McpServer;
-}
+const warnings = createAgentWarningLog({ write: (line) => logger.warn(`Code Mode proxy: ${line}`) });
+const listener = useTcp
+  ? new TcpServerTransport(bindHost, 0, { allowRemoteAddress })
+  : new UdsServerTransport(socketPath);
+listener.onerror = (err) => warnings.warn('listener error', err.message);
+listener.onconnection = (connection) => {
+  // execute_code handlers over the shared sandbox; own JSON-RPC id space
+  const mcpServer = createExecuteCodeServer(sandbox);
+  // Protocol drops transport errors silently without a handler
+  mcpServer.onerror = (err) => warnings.warn('agent connection error', err.message);
+  void mcpServer.connect(connection); // installs the callbacks, then connection.start()
+};
+await listener.start();
 ```
 
 ### Per-Session Socket Isolation
@@ -532,7 +548,7 @@ async function main(): Promise<void> {
 }
 ```
 
-This keeps the proxy server as a single codebase supporting both transports. The transport selection is driven by the presence of `PROXY_SOCKET_PATH` — no separate mode flag needed. Unix domain sockets are the only non-stdio transport; TCP is explicitly not supported.
+This keeps the proxy server as a single codebase supporting both transports. The transport selection is driven by the presence of `PROXY_SOCKET_PATH` — no separate mode flag needed. Unix domain sockets are the only non-stdio transport; TCP is explicitly not supported. (Superseded, 2026-11: the relay also serves TCP when `PROXY_TCP_PORT` is set, which macOS Docker Desktop needs because bind-mounted Unix sockets do not work there; see `tcp-mode-network-egress-restriction.md` and `selectTransportConfig` in `src/trusted-process/mcp-proxy-server.ts`.)
 
 
 ## 6. Agent Configuration
@@ -1119,9 +1135,10 @@ This is enforced in `createDockerAgentSession()` before allocating resources.
 
 **1. Agent tries to escape Docker container**
 - Mitigation: Standard Docker containment (namespaces, cgroups, seccomp)
-- The container runs as non-root (`codespace` user from devcontainers base image)
-- No capabilities granted (`--cap-drop=ALL`)
+- The agent runs as `codespace`, the devcontainers base image's non-root user. This design kept it non-root; as implemented it has passwordless sudo by default (see the as-implemented note below)
+- `--cap-drop=ALL`. This design granted no capabilities; as implemented the capabilities sudo needs are added back by default (below)
 - No privileged mode
+- As implemented (audit finding DINF-3, `src/docker/agent-privileges.ts`): by default the agent keeps passwordless sudo, and the container re-adds SETUID, SETGID, CHOWN, FOWNER, DAC_OVERRIDE and AUDIT_WRITE after `--cap-drop=ALL`. On native Linux Docker without rootless mode or userns-remap, container root is host root on the bind mounts, so after each agent turn, at session end, and after a container whose start failed is removed, the coordinator walks the container's read-write host mounts without following symlinks, strips setuid/setgid bits from the user's files and reports root-owned entries, the mount roots themselves included (`src/docker/host-mount-privilege-scan.ts`). The findings go to the session log and, as a `host_privileged_files` notice (after a turn: what no earlier scan of the bundle reported, or what came back after a complete scan found it gone; at session end: everything left), to the user: the CLI prints it, the web UI and Signal show it, a cron run keeps it in its run record, and a workflow records it in its message log (`destroyDockerInfrastructure` returns the session-end finding to the bundle's owner). With `agentSudo: false` in the user config the container instead starts as numeric UID 1000 with `--security-opt no-new-privileges:true` and none of those capabilities, and every host exec uses that UID; it is refused (before any container work) on Linux hosts not running as UID 1000, on Apple `container`, and with nested Docker.
 
 **2. Agent tries to access arbitrary network destinations**
 - Mitigation: Container runs with `--network=none` — zero IP connectivity
@@ -1137,7 +1154,7 @@ This is enforced in `createDockerAgentSession()` before allocating resources.
 
 **4. Agent floods the proxy with requests**
 - Mitigation: The `CallCircuitBreaker` limits repeated identical calls
-- Resource budget tracker limits total tokens/cost
+- Resource budget tracker limits total tokens/cost (as implemented, the bundle's MITM budget gate limits them, `src/docker/budget-gate.ts`; Docker sessions never ran `ResourceBudgetTracker`)
 - Docker memory and CPU limits prevent resource exhaustion
 
 **5. Agent writes malicious files to the sandbox**
@@ -1157,7 +1174,8 @@ Layer 1: Docker Container + MITM Proxy
   - No network access (--network=none); LLM API calls via TLS-terminating MITM proxy
   - Real API keys never enter the container (fake key swap)
   - Filesystem limited to mounts
-  - Non-root, no capabilities
+  - Agent user codespace, --cap-drop=ALL; as implemented, passwordless sudo and the
+    capabilities it needs by default (agentSudo: false removes both; see §10)
   - Resource limits (memory, CPU)
 
 Layer 2: IronCurtain Policy Engine (MCP Proxy)
@@ -1312,31 +1330,43 @@ export class AuditLogTailer {
 }
 ```
 
+As built, the tailer differs from this sketch in three ways. It polls with
+`fs.watchFile()` (100 ms), and `stop()` removes only its own listener, so
+sessions tailing one log keep their watchers. It starts at the log's current
+end (`startOffset: 'end'`, passed by `DockerAgentSession`): a workflow bundle's
+audit log is shared by every state of the run and a resumed session reuses the
+old session's log, so tailing from offset 0 re-read and re-reported that whole
+history on each new session. And its reads are line-exact: it reads in bounded
+chunks, carries a line whose append is still in progress over to the next read
+instead of dropping it, and skips a line that began before its start offset.
+
 **What can and cannot be synthesized:**
 
 | DiagnosticEvent kind | Available? | Source |
 |---------------------|-----------|--------|
-| `tool_call` | Yes | Audit log entries |
-| `budget_warning` | Yes | DockerAgentSession's own wall-clock/step tracking |
-| `budget_exhausted` | Yes | DockerAgentSession's own tracking |
+| `tool_call` | Yes | Audit log outcome entries (the write-ahead `dispatching` record before each dispatch is skipped) |
+| `budget_warning` | Yes in this design; **No** as implemented (2026-11) | Never emitted: threshold warnings (`warnThresholdPercent`) come only from the builtin agent's `ResourceBudgetTracker` |
+| `budget_exhausted` | Yes | `DockerAgentSession`: as implemented, a turn the between-turn budget admission refuses, a tripped MITM budget gate, or a turn that ran out of time |
 | `agent_text` | **No** | Agent's text generation is opaque |
 | `step_finish` | **No** | Agent's step lifecycle is opaque |
 | `loop_detection` | **No** | Built-in session's internal detection |
 | `result_truncation` | **No** | Built-in session's internal behavior |
 | `message_compaction` | **No** | Built-in session's internal behavior |
+| `message_compaction_failed` | **No** | Built-in session's internal behavior (summarizer failed; the turn continued uncompacted) |
 
 The transport's spinner behavior will differ between session types: Docker sessions show tool call activity (e.g., "Calling filesystem.read_file...") but not text generation progress. This is an accepted limitation — the transport can check `SessionInfo` to determine the session type and adjust its display accordingly if needed.
 
 ### Budget Tracking for Docker Sessions (11b)
 
-The built-in session tracks tokens and cost via the AI SDK. Docker sessions cannot observe token usage — the agent's LLM calls happen inside the container. The `DockerAgentSession` tracks what it can observe:
+The built-in session tracks tokens and cost via the AI SDK. Docker sessions cannot observe token usage — the agent's LLM calls happen inside the container. (As implemented, the host does observe it: every completion exchange passes the MITM proxy, which records the token usage it can measure; see the token row below.) The `DockerAgentSession` tracks what it can observe:
 
 | Metric | Source | Accuracy |
 |--------|--------|----------|
 | `stepCount` | Increment per `docker exec` turn | Exact |
 | `elapsedSeconds` | Wall-clock timer started at first `sendMessage()` | Exact |
-| `totalTokens` / `totalInputTokens` / `totalOutputTokens` | **0** | Unavailable |
-| `estimatedCostUsd` | **0** | Unavailable |
+| `totalTokens` / `totalInputTokens` / `totalOutputTokens` | **0** in this design; as implemented (2026-11), the token usage the MITM proxy observes for the session's completion exchanges (`cumulative`), and the last turn's in the top-level fields | `tokenTrackingStatus` says whether every exchange was measured; partial counts are lower bounds, and `tokenTrackingAvailable` is false only when nothing was observable |
+| `estimatedCostUsd` | Host-observed per-exchange cost (OpenRouter's reported cost, or a list-price estimate for an official provider origin) when every exchange has one; else the agent's validated self-report; else a partial host sum; else **0** with `costSource: 'unknown'` | Reported in `BudgetStatus.costSource` (`observed`, `reported`, `partial`, `unknown`); renderers show "unknown" rather than $0.00 |
+| `lastTurn` | The last completed `docker exec` turn: its tokens, duration, and the increase in session cost over that turn (`stepCount` 1); null before the first turn | Same as the session totals |
 
 **Interface change:** Add a `tokenTrackingAvailable` flag to `BudgetStatus`:
 
@@ -1349,9 +1379,11 @@ export interface BudgetStatus {
 }
 ```
 
-The transport can use this flag to display "N/A" for token and cost fields in the `/budget` command. `ConversationTurn.usage` fields return 0 for Docker sessions.
+The transport can use this flag to display "N/A" for token and cost fields in the `/budget` command. `ConversationTurn.usage` fields return 0 for Docker sessions. As implemented, `ConversationTurn.usage` carries the turn's proxy-observed tokens instead (`usageCompleteness` says whether every exchange was measured), and the flag is false only when the session's usage cannot be observed at all (`tokenTrackingStatus: 'unavailable'`).
 
-The `ResourceBudgetTracker`'s step-count and wall-clock enforcement still works for Docker sessions. Token-based limits (maxTokens, maxCost) are effectively disabled — users should rely on their API key's spending limits instead.
+Docker sessions never ran `ResourceBudgetTracker`. As implemented today, `DockerAgentSession` enforces `maxSessionSeconds` per turn inside the container (coreutils `timeout` plus a host backstop, `src/docker/turn-timeout.ts`; an exhausted turn throws `BudgetExhaustedError('wall_clock')`), and refuses to start a further turn once the session's cumulative steps, proxy-observed tokens or host-observed cost reach their limits (`src/session/budget-admission.ts`). The agent CLI's self-reported cost is display-only.
+
+Token and cost limits are also enforced during a turn, by the bundle's MITM budget gate (`src/docker/budget-gate.ts`; see `tls-terminating-api-proxy.md` §8): the proxy counts every completion exchange of the bundle (attributed by a metrics lease or not), pre-charges each request's output cap, prices usage at list prices, and refuses completion requests once `maxTotalTokens` or `maxEstimatedCostUsd` is reached, with a non-retryable 400 the agent shows. `DockerAgentSession` opens a gate turn around each agent exec (outside turns, completion requests are refused), sweeps the turn's processes when the gate trips, and throws `BudgetExhaustedError` with the exhausted dimension; `assertBudgetAdmitsNextTurn` also refuses the next turn on a latched or exhausted gate. Workflow bundles get the run's effective budget, shared by all lanes; PTY bundles have one session-long allowance.
 
 ### MCP Proxy Manager
 
@@ -1428,9 +1460,14 @@ export interface DockerManager {
    * not returned to the user via sendMessage(). The adapter's
    * extractResponse() receives only stdout.
    *
-   * @param timeoutMs - kill the exec process after this many ms.
-   *   Enforces the session's wall-clock budget. Uses AbortController
-   *   on the spawned child process.
+   * @param timeoutMs - host-side deadline for the exec client. As
+   *   implemented, a deadline hit is reported as `timedOut: true` (exit
+   *   124) from the killed child, never from the client's exit code
+   *   (monotonic elapsed time decides only when the exec implementation
+   *   cannot report `killed`, so a host suspend never reads as a
+   *   timeout); stopping the process inside the container is the job of
+   *   the in-container `timeout` wrapper and marker sweep in
+   *   `src/docker/turn-timeout.ts`.
    */
   exec(containerId: string, command: readonly string[], timeoutMs?: number): Promise<{
     exitCode: number;
@@ -1583,7 +1620,7 @@ ironcurtain start --list-agents                   # List available agents
 
 **Changes:**
 1. Goose adapter (`src/docker/adapters/goose.ts`)
-2. OpenCode adapter (`src/docker/adapters/opencode.ts`)
+2. OpenCode adapter (`src/docker/adapters/opencode.ts`) -- not built; a Codex adapter (`src/docker/adapters/codex.ts`) shipped instead
 3. Agent-specific Docker images or image layers
 
 Each adapter is independent and can be added without modifying existing code (the adapter interface is the extension point).
@@ -1592,12 +1629,13 @@ Each adapter is independent and can be added without modifying existing code (th
 
 ### API Key Protection via MITM Proxy
 
-**Real API keys never enter the container.** The agent receives a randomly generated fake sentinel key (192 bits of entropy). The TLS-terminating MITM proxy on the host validates the fake key and swaps it for the real key before forwarding to the upstream API. This eliminates the key exfiltration trade-off from the original CONNECT proxy design.
+**Real API keys never enter the container.** The agent receives a randomly generated fake sentinel key (192 bits of entropy). The TLS-terminating MITM proxy on the host validates the fake key and swaps it for the real key before forwarding to the upstream API; a request presenting any other credential on a provider route is refused with a local 401, so the proxy never forwards an agent-chosen key either (`src/docker/provider-credentials.ts`). This eliminates the key exfiltration trade-off from the original CONNECT proxy design.
 
 **Residual risk:** A compromised agent could make excessive LLM API calls (running up costs) using the fake key via the MITM proxy. This is mitigated by:
-- Per-session resource budgets (wall-clock timeout, step limits)
+- The bundle's MITM budget gate (token and estimated-cost caps on every completion request the proxy forwards, and no completions outside agent turns in batch and workflow mode)
+- The per-turn wall clock (`maxSessionSeconds`, enforced inside the container) and the between-turn check of the session's cumulative tokens, turns and host-observed cost (`src/session/budget-admission.ts`)
 - Endpoint-level filtering (only completion endpoints, not admin APIs)
-- Users should still configure spending limits on their API keys as defense-in-depth
+- Users should still configure spending limits on their API keys as defense-in-depth: the cost cap is a list-price estimate, and the inputs of the exchanges in flight are not pre-charged
 
 ## 15. Open Questions
 
@@ -1605,7 +1643,7 @@ Each adapter is independent and can be added without modifying existing code (th
 
 2. **API key routing.** Claude Code needs `ANTHROPIC_API_KEY`. Codex needs `OPENAI_API_KEY`. Goose might use either. The adapter's `getProviders()` and `buildEnv()` methods handle this. Each provider gets its own fake sentinel key; the MITM proxy maps each fake key to the corresponding real key. Only the providers declared by the adapter are configured.
 
-3. **Docker image management.** The hybrid approach uses pre-baked per-agent images with the agent CLI pre-installed and first-run setup completed. Who builds these images? Options: (a) user runs `ironcurtain build-images` manually, (b) `createSession()` builds on first use with caching, (c) pre-built images on a registry. For the PoC, option (b) with caching is simplest. The Dockerfile per agent lives in `docker/` in the IronCurtain repo.
+3. **Docker image management.** The hybrid approach uses pre-baked per-agent images with the agent CLI pre-installed and first-run setup completed. Who builds these images? Options: (a) user runs a separate build-images command manually, (b) `createSession()` builds on first use with caching, (c) pre-built images on a registry. For the PoC, option (b) with caching is simplest. The Dockerfile per agent lives in `docker/` in the IronCurtain repo. (As implemented: option (b). A session builds its agent image at start when no build for the current build hash exists (`src/docker/image-identity.ts`), and `ironcurtain images rebuild` rebuilds it without the build cache (`src/docker/images-command.ts`); no build-images command exists.)
 
 4. **Project file injection.** Before the agent starts, the sandbox directory needs to contain the project files. For a "fix this repo" task, the user needs to clone or copy the repo into the sandbox. This could be automated: `ironcurtain start --agent claude-code --repo https://github.com/user/repo "Fix the bug"` would clone the repo into the sandbox before starting the container. This is a convenience feature for Phase 5+.
 

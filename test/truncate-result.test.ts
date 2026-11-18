@@ -5,6 +5,10 @@ import {
   truncateString,
   truncateResult,
   formatKB,
+  linesSize,
+  splitOutputBudget,
+  truncateExecutionOutput,
+  truncateLines,
 } from '../src/session/truncate-result.js';
 
 describe('truncateString', () => {
@@ -147,5 +151,92 @@ describe('formatKB', () => {
     expect(formatKB(1024)).toBe('1.0KB');
     expect(formatKB(102400)).toBe('100.0KB');
     expect(formatKB(1536)).toBe('1.5KB');
+  });
+});
+
+describe('truncateLines', () => {
+  it('returns lines unchanged when they fit', () => {
+    const lines = ['a', 'bb', 'ccc'];
+    const out = truncateLines(lines, 100);
+    expect(out).toEqual({ lines, truncated: false, originalSize: 9, finalSize: 9 });
+  });
+
+  it('keeps head and tail lines around one marker, within the budget', () => {
+    const lines = Array.from({ length: 1_000 }, (_, i) => `line ${i}`.padEnd(50, '.'));
+    const out = truncateLines(lines, 5_000);
+    expect(out.truncated).toBe(true);
+    expect(out.finalSize).toBeLessThanOrEqual(5_000);
+    expect(out.finalSize).toBe(linesSize(out.lines));
+    expect(out.lines[0]).toBe(lines[0]);
+    expect(out.lines.at(-1)).toBe(lines.at(-1));
+    const markers = out.lines.filter((line) => line.startsWith('[... console output truncated'));
+    expect(markers).toHaveLength(1);
+    expect(markers[0]).toContain(`of ${linesSize(lines)} bytes omitted`);
+    // About 80% of the kept lines come from the head.
+    const markerAt = out.lines.indexOf(markers[0]);
+    expect(markerAt).toBeGreaterThan((out.lines.length - 1) * 0.7);
+  });
+
+  it('always keeps the last line, where a failed script reports its error', () => {
+    const lines = [...Array.from({ length: 200 }, () => 'z'.repeat(1_000)), '[ERROR] Code execution failed: boom'];
+    const out = truncateLines(lines, 10_000);
+    expect(out.lines.at(-1)).toBe('[ERROR] Code execution failed: boom');
+    expect(out.finalSize).toBeLessThanOrEqual(10_000);
+  });
+
+  it('cuts a single oversized line instead of dropping it', () => {
+    const out = truncateLines(['q'.repeat(100_000)], 4_000);
+    expect(out.truncated).toBe(true);
+    expect(out.lines[0]).toContain('[... truncated');
+    expect(out.finalSize).toBeLessThanOrEqual(4_000);
+  });
+});
+
+describe('splitOutputBudget', () => {
+  it('keeps both parts whole when they fit', () => {
+    expect(splitOutputBudget(10, 20, 100)).toEqual({ consoleBudget: 10, resultBudget: 20 });
+  });
+
+  it('gives a small part its full size and the rest to the other', () => {
+    expect(splitOutputBudget(10, 500, 100)).toEqual({ consoleBudget: 10, resultBudget: 90 });
+    expect(splitOutputBudget(500, 10, 100)).toEqual({ consoleBudget: 90, resultBudget: 10 });
+  });
+
+  it('halves the budget when both parts are large', () => {
+    expect(splitOutputBudget(500, 500, 100)).toEqual({ consoleBudget: 50, resultBudget: 50 });
+  });
+});
+
+describe('truncateExecutionOutput', () => {
+  it('passes small output through unchanged (same result reference)', () => {
+    const result = { ok: true };
+    const out = truncateExecutionOutput(['hello'], result, 1_000);
+    expect(out.truncated).toBe(false);
+    expect(out.console).toEqual(['hello']);
+    expect(out.result).toBe(result);
+  });
+
+  it('bounds console output and result together', () => {
+    const logs = Array.from({ length: 5_000 }, (_, i) => `log ${i}`.padEnd(100, '-'));
+    const out = truncateExecutionOutput(logs, { blob: 'b'.repeat(200_000) }, 50_000);
+    expect(out.truncated).toBe(true);
+    expect(out.finalSize).toBeLessThanOrEqual(50_000);
+    expect(linesSize(out.console)).toBeLessThanOrEqual(25_000);
+    expect(typeof out.result).toBe('string');
+    expect(out.result as string).toContain('[... truncated');
+    expect(out.originalSize).toBe(linesSize(logs) + JSON.stringify({ blob: 'b'.repeat(200_000) }).length);
+  });
+
+  it('truncates a huge console even when the result is tiny', () => {
+    const logs = Array.from({ length: 20_000 }, () => 'x'.repeat(50));
+    const out = truncateExecutionOutput(logs, 7, 10_000);
+    expect(out.result).toBe(7);
+    expect(out.truncated).toBe(true);
+    expect(linesSize(out.console)).toBeLessThanOrEqual(10_000);
+  });
+
+  it('handles a script that returned nothing', () => {
+    const out = truncateExecutionOutput([], undefined, 100);
+    expect(out).toMatchObject({ console: [], result: undefined, truncated: false, originalSize: 0 });
   });
 });

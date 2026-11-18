@@ -1,5 +1,7 @@
 # Adversarial FSM/Orchestration Review — `evolve-sync-parallelism-slice.md`
 
+**Status (2026-11-14):** Historical: an adversarial review of the state-machine mechanics of `evolve-sync-parallelism-slice.md`; its findings were folded into that design.
+
 Scope: the **state-machine mechanics** of the proposed "N lanes inside one `workers`
 state, driven by the manual pump." Every claim below is grounded in the current tree.
 Cites are `file:line` against `src/workflow/orchestrator.ts`, `machine-builder.ts`,

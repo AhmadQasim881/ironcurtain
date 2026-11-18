@@ -238,4 +238,37 @@ describe('Trajectory credential leakage (writer-input unit test)', () => {
     expect(out['set-cookie']).toBe('<redacted>');
     expect(out['content-type']).toBe('application/json');
   });
+
+  it('(f) every provider key header is redacted before disk, not just the Anthropic ones', async () => {
+    // Gemini's key header is x-goog-api-key; gateways may read api-key. The
+    // redaction set is built from the credential carriers every provider's
+    // key header must belong to, so none of them reaches the corpus.
+    const dir = mkdtempSync(resolve(tmpdir(), 'tj-leak-f-'));
+    try {
+      const writer = createTrajectoryCaptureWriter({ capturesDir: dir });
+      const sid = makeSessionId('sess-f');
+      writer.beginSession({ sessionId: sid });
+      writer.write(
+        buildRecord({
+          sessionId: sid,
+          reqHeaders: {
+            'X-Goog-Api-Key': REAL_KEY,
+            'api-key': REAL_KEY,
+            'anthropic-api-key': REAL_KEY,
+            cookie2: `session=${REAL_KEY}`,
+            'content-type': 'application/json',
+          },
+          reqBodyUtf8: '{"contents":[]}',
+          respHeaders: { 'content-type': 'application/json' },
+          respBodyUtf8: '{}',
+        }),
+      );
+      await flush(writer, sid);
+      const blob = readAllBytes(dir).toString('utf-8');
+      expect(blob).not.toContain('REALKEY12345');
+      expect(blob).toContain('"x-goog-api-key":"<redacted>"');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

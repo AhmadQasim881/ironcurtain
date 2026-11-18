@@ -4,14 +4,73 @@
  * Covers the three discriminated outcomes: ok (parse + validate succeed),
  * `kind: 'parse'` (file unreadable / malformed JSON-YAML), and
  * `kind: 'validate'` (parse succeeds but schema validation fails).
+ *
+ * The file can be one an imported or resumed run's checkpoint names, shipped
+ * inside the imported directory (FU-07): a FIFO or device there must be refused
+ * without blocking or reading it. Those cases run in a child process with a
+ * hard timeout, because a blocking open would freeze this worker for good.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { loadDefinition } from '../src/workflow/definition-loader.js';
+import { MAX_WORKFLOW_DEFINITION_BYTES } from '../src/workflow/discovery.js';
+import { fifoSupported, makeFifo } from './helpers/fifo.js';
+
+const loaderUrl = pathToFileURL(
+  resolve(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'workflow', 'definition-loader.ts'),
+).href;
+const hasDevZero = process.platform !== 'win32' && existsSync('/dev/zero');
+
+const MINIMAL_YAML = [
+  'name: yaml-workflow',
+  'description: yaml is fine too',
+  'initial: done',
+  'states:',
+  '  done:',
+  '    type: terminal',
+  '    description: yaml terminal',
+  '',
+].join('\n');
+
+interface ChildLoadResult {
+  readonly ok: boolean;
+  readonly kind?: string;
+  readonly message?: string;
+  readonly ms: number;
+}
+
+/**
+ * Calls `loadDefinition` on each path in a separate Node process that is
+ * killed after a hard timeout, so a blocking open fails the test instead of
+ * hanging the worker. Put a FIFO first: a regressed (blocking) read then
+ * stalls there and never reaches a device that it would read without end.
+ */
+function loadInChild(paths: readonly string[]): ChildLoadResult[] {
+  const program = [
+    `import { loadDefinition } from ${JSON.stringify(loaderUrl)};`,
+    'const results = [];',
+    'for (const path of JSON.parse(process.argv[1])) {',
+    '  const started = Date.now();',
+    '  const result = loadDefinition(path);',
+    '  results.push({ ok: result.ok, kind: result.kind, message: result.message, ms: Date.now() - started });',
+    '}',
+    'process.stdout.write(JSON.stringify(results));',
+  ].join('\n');
+  const child = spawnSync(
+    process.execPath,
+    ['--import', 'tsx', '--input-type=module', '--eval', program, JSON.stringify(paths)],
+    { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL' },
+  );
+  expect(child.error, 'loadDefinition must return before the hard timeout').toBeUndefined();
+  expect(child.status, child.stderr).toBe(0);
+  return JSON.parse(child.stdout) as ChildLoadResult[];
+}
 
 function writeJson(dir: string, filename: string, body: unknown): string {
   const filePath = resolve(dir, filename);
@@ -126,4 +185,62 @@ describe('loadDefinition', () => {
     if (result.ok) return;
     expect(result.kind).toBe('validate');
   });
+
+  it('follows a symlinked manifest to a regular file', () => {
+    const real = resolve(tmpDir, 'real.yaml');
+    writeFileSync(real, MINIMAL_YAML);
+    symlinkSync(real, resolve(tmpDir, 'linked.yaml'));
+
+    const result = loadDefinition(resolve(tmpDir, 'linked.yaml'));
+    expect(result.ok).toBe(true);
+  });
+
+  it('refuses an unsupported extension, a directory and an oversized file', () => {
+    writeFileSync(resolve(tmpDir, 'workflow.txt'), MINIMAL_YAML);
+    mkdirSync(resolve(tmpDir, 'dir.yaml'));
+    const big = resolve(tmpDir, 'big.yaml');
+    writeFileSync(big, MINIMAL_YAML);
+    // Sparse: the size check refuses it before any byte is read.
+    truncateSync(big, MAX_WORKFLOW_DEFINITION_BYTES + 1);
+
+    expect(loadDefinition(resolve(tmpDir, 'workflow.txt'))).toMatchObject({
+      ok: false,
+      kind: 'parse',
+      message: 'Unsupported workflow file extension: .txt',
+    });
+    expect(loadDefinition(resolve(tmpDir, 'dir.yaml'))).toMatchObject({
+      ok: false,
+      kind: 'parse',
+      message: expect.stringContaining('not a regular file'),
+    });
+    expect(loadDefinition(big)).toMatchObject({
+      ok: false,
+      kind: 'parse',
+      message: expect.stringContaining(`larger than ${MAX_WORKFLOW_DEFINITION_BYTES} bytes`),
+    });
+  });
+
+  it.skipIf(!fifoSupported || !hasDevZero)(
+    'refuses a FIFO, /dev/zero and links to them promptly, without blocking or reading them',
+    () => {
+      const fifo = resolve(tmpDir, 'def.yaml');
+      makeFifo(fifo);
+      symlinkSync(fifo, resolve(tmpDir, 'fifo-link.json'));
+      symlinkSync('/dev/zero', resolve(tmpDir, 'zero.yaml'));
+
+      const results = loadInChild([fifo, resolve(tmpDir, 'fifo-link.json'), '/dev/zero', resolve(tmpDir, 'zero.yaml')]);
+
+      expect(results).toHaveLength(4);
+      for (const result of results) {
+        expect(result).toMatchObject({ ok: false, kind: 'parse' });
+        expect(result.ms).toBeLessThan(2_000);
+      }
+      expect(results[0].message).toContain('not a regular file');
+      expect(results[1].message).toContain('not a regular file');
+      // No extension: refused before the device is ever opened.
+      expect(results[2].message).toBe('Unsupported workflow file extension: ');
+      expect(results[3].message).toContain('not a regular file');
+    },
+    40_000,
+  );
 });

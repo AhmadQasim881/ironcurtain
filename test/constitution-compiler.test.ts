@@ -212,8 +212,10 @@ describe('Constitution Compiler', () => {
       expect(result.errors.some((e) => e.includes('absolute path'))).toBe(true);
     });
 
-    it('catches structural invariant concepts in compiled rules', () => {
-      const badRules: CompiledRule[] = [
+    // PIP-14: wording is only a hint. Rules like these used to be errors, which
+    // dropped the whole server (e.g. google-workspace over a Sheets protected-range rule).
+    it('warns, but does not reject, rules whose wording mentions a structural invariant', () => {
+      const rules: CompiledRule[] = [
         {
           name: 'deny-protected-paths',
           description: 'Deny access to protected path files',
@@ -222,11 +224,29 @@ describe('Constitution Compiler', () => {
           then: 'deny',
           reason: 'Protected paths',
         },
+        {
+          name: 'escalate-gsheets-protected-range-changes',
+          description: 'Changes to protected ranges need approval',
+          principle: 'Editing documents requires approval.',
+          if: { server: ['google-workspace'], tool: ['gsheets_add_protected_range'] },
+          then: 'escalate',
+          reason: 'Protected ranges guard sheet data.',
+        },
+        {
+          name: 'protect-config',
+          description: 'Writing to a protected path is denied by the engine; this escalates other config writes.',
+          principle: 'Configuration changes need approval.',
+          if: { server: ['filesystem'], roles: ['write-path'] },
+          then: 'escalate',
+          reason: 'Config writes need approval.',
+        },
       ];
 
-      const result = validateCompiledRules(badRules);
-      expect(result.valid).toBe(false);
-      expect(result.errors.some((e) => e.includes('structural invariant'))).toBe(true);
+      const result = validateCompiledRules(rules);
+      expect(result.valid).toBe(true);
+      expect(result.errors).toEqual([]);
+      expect(result.warnings).toHaveLength(3);
+      expect(result.warnings.every((w) => w.includes('structural invariant'))).toBe(true);
     });
   });
 

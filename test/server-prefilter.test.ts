@@ -1,6 +1,14 @@
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect } from 'vitest';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { resolve } from 'node:path';
 import { MockLanguageModelV3 } from 'ai/test';
-import { checkServerRelevance, prefilterServers } from '../src/pipeline/server-prefilter.js';
+import {
+  checkServerRelevance,
+  PREFILTER_DECISION_FILE,
+  prefilterServers,
+  type PrefilterCacheOptions,
+} from '../src/pipeline/server-prefilter.js';
 import { mergeServerResults } from '../src/pipeline/pipeline-runner.js';
 import type { ToolAnnotation, CompiledRule } from '../src/pipeline/types.js';
 
@@ -242,6 +250,135 @@ describe('prefilterServers', () => {
     expect(succeeded).toBeDefined();
     expect(failedOpen).toBeDefined();
     expect(failedOpen!.reason).toContain('Pre-filter error');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WP-88 / PIP-15(b): cached pre-filter decisions
+// ---------------------------------------------------------------------------
+
+describe('prefilterServers decision cache', () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  function cacheIn(overrides: Partial<PrefilterCacheOptions> = {}): PrefilterCacheOptions {
+    const outputDir = mkdtempSync(resolve(tmpdir(), 'ic-wp88-prefilter-'));
+    dirs.push(outputDir);
+    return { outputDir, modelId: 'test:haiku', ...overrides };
+  }
+
+  /** Answers per server from `answers` and counts the calls. */
+  function answeringModel(answers: Record<string, { skip: boolean; reason: string } | Error>) {
+    let calls = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        calls++;
+        const system = JSON.stringify(options.prompt.filter((m) => m.role === 'system'));
+        const server = Object.keys(answers).find((name) => system.includes(`Server: \\"${name}\\"`));
+        const answer = server === undefined ? new Error('unknown server') : answers[server];
+        if (answer instanceof Error) throw answer;
+        return makeV3Result(JSON.stringify(answer));
+      },
+    });
+    return { model, callCount: () => calls };
+  }
+
+  const SERVERS: Array<[string, ReadonlyArray<ToolAnnotation>]> = [
+    ['filesystem', filesystemTools],
+    ['github', githubTools],
+  ];
+  const ANSWERS = {
+    filesystem: { skip: false, reason: 'Files are mentioned' },
+    github: { skip: true, reason: 'Nothing about GitHub' },
+  };
+  const TEXT = 'Allow reading local files only';
+
+  it('an unchanged rerun asks the model nothing and returns the same decisions', async () => {
+    const cache = cacheIn();
+    const first = answeringModel(ANSWERS);
+    const decided = await prefilterServers(TEXT, SERVERS, first.model, 'constitution', cache);
+    expect(first.callCount()).toBe(2);
+    expect(decided.map((d) => d.cached)).toEqual([undefined, undefined]);
+    expect(existsSync(resolve(cache.outputDir, 'servers', 'github', PREFILTER_DECISION_FILE))).toBe(true);
+
+    const second = answeringModel({ filesystem: new Error('must not be called'), github: new Error('nor this') });
+    const reused = await prefilterServers(TEXT, SERVERS, second.model, 'constitution', cache);
+
+    expect(second.callCount()).toBe(0);
+    expect(reused).toEqual([
+      { serverName: 'filesystem', skip: false, reason: 'Files are mentioned', cached: true },
+      { serverName: 'github', skip: true, reason: 'Nothing about GitHub', cached: true },
+    ]);
+  });
+
+  it('asks again when the text, the tools, the mode or the model change', async () => {
+    const cache = cacheIn();
+    await prefilterServers(TEXT, SERVERS, answeringModel(ANSWERS).model, 'constitution', cache);
+
+    const changes: Array<() => Promise<unknown>> = [];
+    const counted = answeringModel(ANSWERS);
+    changes.push(() => prefilterServers(`${TEXT} and GitHub issues`, SERVERS, counted.model, 'constitution', cache));
+    const renamedTool: Array<[string, ReadonlyArray<ToolAnnotation>]> = [
+      ['filesystem', [{ ...filesystemTools[0], comment: 'Read a file (now also directories)' }, filesystemTools[1]]],
+    ];
+    changes.push(() => prefilterServers(TEXT, renamedTool, counted.model, 'constitution', cache));
+    changes.push(() => prefilterServers(TEXT, [SERVERS[0]], counted.model, 'task-policy', cache));
+    changes.push(() =>
+      prefilterServers(TEXT, [SERVERS[0]], counted.model, 'constitution', { ...cache, modelId: 'test:other' }),
+    );
+    let expected = 0;
+    for (const [i, change] of changes.entries()) {
+      await change();
+      expected += i === 0 ? 2 : 1;
+      expect(counted.callCount()).toBe(expected);
+    }
+  });
+
+  it('does not cache a fail-open decision after an error', async () => {
+    const cache = cacheIn();
+    const failing = answeringModel({ filesystem: new Error('rate limited'), github: ANSWERS.github });
+    const decided = await prefilterServers(TEXT, SERVERS, failing.model, 'constitution', cache);
+    expect(decided[0]).toMatchObject({ serverName: 'filesystem', skip: false });
+    expect(decided[0].reason).toContain('Pre-filter error');
+    expect(existsSync(resolve(cache.outputDir, 'servers', 'filesystem', PREFILTER_DECISION_FILE))).toBe(false);
+
+    const next = answeringModel(ANSWERS);
+    await prefilterServers(TEXT, SERVERS, next.model, 'constitution', cache);
+    expect(next.callCount()).toBe(1); // filesystem only; github's decision was cached
+  });
+
+  it('refresh asks again and stores the new decision', async () => {
+    const cache = cacheIn();
+    await prefilterServers(TEXT, [SERVERS[1]], answeringModel(ANSWERS).model, 'constitution', cache);
+    const flipped = answeringModel({ ...ANSWERS, github: { skip: false, reason: 'Issues matter after all' } });
+
+    const refreshed = await prefilterServers(TEXT, [SERVERS[1]], flipped.model, 'constitution', {
+      ...cache,
+      refresh: true,
+    });
+
+    expect(flipped.callCount()).toBe(1);
+    expect(refreshed[0]).toMatchObject({ skip: false, reason: 'Issues matter after all' });
+    const stored = JSON.parse(
+      readFileSync(resolve(cache.outputDir, 'servers', 'github', PREFILTER_DECISION_FILE), 'utf-8'),
+    ) as { skip: boolean };
+    expect(stored.skip).toBe(false);
+  });
+
+  it('ignores a damaged cache file', async () => {
+    const cache = cacheIn();
+    await prefilterServers(TEXT, [SERVERS[1]], answeringModel(ANSWERS).model, 'constitution', cache);
+    const file = resolve(cache.outputDir, 'servers', 'github', PREFILTER_DECISION_FILE);
+    const stored = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+    writeFileSync(file, JSON.stringify({ ...stored, skip: 'yes' }));
+
+    const again = answeringModel(ANSWERS);
+    const decided = await prefilterServers(TEXT, [SERVERS[1]], again.model, 'constitution', cache);
+    expect(again.callCount()).toBe(1);
+    expect(decided[0]).toMatchObject({ skip: true });
+    expect(decided[0].cached).toBeUndefined();
   });
 });
 

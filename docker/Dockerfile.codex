@@ -1,9 +1,22 @@
-FROM ironcurtain-base:latest
+# IronCurtain builds every image under a build-hash tag and passes the exact
+# base build it resolved (ironcurtain-base:build-<hash>), so a concurrent build
+# from another checkout cannot swap the base under this one. The default keeps
+# a manual `docker build` working against the moving alias.
+ARG IRONCURTAIN_BASE_IMAGE=ironcurtain-base:latest
+FROM ${IRONCURTAIN_BASE_IMAGE}
 
 # Install OpenAI Codex CLI (Node.js is already in the base image).
-# Unpinned (latest), matching Dockerfile.claude-code's `npm install -g`.
+# Pinned: the MITM's openai-responses request sanitizer keeps only the tool
+# and input-item types this client version sends (recorded in
+# test/docker/fixtures/codex-*-request.json). Before bumping, re-record a
+# request from the new version and check it still passes the sanitizer
+# unchanged, and update CODEX_CLI_VERSION in src/docker/agent-cli-version.ts.
+# The version is part of this file, so a bump changes the image build hash and
+# triggers a rebuild. `agentCliVersions.codex` in ~/.ironcurtain/config.json
+# overrides it with an exact version or "latest" (unqualified: see above).
+ARG CODEX_VERSION=0.157.1
 USER root
-RUN npm install -g @openai/codex
+RUN npm install -g "@openai/codex@${CODEX_VERSION}"
 
 # The entrypoint sources the shared UID/GID remap helper, so that must be
 # present in the image too.

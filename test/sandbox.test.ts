@@ -1,6 +1,16 @@
 import { describe, it, expect } from 'vitest';
 import vm from 'node:vm';
-import { toCallableName, toUtcpCallable, buildInterfacePatchSnippet } from '../src/sandbox/index.js';
+import { isAbsolute, resolve } from 'node:path';
+import {
+  toCallableName,
+  toUtcpCallable,
+  buildInterfacePatchSnippet,
+  buildProxySubprocessEnv,
+  buildServerRelayEnv,
+} from '../src/sandbox/index.js';
+import type { IronCurtainConfig, MCPServerConfig } from '../src/config/types.js';
+import type { OsSandboxPlan } from '../src/trusted-process/sandbox-integration.js';
+import { BACKEND_CALL_TIMEOUT_ENV, DEFAULT_BACKEND_CALL_TIMEOUT_MS } from '../src/trusted-process/call-timeouts.js';
 
 describe('toCallableName', () => {
   it('returns simple names unchanged after sanitization', () => {
@@ -242,5 +252,199 @@ describe('buildInterfacePatchSnippet (real generated snippet)', () => {
     const msg = fn('totally_unknown_xyz');
     expect(msg).toContain('Use the callable name format');
     expect(msg).not.toContain(MANUAL);
+  });
+});
+
+describe('buildProxySubprocessEnv', () => {
+  // No servers, so the OS-sandbox plan is empty; only the env block is under test.
+  const EMPTY_PLAN: OsSandboxPlan = {
+    policy: 'enforce',
+    availability: { available: true, platformSupported: true, problems: [], warnings: [] },
+    resolved: new Map(),
+    refused: [],
+    unconfined: [],
+  };
+
+  function relayConfig(): IronCurtainConfig {
+    return {
+      mcpServers: {},
+      generatedDir: '/abs/generated',
+      allowedDirectory: '/abs/sandbox',
+      escalationTimeoutSeconds: 300,
+      userConfig: {},
+    } as unknown as IronCurtainConfig;
+  }
+
+  function withIronCurtainHome(value: string, fn: () => void): void {
+    const saved = process.env.IRONCURTAIN_HOME;
+    process.env.IRONCURTAIN_HOME = value;
+    try {
+      fn();
+    } finally {
+      if (saved === undefined) delete process.env.IRONCURTAIN_HOME;
+      else process.env.IRONCURTAIN_HOME = saved;
+    }
+  }
+
+  it('hands the relay the IronCurtain home this process resolved, since relays run from the package root', () => {
+    const home = resolve('/abs/ironcurtain-home');
+    withIronCurtainHome(home, () => {
+      const env = buildProxySubprocessEnv(relayConfig(), EMPTY_PLAN);
+      expect(env.IRONCURTAIN_HOME).toBe(home);
+      expect(isAbsolute(env.IRONCURTAIN_HOME)).toBe(true);
+      expect(env.ALLOWED_DIRECTORY).toBe('/abs/sandbox');
+      expect(env.GENERATED_DIR).toBe('/abs/generated');
+    });
+  });
+
+  it('never hands a relay a relative IronCurtain home', () => {
+    withIronCurtainHome('relative-home', () => {
+      expect(() => buildProxySubprocessEnv(relayConfig(), EMPTY_PLAN)).toThrow(/IRONCURTAIN_HOME must be an absolute/);
+    });
+  });
+
+  it('hands the relay the backend call bound it reads, not the escalation timeout it never read', () => {
+    withIronCurtainHome(resolve('/abs/ironcurtain-home'), () => {
+      const env = buildProxySubprocessEnv(relayConfig(), EMPTY_PLAN);
+      expect(env[BACKEND_CALL_TIMEOUT_ENV]).toBe(String(DEFAULT_BACKEND_CALL_TIMEOUT_MS));
+      // The human-approval wait runs in the coordinator (parent process); the
+      // relay has nothing to do with it.
+      expect(env).not.toHaveProperty('ESCALATION_TIMEOUT_SECONDS');
+
+      const custom = buildProxySubprocessEnv({ ...relayConfig(), backendCallTimeoutSeconds: 42 }, EMPTY_PLAN);
+      expect(custom[BACKEND_CALL_TIMEOUT_ENV]).toBe('42000');
+    });
+  });
+
+  it('resolves relative paths against this process cwd, where the policy engine resolves them', () => {
+    // A caller that sets allowedDirectory without loadConfig() could hand
+    // the session a relative path; the relay would refuse it (and its roots
+    // would differ from the policy engine's) if passed through unchanged.
+    const config = {
+      mcpServers: {},
+      generatedDir: 'rel/generated',
+      toolAnnotationsDir: 'rel/annotations',
+      allowedDirectory: 'my-workspace',
+      sessionLogPath: 'rel/session.log',
+      escalationTimeoutSeconds: 300,
+      userConfig: {},
+    } as unknown as IronCurtainConfig;
+    const env = buildProxySubprocessEnv(config, EMPTY_PLAN);
+    expect(env.ALLOWED_DIRECTORY).toBe(resolve('my-workspace'));
+    expect(env.GENERATED_DIR).toBe(resolve('rel/generated'));
+    expect(env.TOOL_ANNOTATIONS_DIR).toBe(resolve('rel/annotations'));
+    expect(env.SESSION_LOG_PATH).toBe(resolve('rel/session.log'));
+  });
+
+  it('does not hand a relay the PTY session mode: the coordinator gets it as an option', () => {
+    // Relays do not run the auto-approver; the in-process coordinator reads
+    // `isPtySession` from the config, so no environment variable carries it.
+    const env = buildProxySubprocessEnv({ ...relayConfig(), isPtySession: true }, EMPTY_PLAN);
+    expect(env).not.toHaveProperty('IRONCURTAIN_PTY_SESSION');
+  });
+
+  it('carries no server configuration: that is per relay (buildServerRelayEnv)', () => {
+    const config = {
+      ...relayConfig(),
+      mcpServers: { github: { command: 'docker', args: ['run'], sandbox: false } },
+    } as unknown as IronCurtainConfig;
+    expect(buildProxySubprocessEnv(config, EMPTY_PLAN)).not.toHaveProperty('MCP_SERVERS_CONFIG');
+  });
+
+  it('tells the relay where the user moved the credential stores it must hide from sandboxed servers', () => {
+    // The relay inherits only the allowlist, and builds every sandboxed
+    // server's srt denyRead baseline from ANTHROPIC_CONFIG_DIR and
+    // CODEX_HOME (credential-stores.ts). Without them it would deny the
+    // default locations while the real stores stayed readable.
+    const names = ['ANTHROPIC_CONFIG_DIR', 'CODEX_HOME'] as const;
+    const saved = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    try {
+      process.env.ANTHROPIC_CONFIG_DIR = '/data/anthropic-cli';
+      process.env.CODEX_HOME = '/data/codex';
+      const env = buildProxySubprocessEnv(relayConfig(), EMPTY_PLAN);
+      expect(env.ANTHROPIC_CONFIG_DIR).toBe('/data/anthropic-cli');
+      expect(env.CODEX_HOME).toBe('/data/codex');
+
+      // Unset or empty (credential-stores.ts reads an empty value as unset): not sent.
+      delete process.env.ANTHROPIC_CONFIG_DIR;
+      process.env.CODEX_HOME = '';
+      const unset = buildProxySubprocessEnv(relayConfig(), EMPTY_PLAN);
+      expect(unset).not.toHaveProperty('ANTHROPIC_CONFIG_DIR');
+      expect(unset).not.toHaveProperty('CODEX_HOME');
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+});
+
+describe('buildServerRelayEnv', () => {
+  const proxyEnv = { GENERATED_DIR: '/abs/generated', IRONCURTAIN_HOME: '/abs/home' };
+  const servers: Record<string, MCPServerConfig> = {
+    github: {
+      command: 'docker',
+      args: ['run', '-i', '--rm', '-e', 'GITHUB_PERSONAL_ACCESS_TOKEN', 'ghcr.io/github/github-mcp-server'],
+      sandbox: false,
+    },
+    memory: {
+      command: 'node',
+      args: ['memory.js'],
+      env: { MEMORY_DB_PATH: '/db', MEMORY_LLM_BASE_URL: 'u' },
+      sandbox: false,
+    },
+  };
+  const hostEnv = {
+    PATH: '/usr/bin',
+    GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_host',
+    ANTHROPIC_API_KEY: 'sk-ant-host',
+    NODE_OPTIONS: '--require /tmp/evil.js',
+  };
+
+  it("gives a relay only its own server's config, filter and credentials", () => {
+    const env = buildServerRelayEnv(
+      proxyEnv,
+      'github',
+      servers.github,
+      { GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_cfg' },
+      hostEnv,
+    );
+    expect(env.GENERATED_DIR).toBe('/abs/generated');
+    expect(env.SERVER_FILTER).toBe('github');
+    expect(JSON.parse(env.MCP_SERVERS_CONFIG)).toEqual({ github: servers.github });
+    expect(env.MCP_SERVERS_CONFIG).not.toContain('memory');
+    expect(JSON.parse(env.SERVER_CREDENTIALS)).toEqual({ GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_cfg' });
+  });
+
+  it("forwards the host values of the server's `-e` names and nothing else from the host", () => {
+    const github = buildServerRelayEnv(proxyEnv, 'github', servers.github, undefined, hostEnv);
+    expect(github.GITHUB_PERSONAL_ACCESS_TOKEN).toBe('ghp_host');
+    expect(github).not.toHaveProperty('ANTHROPIC_API_KEY');
+    expect(github).not.toHaveProperty('NODE_OPTIONS');
+    expect(github).not.toHaveProperty('PATH');
+    expect(github).not.toHaveProperty('SERVER_CREDENTIALS');
+
+    const memory = buildServerRelayEnv(proxyEnv, 'memory', servers.memory, undefined, hostEnv);
+    expect(memory).not.toHaveProperty('GITHUB_PERSONAL_ACCESS_TOKEN');
+    expect(JSON.parse(memory.MCP_SERVERS_CONFIG)).toEqual({ memory: servers.memory });
+  });
+
+  it('never lets a `-e` name replace what the relay is configured with', () => {
+    const greedy: MCPServerConfig = {
+      command: 'docker',
+      args: ['run', '-e', 'IRONCURTAIN_HOME', '-e', 'GENERATED_DIR', '-e', 'MCP_SERVERS_CONFIG', '-e', 'TOKEN', 'img'],
+      sandbox: false,
+    };
+    const env = buildServerRelayEnv(proxyEnv, 'greedy', greedy, undefined, {
+      IRONCURTAIN_HOME: '/host/elsewhere',
+      GENERATED_DIR: '/host/policy',
+      MCP_SERVERS_CONFIG: '{"other":{}}',
+      TOKEN: 'host-token',
+    });
+    expect(env.IRONCURTAIN_HOME).toBe('/abs/home');
+    expect(env.GENERATED_DIR).toBe('/abs/generated');
+    expect(JSON.parse(env.MCP_SERVERS_CONFIG)).toEqual({ greedy });
+    expect(env.TOKEN).toBe('host-token');
   });
 });

@@ -7,16 +7,19 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { connect as netConnect, type Socket } from 'node:net';
 import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { createCodeModeProxy, type DockerProxy } from '../src/docker/code-mode-proxy.js';
 import type { IronCurtainConfig } from '../src/config/types.js';
-import type { CompiledPolicyFile, ToolAnnotationsFile } from '../src/pipeline/types.js';
+import type { CompiledPolicyFile, StoredToolAnnotationsFile } from '../src/pipeline/types.js';
 import { testCompiledPolicy, testToolAnnotations, REAL_TMP } from './fixtures/test-policy.js';
 import { UdsClientTransport } from './helpers/uds-client-transport.js';
 import { isIsolatedVmAvailable } from './helpers/isolated-vm-available.js';
+import { packagedFilesystemServer } from './helpers/filesystem-server.js';
+import { testUserConfig } from './helpers/user-config.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(__dirname, '..');
@@ -29,7 +32,7 @@ const SOCKET_PATH = `${REAL_TMP}/ironcurtain-docker-cm-test-${process.pid}.sock`
 function writeTestArtifacts(
   dir: string,
   compiledPolicy: CompiledPolicyFile,
-  toolAnnotations: ToolAnnotationsFile,
+  toolAnnotations: StoredToolAnnotationsFile,
 ): void {
   mkdirSync(dir, { recursive: true });
   writeFileSync(resolve(dir, 'compiled-policy.json'), JSON.stringify(compiledPolicy));
@@ -60,8 +63,7 @@ describe.skipIf(!isIsolatedVmAvailable())('Docker Code Mode proxy integration', 
     mcpServers: {
       filesystem: {
         description: 'Read, write, search, and manage files and directories',
-        command: 'npx',
-        args: ['-y', '@modelcontextprotocol/server-filesystem', SANDBOX_DIR],
+        ...packagedFilesystemServer(SANDBOX_DIR),
         sandbox: false,
       },
     },
@@ -75,30 +77,7 @@ describe.skipIf(!isIsolatedVmAvailable())('Docker Code Mode proxy integration', 
     constitutionPath: resolve(projectRoot, 'src/config/constitution.md'),
     agentModelId: 'anthropic:claude-sonnet-4-6',
     escalationTimeoutSeconds: 300,
-    userConfig: {
-      agentModelId: 'anthropic:claude-sonnet-4-6',
-      policyModelId: 'anthropic:claude-sonnet-4-6',
-      anthropicApiKey: '',
-      googleApiKey: '',
-      openaiApiKey: '',
-      escalationTimeoutSeconds: 300,
-      resourceBudget: {
-        maxTotalTokens: 1_000_000,
-        maxSteps: 200,
-        maxSessionSeconds: 1800,
-        maxEstimatedCostUsd: 5.0,
-        warnThresholdPercent: 80,
-      },
-      autoCompact: {
-        enabled: false,
-        thresholdTokens: 80_000,
-        keepRecentMessages: 10,
-        summaryModelId: 'anthropic:claude-haiku-4-5',
-      },
-      autoApprove: { enabled: false, modelId: 'anthropic:claude-haiku-4-5' },
-      auditRedaction: { enabled: true },
-      serverCredentials: {},
-    },
+    userConfig: testUserConfig(),
   };
 
   beforeAll(async () => {
@@ -200,5 +179,55 @@ describe.skipIf(!isIsolatedVmAvailable())('Docker Code Mode proxy integration', 
       const text = (result.content as Array<{ type: string; text: string }>)[0].text;
       expect(text).toContain('Unknown tool');
     });
+  });
+
+  it('serves concurrent clients on separate MCP servers with colliding JSON-RPC ids (DINF-9)', async () => {
+    // Every SDK Client numbers its requests from the same start, so both
+    // initialize requests share one id and both tool calls share another.
+    // With one MCP server per connection each lane gets its own answer and
+    // neither connection is evicted by the other.
+    const run = (lane: string): Promise<string> =>
+      withClient(SOCKET_PATH, `lane-${lane}`, async (client) => {
+        const result = await client.callTool({
+          name: 'execute_code',
+          arguments: { code: `return "lane-${lane}";` },
+        });
+        return (result.content as Array<{ type: string; text: string }>)[0].text;
+      });
+    const [a, b] = await Promise.all([run('a'), run('b')]);
+    expect(a).toBe('lane-a');
+    expect(b).toBe('lane-b');
+  });
+
+  it('rejects a malformed frame without dropping the connection or disturbing other clients (TPM-7)', async () => {
+    const raw = await new Promise<Socket>((resolve, reject) => {
+      const socket = netConnect(SOCKET_PATH, () => resolve(socket));
+      socket.on('error', reject);
+    });
+    try {
+      // Before the transport guard this threw out of the socket's 'data'
+      // handler and exited the host process.
+      raw.write('this is not json\n');
+
+      // Another client's full MCP session is unaffected.
+      await withClient(SOCKET_PATH, 'test-bystander', async (client) => {
+        expect((await client.listTools()).tools[0].name).toBe('execute_code');
+      });
+
+      // The offending connection stays up: its next valid request is answered.
+      const reply = new Promise<string>((resolve) => {
+        let buffer = '';
+        raw.on('data', (chunk: Buffer) => {
+          buffer += chunk.toString();
+          const newline = buffer.indexOf('\n');
+          if (newline !== -1) resolve(buffer.slice(0, newline));
+        });
+      });
+      raw.write('{"jsonrpc":"2.0","id":1,"method":"ping"}\n');
+      expect(JSON.parse(await reply)).toEqual({ jsonrpc: '2.0', id: 1, result: {} });
+      expect(raw.destroyed).toBe(false);
+    } finally {
+      raw.destroy();
+    }
   });
 });

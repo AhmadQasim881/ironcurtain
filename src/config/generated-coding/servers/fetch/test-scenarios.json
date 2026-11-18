@@ -213,7 +213,7 @@
         }
       },
       "expectedDecision": "allow",
-      "reasoning": "raw.githubusercontent.com matches *.githubusercontent.com on the @popular-development-sites list.",
+      "reasoning": "raw.githubusercontent.com is listed exactly on the @popular-development-sites list.",
       "source": "generated"
     },
     {

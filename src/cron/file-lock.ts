@@ -1,176 +1,121 @@
 /**
  * Advisory file locking for the job store.
  *
- * Uses mkdir (atomic on POSIX) to create a lock directory next to the
- * target file. The lock directory contains a metadata file with the
- * owning PID and timestamp, enabling stale lock detection when a
- * process crashes without releasing.
+ * Built on docker-workload/process-lock, the lock shared by the daemon,
+ * session and workflow locks: the owner record (pid, OS process-start
+ * identity, random token) is written in full under a unique name and
+ * published with an atomic hard link, so a contender never sees a lock
+ * without its owner; a lock whose owner died (or whose pid was reused by
+ * another process) is reclaimed by exactly one contender, which captures the
+ * exact inode it judged stale; and release removes the lock only while it is
+ * still the inode this process published. A live owner's lock is never taken
+ * over, however long it is held: a contender waits, and gives up after
+ * {@link DEFAULT_MAX_WAIT_MS}.
  *
- * This is designed for short-lived critical sections (read-modify-write),
- * not long-held process-level locks. For process singleton enforcement,
- * see src/escalation/listener-lock.ts.
+ * This is designed for short-lived critical sections (load-modify-save of a
+ * job.json), not long-held process-level locks. For process singleton
+ * enforcement, see src/daemon/daemon-lock.ts and
+ * src/escalation/listener-lock.ts.
  */
 
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { isPidAlive } from '../escalation/listener-lock.js';
+import {
+  acquireProcessLock,
+  ProcessLockBusyError,
+  type ProcessIdentityResolver,
+  type ProcessLockHandle,
+} from '../docker-workload/process-lock.js';
+import * as logger from '../logger.js';
 
-/** Default stale timeout: 30 seconds. */
-const DEFAULT_STALE_MS = 30_000;
-
-/** Retry interval when waiting for a lock. */
+/** Retry interval while waiting for a lock. */
 const RETRY_INTERVAL_MS = 50;
 
-/** Maximum time to wait for a lock before giving up. */
-const MAX_WAIT_MS = 10_000;
+/** Longest a contender waits for a live owner to release the lock. */
+export const DEFAULT_MAX_WAIT_MS = 10_000;
 
-interface LockMetadata {
-  pid: number;
-  timestamp: number;
+/** A held advisory lock. */
+export interface FileLock {
+  readonly path: string;
+  /**
+   * Releases the lock; idempotent. Throws when the lock is no longer the one
+   * this process published (its job directory was deleted meanwhile, say),
+   * and then removes nothing.
+   */
+  release(): void;
+}
+
+export interface AcquireFileLockOptions {
+  /** How long to wait for a live owner (default {@link DEFAULT_MAX_WAIT_MS}); 0 tries once. */
+  readonly maxWaitMs?: number;
+  /** Test seam; production asks the OS process table. */
+  readonly processIdentityForPid?: ProcessIdentityResolver;
 }
 
 /**
- * Attempts to acquire an advisory lock for the given path.
- * Returns true if the lock was acquired, false otherwise.
- *
- * The lock is a directory at `{path}.lock/` containing a `meta.json`
- * with the owning PID and creation timestamp.
+ * Acquires the advisory lock at `lockPath`, waiting while a live process
+ * holds it. Resolves undefined when the wait times out. Any other failure
+ * (the lock's directory does not exist, the filesystem refuses the write)
+ * rejects.
  */
-function tryAcquire(lockDir: string, staleMs: number): boolean {
-  // Attempt atomic mkdir first — this is the authoritative lock acquisition.
-  // Only check for stale locks after EEXIST, avoiding a TOCTOU race.
-  try {
-    mkdirSync(lockDir);
-  } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
-      throw err;
+export async function acquireLock(
+  lockPath: string,
+  options: AcquireFileLockOptions = {},
+): Promise<FileLock | undefined> {
+  const deadline = Date.now() + (options.maxWaitMs ?? DEFAULT_MAX_WAIT_MS);
+  for (;;) {
+    let handle: ProcessLockHandle;
+    try {
+      handle = acquireProcessLock(
+        lockPath,
+        options.processIdentityForPid ? { processIdentityForPid: options.processIdentityForPid } : {},
+      );
+    } catch (err) {
+      if (!(err instanceof ProcessLockBusyError)) throw err;
+      if (Date.now() >= deadline) return undefined;
+      await new Promise((done) => setTimeout(done, RETRY_INTERVAL_MS));
+      continue;
     }
-    // Lock dir exists — check if it's stale
-    if (isLockStale(lockDir, staleMs)) {
-      forceRelease(lockDir);
-      // Retry mkdir after releasing stale lock
-      try {
-        mkdirSync(lockDir);
-      } catch (retryErr: unknown) {
-        if ((retryErr as NodeJS.ErrnoException).code === 'EEXIST') {
-          return false; // Another process grabbed it
-        }
-        throw retryErr;
-      }
-    } else {
-      return false;
-    }
+    return { path: lockPath, release: () => handle.release() };
   }
-
-  // Write metadata for stale detection
-  const meta: LockMetadata = { pid: process.pid, timestamp: Date.now() };
-  try {
-    writeFileSync(resolve(lockDir, 'meta.json'), JSON.stringify(meta));
-  } catch {
-    // If we can't write metadata, release and fail
-    forceRelease(lockDir);
-    return false;
-  }
-
-  return true;
-}
-
-/**
- * Checks whether an existing lock is stale (owner dead or timed out).
- */
-function isLockStale(lockDir: string, staleMs: number): boolean {
-  const metaPath = resolve(lockDir, 'meta.json');
-  try {
-    const raw = readFileSync(metaPath, 'utf-8');
-    const meta = JSON.parse(raw) as LockMetadata;
-
-    // Check if the owning process is still alive
-    if (!isPidAlive(meta.pid)) {
-      return true;
-    }
-
-    // Check if the lock has exceeded the stale timeout
-    if (Date.now() - meta.timestamp > staleMs) {
-      return true;
-    }
-
-    return false;
-  } catch {
-    // No metadata or unreadable -- treat as stale
-    return true;
-  }
-}
-
-/**
- * Force-removes a lock directory. Best-effort.
- */
-function forceRelease(lockDir: string): void {
-  try {
-    rmSync(lockDir, { recursive: true, force: true });
-  } catch {
-    /* best effort */
-  }
-}
-
-/**
- * Releases an advisory lock. Safe to call even if the lock is not held.
- */
-export function releaseLock(lockDir: string): void {
-  forceRelease(lockDir);
-}
-
-/**
- * Acquires an advisory lock, retrying until timeout.
- *
- * @param lockDir Path to the lock directory (typically `{target}.lock`)
- * @param staleMs Time in ms after which an unreleased lock is considered stale
- * @returns true if acquired, false if timed out
- */
-export async function acquireLock(lockDir: string, staleMs: number = DEFAULT_STALE_MS): Promise<boolean> {
-  const deadline = Date.now() + MAX_WAIT_MS;
-
-  while (Date.now() < deadline) {
-    if (tryAcquire(lockDir, staleMs)) {
-      return true;
-    }
-    await new Promise((resolve) => setTimeout(resolve, RETRY_INTERVAL_MS));
-  }
-
-  return false;
 }
 
 /**
  * Executes a function while holding an advisory file lock.
  *
- * Acquires the lock, runs the function, and releases the lock in a
- * finally block. Throws if the lock cannot be acquired within the
- * timeout period.
- *
- * @param lockDir Path to the lock directory
- * @param fn The function to execute under lock
- * @param staleMs Stale lock timeout (default 30s)
+ * Acquires the lock, runs the function, and releases the lock in a finally
+ * block. Throws if the lock cannot be acquired within the wait. A lock that
+ * was lost while `fn` ran (its directory was removed by a job deletion) is
+ * logged rather than thrown: `fn` has already done its work.
  */
 export async function withFileLock<T>(
-  lockDir: string,
+  lockPath: string,
   fn: () => T | Promise<T>,
-  staleMs: number = DEFAULT_STALE_MS,
+  options: AcquireFileLockOptions = {},
 ): Promise<T> {
-  const acquired = await acquireLock(lockDir, staleMs);
-  if (!acquired) {
-    throw new Error(`Failed to acquire file lock: ${lockDir} (timed out after ${MAX_WAIT_MS}ms)`);
+  const lock = await acquireLock(lockPath, options);
+  if (!lock) {
+    throw new Error(
+      `Failed to acquire file lock: ${lockPath} (still held by another process after ` +
+        `${options.maxWaitMs ?? DEFAULT_MAX_WAIT_MS}ms)`,
+    );
   }
 
   try {
     return await fn();
   } finally {
-    releaseLock(lockDir);
+    try {
+      lock.release();
+    } catch (err) {
+      logger.warn(`[file-lock] ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 }
 
 /**
- * Returns the conventional lock directory path for a job directory.
- * The lock is placed at `{jobDir}/job.json.lock/`.
+ * Returns the conventional lock file path for a job directory:
+ * `{jobDir}/job.lock`. (Older versions used a `job.json.lock/` directory;
+ * one left behind by a crash is ignored.)
  */
-export function getJobLockDir(jobDir: string): string {
-  return resolve(jobDir, 'job.json.lock');
+export function getJobLockPath(jobDir: string): string {
+  return resolve(jobDir, 'job.lock');
 }

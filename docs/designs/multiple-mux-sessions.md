@@ -1,5 +1,7 @@
 # Multiple Parallel Mux Sessions
 
+**Status (2026-11-14):** Implemented: each mux has its own id (`muxId`) and owns the sessions it spawns; the single-instance lock now covers only `ironcurtain escalation-listener` (`src/escalation/listener-lock.ts`).
+
 ## 1. Problem Statement
 
 Running `ironcurtain mux` twice currently fails with:
@@ -134,19 +136,15 @@ To implement this cleanly:
 
 - **Rename the lock file** to `escalation-listener.lock` (same as today -- no change needed).
 - **The mux no longer acquires this lock.** Only `escalation-listener` does.
-- **The mux ignores unowned sessions if an escalation listener is running.** The mux checks for the lock file's existence (without acquiring it) and, if present, skips unowned sessions entirely. This prevents the mux from racing with a standalone listener on unowned sessions.
+- **The mux ignores unowned sessions if an escalation listener is running.** The mux inspects the lock (without acquiring it) and, if a live listener holds it, skips unowned and orphaned sessions entirely. This prevents the mux from racing with a standalone listener on unowned sessions.
+- **The standalone listener skips sessions a live mux owns** (`muxId` set and `muxPid` alive, the same rule as the mux's own filter; the web UI daemon registers its PTY sessions the same way), so no escalation is prompted for in two UIs. It picks up an orphaned session once its owner is gone.
+- **The lock is a `docker-workload/process-lock` record** (`src/escalation/listener-lock.ts`): pid, OS process-start identity and a random token, published atomically. Two listeners starting together cannot both win, a crashed listener's lock is reclaimed by exactly one contender (also when its pid now belongs to another process), and release removes only the lock this listener published. The listener releases it on SIGHUP (its terminal closed) and SIGTERM as well as on a normal exit.
 
 ```typescript
 // In mux-escalation-manager.ts
 function isStandaloneListenerRunning(): boolean {
-  const lockPath = getListenerLockPath();
-  try {
-    const content = readFileSync(lockPath, 'utf-8');
-    const pid = parseInt(content.trim(), 10);
-    return !isNaN(pid) && isPidAlive(pid);
-  } catch {
-    return false;
-  }
+  // Held by a live process: same pid and process-start identity as recorded.
+  return isListenerLockHeld(getListenerLockPath());
 }
 ```
 

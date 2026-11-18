@@ -30,7 +30,8 @@
 
 import { isIP } from 'node:net';
 import { z } from 'zod';
-import { loadImmutableHostJson } from '../hardened-fs.js';
+import { loadPackageAssetJson } from '../hardened-fs.js';
+import { getIronCurtainPackageRoot } from './docker-workload-paths.js';
 import {
   addDuplicateIssues,
   HEADER_NAME_REGEX,
@@ -244,12 +245,21 @@ export interface AuthorizedRegistryEgressRequest {
   readonly redirectHop: number;
 }
 
-/** Load a strict, non-writable, non-symlink manifest once, hash it for audit. */
-export function loadRegistryEgressManifest(path: string): LoadedRegistryEgressManifest {
-  const loaded = loadImmutableHostJson(path, {
+/**
+ * Load a strict, non-symlink manifest once, hash it for audit. The manifest
+ * ships in the package, so it is read under the package-asset ownership and
+ * mode rules below `packageRoot` (only tests override it): nobody but root,
+ * the current user or the package owner may be able to change it.
+ */
+export function loadRegistryEgressManifest(
+  path: string,
+  packageRoot: string = getIronCurtainPackageRoot(),
+): LoadedRegistryEgressManifest {
+  const loaded = loadPackageAssetJson(path, {
     label: 'registry-egress manifest',
     schema: registryEgressManifestSchema,
     maxBytes: MAX_REGISTRY_EGRESS_MANIFEST_BYTES,
+    packageRoot,
   });
   return {
     path: loaded.path,

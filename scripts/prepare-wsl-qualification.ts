@@ -4,7 +4,7 @@ import { rmSync } from 'node:fs';
 import { release } from 'node:os';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { loadUserConfig, type ResolvedUserConfig } from '../src/config/user-config.js';
+import { loadUserConfig, USER_CONFIG_DEFAULTS, type ResolvedUserConfig } from '../src/config/user-config.js';
 import { resolveDockerWorkloadConfig } from '../src/docker-workload/config.js';
 import { ensureDockerImage } from '../src/docker/docker-infrastructure.js';
 import type { AgentId } from '../src/docker/agent-adapter.js';
@@ -20,7 +20,7 @@ export async function prepareWslQualificationImages(
     const config: ResolvedUserConfig = {
       ...loadUserConfig({ readOnly: true }),
       containerRuntime: 'docker',
-      dockerResources: { memoryMb: 4096, cpus: 2 },
+      dockerResources: { memoryMb: 4096, cpus: 2, pidsLimit: USER_CONFIG_DEFAULTS.dockerResources.pidsLimit },
       dockerWorkload: resolveDockerWorkloadConfig(
         { enabled: true, networkAccess: 'offline' },
         { memoryMb: 4096, cpus: 2 },

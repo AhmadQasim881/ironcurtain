@@ -26,6 +26,7 @@ const version = "ironcurtain-fixed-relay-v1"
 const dockerDesktopHostGatewayAlias = "host.docker.internal"
 const fixedUnixTarget = "/run/ironcurtain-upstream.sock"
 const maxProxyHeaderBytes = 64 * 1024
+const proxyAuthorizationEnv = "IRONCURTAIN_FIXED_RELAY_PROXY_AUTHORIZATION"
 
 var errByteLimit = errors.New("relay byte limit reached")
 
@@ -72,6 +73,7 @@ func (w *boundedWriter) Write(contents []byte) (int, error) {
 
 func main() {
 	configuration, showVersion, err := parseConfig(os.Args[1:])
+	_ = os.Unsetenv(proxyAuthorizationEnv)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "configuration error: %v\n", err)
 		os.Exit(2)
@@ -110,7 +112,6 @@ func parseConfig(args []string) (config, bool, error) {
 	maxBytes := flags.Int64("max-bytes", 256*1024*1024, "maximum bytes in each direction")
 	maxDuration := flags.Duration("max-duration", 10*time.Minute, "maximum stream lifetime")
 	dialTimeout := flags.Duration("dial-timeout", 5*time.Second, "fixed-target dial timeout")
-	proxyAuthorization := flags.String("proxy-authorization", "", "fixed Proxy-Authorization header injected upstream")
 	showVersion := flags.Bool("version", false, "print version")
 	if err := flags.Parse(args); err != nil {
 		return config{}, false, err
@@ -168,7 +169,10 @@ func parseConfig(args []string) (config, bool, error) {
 	if *dialTimeout < 100*time.Millisecond || *dialTimeout > time.Minute {
 		return config{}, false, errors.New("dial-timeout must be between 100ms and 1m")
 	}
-	if err := validateProxyAuthorization(*proxyAuthorization); err != nil {
+	// The trusted Docker CLI passes this through its private environment, never
+	// a host/container command argument. main clears it before serving.
+	proxyAuthorization := os.Getenv(proxyAuthorizationEnv)
+	if err := validateProxyAuthorization(proxyAuthorization); err != nil {
 		return config{}, false, err
 	}
 	return config{
@@ -180,7 +184,7 @@ func parseConfig(args []string) (config, bool, error) {
 		maxBytes:           *maxBytes,
 		maxDuration:        *maxDuration,
 		dialTimeout:        *dialTimeout,
-		proxyAuthorization: *proxyAuthorization,
+		proxyAuthorization: proxyAuthorization,
 	}, false, nil
 }
 

@@ -1,6 +1,7 @@
 # Fetch Server & User Credentials
 
-**Status:** Proposed
+**Status (2026-11-14):** Implemented: the fetch server (`src/servers/fetch-server.ts`, with web search and the connect-time destination guard in `src/servers/guarded-fetch.ts`) and per-server credentials (`serverCredentials`).
+
 **Date:** 2026-02-19
 **Author:** IronCurtain Engineering
 **Depends on:** TB1a (Git Server Integration & Role Extensibility)
@@ -18,6 +19,7 @@ The `fetch-url` role (defined in `multi-server-onboarding.md`) is exercised by t
 Build a minimal custom server (`src/servers/fetch-server.ts`) rather than depending on the official Python fetch server or community alternatives.
 
 **Rationale:**
+
 - Full control over tool schema (inspectable arguments for policy)
 - No Python runtime dependency
 - Single file (~100 lines) using `@modelcontextprotocol/sdk`
@@ -56,13 +58,13 @@ Single `http_fetch` tool (GET-only):
 }
 ```
 
-**Implementation:** Uses Node's built-in `fetch` (undici). Zero external HTTP dependencies, trivial to sandbox inside bwrap. Does not execute JavaScript — serves static content only. A Playwright-based browser server can be added separately if JS rendering is needed in the future.
+**Implementation:** Uses undici's own `fetch` with a per-call undici `Agent` (the npm `undici` package, not Node's global `fetch`, which bundles a different undici that must not be mixed with an npm dispatcher); see Section 2.4. Does not execute JavaScript — serves static content only. A Playwright-based browser server can be added separately if JS rendering is needed in the future.
 
-Response includes status code, headers (selected), and body (truncated to `max_length`). By default, HTML responses are converted to markdown using `turndown` for readability. Set `raw_html: true` to inspect the original HTML. If `turndown` throws on malformed input, the server falls back to returning the raw HTML body.
+Response includes status code, the final URL (`url`), the same-origin redirects followed (`redirects`), headers (selected), and body (truncated to `max_length`). By default, HTML responses are converted to markdown using `turndown` for readability. The shipped tool replaced `raw_html` with `format: "markdown" | "text" | "html"`; `format: "html"` returns the original HTML. If `turndown` throws on malformed input, the server falls back to returning the raw HTML body. See Section 2.9 for decoding and binary content.
 
 The `headers` parameter is annotated with role `none` — the policy engine does not inspect header values. Header-level controls (e.g., blocking `Authorization` headers) are deferred.
 
-The fetch server injects a `User-Agent` header on every request: `IronCurtain/0.1 (AI Agent Runtime)`. This is applied *after* merging agent-provided headers, so the agent cannot override it. Server operators can use this to identify, rate-limit, or block AI agent traffic.
+The fetch server injects a `User-Agent` header on every request: `IronCurtain/0.1 (AI Agent Runtime)`. This is applied _after_ merging agent-provided headers, so the agent cannot override it. Server operators can use this to identify, rate-limit, or block AI agent traffic.
 
 ### 2.3 Server Configuration
 
@@ -80,6 +82,8 @@ The fetch server injects a `User-Agent` header on every request: `IronCurtain/0.
 ```
 
 `allowedDomains: ["*"]` means no OS-level network restriction. The policy engine controls what the agent is ALLOWED to fetch (semantic intent). The sandbox layer controls what the process CAN reach (containment). These are separate concerns — `"*"` at the sandbox level means the untrusted domain gate passes all domain-name URLs through to compiled rule evaluation. However, IP-address hostnames are **not** matched by `"*"` (see Section 2.4).
+
+**As shipped:** the fetch entry is `"sandbox": false` (srt's network sandbox blocks the Unix domain sockets tsx needs in dev mode), so the fetch server runs on the host without OS-level containment. With no `allowedDomains`, the policy engine gates fetch with its default `['*']` (Section 2.4): names pass to the compiled rules, IP literals escalate, and local or cloud-metadata hosts are denied structurally. The policy layer still sees only the requested URL and resolves no names, so the connect-time SSRF defence lives in the fetch server itself (Section 2.4).
 
 ### 2.4 SSRF Protection (Structural Invariant)
 
@@ -103,49 +107,78 @@ function isIpAddress(domain: string): boolean {
 }
 
 // In domainMatchesAllowlist:
-if (pattern === '*') return !isIpAddress(domain);  // was: return true
+if (pattern === '*') return !isIpAddress(domain); // was: return true
 ```
+
+`isIpAddress()` now delegates to `classifyHostLiteral()` in `src/net/address-policy.ts`, so every spelling the resolver or URL parser accepts counts as an IP: the inet_aton forms (`2130706433`, `127.1`, `0x7f000001`, `0177.0.0.1`), IPv6 bracketed or not, zone-scoped IPv6, and malformed literals. The regex above missed all but the dotted quad. Git remote hosts are canonicalized the same way before matching (see multi-server-onboarding.md section 4.2).
 
 **Resulting behavior by allowlist configuration:**
 
-| `allowedDomains` | Domain URL | IP URL | IP in explicit list |
-|---|---|---|---|
-| `["*"]` | domain gate pass → compiled rules | **escalate** | n/a |
-| `["*", "192.168.1.100"]` | domain gate pass → compiled rules | **escalate** (unless explicit match) | domain gate pass → compiled rules |
-| `["github.com"]` | escalate (unless match) | **escalate** | n/a |
-| not configured | domain gate skipped → compiled rules | domain gate skipped → compiled rules | n/a |
+| `allowedDomains`         | Domain URL                            | IP URL                               | IP in explicit list               |
+| ------------------------ | ------------------------------------- | ------------------------------------ | --------------------------------- |
+| `["*"]`                  | domain gate pass → compiled rules     | **escalate**                         | n/a                               |
+| `["*", "192.168.1.100"]` | domain gate pass → compiled rules     | **escalate** (unless explicit match) | domain gate pass → compiled rules |
+| `["github.com"]`         | escalate (unless match)               | **escalate**                         | n/a                               |
+| not configured           | default `["*"]` gate → compiled rules | **escalate**                         | n/a                               |
 
-**Note:** Servers with URL-category roles should always have an `allowedDomains` entry to ensure the untrusted domain gate SSRF protection fires. A config-load-time warning is emitted when a server's tools include `fetch-url` or `git-remote-url` roles but no `allowedDomains` is configured.
+**Default gate.** A server whose entry has no `allowedDomains` is gated by the engine's default `["*"]` (`DEFAULT_DOMAIN_GATE` in `policy-engine.ts`), so the table's first row applies to it: a compiled "allow" rule without a `domains` condition never admits an address literal. This replaced the config-load-time warning originally planned for a server with `fetch-url` or `git-remote-url` roles and no `allowedDomains`; the shipped fetch server has none (Section 2.3). A `fetch-url` value that is not an http(s) URL with a host (`file:///etc/passwd`, a bare `host:port`) is unverifiable and escalates on the gate.
 
-**Known limitation:** DNS rebinding (a domain resolving to a private IP) is not detected at the policy layer. This is a network-layer concern that srt/socat can address in a future enhancement.
+**Local and metadata destinations are denied, not escalated.** Whatever the allowlist or the compiled rules say, a `fetch-url` whose host is `localhost`, `*.localhost`, `*.local`, `*.internal` (including `metadata.google.internal`), another local name (`isLocalOrMetadataHostname` in `src/net/address-policy.ts`) or a metadata IP literal in any spelling (`169.254.169.254`, `fd00:ec2::254`, `100.100.100.200`, ...) is denied structurally (`structural-local-destination-deny`, `isLocalOrMetadataHost` in `domain-utils.ts`). Such a fetch reads credentials or unauthenticated local services, never web content, so no human approval is offered. Other private IP literals (`127.0.0.1`, `10.0.0.1`) only escalate, because `fetch.allowPrivateNetworks` (below) can legitimately admit a literal a human approves; `localhost` itself stays denied at the policy layer, so with the opt-in a loopback service is fetched by its IP literal.
+
+**Known limitation:** DNS rebinding (a domain resolving to a private IP) is not detected at the policy layer, which never resolves names. For the fetch server it is handled at connect time, below.
+
+#### Connect-time destination guard (`src/servers/guarded-fetch.ts`)
+
+Because the policy layer sees only the URL string, the fetch server screens every destination itself, on every request including the first:
+
+- **Names** resolve through `createGuardedLookup` (`src/net/address-policy.ts`), installed as the undici `Agent`'s `connect.lookup`. The whole answer set must be public and contain no metadata address (`isMetadataAddress`); any loopback, RFC 1918, CGNAT, link-local, metadata, ULA, multicast, documentation or IPv4-mapped/embedded private answer fails the lookup, and so does Azure's WireServer `168.63.129.16`, which is public. The socket connects to an address that passed the check, so DNS rebinding cannot swap it in between.
+- **IP literals** never reach a lookup (Node connects to them directly), so the URL host is screened with `screenIpLiteral` and `isMetadataAddress` before the request. WHATWG URL parsing has already canonicalized decimal, octal, hex and short IPv4 forms and IPv4-mapped IPv6.
+- **Local and metadata names** (`localhost`, `*.local`, `*.internal`, `metadata.google.internal`, ...) are refused before any lookup by `isLocalOrMetadataHostname`.
+
+**Private networks opt-in.** `fetch.allowPrivateNetworks: true` in `~/.ironcurtain/config.json` (default `false`) admits private destinations that the requested, policy-evaluated URL names literally: a private IP literal (RFC 1918, CGNAT, loopback, IPv6 ULA) or `localhost` / `*.localhost`, which the server pins to `127.0.0.1` / `::1` without a lookup. Link-local and metadata addresses (including the documented metadata and credential endpoints that sit inside the admitted ULA and CGNAT ranges: AWS's `fd00:ec2::254` and `fd00:ec2::23`, Google Cloud's `fd20:ce::254`, Oracle's `fd00:c1::a9fe:a9fe`, Akamai's `fd00:a9fe:a9fe::1`, Scaleway's `fd00:42::42` and Alibaba Cloud's `100.100.100.200`), metadata names, other local names and DNS answers in private ranges stay blocked even then, and redirects can never reach a different host (Section 2.5). The flag reaches the fetch server process only through its environment: `loadConfig()` always writes `IRONCURTAIN_FETCH_ALLOW_PRIVATE_NETWORKS` (`1` or `0`) into `mcpServers.fetch.env`, so the config file decides, and a server spawned without the variable blocks every non-public destination. No tool argument can change it. Tests use the same variable when they spawn the server.
 
 ### 2.5 Redirect Handling
 
-The fetch server follows redirects normally (up to 5 hops to prevent infinite loops). No per-hop policy re-evaluation — if the policy approved the initial URL, the domain's redirect decisions are trusted. This matches browser semantics and avoids false-positive blocks on CDN redirects, URL shorteners, and load balancers.
+> **Superseded.** The original design followed redirects with no per-hop policy re-evaluation and accepted that an allowed domain could redirect anywhere. In practice the `maxRedirections` hop cap was silently ignored by `fetch` (it followed up to the Fetch-spec limit of 20), agent-supplied headers survived cross-origin hops, and an allow-listed domain hosting user content or an open redirect could bounce a host-side fetch into loopback services or cloud metadata. The behaviour below replaces it.
 
-**Accepted risk:** A server at an allowed domain can redirect to an untrusted domain, and the response will be returned to the agent. This is the same trust model as a browser — approving navigation to a domain implicitly trusts its redirects.
+Requests use `redirect: 'manual'`, and the fetch server decides each hop itself:
+
+- **Same-origin redirects** (same scheme, host and port) are followed, at most 5 per call; a 6th is refused with a `REDIRECT_LIMIT` error. Each hop is re-validated (scheme, credentials, destination screen) and goes through the same connect-time guard. Because the origin is unchanged, the destination is still the one the policy evaluated, and agent-supplied headers go with it.
+- **Cross-origin redirects** are never followed. The result carries the 3xx status, an empty body and `redirect: { location, followed: false, reason: "cross-origin" }`, with the `Location` resolved to an absolute URL. If the agent wants the target, it calls `http_fetch` again, and that call is policy-evaluated, escalatable and audited like any other. Agent-supplied headers therefore never leave the evaluated origin.
+- Every result reports `url` (the URL whose response is returned) and `redirects` (each followed hop's status, URL and location), and errors raised mid-chain report the same, so the redirect path is visible to the agent and, for errors, in the audit log.
+
+This costs an extra tool call for common cross-origin redirects (`http` to `https`, apex to `www`) in exchange for every contacted origin being one the policy evaluated.
 
 ### 2.6 Response Limits
 
 Beyond `max_length` (character truncation of the response body), the fetch server enforces:
+
 - **Hard response size limit:** 10 MB maximum raw response body. Responses exceeding this are aborted mid-stream.
-- **Request timeout:** 30 seconds per request (server-side constant, not agent-configurable).
+- **Request timeout:** 30 seconds by default; the agent may choose 1–60 seconds with the `timeout` argument. The deadline covers the whole call: every redirect hop and the body.
 
 These prevent resource exhaustion from streaming endpoints or slow servers.
 
 ### 2.7 Constitution Updates
 
 ```markdown
- - The agent may fetch web content via HTTP GET from any domain for reading purposes.
+- The agent may fetch web content via HTTP GET from any domain for reading purposes.
 ```
 
 ### 2.8 Handwritten Scenarios
 
 ```typescript
-'Fetch GET from any domain -- allow'
-'Fetch with raw IP address URL -- escalate (SSRF protection)'
-'Unknown fetch tool -- deny (structural invariant)'
+'Fetch GET from any domain -- allow';
+'Fetch with raw IP address URL -- escalate (SSRF protection)';
+'Unknown fetch tool -- deny (structural invariant)';
 ```
+
+### 2.9 Response Decoding and Binary Content
+
+Implemented in `src/servers/fetch-content.ts`:
+
+- **Classification** by the `Content-Type` essence: `text/html` and `application/xhtml+xml` are HTML (converted per `format`); `text/*`, `*+json`, `*+xml` and the common textual `application/*` types are text; a missing type or `application/octet-stream` is sniffed (binary if the first bytes contain a byte that never occurs in text, or look like a PDF); everything else (images, audio, video, fonts, PDFs, archives) is binary.
+- **Binary** responses are never decoded. A body whose declared type is binary is not even downloaded; a sniffed one has been read (within the 10 MB cap). The result has an empty body and `binary: { contentType, size }`, where `size` is the bytes received when the body was sniffed, else the declared `Content-Length`, else `null`.
+- **Charset**: a byte order mark wins, then the `Content-Type` `charset` parameter, then the document's own declaration (`<meta charset>` or `<meta http-equiv="Content-Type" content="...; charset=...">` in the first 1024 bytes for HTML, the XML declaration for XML types), then UTF-8. Labels are resolved with `TextDecoder`, so `iso-8859-1` decodes as windows-1252 as in browsers; an unknown label falls back instead of failing.
 
 ## 3. User Credential Configuration
 
@@ -165,12 +198,12 @@ Extend `~/.ironcurtain/config.json` with a `serverCredentials` section:
 
   "serverCredentials": {
     "git": {
-      "GH_TOKEN": "ghp_xxxxxxxxxxxx"
+      "GH_TOKEN": "ghp_xxxxxxxxxxxx",
     },
     "fetch": {
-      "FETCH_API_KEY": "key_xxxxxxxxxxxx"
-    }
-  }
+      "FETCH_API_KEY": "key_xxxxxxxxxxxx",
+    },
+  },
 }
 ```
 
@@ -190,9 +223,7 @@ Later values override earlier ones. A user can override a default env var from `
 // src/config/user-config.ts
 const userConfigSchema = z.object({
   // ... existing fields ...
-  serverCredentials: z
-    .record(z.string(), z.record(z.string(), z.string().min(1)))
-    .optional(),
+  serverCredentials: z.record(z.string(), z.record(z.string(), z.string().min(1))).optional(),
 });
 
 export interface ResolvedUserConfig {
@@ -209,40 +240,55 @@ In `mergeWithDefaults()`, `serverCredentials` defaults to `{}` when absent from 
 
 The proxy runs as a separate child process (one per backend server via `SERVER_FILTER`). Server credentials flow through a carefully scoped pipeline:
 
-**Data path:** `config.userConfig.serverCredentials` -> `Sandbox.initialize()` -> per-server `proxyEnv.SERVER_CREDENTIALS` -> proxy-side env merge.
+**Data path:** `config.userConfig.serverCredentials` -> `Sandbox.initialize()` -> per-server `SERVER_CREDENTIALS` in that relay's environment block (`buildServerRelayEnv()`) -> the relay's backend environment (`buildBackendEnv()`).
 
 ```typescript
-// sandbox/index.ts -- pass ONLY the current server's credentials
-for (const serverName of Object.keys(config.mcpServers)) {
+// sandbox/index.ts (connectBackendSubprocesses) -- one relay per server,
+// each given ONLY its own server's config and credentials
+const relays = relayServerNames(config, osSandboxPlan).map((serverName) => {
   const serverCreds = config.userConfig.serverCredentials[serverName];
-  mcpServers[serverName] = {
-    // ...existing fields...
-    env: {
-      ...proxyEnv,
-      SERVER_FILTER: serverName,
-      // Per-server isolation: each proxy only receives its own credentials
-      ...(serverCreds ? { SERVER_CREDENTIALS: JSON.stringify(serverCreds) } : {}),
+  return {
+    serverName,
+    config: {
+      command: PROXY_COMMAND,
+      args: [...PROXY_ARGS],
+      // buildServerRelayEnv(): the host values of this server's `-e NAME`
+      // arguments, the shared proxyEnv block, then
+      //   MCP_SERVERS_CONFIG: JSON.stringify({ [serverName]: serverConfig }),
+      //   SERVER_FILTER: serverName,
+      //   SERVER_CREDENTIALS: JSON.stringify(serverCreds)   (when set)
+      env: buildServerRelayEnv(proxyEnv, serverName, config.mcpServers[serverName], serverCreds),
+      sandbox: false,
     },
   };
-}
+});
+// The relays start concurrently (RELAY_CONNECT_CONCURRENCY at a time) via
+// manager.connect(); MCPClientManager.connect() adds only the allowlist of
+// trusted-process/child-env.ts, never the host's process.env.
 
 // mcp-proxy-server.ts -- parse flat credential map, scrub from process.env
-const serverCredentials: Record<string, string> =
-  process.env.SERVER_CREDENTIALS ? JSON.parse(process.env.SERVER_CREDENTIALS) : {};
-delete process.env.SERVER_CREDENTIALS;  // Prevent leakage to MCP server children
+const serverCredentials: Record<string, string> = process.env.SERVER_CREDENTIALS
+  ? JSON.parse(process.env.SERVER_CREDENTIALS)
+  : {};
+delete process.env.SERVER_CREDENTIALS; // Prevent leakage to MCP server children
 
-// When spawning each MCP server:
+// When spawning each MCP server (buildBackendEnv):
 const spawnEnv = {
-  ...(process.env as Record<string, string>),
+  ...inheritedEnv(process.env, { passthroughNames: passthroughEnvNames(config.args), sshAgent: isGitBackend(serverName) }),
+  GIT_CEILING_DIRECTORIES: gitCeilingDirectories(serverCwd),
   ...(config.env ?? {}),
-  ...serverCredentials,  // flat map since we filtered per-server in sandbox
+  ...serverCredentials, // flat map since we filtered per-server in sandbox
+  ...oauthEnv,
 };
 ```
 
 **Security invariants:**
-1. Each proxy process receives credentials ONLY for its own server (least privilege).
+
+1. Each proxy process receives credentials ONLY for its own server (least privilege), and only its own server's configuration in `MCP_SERVERS_CONFIG`.
 2. `SERVER_CREDENTIALS` is deleted from `process.env` immediately after parsing, before any MCP server children are spawned.
-3. Credentials are merged last in the env chain, so they override both system env and static `mcp-servers.json` values.
+3. Credentials are merged after the inherited allowlist and the server's `env` block, so they override both system env and static `mcp-servers.json` values. One exception (2026-11): for the git backend the hardened git environment (`hardenGitBackendEnv`, `src/trusted-process/git-backend-env.ts`) is applied last, after the credentials, so no merged value can weaken it (`buildBackendEnv` in `src/trusted-process/mcp-proxy-server.ts`).
+4. Neither the relay nor the backend inherits the host environment: both get the allowlist of `src/trusted-process/child-env.ts` (system variables such as `PATH`, `HOME`, locale, temp, proxy and npm settings), plus, for a docker-style `-e NAME` argument, that one host variable. Provider API keys and other servers' tokens never reach a backend.
+5. A `-e NAME` variable counts as present when it is set in the host environment, the server's `env` block or its stored credentials (`isEnvVarProvided()`), so a server whose token exists only in `serverCredentials` starts instead of being skipped -- the same rule `ironcurtain doctor` reports.
 
 ### 3.6 Config File Permissions
 
@@ -259,17 +305,15 @@ Add `serverCredentials` to `SENSITIVE_FIELDS` to prevent the backfill mechanism 
 ```typescript
 const userConfigSchema = z.object({
   // ...existing fields...
-  serverCredentials: z
-    .record(z.string(), z.record(z.string(), z.string().min(1)))
-    .optional(),
+  serverCredentials: z.record(z.string(), z.record(z.string(), z.string().min(1))).optional(),
 });
 ```
 
 ### 3.9 Credential Masking
 
-MCP server stderr lines are scanned for known credential values before writing to the session log. Matching substrings are replaced with `***REDACTED***`. This is inline string replacement in the proxy's stderr handler — not a dedicated utility class.
+MCP server stderr lines are scanned for known credential values before writing to the session log. Matching substrings are replaced with `***REDACTED***`, longest value first. The values are the server's stored credentials, the OAuth variables the relay prepared for it, and each value of at least 8 characters that its environment holds for a variable its `-e NAME` arguments forward (a token exported in the shell, such as `GITHUB_PERSONAL_ACCESS_TOKEN`). This is plain string replacement, built per backend by `backendStderrRedactor()` in the relay (`src/trusted-process/mcp-proxy-server.ts`) and applied to streamed lines and to the startup stderr a failed connection quotes alike. Streamed stderr is redacted in whole lines (`lineBufferedText()`): a pipe can deliver one write in several chunks, and a value split between two of them would otherwise reach the log in two unmasked halves. Text after the last newline waits for the rest of its line, for the end of the stream, or until it exceeds 64 KiB.
 
-Audit log redaction is not implemented. The path from credential to tool argument is indirect (server echoes credential in response → enters LLM context → agent passes as argument) and unreliable to catch via string matching. See `docs/SECURITY_CONCERNS.md` §8 for the full threat analysis and design rationale.
+This design left the audit log unredacted: the path from credential to tool argument is indirect (server echoes credential in response → enters LLM context → agent passes as argument) and unreliable to catch via string matching. As implemented since, audit entries are redacted too, on by default (`auditRedaction.enabled`): `src/trusted-process/audit-redactor.ts` masks well-known key and token formats, and the exact credential values IronCurtain holds, collected by `src/trusted-process/audit-secrets.ts` (configured server credentials, provider API keys, OAuth tokens), are replaced wherever they appear in tool arguments and results. See `docs/SECURITY_CONCERNS.md` §8 for the threat analysis and the residual risk (a credential echoed in a tool response still reaches the LLM context unmasked).
 
 ## 4. Implementation Phases
 
@@ -278,12 +322,15 @@ Phase numbering continues from TB1a (phases 1–3).
 ### Phase 4: Fetch Server
 
 **New files:**
+
 - `src/servers/fetch-server.ts` -- minimal fetch MCP server using Node built-in `fetch` + `turndown`
 
 **New dependency:**
+
 - `turndown` -- HTML-to-markdown conversion (optional, controlled by `raw_html` parameter)
 
 **Files changed:**
+
 - `src/config/mcp-servers.json` -- add fetch server entry
 - `src/config/index.ts` -- stop filtering `*` in `extractServerDomainAllowlists()`
 - `src/config/constitution.md` -- add fetch-specific guidance
@@ -295,6 +342,7 @@ Phase numbering continues from TB1a (phases 1–3).
 ### Phase 5: User Credential Configuration
 
 **Files changed:**
+
 - `src/config/user-config.ts` -- add `serverCredentials` to schema, `ResolvedUserConfig`, `SENSITIVE_FIELDS`, and `mergeWithDefaults()` (default `{}`); set 0o600 permissions on config file creation; warn on world-readable permissions
 - `src/config/index.ts` -- validate `serverCredentials` keys against `mcp-servers.json` server names in `loadConfig()` (after both configs are loaded)
 - `src/trusted-process/mcp-proxy-server.ts` -- read `SERVER_CREDENTIALS` env var (flat per-server map), delete from `process.env` before spawning children, merge into spawn env; inline credential masking in stderr handler
@@ -315,7 +363,13 @@ Phase numbering continues from TB1a (phases 1–3).
 - `raw_html: true` returns original HTML without conversion
 - Response exceeding 10 MB hard limit is aborted
 - Request timeout fires after configured duration
-- Redirects followed up to 5 hops; infinite redirect loop returns error
+- Same-origin redirects followed up to 5 hops and reported; a 6th hop is refused
+- Cross-origin redirect returned (status and `location`), not followed; the target is never contacted
+- SSRF: redirects to 127.0.0.1 and 169.254.169.254 are not followed, and direct requests to them are refused
+- SSRF: a hostname resolving to loopback (or a mixed public/private answer set) is refused at connect time
+- SSRF: loopback, private, link-local and metadata IP literals in every textual form are refused; with `fetch.allowPrivateNetworks`, private literals and `localhost` are allowed but metadata stays refused
+- Agent-supplied `User-Agent` in any spelling is replaced
+- Latin-1 page decoded by `Content-Type` charset and by `<meta charset>`; XHTML treated as HTML; binary response returns metadata
 - SSRF: IP-address URLs escalated by policy engine (structural invariant)
 - SSRF: `*` wildcard does not match IP-address hostnames
 - SSRF: explicit IP in allowlist passes policy

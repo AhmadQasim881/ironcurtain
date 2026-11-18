@@ -194,11 +194,12 @@ describe('package build-trust staging', () => {
     expect(() => stageDockerBuildShim(BUNDLE_ID, 'packages', { ...options(), caGeneration: 'bad' })).toThrow(
       /CA generation/u,
     );
-    expect(stageDockerBuildShim(BUNDLE_ID, 'none', options())).toBeUndefined();
+    expect(stageDockerBuildShim(BUNDLE_ID, 'offline', options())).toBeUndefined();
+    expect(stageDockerBuildShim(BUNDLE_ID, 'images', options())).toBeUndefined();
   });
   it('removes staged authority with the bundle runtime root', () => {
     const staged = stageDockerBuildShim(BUNDLE_ID, 'packages', options())!;
-    removeBundleRuntimeRoot(BUNDLE_ID);
+    removeBundleRuntimeRoot(BUNDLE_ID, 'test teardown');
     expect(() => lstatSync(staged.artifacts[0].source)).toThrow(/ENOENT/u);
   });
 });

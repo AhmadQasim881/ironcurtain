@@ -1,9 +1,11 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import type { SessionDto, PersonaListItem, CreateSessionOptions } from '../../types.js';
+  import { formatCostUsd } from '$lib/format.js';
   import { Button } from '$lib/components/ui/button/index.js';
   import { Badge } from '$lib/components/ui/badge/index.js';
   import { Input } from '$lib/components/ui/input/index.js';
+  import { formatTrackedTokens, NO_EXCHANGES_OBSERVED_YET } from './usage-format.js';
 
   let {
     sessions,
@@ -143,9 +145,11 @@
         >
           <option value="">Default</option>
           {#each personas as persona (persona.name)}
-            <option value={persona.name} disabled={!persona.compiled}>
+            <!-- A stale policy no longer matches the persona's constitution; the daemon refuses it. -->
+            <option value={persona.name} disabled={!persona.compiled || persona.stale !== undefined}>
               {persona.name}{#if !persona.compiled}
-                (not compiled){/if}
+                (not compiled){:else if persona.stale !== undefined}
+                (policy stale){/if}
             </option>
           {/each}
         </select>
@@ -197,6 +201,7 @@
       </div>
     {/if}
     {#each [...sessions.values()] as session (session.label)}
+      {@const tokens = formatTrackedTokens(session.budget.totalTokens, session.budget)}
       <button
         data-testid="session-item-{session.label}"
         onclick={() => onselect(session.label)}
@@ -222,8 +227,10 @@
             Stopping…
           </div>
         {/if}
-        <div class="text-xs text-muted-foreground mt-1">
-          {session.turnCount} turns &middot; {session.budget.estimatedCostUsd.toFixed(2)}
+        <div class="text-xs text-muted-foreground mt-1" data-testid="session-usage-{session.label}">
+          {session.turnCount} turns{#if tokens !== undefined}
+            &middot; {tokens === NO_EXCHANGES_OBSERVED_YET ? tokens.toLowerCase() : `${tokens} tokens`}{/if}
+          &middot; {formatCostUsd(session.budget.estimatedCostUsd, session.budget.costSource)}
         </div>
         {#if session.hasPendingEscalation}
           <Badge variant="destructive" class="mt-1">escalation</Badge>

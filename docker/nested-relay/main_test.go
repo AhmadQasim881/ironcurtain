@@ -29,6 +29,7 @@ func TestBoundedWriterNeverForwardsOverflowByte(t *testing.T) {
 }
 
 func TestParseConfigAcceptsOnlyFixedIPv4Tuple(t *testing.T) {
+	t.Setenv(proxyAuthorizationEnv, testProxyAuthorization)
 	configuration, showVersion, err := parseConfig([]string{
 		"--listen", "172.31.44.2:8443",
 		"--target", "192.168.65.2:9443",
@@ -37,7 +38,6 @@ func TestParseConfigAcceptsOnlyFixedIPv4Tuple(t *testing.T) {
 		"--max-bytes", "1048576",
 		"--max-duration", "30s",
 		"--dial-timeout", "1s",
-		"--proxy-authorization", testProxyAuthorization,
 	})
 	if err != nil || showVersion {
 		t.Fatalf("parseConfig failed: showVersion=%v err=%v", showVersion, err)
@@ -48,11 +48,11 @@ func TestParseConfigAcceptsOnlyFixedIPv4Tuple(t *testing.T) {
 }
 
 func TestParseConfigAcceptsOnlyFrozenDockerDesktopHostAlias(t *testing.T) {
+	t.Setenv(proxyAuthorizationEnv, testProxyAuthorization)
 	configuration, showVersion, err := parseConfig([]string{
 		"--listen", "172.31.44.2:8443",
 		"--target", "host.docker.internal:9443",
 		"--allow-cidr", "172.31.44.0/24",
-		"--proxy-authorization", testProxyAuthorization,
 	})
 	if err != nil || showVersion {
 		t.Fatalf("parseConfig failed: showVersion=%v err=%v", showVersion, err)
@@ -63,7 +63,8 @@ func TestParseConfigAcceptsOnlyFrozenDockerDesktopHostAlias(t *testing.T) {
 }
 
 func TestParseConfigUnixTargetIsFixedAndExclusive(t *testing.T) {
-	base := []string{"--listen", "172.31.44.2:8443", "--allow-cidr", "172.31.44.0/24", "--proxy-authorization", testProxyAuthorization}
+	t.Setenv(proxyAuthorizationEnv, testProxyAuthorization)
+	base := []string{"--listen", "172.31.44.2:8443", "--allow-cidr", "172.31.44.0/24"}
 	configuration, _, err := parseConfig(append(append([]string{}, base...), "--target-unix", fixedUnixTarget))
 	if err != nil || configuration.targetNetwork != "unix" || configuration.targetAddress != fixedUnixTarget {
 		t.Fatalf("unexpected Unix target configuration: %#v err=%v", configuration, err)
@@ -101,8 +102,8 @@ func TestParseConfigRequiresCanonicalProxyAuthorization(t *testing.T) {
 		"--allow-cidr", "172.31.44.0/24",
 	}
 	for _, authorization := range []string{"", "Bearer secret", "Basic bm90LWlyb25jdXJ0YWlu"} {
-		args := append(append([]string{}, base...), "--proxy-authorization", authorization)
-		if _, _, err := parseConfig(args); err == nil {
+		t.Setenv(proxyAuthorizationEnv, authorization)
+		if _, _, err := parseConfig(base); err == nil {
 			t.Fatalf("expected proxy authorization rejection for %q", authorization)
 		}
 	}
@@ -264,4 +265,15 @@ func injectTestRequest(request string) (string, error) {
 	_ = server.Close()
 	<-done
 	return forwarded.String(), err
+}
+
+func TestParseConfigRefusesCredentialCommandArguments(t *testing.T) {
+	t.Setenv(proxyAuthorizationEnv, testProxyAuthorization)
+	_, _, err := parseConfig([]string{"--proxy-authorization", testProxyAuthorization})
+	if err == nil {
+		t.Fatal("credential command arguments must be refused")
+	}
+	if strings.Contains(err.Error(), testProxyAuthorization) {
+		t.Fatal("credential leaked through configuration error")
+	}
 }

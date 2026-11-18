@@ -1,25 +1,41 @@
 import {
   readFileSync,
+  readdirSync,
   existsSync,
   mkdirSync,
-  writeFileSync,
-  appendFileSync,
-  readdirSync,
   statSync,
   lstatSync,
   unlinkSync,
-  cpSync,
+  type Dirent,
 } from 'node:fs';
-import { resolve } from 'node:path';
+import { posix, relative, resolve, sep } from 'node:path';
 import { isWithinDirectory } from '../types/argument-roles.js';
 import { errorMessage } from '../utils/error-message.js';
 import { sha256Hex } from '../hash.js';
-import { MessageLog, type AgentRetryReason } from './message-log.js';
-import { resolveWorkflowResourceBudget, workflowBudgetUsage, type WorkflowBudget } from './resource-budget.js';
+import { hashUntrustedRegularFileBelow, readUntrustedRegularFileBelow, UntrustedFileError } from '../hardened-fs.js';
+import {
+  CHECKPOINT_SAVE_ERROR_CONTEXT,
+  HOST_MOUNT_SCAN_ERROR_CONTEXT,
+  MessageLog,
+  type AgentRetryReason,
+} from './message-log.js';
+import {
+  persistedWorkflowBudget,
+  resolveWorkflowResourceBudget,
+  workflowBudgetUsage,
+  workflowSessionBudgetOptions,
+  type WorkflowBudget,
+} from './resource-budget.js';
+import {
+  WorkflowUsageMeter,
+  findWorkflowBudgetBreach,
+  workflowUsageFromCheckpoint,
+  type WorkflowBudgetBreach,
+  type WorkflowUsage,
+} from './workflow-usage.js';
+import { describeCumulativeBudgetExhaustion, findCumulativeBudgetExhaustion } from '../session/budget-admission.js';
 import { isTerminalWorkflowPhase, terminalPhaseFromStateName } from './terminal-phase.js';
 import { createHash, type Hash } from 'node:crypto';
-import { execFile as execFileCb } from 'node:child_process';
-import { promisify } from 'node:util';
 import * as http from 'node:http';
 import { createActor, fromPromise, type AnyActorRef, type AnyStateMachine, type Snapshot } from 'xstate';
 import type {
@@ -36,14 +52,31 @@ import type {
   HumanGateStateDefinition,
   AgentStateDefinition,
   DeterministicStateDefinition,
+  WorkflowStateDefinition,
   AgentOutput,
+  WorkflowToolCallEscalation,
+  WorkflowToolCallEscalationDecision,
+  WorkflowToolCallEscalationOutcome,
+  WorkflowSettings,
 } from './types.js';
+import type { ToolCallRequest } from '../types/mcp.js';
+import type { WhitelistCandidateIpc } from '../trusted-process/approval-whitelist.js';
+import type {
+  EscalationPromptDetails,
+  EscalationPromptFn,
+  EscalationResult,
+} from '../trusted-process/tool-call-coordinator.js';
+import type { WorkflowCommitHandler } from '../trusted-process/workflow-commit-tool.js';
+import { WorkflowCommitChannel, type WorkflowCommitInvocation } from './workflow-commit.js';
 import {
   createWorkflowId,
+  isSafeWorkflowId,
   WORKFLOW_ARTIFACT_DIR,
   GLOBAL_PERSONA,
   DEFAULT_CONTAINER_SCOPE,
+  DEFAULT_GATE_IDLE_TIMEOUT_MINUTES,
   DETERMINISTIC_RESULT_ERROR_VERDICT,
+  MAX_DETERMINISTIC_TIMEOUT_MS,
   resolveWorkflowSkillsOptions,
 } from './types.js';
 import {
@@ -53,23 +86,43 @@ import {
   getBundleRuntimeRoot,
   getBundleStatesDir,
   getInvocationDir,
+  getWorkflowContainersDir,
+  getWorkflowWorkspaceLocksDir,
   nextStateSlug,
 } from '../config/paths.js';
 import { POLICY_LOAD_PATH } from '../trusted-process/control-server.js';
+import { EscalationWithdrawnError } from '../trusted-process/escalation-wait.js';
+import { boundReviewerText, MAX_REVIEWER_CONTEXT_CHARS } from '../trusted-process/escalation-context.js';
+import { toDisplayText } from '../terminal/display-sanitize.js';
 import { loadConfig, loadPersonaPolicyArtifacts } from '../config/index.js';
+import { applyReadOnlyWorkspace, READ_ONLY_OUTPUT_SERVER } from '../config/read-only-workspace.js';
+import type { ReadOnlyWorkspace } from '../types/read-only-workspace.js';
+import { readOnlyWorkspaceForScope, readOnlyWorkspaceForState } from './workspace-access.js';
 import { getBundleCapturesDir } from '../config/paths.js';
 import { validatePolicyDir } from '../config/validate-policy-dir.js';
-import type { ResolvedUserConfig } from '../config/user-config.js';
-import { getTokenStreamBus } from '../docker/token-stream-bus.js';
+import { requireTaskScopeDir } from '../config/task-scope-policy.js';
+import {
+  USER_CONFIG_DEFAULTS,
+  type ResolvedResourceBudgetConfig,
+  type ResolvedUserConfig,
+} from '../config/user-config.js';
+import type { IronCurtainConfig } from '../config/types.js';
+import { isWorkspaceValidationError, validateWorkspacePath } from '../session/workspace-validation.js';
+import { getLlmMetricsEventBus } from '../llm-metrics/event-bus.js';
 import { getPersonaDefinitionPath, resolvePersona } from '../persona/resolve.js';
+import { findPersonaOverridesProblem } from '../persona/persona-overrides.js';
 import { isMemoryEnabledForPersonaName } from '../persona/memory-gate.js';
 import { extractRequiredServers } from '../trusted-process/policy-roots.js';
 import { createPersonaName } from '../persona/types.js';
 import { MEMORY_SERVER_NAME } from '../memory/memory-annotations.js';
+import { GLOBAL_APPROVAL_SCOPE } from '../audit/approval-history.js';
 import type {
   AgentConversationId,
   AgentTurnResult,
   BundleId,
+  DiagnosticEvent,
+  EscalationRequest,
+  SendMessageOptions,
   Session,
   SessionId,
   SessionOptions,
@@ -82,13 +135,20 @@ import {
   type AgentId,
   type TransientFailureKind,
 } from '../docker/agent-adapter.js';
+import { resolveScopeDockerAgent, resolveStateDockerAgent, toAgentId } from './agent-harness.js';
 import {
   buildWorkflowExecCommand,
   ensureSecureBundleDir,
   type DockerInfrastructure,
+  type DockerInfrastructureTeardown,
 } from '../docker/docker-infrastructure.js';
+import { formatSessionNotice, type HostPrivilegedFilesDiagnostic } from '../session/startup-notices.js';
 import type { ContainerRuntime } from '../docker/types.js';
+import { runBoundedContainerCommand } from '../docker/turn-timeout.js';
 import {
+  buildAgentInvokeInput,
+  buildDeterministicInvokeInput,
+  buildFanOutInvokeInput,
   buildWorkflowMachine,
   truncateAgentOutput,
   type AgentInvokeInput,
@@ -105,49 +165,111 @@ import type { CheckpointStore } from './checkpoint.js';
 import {
   parseAgentStatus,
   AgentStatusParseError,
+  buildMissingCommitReprompt,
   buildStatusBlockReprompt,
   getValidVerdicts,
   buildInvalidVerdictReprompt,
   stripAgentStatusFences,
+  type WorkflowCommitPrompt,
 } from './status-parser.js';
 import {
   buildAgentCommand,
   buildAgentReplacementCommand,
+  artifactRepromptReadOnly,
   buildArtifactReprompt,
   buildStatusInstructions,
+  type AgentPromptOptions,
 } from './prompt-builder.js';
 import {
   DEFAULT_EVOLVE_LANE_DIR,
   DEFAULT_EVOLVE_LANE_RELATIVE_DIR,
+  MAX_FAN_OUT_LANES,
   evolveResultScriptIndex,
   evolveStepName,
   resolveFanOutWorkers,
 } from './lane-template.js';
-import { collectFilesRecursive, hasAnyFiles, snapshotArtifacts } from './artifacts.js';
+import { AgentSlotPool, AgentSlotRequestError, type AgentSlotLease, type AgentSlotUsage } from './agent-slot-pool.js';
+import {
+  ARTIFACT_WALK_LIMITS,
+  ensureWorkflowGitignored,
+  hasAnyFiles,
+  prepareWorkflowArtifactDir,
+  prepareWritableOutputDirs,
+  resolveArtifactOutputDir,
+  snapshotArtifacts,
+  walkTreeNoFollow,
+  type ArtifactDirCheck,
+  type WalkLimits,
+} from './artifacts.js';
 import {
   isExecutableState,
   isSafeWorkspaceRelativePath,
   parseArtifactRef,
+  usesSharedContainer,
   validateDefinition,
   validateWorkflowSkillReferences,
 } from './validate.js';
 import { parseDefinitionFile, getWorkflowPackageDir } from './discovery.js';
+import {
+  copyWorkflowStagedDirectory,
+  isOwnWorkflowRunsDirectory,
+  validatedWorkflowStagedDirectory,
+} from './staged-directories.js';
 import { resolveSkillsForSession } from '../skills/discovery.js';
 import type { ResolvedSkill } from '../skills/types.js';
 import { discoverWorkflowRuns } from './workflow-discovery.js';
-import { isCheckpointResumable } from './checkpoint.js';
+import {
+  isCheckpointResumable,
+  isWorkflowRunFileTooNewError,
+  rebaseRunLocalPaths,
+  RUN_SCRIPTS_DIRNAME,
+  RUN_SKILLS_DIRNAME,
+  RUN_WORKSPACE_DIRNAME,
+} from './checkpoint.js';
+import { readRunDefinitionRaw, runDefinitionPath, writeRunDefinition } from './run-definition.js';
 import {
   AgentInvocationError,
+  GateResolutionError,
+  WorkflowBudgetExhaustedError,
   WorkflowQuotaExhaustedError,
   WorkflowTransientFailureError,
   WorkflowResumeError,
   isWorkflowQuotaExhaustedError,
   isWorkflowTransientFailureError,
 } from './errors.js';
-import { commitContainerSnapshot, removeContainerSnapshotImages } from './container-snapshots.js';
+import { acceptedGateEvents, assertGateResolutionAllowed, isGateIdFor, mintGateId } from './gate-binding.js';
+import {
+  commitContainerSnapshot,
+  isContainerSnapshotSkippedError,
+  removeContainerSnapshotImages,
+} from './container-snapshots.js';
 import { commandExists } from '../trusted-process/container-command.js';
+import { DEFAULT_EXEC_TIMEOUT_MS } from '../docker/docker-manager.js';
+import {
+  describeHostCommandFailure,
+  describeProgram,
+  hostCommandSucceeded,
+  runHostCommand,
+} from './host-command-runner.js';
+import {
+  claimWorkflowRunLock,
+  claimWorkflowWorkspaceLock,
+  isWorkflowLockBusyError,
+  isWorkflowRunLockHeld,
+  releaseWorkflowLock,
+} from './run-lock.js';
+import type { ProcessLockHandle } from '../docker-workload/process-lock.js';
 
-const execFileAsync = promisify(execFileCb);
+/**
+ * How every agent turn of a workflow state is sent. The prompt is built by
+ * the orchestrator (prompt-builder.ts) from the workflow definition, the
+ * task, gate feedback and the previous states' output, so text an upstream
+ * agent wrote is part of it. A `'system'` turn is never recorded as the
+ * trusted user context the auto-approver matches escalations against (see
+ * `Session.sendMessage`): the session clears that context instead, so no
+ * agent's words can authorize an escalation in a later state.
+ */
+export const WORKFLOW_AGENT_TURN: SendMessageOptions = Object.freeze({ origin: 'system' });
 
 // ---------------------------------------------------------------------------
 // Transition message truncation
@@ -163,6 +285,24 @@ const TRANSITION_TRUNCATION_NOTICE = '\n\n[... truncated]';
  * surface fast rather than wedge the workflow.
  */
 const LOAD_POLICY_RPC_TIMEOUT_MS = 10_000;
+
+/**
+ * Below this much remaining snapshot budget a stop skips the commit instead of
+ * starting one that would be killed almost at once.
+ */
+const MIN_SNAPSHOT_COMMIT_MS = 1_000;
+
+/**
+ * Entries into `state` so far, as the machine counts them (agent states
+ * only; other states count none). Read defensively: the context can come
+ * from a checkpoint written by an older build.
+ */
+function visitCountOf(snapshot: { readonly context: unknown }, state: string): number {
+  const visitCounts = (snapshot.context as { readonly visitCounts?: unknown } | undefined)?.visitCounts;
+  if (typeof visitCounts !== 'object' || visitCounts === null || !Object.hasOwn(visitCounts, state)) return 0;
+  const count: unknown = (visitCounts as Readonly<Record<string, unknown>>)[state];
+  return typeof count === 'number' ? count : 0;
+}
 
 function truncateForTransition(text: string | null | undefined): string | undefined {
   if (!text) return undefined;
@@ -216,6 +356,8 @@ type RoundChildDrainTrigger = Pick<RoundChildOutcome, 'index' | 'status' | 'cont
  * guard the drain loop checks so a lane that already settled is never drained;
  * `drain` is the external resolver that natural-settle alone cannot express
  * (see {@link waitForRoundChild} for why `xstate.waitFor` does not fit).
+ * `stop` is the abort-time resolver: it stops the lane like `drain` but
+ * without a peer trigger, because the whole run is stopping (see `abort()`).
  */
 interface RoundChildWaiter {
   readonly index: number;
@@ -223,6 +365,7 @@ interface RoundChildWaiter {
   readonly promise: Promise<RoundChildOutcome>;
   readonly isSettled: () => boolean;
   readonly drain: (trigger: RoundChildDrainTrigger) => void;
+  readonly stop: () => void;
 }
 
 /**
@@ -256,6 +399,20 @@ type FanOutDbReconstructionResult =
   | { readonly kind: 'unavailable' }
   | { readonly kind: 'ready'; readonly reconstruction: FanOutDbReconstruction }
   | { readonly kind: 'error'; readonly error: string };
+
+/**
+ * The step of a fan-out batch that failed, as named in the message log
+ * (`fan-out "<state>" <stage>`). `configuration` and `preflight` refuse the
+ * batch before any lane starts.
+ */
+type FanOutFailureStage =
+  | 'configuration'
+  | 'preflight'
+  | 'batch reconstruction'
+  | 'lane preparation'
+  | 'join'
+  | 'cognition promotion'
+  | 'stop signals';
 
 /**
  * Crash-resume overrides threaded into the barrier `sample_batch`: `batchIndex`
@@ -297,29 +454,48 @@ function tryParseAgentStatus(responseText: string): ParseResult {
 }
 
 /**
- * Conservative between-turn admission check for recovery work. Session limits
- * remain per-turn; a completed turn may take cumulative usage past the same
- * threshold, but no later recovery turn is launched once that is visible.
- *
- * Deliberately excludes `maxSessionSeconds`. That limit is defined per-turn
- * (`ResourceBudgetTracker` compares it against the current turn's elapsed
- * time), so summing every turn's active time against it would silently convert
- * a per-turn cap into a ceiling on the state's total duration. Agent states are
- * expected to run for hours across many turns; the token, step, and cost
- * limits already stop the pointless-retry case this check exists for.
+ * Conservative between-turn admission check, applied before a state's primary
+ * turn and before every recovery, replacement and artifact-retry turn. Session
+ * limits remain per-turn; a completed turn may take cumulative usage past the
+ * same threshold, but no later turn is launched once that is visible.
+ * Host-derived numbers only (an agent's self-reported cost never counts); see
+ * `session/budget-admission.ts` for the rationale and for why
+ * `maxSessionSeconds` is excluded.
  */
 function cumulativeBudgetExhaustionReason(session: Session): string | undefined {
-  const { cumulative, limits, tokenTrackingAvailable } = session.getBudgetStatus();
-  if (tokenTrackingAvailable && limits.maxTotalTokens != null && cumulative.totalTokens >= limits.maxTotalTokens) {
-    return `token budget exhausted (${cumulative.totalTokens}/${limits.maxTotalTokens})`;
-  }
-  if (limits.maxSteps != null && cumulative.stepCount >= limits.maxSteps) {
-    return `step budget exhausted (${cumulative.stepCount}/${limits.maxSteps})`;
-  }
-  if (limits.maxEstimatedCostUsd != null && cumulative.estimatedCostUsd >= limits.maxEstimatedCostUsd) {
-    return `cost budget exhausted ($${cumulative.estimatedCostUsd.toFixed(2)}/$${limits.maxEstimatedCostUsd.toFixed(2)})`;
-  }
-  return undefined;
+  const exhaustion = findCumulativeBudgetExhaustion(session.getBudgetStatus());
+  return exhaustion === undefined ? undefined : describeCumulativeBudgetExhaustion(exhaustion);
+}
+
+/**
+ * True for a turn the session stopped while it ran: at its per-turn
+ * wall-clock limit, or because the bundle's MITM budget gate refused a
+ * completion (`turnStopped`). Matched by the error-code discriminant (not
+ * `instanceof`) so the workflow layer does not depend on the session module
+ * that threw it.
+ */
+function isStoppedTurnBudgetExhaustion(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return false;
+  const { code, dimension, turnStopped } = err as { code?: unknown; dimension?: unknown; turnStopped?: unknown };
+  return code === 'BUDGET_EXHAUSTED' && (dimension === 'wall_clock' || turnStopped === true);
+}
+
+/**
+ * Gate idle timeout of a raise, in minutes, or undefined when the run waits
+ * for its decision indefinitely: the workflow's `gateIdleTimeoutMinutes`
+ * when set (`null` disables the timeout), otherwise
+ * `DEFAULT_GATE_IDLE_TIMEOUT_MINUTES` for a run that holds a shared
+ * container at the gate. A run that holds nothing keeps waiting by default:
+ * stopping it would release nothing. Exported for tests.
+ */
+export function resolveGateIdleTimeoutMinutes(
+  settings: WorkflowSettings | undefined,
+  holdsContainer: boolean,
+): number | undefined {
+  const configured = settings?.gateIdleTimeoutMinutes;
+  if (configured === null) return undefined;
+  if (configured !== undefined) return configured;
+  return holdsContainer ? DEFAULT_GATE_IDLE_TIMEOUT_MINUTES : undefined;
 }
 
 /**
@@ -328,13 +504,41 @@ function cumulativeBudgetExhaustionReason(session: Session): string | undefined 
  * Used for critical error messages that MUST reach the terminal.
  */
 function writeStderr(message: string): void {
-  process.stderr.write(`${message}\n`);
+  process.stderr.write(`${toDisplayText(message, { maxLength: 4096 })}\n`);
+}
+
+/**
+ * The host-mount findings a bundle teardown resolved with
+ * (`DockerInfrastructureTeardown.privilegedFiles`); a stub teardown resolves
+ * with none.
+ */
+function teardownPrivilegedFiles(teardown: unknown): HostPrivilegedFilesDiagnostic | undefined {
+  if (typeof teardown !== 'object' || teardown === null) return undefined;
+  return (teardown as DockerInfrastructureTeardown).privilegedFiles;
+}
+
+/** True when `path` names an existing directory (following symlinks). */
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** True when `path` itself is a directory, not a symlink to one. */
+function isRealDirectory(path: string): boolean {
+  try {
+    return lstatSync(path).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 /** Per-run subdirectory name for the staged copy of the workflow's bundled `skills/` tree. */
-const STAGED_WORKFLOW_SKILLS_SUBDIR = 'workflow-skills';
+const STAGED_WORKFLOW_SKILLS_SUBDIR = RUN_SKILLS_DIRNAME;
 /** Per-run subdirectory name for the staged copy of workflow helper scripts. */
-const STAGED_WORKFLOW_SCRIPTS_SUBDIR = 'workflow-scripts';
+const STAGED_WORKFLOW_SCRIPTS_SUBDIR = RUN_SCRIPTS_DIRNAME;
 
 /**
  * Workspace-relative segments of the evolve engine's per-step code directory:
@@ -349,6 +553,31 @@ const STAGED_WORKFLOW_SCRIPTS_SUBDIR = 'workflow-scripts';
  */
 const EVOLVE_STEP_CODE_PATH_SEGMENTS = ['.evolve_runs', 'main', 'steps'] as const;
 const EVOLVE_STEP_CODE_FILENAME = 'code';
+
+// Caps for host-side reads of agent-writable workspace files. Every such read
+// goes through the no-follow, non-blocking, bounded helpers in hardened-fs: a
+// container can replace any of these paths with a FIFO, a symlink to
+// /dev/zero or a symlinked directory, and a blocking or unbounded read here
+// would hang or crash the daemon hosting every other workflow and session.
+/** A deterministic state's `resultFile` (a small JSON verdict envelope). */
+const MAX_RESULT_FILE_BYTES = 1024 * 1024;
+/** The evolve engine's `database_data/nodes.json` node map. */
+const MAX_EVOLVE_NODES_BYTES = 64 * 1024 * 1024;
+/** One fan-out candidate source (`steps/<step>/code`), hashed for duplicate stats. */
+const MAX_EVOLVE_CANDIDATE_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Bounds for the workspace-root listing behind stall detection. Larger than
+ * {@link ARTIFACT_WALK_LIMITS} because a code workspace is legitimately bigger
+ * than one artifact directory; past it the listing is partial (and the hash
+ * says so), which can only make a stall go undetected.
+ */
+const WORKSPACE_HASH_LIMITS: WalkLimits = { maxEntries: 200_000, maxDepth: 64 };
+
+/** The only guard that reads `AgentInvokeResult.outputHash` (machine-builder). */
+const STALL_GUARD = 'isStalled';
+/** `outputHash` for a state with no `isStalled` transition: nothing reads it, so nothing is walked. */
+const OUTPUT_HASH_NOT_COMPUTED = '';
 
 /**
  * Stages the workflow package's `skills/` tree into the run directory
@@ -395,9 +624,7 @@ function stageWorkflowSubdir(
   const source = resolve(packageDir, sourceSubdir);
   if (!existsSync(source)) return undefined;
 
-  const stagedDir = resolve(runMetaDir, stagedSubdir);
-  cpSync(source, stagedDir, { recursive: true });
-  return stagedDir;
+  return copyWorkflowStagedDirectory(source, runMetaDir, stagedSubdir === RUN_SKILLS_DIRNAME ? 'skills' : 'scripts');
 }
 
 /**
@@ -423,12 +650,18 @@ function resolveWorkflowSkillsDirOnResume(opts: {
   checkpointedStagedDir: string | undefined;
   packageDir: string;
   runMetaDir: string;
+  allowPackageRecovery: boolean;
 }): string | undefined {
-  const { workflowId, checkpointedStagedDir, packageDir, runMetaDir } = opts;
+  const { workflowId, checkpointedStagedDir, packageDir, runMetaDir, allowPackageRecovery } = opts;
 
   if (checkpointedStagedDir !== undefined && existsSync(checkpointedStagedDir)) {
-    return checkpointedStagedDir;
+    const staged = validatedWorkflowStagedDirectory(runMetaDir, checkpointedStagedDir, 'skills');
+    if (staged === undefined)
+      throw new WorkflowResumeError('WORKFLOW_NOT_RESUMABLE', 'Invalid workflow-skills staging directory');
+    return staged;
   }
+
+  if (!allowPackageRecovery) return undefined;
 
   try {
     const restaged = stageWorkflowSkillsAtStart(packageDir, runMetaDir);
@@ -459,12 +692,18 @@ function resolveWorkflowScriptsDirOnResume(opts: {
   checkpointedStagedDir: string | undefined;
   packageDir: string;
   runMetaDir: string;
+  allowPackageRecovery: boolean;
 }): string | undefined {
-  const { workflowId, checkpointedStagedDir, packageDir, runMetaDir } = opts;
+  const { workflowId, checkpointedStagedDir, packageDir, runMetaDir, allowPackageRecovery } = opts;
 
   if (checkpointedStagedDir !== undefined && existsSync(checkpointedStagedDir)) {
-    return checkpointedStagedDir;
+    const staged = validatedWorkflowStagedDirectory(runMetaDir, checkpointedStagedDir, 'scripts');
+    if (staged === undefined)
+      throw new WorkflowResumeError('WORKFLOW_NOT_RESUMABLE', 'Invalid workflow-scripts staging directory');
+    return staged;
   }
+
+  if (!allowPackageRecovery) return undefined;
 
   try {
     const restaged = stageWorkflowScriptsAtStart(packageDir, runMetaDir);
@@ -495,6 +734,39 @@ function resolveWorkflowScriptsDirOnResume(opts: {
   return undefined;
 }
 
+/**
+ * The audit log path of every bundle the run's earlier legs minted
+ * (`containers/<bundleId>/audit.jsonl`; a file need not exist). Listed at
+ * resume, before the resumed leg mints any bundle, so it names exactly the
+ * earlier legs' bundles (see `WorkflowInstance.priorBundleAuditLogPaths`).
+ *
+ * Only a coordinator with taint escalation enabled reads these files. A
+ * containers directory that cannot be listed is returned itself, so that
+ * replay fails closed (a directory or an unreadable path taints the
+ * session) instead of silently restoring nothing.
+ */
+function listPriorBundleAuditLogPaths(workflowId: WorkflowId): readonly string[] {
+  let containersDir: string;
+  try {
+    containersDir = getWorkflowContainersDir(workflowId);
+  } catch {
+    // An id that is not a path-safe slug cannot mint a bundle either (every
+    // bundle path asserts the same), so there is nothing to replay.
+    return [];
+  }
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(containersDir, { withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    return [containersDir];
+  }
+  return entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => resolve(containersDir, entry.name, 'audit.jsonl'))
+    .sort();
+}
+
 // ---------------------------------------------------------------------------
 // Public interfaces
 // ---------------------------------------------------------------------------
@@ -515,6 +787,8 @@ export interface WorkflowTabHandle {
  */
 export interface CreateWorkflowInfrastructureInput {
   readonly workflowId: WorkflowId;
+  /** Actual run root from the orchestrator, independent of checkpoint paths. */
+  readonly workflowRunDir?: string;
   /**
    * Stable key for this bundle. Minted by the orchestrator via
    * `createBundleId()` before the factory is invoked so both the
@@ -554,8 +828,27 @@ export interface CreateWorkflowInfrastructureInput {
    * See `docs/designs/workflow-session-identity.md` §2.5.
    */
   readonly scope: string;
-  /** Union of MCP server names required across every agent state in this scope. */
+  /**
+   * Union of MCP server names required across every agent state in this
+   * scope. The orchestrator never adds the memory server to it, and the
+   * default factory refuses to start one even if a compiled policy names
+   * it: see `getRequiredServersForScope`.
+   */
   readonly requiredServers: ReadonlySet<string>;
+  /**
+   * Widest fan-out (lane count) of any segment that runs in this scope, or
+   * 1 when none does. The default factory hands it to the bundle's
+   * coordinator (`ToolCallCoordinatorOptions.maxLanes`): each lane's agent
+   * connection gets its own circuit-breaker window, and this bounds the
+   * all-lanes total. Stub factories may ignore it.
+   */
+  readonly maxLanes: number;
+  /**
+   * The run's task scope (`--task-scoped`), canonical and validated. The
+   * bundle's coordinator intersects it with every persona policy it loads;
+   * absent for an unscoped run.
+   */
+  readonly taskPolicyDir?: string;
   /**
    * Initial skills staged at bundle creation (user + workflow only).
    * Persona skills are layered in per-state via `bundle.restageSkills`.
@@ -563,8 +856,64 @@ export interface CreateWorkflowInfrastructureInput {
   readonly resolvedSkills?: readonly ResolvedSkill[];
   /** Per-run staged workflow scripts directory to mount read-only in the bundle. */
   readonly workflowScriptsDir?: string;
-  /** Optional immutable snapshot image digest to use for the main container. */
+  /**
+   * Optional immutable snapshot image digest to use for the main container,
+   * with the agent image build it was committed from. The bundle uses it only
+   * when it resolves that same build (see `selectResumableSnapshot`).
+   */
   readonly baseImageOverride?: string;
+  /** `ContainerSnapshotRef.agentBuildHash` of {@link baseImageOverride}. */
+  readonly baseImageAgentBuildHash?: string;
+  /**
+   * `ContainerSnapshotRef.agentSudo` of {@link baseImageOverride}, when the
+   * snapshot recorded it. A bundle planned with `agentSudo: false` uses only a
+   * snapshot recorded as taken without sudo.
+   */
+  readonly baseImageAgentSudo?: boolean;
+  /**
+   * In-process escalation handler for the bundle's coordinator. The
+   * orchestrator binds it to the workflow instance so a tool call that
+   * policy escalates inside the shared container surfaces as a
+   * {@link WorkflowToolCallEscalation} (lifecycle event, `getStatus`
+   * consumers, `resolveToolCallEscalation`) instead of being denied for
+   * lack of a handler. The default factory hands it to
+   * `createDockerInfrastructure`; stub factories may ignore it.
+   */
+  readonly onEscalation?: EscalationPromptFn;
+  /**
+   * The run's effective resource limits (`WorkflowBudget.limits`). The
+   * bundle's MITM budget gate enforces their token and cost caps on every
+   * lane of the scope together. Absent: the loaded config's limits apply.
+   */
+  readonly resourceBudget?: ResolvedResourceBudgetConfig;
+  /**
+   * Audit logs of the bundles a resumed run's earlier legs minted (empty
+   * for a run that was not resumed). The default factory sets them as
+   * `IronCurtainConfig.taintReplayAuditLogPaths`, so with taint escalation
+   * enabled the bundle's coordinator starts tainted when the run had read
+   * untrusted content before it was resumed.
+   */
+  readonly taintReplayAuditLogPaths?: readonly string[];
+  /**
+   * The bundle's commit channel: the target of its coordinator's
+   * `workflow_commit` tool. Every agent state that borrows the bundle
+   * commits its result through it. The default factory hands it to
+   * `createDockerInfrastructure`; the coordinator then registers the tool
+   * and calls `attach()`. A factory that ignores it leaves the channel
+   * unattached, and the bundle's states fall back to the YAML status block.
+   */
+  readonly workflowCommit?: WorkflowCommitHandler;
+  /**
+   * Present when the scope's agent states are read-only
+   * (`workspaceAccess: read-only`, see `readOnlyWorkspaceForScope`): the
+   * bundle mounts `/workspace` read-only, runs without nested Docker, and its
+   * coordinator denies every change outside these writable directories (the
+   * scope's `.workflow/<output>` directories) under every persona it loads.
+   * The default factory applies it with `applyReadOnlyWorkspace` and the
+   * bundle records it (`DockerInfrastructure.readOnlyWorkspace`); a read-only
+   * state refuses a bundle from a factory that ignored it.
+   */
+  readonly readOnlyWorkspace?: ReadOnlyWorkspace;
 }
 
 /** Inputs for starting the coordinator's HTTP control server on a workflow bundle. */
@@ -603,12 +952,31 @@ export interface WorkflowOrchestratorDeps {
   readonly checkpointStore: CheckpointStore;
 
   /**
-   * Resolved user config. Consulted by `getRequiredServersForScope` to
-   * decide whether to mint the memory relay for a shared-container
-   * bundle (memory is opt-in per persona; see
-   * docs/designs/per-persona-memory-optin.md).
+   * Resolved user config. Consulted for container snapshots and, when a
+   * shared-container bundle is minted, to report the personas in its
+   * scope that have memory enabled but run without it: shared-container
+   * bundles start no memory server (see `reportUnavailableMemory` and
+   * docs/designs/per-persona-memory-optin.md §1.2).
    */
   readonly userConfig: ResolvedUserConfig;
+
+  /**
+   * Protected paths (`IronCurtainConfig.protectedPaths`) that
+   * `validateWorkspacePath()` checks a caller-supplied workspace against,
+   * in `start()` and when `resume()` meets a checkpoint whose workspace is
+   * not the run's derived default. When omitted, the orchestrator loads
+   * them from `loadConfig()` at validation time.
+   */
+  readonly protectedPaths?: readonly string[];
+
+  /**
+   * Directory of the cross-process workspace locks (see
+   * `src/workflow/run-lock.ts`). Every orchestrator that may share a
+   * workspace must use the same directory; defaults to
+   * `{home}/workflow-workspace-locks`. The run lock always lives in the run's
+   * own directory under `baseDir`.
+   */
+  readonly workspaceLockDir?: string;
 
   /**
    * Factory for creating a workflow-scoped Docker infrastructure bundle.
@@ -624,9 +992,12 @@ export interface WorkflowOrchestratorDeps {
    * workflow terminal states, abort, and shutdownAll. When omitted, the
    * orchestrator loads the default implementation lazily from
    * `src/docker/docker-infrastructure.ts`. Tests override this to avoid
-   * touching real Docker resources.
+   * touching real Docker resources. Resolves with what the teardown found
+   * for the user (`DockerInfrastructureTeardown`, as
+   * `destroyDockerInfrastructure` does: the run records it in its message
+   * log); a stub may resolve with nothing.
    */
-  readonly destroyWorkflowInfrastructure?: (infra: DockerInfrastructure) => Promise<void>;
+  readonly destroyWorkflowInfrastructure?: (infra: DockerInfrastructure) => Promise<unknown>;
 
   /**
    * Attaches the coordinator's HTTP control server to the workflow
@@ -659,6 +1030,18 @@ export interface WorkflowOrchestratorDeps {
    * See docs/designs/mitm-token-trajectory-capture.md §10.
    */
   readonly captureTracesOverride?: boolean;
+
+  /**
+   * Cap on concurrent workflow agent environments (see
+   * `agent-slot-pool.ts`): every shared-container run reserves slots for
+   * its bundles before the first mint, every other agent session takes one
+   * for its lifetime, and both wait while the cap is reached. When omitted
+   * the orchestrator builds its own pool from
+   * `userConfig.maxConcurrentAgentSessions`; the daemon runs all workflows
+   * through one orchestrator, so that pool is daemon-wide. Tests inject a
+   * small pool to observe queueing.
+   */
+  readonly agentSlots?: AgentSlotPool;
 }
 
 /** Lifecycle events emitted by the orchestrator. */
@@ -680,6 +1063,23 @@ export type WorkflowLifecycleEvent =
     }
   | { readonly kind: 'gate_raised'; readonly workflowId: WorkflowId; readonly gate: HumanGateRequest }
   | { readonly kind: 'gate_dismissed'; readonly workflowId: WorkflowId; readonly gateId: string }
+  /**
+   * A tool call escalated by policy during an agent state now waits for a
+   * human. The agent is blocked inside the call until it is resolved via
+   * `resolveToolCallEscalation` or expires at the escalation timeout.
+   */
+  | {
+      readonly kind: 'tool_call_escalation_raised';
+      readonly workflowId: WorkflowId;
+      readonly escalation: WorkflowToolCallEscalation;
+    }
+  /** Pairs 1:1 with `tool_call_escalation_raised`; `expired` means nobody decided. */
+  | {
+      readonly kind: 'tool_call_escalation_resolved';
+      readonly workflowId: WorkflowId;
+      readonly escalationId: string;
+      readonly outcome: WorkflowToolCallEscalationOutcome;
+    }
   | {
       readonly kind: 'agent_started';
       readonly workflowId: WorkflowId;
@@ -720,6 +1120,8 @@ export type WorkflowLifecycleEvent =
 /** Extended workflow detail for the web UI. */
 export interface WorkflowDetail {
   readonly budget?: WorkflowBudget;
+  /** Run-wide usage: tokens by kind, cost, active time and tracking status. */
+  readonly usage?: WorkflowUsage;
   readonly definition: WorkflowDefinition;
   readonly transitionHistory: readonly TransitionRecord[];
   readonly workspacePath: string;
@@ -727,29 +1129,163 @@ export interface WorkflowDetail {
     readonly taskDescription: string;
     readonly round: number;
     readonly maxRounds: number;
+    /** Run-wide total tokens (`usage.totalTokens`). */
     readonly totalTokens: number;
     readonly visitCounts: Record<string, number>;
   };
 }
 
+/** Terminal reason recorded by `abort()` when the caller names none. */
+export const DEFAULT_WORKFLOW_ABORT_REASON = 'Workflow aborted by user';
+
+/** Options for stopping runs (`abort`, `shutdownAll`). */
+export interface WorkflowStopOptions {
+  /**
+   * Recorded as the terminal `reason` in the checkpoint, the `failed`
+   * lifecycle event and the tab, so a daemon shutdown or an interrupt is not
+   * mislabeled as a user abort. Defaults to {@link DEFAULT_WORKFLOW_ABORT_REASON}.
+   */
+  readonly reason?: string;
+  /**
+   * Upper bound, in milliseconds, on the time one run spends committing its
+   * `snapshotOnStop` container snapshots. Each scope's commit gets what is
+   * left of the budget as its timeout, and scopes the budget no longer covers
+   * stop without a snapshot (resume then starts them fresh). Callers that
+   * must exit by a deadline (a signal handler's force exit, systemd's stop
+   * timeout) pass one; without it every commit gets the default 10-minute
+   * timeout.
+   */
+  readonly snapshotBudgetMs?: number;
+}
+
+/** Optional settings for {@link WorkflowController.start}. */
+export interface WorkflowStartOptions {
+  /**
+   * Task scope of the run (`--task-scoped`): a published task-scope
+   * directory. Opt-in only; absent means the run is not task-scoped.
+   */
+  readonly taskPolicyDir?: string;
+}
+
+/** Options of {@link WorkflowController.resume}. */
+export interface WorkflowResumeOptions {
+  /**
+   * Apply the definition's current resource budget instead of the one the
+   * checkpoint recorded.
+   */
+  readonly useCurrentBudget?: boolean;
+  /**
+   * Ignore the container snapshots the checkpoint references: no scope starts
+   * from one, and the resume checkpoint no longer lists them, so no later
+   * stop removes them as superseded. For a checkpoint whose references
+   * nothing vouches for (`workflow resume-standalone` of a base directory
+   * other than this home's own); a daemon import drops them the same way.
+   */
+  readonly ignoreContainerSnapshots?: boolean;
+}
+
 /** The narrow controller interface exposed to the mux. */
 export interface WorkflowController {
-  start(definitionPath: string, taskDescription: string, workspacePath?: string): Promise<WorkflowId>;
-  resume(workflowId: WorkflowId, options?: { useCurrentBudget?: boolean }): Promise<void>;
+  /**
+   * Starts a workflow. A caller-supplied `workspacePath` must be an existing
+   * directory that passes `validateWorkspacePath()`; the run then uses its
+   * canonical form. A rejected path throws a `WorkspaceValidationError`
+   * (`code` discriminant) before anything is created. Without one, the run
+   * gets a fresh default workspace under the base directory.
+   *
+   * `options.taskPolicyDir` (`--task-scoped`) is a task scope compiled from
+   * the task by the caller's CLI entry point: every agent state's policy is
+   * intersected with it. A directory that does not validate throws before
+   * anything is created.
+   */
+  start(
+    definitionPath: string,
+    taskDescription: string,
+    workspacePath?: string,
+    options?: WorkflowStartOptions,
+  ): Promise<WorkflowId>;
+  resume(workflowId: WorkflowId, options?: WorkflowResumeOptions): Promise<void>;
   listResumable(): WorkflowId[];
   getStatus(id: WorkflowId): WorkflowStatus | undefined;
   getBudget(id: WorkflowId): WorkflowBudget | undefined;
   getDetail(id: WorkflowId): WorkflowDetail | undefined;
   listActive(): readonly WorkflowId[];
+  /**
+   * Applies a decision bound to one raise of a gate (`event.gateId`). Throws
+   * `GateResolutionError` (see its `code`) when the workflow is unknown, not
+   * waiting, the id is not the active raise, the event is not one the gate
+   * accepts, or feedback is missing; a refused decision changes nothing.
+   */
   resolveGate(id: WorkflowId, event: HumanGateEvent): void;
-  abort(id: WorkflowId): Promise<void>;
+  /** Tool-call escalations currently waiting for a human decision in this workflow. */
+  listToolCallEscalations(id: WorkflowId): readonly WorkflowToolCallEscalation[];
+  /**
+   * Settles a pending tool-call escalation. Returns false when the workflow
+   * or the escalation is unknown (already resolved, expired, or never raised).
+   */
+  resolveToolCallEscalation(
+    id: WorkflowId,
+    escalationId: string,
+    decision: WorkflowToolCallEscalationDecision,
+  ): boolean;
+  /**
+   * Stops a run: every in-flight session, fan-out lane and deterministic
+   * command is told to stop before the terminal checkpoint is written, and
+   * the run stays resumable. On a run that is already stopping (another
+   * abort, a terminal transition) it resolves once that stop has finished.
+   */
+  abort(id: WorkflowId, options?: WorkflowStopOptions): Promise<void>;
   onEvent(callback: (event: WorkflowLifecycleEvent) => void): void;
-  shutdownAll(): Promise<void>;
+  /**
+   * Aborts every run and drains every teardown. Final: afterwards `start()`
+   * and `resume()` refuse, so a request racing the shutdown cannot leave a
+   * run behind.
+   */
+  shutdownAll(options?: WorkflowStopOptions): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
 // Internal types
 // ---------------------------------------------------------------------------
+
+/** One entry of {@link WorkflowInstance.liveAgentTurnsByBundle}. */
+interface LiveAgentTurn {
+  /** Persona whose policy the invocation's tool calls must be evaluated under. */
+  readonly persona: string;
+  /** Settles once the invocation has finished and its session is closed. */
+  readonly ended: Promise<void>;
+}
+
+/**
+ * A tool-call escalation waiting on the workflow's human route. Two kinds
+ * share this shape: coordinator escalations from a shared-container bundle
+ * (`settle` resolves the coordinator's in-process promise) and session
+ * escalations surfaced by a session's file-IPC watcher (`settle` writes the
+ * response file through `session.resolveEscalation`).
+ */
+interface PendingToolCallEscalation {
+  readonly escalation: WorkflowToolCallEscalation;
+  /**
+   * Identity of the session whose watcher surfaced a file-IPC escalation;
+   * absent for coordinator escalations. Used to expire the entries of a
+   * session when its watcher reports expiry or the session ends.
+   */
+  readonly owner?: object;
+  /**
+   * Bundle whose coordinator raised a shared-container escalation; absent
+   * for session escalations. Used to withdraw the bundle's escalations once
+   * no agent turn is live on it any more.
+   */
+  readonly bundleId?: string;
+  /** Delivers the human decision to whoever is waiting. */
+  readonly settle: (decision: WorkflowToolCallEscalationDecision) => void;
+  /**
+   * Ends the coordinator's wait without a decision (it is denied as
+   * cancelled, never as a human denial). Absent for session escalations:
+   * their session's coordinator times them out or cancels them on close.
+   */
+  readonly withdraw?: (detail: string) => void;
+}
 
 interface WorkflowInstance {
   resourceBudget: WorkflowBudget;
@@ -771,17 +1307,34 @@ interface WorkflowInstance {
    */
   readonly workflowSkillsDir: string | undefined;
   readonly workflowScriptsDir: string | undefined;
-  readonly containerSnapshots: Readonly<Record<string, ContainerSnapshotRef>> | undefined;
+  /**
+   * Canonical task-scope directory of a `--task-scoped` run, validated at
+   * start and again on resume. Every agent state's session (or the bundle
+   * coordinator in shared-container mode) intersects its persona policy
+   * with it. Undefined for an unscoped run.
+   */
+  readonly taskPolicyDir: string | undefined;
+  /**
+   * The snapshot each scope restores from: those of the checkpoint resumed
+   * from, replaced by the ones a stop commits once its terminal checkpoint is
+   * saved. Every checkpoint save records them, so a crash between two stops
+   * still resumes each scope from its snapshot, and the next stop finds them
+   * on disk to remove as superseded.
+   */
+  containerSnapshots: Readonly<Record<string, ContainerSnapshotRef>> | undefined;
   readonly actor: AnyActorRef;
   readonly roundMachinesByState: ReadonlyMap<string, AnyStateMachine>;
   readonly gateStateNames: ReadonlySet<string>;
   readonly terminalStateNames: ReadonlySet<string>;
   readonly activeSessions: Set<Session>;
+  /** A close remains active until teardown and its final usage sample finish. */
+  readonly sessionClosures: WeakMap<Session, Promise<void>>;
   readonly artifactDir: string;
   /**
-   * Root directory where the agent session operates.
-   * Either a fresh directory created by the orchestrator
-   * or a user-provided path via --workspace.
+   * Root directory where the agent session operates. Either the run's
+   * default `<baseDir>/<workflowId>/workspace`, derived and created by the
+   * orchestrator, or the canonical path that `validateWorkspacePath()`
+   * returned for a user-provided `--workspace`.
    */
   readonly workspacePath: string;
   readonly tab: WorkflowTabHandle;
@@ -793,12 +1346,39 @@ interface WorkflowInstance {
   finalStatus?: WorkflowStatus;
   /** True only after terminal persistence and infrastructure teardown finish. */
   terminalReady: boolean;
-  /** Active gate ID, if the machine is waiting at a human gate. */
+  /**
+   * Per-raise id of the gate the machine is waiting at (see
+   * `HumanGateRequest.gateId`). Minted when the machine enters a gate state
+   * (before that transition's checkpoint, so resume restores it), cleared by
+   * `resolveGate` once a decision bound to it passes validation.
+   */
   activeGateId?: string;
+  /**
+   * The gate id most recently handed to `deps.raiseGate`. XState notifies
+   * the actor subscription on every processed event, including ones the
+   * gate state has no handler for, so this distinguishes a fresh raise from
+   * a no-op snapshot while already waiting.
+   */
+  raisedGateId?: string;
+  /**
+   * Tool-call escalations waiting for a human, keyed by escalation id.
+   * Populated by the bundle coordinator's in-process handler and by the
+   * per-session escalation watchers; drained by `resolveToolCallEscalation`,
+   * expiry (timeout / cancellation) and session end.
+   */
+  readonly pendingEscalations: Map<string, PendingToolCallEscalation>;
   /** Tracks the last error surfaced to avoid emitting duplicate lifecycle events. */
   lastSurfacedError?: string;
+  /**
+   * Unsafe artifact outputs already reported as security events (keyed by
+   * reason and path), so a symlink planted once is logged once per run rather
+   * than at every artifact check. Created on first use.
+   */
+  reportedArtifactRejections?: Set<string>;
   /** Timestamp when the current state was entered, for transition duration tracking. */
   stateEnteredAt?: number;
+  /** Checkpoint saves that failed in a row; reset by the next successful save. */
+  checkpointSaveFailures?: number;
   /** Append-only JSONL message log for debugging. */
   readonly messageLog: MessageLog;
   /**
@@ -822,6 +1402,16 @@ interface WorkflowInstance {
    */
   readonly bundlesByScope: Map<string, DockerInfrastructure>;
   /**
+   * Audit logs of the bundles the run's earlier legs minted, listed by
+   * `resume` before this leg mints any (absent for a run that was not
+   * resumed). Every bundle this leg mints replays them when taint
+   * escalation is enabled: a resumed run mints new bundles with new audit
+   * logs, and without the replay the taint an earlier leg recorded would
+   * be lost. All scopes' logs are replayed (the checkpoint does not record
+   * which scope a bundle served), which can only add taint.
+   */
+  readonly priorBundleAuditLogPaths?: readonly string[];
+  /**
    * Memoized compiled-policy directory per persona. Populated on first
    * use by `cyclePolicy` to avoid re-reading `persona.json` / running
    * `loadConfig()` on every state transition.
@@ -836,6 +1426,18 @@ interface WorkflowInstance {
    */
   readonly currentPersonaByBundle: Map<string, string>;
   /**
+   * Agent invocations live on each shared-container bundle, keyed by
+   * `BundleId`, each with the persona whose policy its tool calls need.
+   * `cyclePolicy` waits for every live invocation of ANOTHER persona to end
+   * before it swaps the bundle's single coordinator policy, so a swap never
+   * changes the rules under a running turn. Serial states never overlap; the
+   * case this exists for is a drained fan-out lane, whose in-flight turn keeps
+   * running in the container after the batch returned (borrow-mode
+   * `session.close()` does not stop it) while the run moves on to a state of
+   * a different persona. See {@link registerLiveAgentTurn}.
+   */
+  readonly liveAgentTurnsByBundle: Map<string, Set<LiveAgentTurn>>;
+  /**
    * Required-server snapshot taken at bundle mint, keyed by `BundleId`.
    * `cyclePolicy` checks each newly loaded persona's required servers
    * against this set so a mid-workflow persona recompile that adds a
@@ -845,13 +1447,70 @@ interface WorkflowInstance {
    */
   readonly mintedServersByBundle: Map<string, ReadonlySet<string>>;
   /**
-   * Set once `destroyWorkflowInfrastructure` begins teardown. An
-   * `ensureBundleForScope` call that suspended at `await factory(...)`
-   * must observe this flag before publishing into `bundlesByScope` —
-   * otherwise a container minted mid-abort would leak past the
-   * post-teardown leak assertion.
+   * Agent slots reserved for this run's shared-container bundles: one per
+   * scope the run can mint, taken in a single request before its first
+   * mint (see {@link WorkflowOrchestrator.reserveBundleSlots}). Undefined
+   * while the run holds no bundle and no mint is under way; returned once
+   * its last bundle is gone.
    */
-  aborted: boolean;
+  bundleSlots?: Promise<AgentSlotLease>;
+  /**
+   * Bundle mints of this run currently in progress (waiting for slots,
+   * building, or cleaning up an orphan). The slot reservation outlives a
+   * teardown that races a mint until the mint has finished.
+   */
+  bundleMintsInFlight: number;
+  /**
+   * The agent slot held by each live session that brings its own
+   * environment (no shared bundle). Released when the session's invocation
+   * ends, or by `abort()` once it has closed the session, whichever comes
+   * first (release is idempotent).
+   */
+  readonly sessionSlots: Map<Session, AgentSlotLease>;
+  /**
+   * Commit channel of each live shared-container bundle, keyed by
+   * `BundleId`: the target of that bundle's `workflow_commit` tool (see
+   * `workflow-commit.ts`). Created with the bundle in `ensureBundleForScope`
+   * and dropped at teardown. States without a borrowed bundle get a
+   * per-invocation channel instead.
+   */
+  readonly commitChannelsByBundle: Map<string, WorkflowCommitChannel>;
+  /**
+   * The gate idle timer of the raise the run is waiting at (see
+   * `armGateIdleTimer`), if one is armed. Cleared when the gate is
+   * resolved and when the run stops.
+   */
+  gateIdleTimer?: { readonly gateId: string; readonly timer: ReturnType<typeof setTimeout> };
+  /**
+   * The run's stop signal. Aborted at the very top of `abort()` (before its
+   * first await) and by `destroyWorkflowInfrastructure`, which every stop
+   * path (abort, shutdownAll, a terminal state) runs, so it means "this run
+   * is stopping". Every executor re-checks it after each await
+   * (`runAgentState`, `executeDeterministicState`, `runFanOutSegment`,
+   * `ensureBundleForScope`): a session created after the abort is closed at
+   * once and no further turn, lane, command or bundle mint starts. It kills
+   * the process group of any host deterministic command still running,
+   * including commands started by the resume replay, which has no XState
+   * invoke signal of its own.
+   * In particular an `ensureBundleForScope` call that suspended at
+   * `await factory(...)` must observe it before publishing into
+   * `bundlesByScope`; otherwise a container minted mid-abort would leak past
+   * the post-teardown leak assertion.
+   */
+  readonly stopController: AbortController;
+  /**
+   * Waiters of the fan-out lanes currently running, so `abort()` can stop
+   * them: a lane is a free-standing root actor that stopping the parent actor
+   * does not reach. Registered by `runFanOutSegment` before the lanes start
+   * and removed once the batch settles.
+   */
+  readonly fanOutChildren: Set<RoundChildWaiter>;
+  /**
+   * Cross-process run and workspace locks (see `run-lock.ts`), held from
+   * `start()` / `resume()` until `terminalReady` and released by
+   * {@link WorkflowOrchestrator.markTerminalReady}.
+   */
+  locks: { run?: ProcessLockHandle; workspace?: ProcessLockHandle };
   /**
    * Tracks the fire-and-forget Docker teardown started by
    * `handleWorkflowComplete` on a normal terminal. The terminal handler runs
@@ -867,6 +1526,17 @@ interface WorkflowInstance {
    */
   teardownPromise?: Promise<void>;
   /**
+   * The run's terminal handling once it has begun: the rest of `abort()`
+   * after it claimed `finalStatus`, or of `handleWorkflowComplete`. Settles
+   * once the run is `terminalReady` (snapshot, terminal checkpoint, teardown
+   * and lock release all done). A later stop (a second abort, `shutdownAll()`
+   * during a user abort or a terminal snapshot) joins it rather than returning
+   * while the first is still committing a snapshot, which would let the
+   * caller tear the container down under the commit and exit before the
+   * terminal checkpoint is written.
+   */
+  terminalHandling?: Promise<void>;
+  /**
    * Stamped by `throwIfQuotaExhausted` when an agent turn reports
    * upstream quota exhaustion. `handleWorkflowComplete` consults this
    * to force an abort-like terminal phase and preserve the checkpoint,
@@ -877,23 +1547,29 @@ interface WorkflowInstance {
    */
   quotaExhausted?: { readonly resetAt?: Date; readonly rawMessage: string };
   /**
-   * Three coordinated pieces of token-stream accounting state, grouped
-   * so lifecycle (setup/teardown) operates on one value. `outputTokens`
-   * accumulates `message_end.outputTokens` for any event whose session
-   * id is in `sessionIds`. `unsubscribe` is set at `setupTokenSubscription`
-   * and cleared on teardown; presence indicates "subscribed."
+   * Run-wide usage: tokens from the metrics bus (Docker sessions) and the
+   * AI SDK (builtin sessions), session costs, at least what each bundle's
+   * MITM budget gate charged, and active time, continued from the checkpoint
+   * on resume. Read by the display, every checkpoint and the
+   * `settings.workflowBudget` check. See workflow-usage.ts.
    */
-  tokens: {
-    outputTokens: number;
-    readonly sessionIds: Set<SessionId>;
-    unsubscribe?: () => void;
-  };
+  readonly usage: WorkflowUsageMeter;
+  /** Metrics-bus subscription feeding `usage`; set while the run is live. */
+  unsubscribeUsage?: () => void;
   /**
    * Sibling of `quotaExhausted`: drives the same checkpoint-preserving
    * abort path. Survives only in-process; the checkpoint does not
    * record it.
    */
   transientFailure?: { readonly kind: TransientFailureKind; readonly rawMessage: string };
+  /**
+   * Stamped when a state or lane step was refused because the run reached
+   * its `settings.workflowBudget`. Drives the same checkpoint-preserving
+   * abort path as `quotaExhausted`, even when a fan-out batch folded the
+   * refused lane into a verdict. In-process only: a resumed run checks the
+   * ceiling afresh before its first state.
+   */
+  workflowBudgetExhausted?: { readonly reason: string; readonly breach: WorkflowBudgetBreach };
 }
 
 // ---------------------------------------------------------------------------
@@ -903,8 +1579,81 @@ interface WorkflowInstance {
 export class WorkflowOrchestrator implements WorkflowController {
   private readonly workflows = new Map<WorkflowId, WorkflowInstance>();
   private readonly lifecycleCallbacks: Array<(e: WorkflowLifecycleEvent) => void> = [];
+  /** Set by `shutdownAll()`; from then on `start()` and `resume()` refuse. */
+  private shuttingDown = false;
+  /** Cap on concurrent agent environments across every workflow this orchestrator runs. */
+  private readonly agentSlots: AgentSlotPool;
 
-  constructor(private readonly deps: WorkflowOrchestratorDeps) {}
+  constructor(private readonly deps: WorkflowOrchestratorDeps) {
+    this.agentSlots =
+      deps.agentSlots ??
+      new AgentSlotPool(deps.userConfig.maxConcurrentAgentSessions ?? USER_CONFIG_DEFAULTS.maxConcurrentAgentSessions);
+  }
+
+  // -----------------------------------------------------------------------
+  // Run lifecycle: stop signal, locks, terminal readiness
+  // -----------------------------------------------------------------------
+
+  /** True once the run has begun stopping (abort, shutdown or terminal teardown). */
+  private isStopping(instance: WorkflowInstance): boolean {
+    return instance.stopController.signal.aborted;
+  }
+
+  /** Throws when the run is stopping, naming what was not started. */
+  private throwIfStopping(instance: WorkflowInstance, what: string): void {
+    if (this.isStopping(instance)) {
+      throw new Error(`Workflow ${instance.id} is stopping; not starting ${what}`);
+    }
+  }
+
+  /** Refuses new runs once `shutdownAll()` has begun. */
+  private assertAcceptingRuns(action: string): void {
+    if (this.shuttingDown) {
+      throw new Error(`Cannot ${action}: the workflow orchestrator is shutting down`);
+    }
+  }
+
+  /**
+   * Claims the cross-process locks of a run that is about to start: the
+   * workspace lock (an existing directory) first, so a start refused on a busy
+   * workspace leaves no run directory behind (claiming the run lock creates
+   * it), then the run lock of its fresh id. On a failure nothing stays held.
+   * A busy lock surfaces as `WorkflowLockBusyError` (see `run-lock.ts`).
+   * Both claims are non-blocking, so the order cannot deadlock against
+   * `resume()`, which needs the run lock first to read the workspace.
+   */
+  private claimRunLocks(workflowId: WorkflowId, workspacePath: string): WorkflowInstance['locks'] {
+    const workspace = claimWorkflowWorkspaceLock(
+      this.deps.workspaceLockDir ?? getWorkflowWorkspaceLocksDir(),
+      workspacePath,
+    );
+    try {
+      const run = claimWorkflowRunLock(this.deps.baseDir, workflowId);
+      return { run, workspace };
+    } catch (err) {
+      this.releaseRunLocks({ workspace });
+      throw err;
+    }
+  }
+
+  private releaseRunLocks(locks: WorkflowInstance['locks']): void {
+    const report = (message: string): void => writeStderr(`[workflow] ${message}`);
+    releaseWorkflowLock(locks.workspace, report);
+    releaseWorkflowLock(locks.run, report);
+  }
+
+  /**
+   * The single place a run becomes `terminalReady`: its terminal checkpoint is
+   * durable and its teardown has finished, so the run and workspace locks are
+   * released in the same step and another process may resume it at once.
+   */
+  private markTerminalReady(instance: WorkflowInstance): void {
+    this.clearGateIdleTimer(instance);
+    const locks = instance.locks;
+    instance.locks = {};
+    this.releaseRunLocks(locks);
+    instance.terminalReady = true;
+  }
 
   /** Build a partial log entry with shared fields for the given workflow instance. */
   private logBase(instance: WorkflowInstance): { ts: string; workflowId: string; state: string } {
@@ -931,15 +1680,21 @@ export class WorkflowOrchestrator implements WorkflowController {
   // -----------------------------------------------------------------------
 
   /**
-   * Validates that all non-"global" personas referenced in the workflow
-   * definition actually exist on disk. Fails fast with a clear error
-   * listing all missing personas.
+   * Validates, before the run starts, every non-"global" persona the
+   * definition's agent states use: its persona.json must exist, and its
+   * `agentModelId` and `resourceBudget` overrides must be well-formed
+   * (`findPersonaOverridesProblem`, the check cron runs make). A malformed
+   * override would otherwise be refused only when the state that uses it
+   * creates its session (PERSONA_OVERRIDES_INVALID), after the states before
+   * it had run and spent budget. Fails fast with one error listing every
+   * problem.
    *
-   * Only checks for persona.json existence -- does NOT verify compiled
-   * policy (that happens at session creation time via resolvePersona).
+   * Does NOT verify the compiled policy (that happens at session creation
+   * time via resolvePersona).
    */
   private validatePersonas(definition: WorkflowDefinition): void {
     const missing: string[] = [];
+    const statesByPersona = new Map<string, string[]>();
     for (const [stateId, state] of Object.entries(definition.states)) {
       if (state.type !== 'agent') continue;
       const persona = state.persona;
@@ -948,15 +1703,32 @@ export class WorkflowOrchestrator implements WorkflowController {
       const defPath = getPersonaDefinitionPath(createPersonaName(persona));
       if (!existsSync(defPath)) {
         missing.push(`"${persona}" (used by state "${stateId}")`);
+        continue;
+      }
+      statesByPersona.set(persona, [...(statesByPersona.get(persona) ?? []), stateId]);
+    }
+
+    const invalid: string[] = [];
+    for (const [persona, stateIds] of statesByPersona) {
+      const problem = findPersonaOverridesProblem(persona);
+      if (problem !== undefined) {
+        invalid.push(`${problem} (used by ${stateIds.map((stateId) => `state "${stateId}"`).join(', ')})`);
       }
     }
 
+    const problems: string[] = [];
     if (missing.length > 0) {
-      throw new Error(
+      problems.push(
         `Workflow references personas that do not exist:\n` +
           `  ${missing.join('\n  ')}\n` +
           `Create them with: ironcurtain persona create <name>`,
       );
+    }
+    if (invalid.length > 0) {
+      problems.push(`Workflow references personas with invalid settings:\n  ${invalid.join('\n  ')}`);
+    }
+    if (problems.length > 0) {
+      throw new Error(problems.join('\n'));
     }
   }
 
@@ -968,12 +1740,12 @@ export class WorkflowOrchestrator implements WorkflowController {
    * Determines whether a workflow should run in shared-container mode.
    * Requires both an explicit opt-in via `settings.sharedContainer` and
    * a Docker-backed agent. Builtin workflows ignore the flag entirely.
+   * Delegates to the validator's `usesSharedContainer` so the static
+   * rules that mirror this decision (fan-out persona homogeneity) can
+   * never disagree with the runtime.
    */
   private shouldUseSharedContainer(definition: WorkflowDefinition): boolean {
-    const settings = definition.settings ?? {};
-    if (settings.sharedContainer !== true) return false;
-    if (settings.mode === 'builtin') return false;
-    return true;
+    return usesSharedContainer(definition.settings);
   }
 
   /**
@@ -994,33 +1766,121 @@ export class WorkflowOrchestrator implements WorkflowController {
    * on partial initialization. The map is **not** populated in that case
    * — the scope entry remains absent so a later state can retry.
    *
-   * Concurrency: relies on serial XState invocations — there is no
-   * parallel agent-state fan-out today. If that ever lands, add an
-   * in-flight-promise guard to prevent concurrent lazy-mint races for
-   * the same scope.
+   * Concurrency: this is an unguarded check-then-act across `await`s, so
+   * it is only safe while callers for one scope run serially. Serial
+   * XState invocations satisfy that for ordinary states; parallel
+   * agent-state fan-out (`runFanOutSegment`, N child actors running
+   * concurrently) does NOT, which is why {@link preMintFanOutScopeBundle}
+   * mints the segment's bundle once, before any lane starts, so every lane
+   * finds the entry already present and borrows it here. The MCP
+   * transport supports N lanes sharing one bundle: the Code Mode proxy
+   * serves each agent connection with its own MCP server over the shared
+   * coordinator (`src/docker/code-mode-proxy.ts`). The lanes still share
+   * that coordinator's single active policy, so concurrent lanes with
+   * different personas are refused (statically by the validator's
+   * `validateFanOutLaneConcurrency`, at runtime by
+   * `preMintFanOutScopeBundle`; see
+   * docs/designs/workflow-container-lifecycle.md). Any new concurrent
+   * caller must follow the pre-mint pattern or add an in-flight-promise
+   * guard here.
    *
    * Abort race: if `destroyWorkflowInfrastructure` begins while a mint
    * is suspended at either `await factory(...)` or `await startServer(...)`,
    * the mint completes but must not publish into `bundlesByScope` —
    * destroy already snapshot-cleared the map and would miss the late
-   * insertion. `instance.aborted` is the barrier, consulted at both
-   * `await` points; on observed abort we tear down the just-built
-   * bundle and throw without updating the map.
+   * insertion. The run's stop signal (`instance.stopController`, aborted
+   * at the top of `abort()` and when teardown begins) is the barrier,
+   * consulted at both `await` points; on observed abort we tear down the
+   * just-built bundle and throw without updating the map.
+   *
+   * Agent slots: before its first mint the run reserves one slot per scope
+   * it can mint ({@link reserveBundleSlots}), waiting while the
+   * daemon-wide cap is reached; an abort ends the wait. The reservation is
+   * returned once the run holds no bundle and no mint is in flight (after
+   * teardown, after a failed first mint, after an orphan's cleanup).
    */
   private async ensureBundleForScope(instance: WorkflowInstance, scope: string): Promise<DockerInfrastructure> {
-    if (instance.aborted) {
+    if (this.isStopping(instance)) {
       throw new Error(`Workflow ${instance.id} is aborting; cannot mint bundle for scope "${scope}"`);
     }
     const existing = instance.bundlesByScope.get(scope);
     if (existing) return existing;
 
-    const settings = instance.definition.settings ?? {};
-    const agentId = (settings.dockerAgent ?? 'claude-code') as AgentId;
+    instance.bundleMintsInFlight += 1;
+    try {
+      return await this.mintBundleForScope(instance, scope);
+    } finally {
+      instance.bundleMintsInFlight -= 1;
+      this.releaseBundleSlotsIfIdle(instance);
+    }
+  }
+
+  /**
+   * The snapshot a scope's bundle may start from on resume. One that records
+   * no agent image build (committed before snapshots carried one) is never
+   * offered: its in-container entrypoint scripts and agent CLI could be from
+   * any build. The bundle refuses the rest unless its own resolved build
+   * matches (`selectResumableSnapshot` in docker-infrastructure.ts).
+   */
+  private snapshotToResume(instance: WorkflowInstance, scope: string): ContainerSnapshotRef | undefined {
+    const snapshot = instance.containerSnapshots?.[scope];
+    if (snapshot === undefined) return undefined;
+    if (typeof snapshot.agentBuildHash !== 'string') {
+      this.reportSnapshotNotResumed(
+        instance,
+        scope,
+        snapshot,
+        'the snapshot does not record the agent image build it was taken from',
+      );
+      return undefined;
+    }
+    return snapshot;
+  }
+
+  private reportSnapshotNotResumed(
+    instance: WorkflowInstance,
+    scope: string,
+    snapshot: ContainerSnapshotRef,
+    reason: string,
+  ): void {
+    const takenBy =
+      typeof snapshot.ironcurtainVersion === 'string'
+        ? ` (snapshot taken by IronCurtain ${toDisplayText(snapshot.ironcurtainVersion, { maxLength: 64 })})`
+        : '';
+    writeStderr(
+      `[workflow] ${instance.id} scope "${scope}" starts from a fresh container instead of its snapshot: ` +
+        `${toDisplayText(reason, { maxLength: 300 })}${takenBy}. Its workspace is unchanged; ` +
+        'anything else installed in the old container must be set up again.',
+    );
+  }
+
+  /** The body of {@link ensureBundleForScope} once it knows it must mint. */
+  private async mintBundleForScope(instance: WorkflowInstance, scope: string): Promise<DockerInfrastructure> {
+    // The scope's one container is built from one harness image: the harness
+    // its agent states share, or the workflow default for a scope that only
+    // runs deterministic states. Validation rejects a scope that mixes
+    // harnesses; `resolveScopeDockerAgent` throws for one that bypassed it,
+    // before an agent slot is reserved or anything is minted, rather than
+    // build a container some of the scope's states would run in on the wrong
+    // agent. Every agent state, container deterministic state and fan-out
+    // pre-mint reaches a scope's bundle through here, so this is the one
+    // runtime check.
+    const agentId = toAgentId(resolveScopeDockerAgent(instance.definition, scope));
+
+    await this.reserveBundleSlots(instance);
+    // Abort may have landed while the reservation waited for a slot.
+    if (this.isStopping(instance)) {
+      throw new Error(`Workflow ${instance.id} was aborted while waiting for an agent slot for scope "${scope}"`);
+    }
+
     // Mint a fresh UUID per scope: each bundle needs its own on-disk
     // directory tree, coordinator control socket, and Docker container
     // name. Unlike single-session CLI (`bundleId === sessionId`),
     // workflow scopes produce genuine standalone `BundleId`s.
     const bundleId = createBundleId();
+    // Exchanges this bundle's MITM cannot tie to an invocation lease carry
+    // only the bundle id; register it before the bundle can carry traffic.
+    instance.usage.addBundle(bundleId);
     const controlSocketPath = getBundleControlSocketPath(bundleId);
     // Ensure the per-bundle runtime root exists BEFORE the coordinator
     // tries to bind its UDS there. Routes through `ensureSecureBundleDir`
@@ -1030,39 +1890,77 @@ export class WorkflowOrchestrator implements WorkflowController {
     ensureSecureBundleDir(getBundleRuntimeRoot(bundleId));
 
     const requiredServers = this.getRequiredServersForScope(instance, scope);
+    this.reportUnavailableMemory(instance, scope);
+    // A read-only scope's writable output directories must be real
+    // directories below the workspace before its coordinator exists.
+    const readOnlyWorkspace = readOnlyWorkspaceForScope(instance.definition, scope);
+    if (readOnlyWorkspace) this.prepareReadOnlyOutputs(instance, readOnlyWorkspace);
     // Persona-less initial set; per-state restaging fills in persona skills later.
     // Reads the cached per-run staged path (set at start / resume) so
     // the bundle never depends on the original package directory still
     // being on disk.
+    for (const kind of ['skills', 'scripts'] as const) {
+      const path = kind === 'skills' ? instance.workflowSkillsDir : instance.workflowScriptsDir;
+      if (
+        path !== undefined &&
+        validatedWorkflowStagedDirectory(this.runDirOf(instance.id), path, kind) === undefined
+      ) {
+        throw new WorkflowResumeError('WORKFLOW_NOT_RESUMABLE', `Invalid workflow-${kind} staging directory`);
+      }
+    }
     const resolvedSkills = resolveSkillsForSession({ workflowSkillsDir: instance.workflowSkillsDir });
     const factory = this.deps.createWorkflowInfrastructure ?? (await this.loadDefaultInfrastructureFactory());
-    const baseImageOverride = instance.containerSnapshots?.[scope]?.image;
+    const snapshot = this.snapshotToResume(instance, scope);
+    // The bundle's coordinator offers workflow_commit to every state that
+    // borrows the bundle; this channel receives those commits.
+    const commitChannel = new WorkflowCommitChannel();
     const infra = await factory({
       workflowId: instance.id,
+      workflowRunDir: this.runDirOf(instance.id),
       bundleId,
       agentId,
       controlSocketPath,
       workspacePath: instance.workspacePath,
       scope,
       requiredServers,
+      maxLanes: maxLanesForScope(instance.definition, scope),
+      ...(instance.taskPolicyDir !== undefined ? { taskPolicyDir: instance.taskPolicyDir } : {}),
       resolvedSkills,
       workflowScriptsDir: instance.workflowScriptsDir,
-      baseImageOverride,
+      ...(snapshot === undefined
+        ? {}
+        : {
+            baseImageOverride: snapshot.image,
+            baseImageAgentBuildHash: snapshot.agentBuildHash,
+            ...(snapshot.agentSudo === undefined ? {} : { baseImageAgentSudo: snapshot.agentSudo }),
+          }),
+      // Escalated tool calls inside this bundle wait on the workflow's
+      // human route instead of being denied for lack of a handler.
+      onEscalation: (request, reason, context, whitelistCandidates, details) =>
+        this.handleCoordinatorEscalation(instance, bundleId, request, reason, context, whitelistCandidates, details),
+      resourceBudget: instance.resourceBudget.limits,
+      // A resumed run's taint (taint escalation enabled) lives in the audit
+      // logs of the bundles its earlier legs minted.
+      taintReplayAuditLogPaths: instance.priorBundleAuditLogPaths ?? [],
+      workflowCommit: commitChannel,
+      ...(readOnlyWorkspace ? { readOnlyWorkspace } : {}),
     });
 
     // Abort may have landed while `factory()` was suspended. Publishing
     // into `bundlesByScope` now would leak past the destroy's leak
-    // assertion; destroy the orphan inline and throw. ESLint cannot see
-    // that `instance.aborted` is mutated by the concurrent
-    // `destroyWorkflowInfrastructure` call between the two reads.
-    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-    if (instance.aborted) {
+    // assertion; destroy the orphan inline and throw.
+    if (this.isStopping(instance)) {
       const destroy = this.deps.destroyWorkflowInfrastructure ?? (await this.loadDefaultInfrastructureTeardown());
-      await destroy(infra).catch((teardownErr: unknown) => {
-        writeStderr(
-          `[workflow] destroyDockerInfrastructure during abort recovery for ${instance.id} (bundle ${bundleId}): ${toErrorMessage(teardownErr)}`,
-        );
-      });
+      await destroy(infra)
+        .then((result) => {
+          const notice = teardownPrivilegedFiles(result);
+          if (notice) this.recordHostPrivilegedFiles(instance, notice);
+        })
+        .catch((teardownErr: unknown) => {
+          writeStderr(
+            `[workflow] destroyDockerInfrastructure during abort recovery for ${instance.id} (bundle ${bundleId}): ${toErrorMessage(teardownErr)}`,
+          );
+        });
       throw new Error(`Workflow ${instance.id} was aborted during bundle mint for scope "${scope}"`);
     }
 
@@ -1074,34 +1972,146 @@ export class WorkflowOrchestrator implements WorkflowController {
       await startServer({ infra, socketPath: controlSocketPath });
     } catch (err) {
       const destroy = this.deps.destroyWorkflowInfrastructure ?? (await this.loadDefaultInfrastructureTeardown());
-      await destroy(infra).catch((teardownErr: unknown) => {
-        writeStderr(
-          `[workflow] destroyDockerInfrastructure during control-server recovery for ${instance.id}: ${toErrorMessage(teardownErr)}`,
-        );
-      });
+      await destroy(infra)
+        .then((result) => {
+          const notice = teardownPrivilegedFiles(result);
+          if (notice) this.recordHostPrivilegedFiles(instance, notice);
+        })
+        .catch((teardownErr: unknown) => {
+          writeStderr(
+            `[workflow] destroyDockerInfrastructure during control-server recovery for ${instance.id}: ${toErrorMessage(teardownErr)}`,
+          );
+        });
       throw err;
     }
 
     // Abort check #2: abort may have landed while `startServer()` was
     // suspended. Publishing into `bundlesByScope` now would leak past
     // the destroy's leak assertion; tear down the just-built bundle
-    // and throw. ESLint cannot see that `instance.aborted` is mutated
-    // by the concurrent `destroyWorkflowInfrastructure` call between
-    // the two reads.
-    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-    if (instance.aborted) {
+    // and throw.
+    if (this.isStopping(instance)) {
       const destroy = this.deps.destroyWorkflowInfrastructure ?? (await this.loadDefaultInfrastructureTeardown());
-      await destroy(infra).catch((teardownErr: unknown) => {
-        writeStderr(
-          `[workflow] destroyDockerInfrastructure during abort recovery (post-startServer) for ${instance.id} (bundle ${bundleId}): ${toErrorMessage(teardownErr)}`,
-        );
-      });
+      await destroy(infra)
+        .then((result) => {
+          const notice = teardownPrivilegedFiles(result);
+          if (notice) this.recordHostPrivilegedFiles(instance, notice);
+        })
+        .catch((teardownErr: unknown) => {
+          writeStderr(
+            `[workflow] destroyDockerInfrastructure during abort recovery (post-startServer) for ${instance.id} (bundle ${bundleId}): ${toErrorMessage(teardownErr)}`,
+          );
+        });
       throw new Error(`Workflow ${instance.id} was aborted during control-server attach for scope "${scope}"`);
     }
 
     instance.bundlesByScope.set(scope, infra);
+    // The run's usage counts at least what the bundle's budget gate charges
+    // for every completion its MITM forwards, attributed or not, priced or
+    // not, statistics on or off (see workflow-usage.ts); the meter keeps
+    // reading the gate after the bundle is gone.
+    if (infra.budgetGate !== undefined) instance.usage.trackBundleGate(bundleId, infra.budgetGate);
     instance.mintedServersByBundle.set(bundleId, requiredServers);
+    instance.commitChannelsByBundle.set(bundleId, commitChannel);
+    if (snapshot !== undefined && infra.snapshotRefusal !== undefined) {
+      this.reportSnapshotNotResumed(instance, scope, snapshot, infra.snapshotRefusal);
+    }
     return infra;
+  }
+
+  /**
+   * Resolves once this run holds its agent slots for shared-container
+   * bundles, waiting in the daemon-wide queue while the cap is reached.
+   *
+   * The run asks for one slot per scope it can mint, all in ONE request,
+   * before its first mint, and keeps them until its last bundle is gone. It
+   * never waits for slots while holding some, so runs queued behind each
+   * other cannot deadlock (two runs each holding one scope and waiting for
+   * a second could). A run that needs more slots than the whole cap is
+   * refused at once with `AgentSlotRequestError` (`start()` and `resume()`
+   * refuse it up front). Concurrent mints of one run share the one request. An aborted
+   * or refused request holds nothing and is forgotten, so a later mint asks
+   * again.
+   */
+  private reserveBundleSlots(instance: WorkflowInstance): Promise<AgentSlotLease> {
+    if (instance.bundleSlots !== undefined) return instance.bundleSlots;
+    this.assertAgentSlotDemandFits(instance.definition);
+    const slots = workflowBundleScopes(instance.definition).size;
+    const reservation = this.agentSlots.acquire(slots, {
+      signal: instance.stopController.signal,
+      onWait: (usage) =>
+        this.reportAgentSlotWait(instance, `Shared container (${slots} slot${slots === 1 ? '' : 's'})`, usage),
+    });
+    instance.bundleSlots = reservation;
+    void reservation.catch(() => {
+      if (instance.bundleSlots === reservation) instance.bundleSlots = undefined;
+    });
+    return reservation;
+  }
+
+  /**
+   * Returns the run's bundle slots once it holds no bundle and no mint is
+   * in flight: after teardown, after a first mint that failed, and after an
+   * in-flight mint that raced a teardown has destroyed its orphan.
+   */
+  private releaseBundleSlotsIfIdle(instance: WorkflowInstance): void {
+    if (instance.bundleMintsInFlight > 0 || instance.bundlesByScope.size > 0) return;
+    const reservation = instance.bundleSlots;
+    if (reservation === undefined) return;
+    instance.bundleSlots = undefined;
+    void reservation.then(
+      (lease) => lease.release(),
+      () => undefined,
+    );
+  }
+
+  /**
+   * Takes the agent slot for one agent session that brings its own
+   * environment (no shared bundle), waiting while the cap is reached. The
+   * wait ends when the run stops or, for a fan-out lane, when the batch
+   * drains the lane.
+   */
+  private async acquireSessionSlot(
+    instance: WorkflowInstance,
+    stateId: string,
+    signal: AbortSignal | undefined,
+  ): Promise<AgentSlotLease> {
+    try {
+      return await this.agentSlots.acquire(1, {
+        signal: signal ? AbortSignal.any([instance.stopController.signal, signal]) : instance.stopController.signal,
+        onWait: (usage) => this.reportAgentSlotWait(instance, `Agent "${stateId}"`, usage),
+      });
+    } catch (err) {
+      throw new Error(`Agent state "${stateId}" stopped while waiting for an agent slot: ${toErrorMessage(err)}`, {
+        cause: err,
+      });
+    }
+  }
+
+  /** Tells the run's tab and stderr that it is queued on the agent concurrency cap. */
+  private reportAgentSlotWait(instance: WorkflowInstance, what: string, usage: AgentSlotUsage): void {
+    const message =
+      `${what} is waiting for a free agent slot: ${usage.inUse} of ${usage.capacity} in use, ` +
+      `${usage.waiting} waiting (maxConcurrentAgentSessions)`;
+    writeStderr(`[workflow] ${instance.id}: ${message}`);
+    instance.tab.write(`[agent] ${message}`);
+  }
+
+  /**
+   * Refuses, before anything is created, a shared-container definition that
+   * needs more agent slots than the cap allows: its slot reservation could
+   * never be served. Other definitions take one slot per session and always
+   * fit.
+   */
+  private assertAgentSlotDemandFits(definition: WorkflowDefinition): void {
+    if (!this.shouldUseSharedContainer(definition)) return;
+    const slots = workflowBundleScopes(definition).size;
+    if (slots > this.agentSlots.capacity) {
+      throw new AgentSlotRequestError(
+        slots,
+        this.agentSlots.capacity,
+        `Workflow "${definition.name}" (one per shared container scope)`,
+      );
+    }
   }
 
   /**
@@ -1119,31 +2129,117 @@ export class WorkflowOrchestrator implements WorkflowController {
     return dir;
   }
 
+  /** The distinct personas of the agent states that run in `scope`, in definition order. */
+  private getPersonasForScope(instance: WorkflowInstance, scope: string): string[] {
+    const personas = new Set<string>();
+    for (const stateConfig of Object.values(instance.definition.states)) {
+      if (stateConfig.type !== 'agent') continue;
+      if ((stateConfig.containerScope ?? DEFAULT_CONTAINER_SCOPE) !== scope) continue;
+      personas.add(stateConfig.persona);
+    }
+    return [...personas];
+  }
+
   /**
    * Computes the union of MCP server names required by every agent state
    * sharing `scope`. Threaded into the workflow infrastructure factory so
    * the bundle only spawns proxies the policies actually reference.
+   *
+   * Never adds the memory server, even for personas with memory
+   * enabled. Memory is not in compiled policies; a standalone session adds
+   * it to its own config, with that persona's database. A shared-container
+   * bundle has one coordinator for every persona in the scope, and the
+   * memory server is trusted (it bypasses policy), so one bundle-wide memory
+   * server would let every persona read and write a single persona's
+   * database. Until bundles can run one isolated backend per persona, they
+   * run none: the default factory refuses it (`withoutMemoryServer`), and
+   * borrowing sessions keep the memory gate closed so no prompt advertises
+   * it. See docs/designs/per-persona-memory-optin.md §1.2.
    */
   private getRequiredServersForScope(instance: WorkflowInstance, scope: string): ReadonlySet<string> {
     const union = new Set<string>();
-    const seenPersonas = new Set<string>();
-    for (const stateConfig of Object.values(instance.definition.states)) {
-      if (stateConfig.type !== 'agent') continue;
-      const stateScope = stateConfig.containerScope ?? DEFAULT_CONTAINER_SCOPE;
-      if (stateScope !== scope) continue;
-      if (seenPersonas.has(stateConfig.persona)) continue;
-      seenPersonas.add(stateConfig.persona);
-      const { compiledPolicy } = loadPersonaPolicyArtifacts(this.getPolicyDir(instance, stateConfig.persona));
+    for (const persona of this.getPersonasForScope(instance, scope)) {
+      const { compiledPolicy } = loadPersonaPolicyArtifacts(this.getPolicyDir(instance, persona));
       for (const server of extractRequiredServers(compiledPolicy)) {
         union.add(server);
       }
-      // Memory is bolt-on (not in compiled policy). `Set.add` is
-      // idempotent, so adding here per-persona preserves any-wants-it.
-      if (isMemoryEnabledForPersonaName(stateConfig.persona, this.deps.userConfig)) {
-        union.add(MEMORY_SERVER_NAME);
-      }
     }
+    // A read-only scope's agents write their outputs through the filesystem
+    // server: their own tools cannot write the read-only workspace mount.
+    if (readOnlyWorkspaceForScope(instance.definition, scope)) union.add(READ_ONLY_OUTPUT_SERVER);
     return union;
+  }
+
+  /**
+   * Makes the writable output directories of a read-only state or scope real
+   * directories below the workspace (see `prepareWritableOutputDirs`) and
+   * reports every agent-planted entry it had to move aside.
+   */
+  private prepareReadOnlyOutputs(instance: WorkflowInstance, readOnlyWorkspace: ReadOnlyWorkspace): void {
+    for (const warning of prepareWritableOutputDirs(instance.workspacePath, readOnlyWorkspace.writablePaths)) {
+      writeStderr(`[workflow] Warning: ${warning}`);
+      instance.tab.write(`[warning] ${warning}`);
+    }
+  }
+
+  /**
+   * The notices of an agent state's session the run shows (its sessions'
+   * `onDiagnostic`): a stale compiled policy on stderr, where session start
+   * wrote it before sessions reported it as a notice, and host-mount findings
+   * (see {@link recordHostPrivilegedFiles}). Other diagnostics are not shown.
+   */
+  private reportSessionNotice(instance: WorkflowInstance, event: DiagnosticEvent): void {
+    if (event.kind === 'policy_stale') {
+      writeStderr(`[workflow] ${formatSessionNotice(event).trimStart()}`);
+    } else if (event.kind === 'host_privileged_files') {
+      this.recordHostPrivilegedFiles(instance, event);
+    }
+  }
+
+  /**
+   * Setuid/setgid or root-owned files an agent left in its container's host
+   * mounts (after a turn, or what a bundle's teardown found left behind):
+   * on stderr, in the workflow tab and in the message log, where they stay
+   * with the run (a warning entry; it does not mark the run failed).
+   */
+  private recordHostPrivilegedFiles(instance: WorkflowInstance, event: HostPrivilegedFilesDiagnostic): void {
+    const notice = formatSessionNotice(event).trimStart();
+    writeStderr(`[workflow] ${notice}`);
+    instance.tab.write(notice);
+    try {
+      instance.messageLog.append({
+        ...this.logBase(instance),
+        type: 'error',
+        error: notice,
+        context: HOST_MOUNT_SCAN_ERROR_CONTEXT,
+      });
+    } catch (err) {
+      writeStderr(`[workflow] Failed to record a host-mount finding for ${instance.id}: ${toErrorMessage(err)}`);
+    }
+  }
+
+  /**
+   * Tells the user, once per minted bundle, which personas in `scope` have
+   * memory enabled but will run without it, because shared-container
+   * bundles start no memory server (see {@link getRequiredServersForScope}).
+   * The sessions themselves stay consistent on their own: borrowing a
+   * bundle closes their memory gate, so neither the persona prompt nor
+   * CLAUDE.md mentions the missing tool. This notice only explains why.
+   *
+   * `GLOBAL_PERSONA` is skipped: it is the no-persona sentinel (the session
+   * factory runs those states without a persona), so they never have memory
+   * in any mode, even if a persona directory of that name exists.
+   */
+  private reportUnavailableMemory(instance: WorkflowInstance, scope: string): void {
+    const personas = this.getPersonasForScope(instance, scope).filter(
+      (persona) => persona !== GLOBAL_PERSONA && isMemoryEnabledForPersonaName(persona, this.deps.userConfig),
+    );
+    if (personas.length === 0) return;
+    const message =
+      `memory is enabled for persona(s) ${personas.join(', ')}, but shared-container workflows do not run ` +
+      `the memory server: their states in scope "${scope}" run without memory`;
+    writeStderr(`[workflow] ${message}`);
+    instance.tab.write(`[memory] ${message}`);
   }
 
   /**
@@ -1157,6 +2253,17 @@ export class WorkflowOrchestrator implements WorkflowController {
    * the bundle is passed explicitly — cycle the scope the state is
    * about to enter, not some other scope's bundle.
    *
+   * The swap is bundle-wide: the coordinator holds ONE active policy for
+   * every session borrowing the bundle. That is only correct while
+   * states run one at a time. Concurrent fan-out lanes therefore must
+   * share a persona, and `preMintFanOutScopeBundle` installs it here
+   * once before the lanes start so each lane's own call hits the
+   * short-circuit below instead of racing a `loadPolicy` RPC. A swap
+   * also waits for every live agent invocation of another persona on
+   * the bundle to end ({@link waitForOtherPersonaTurns}): a drained
+   * lane's in-flight turn outlives its batch and would otherwise run
+   * the rest of its turn under the next state's policy.
+   *
    * On failure (control socket unreachable, coordinator reports a load
    * error) this throws — the workflow must not proceed under the
    * previous persona's policy.
@@ -1167,6 +2274,9 @@ export class WorkflowOrchestrator implements WorkflowController {
     // would otherwise re-send an identical `loadPolicy` — a no-op on
     // the coordinator that still costs a UDS round-trip and a policy
     // engine rebuild.
+    if (instance.currentPersonaByBundle.get(bundle.bundleId) === persona) return;
+
+    await this.waitForOtherPersonaTurns(instance, bundle, persona);
     if (instance.currentPersonaByBundle.get(bundle.bundleId) === persona) return;
 
     const policyDir = this.getPolicyDir(instance, persona);
@@ -1214,6 +2324,94 @@ export class WorkflowOrchestrator implements WorkflowController {
   }
 
   /**
+   * Marks an agent invocation as live on `bundleId` under `persona` (see
+   * {@link WorkflowInstance.liveAgentTurnsByBundle}). Returns the release
+   * function, which is idempotent; the caller runs it once the invocation
+   * has finished and its session is closed.
+   */
+  private registerLiveAgentTurn(instance: WorkflowInstance, bundleId: string, persona: string): () => void {
+    let settle: () => void = () => {};
+    const turn: LiveAgentTurn = {
+      persona,
+      ended: new Promise<void>((resolveEnded) => {
+        settle = resolveEnded;
+      }),
+    };
+    const turns = instance.liveAgentTurnsByBundle.get(bundleId) ?? new Set<LiveAgentTurn>();
+    instance.liveAgentTurnsByBundle.set(bundleId, turns);
+    turns.add(turn);
+    return () => {
+      if (!turns.delete(turn)) return;
+      if (turns.size === 0 && instance.liveAgentTurnsByBundle.get(bundleId) === turns) {
+        instance.liveAgentTurnsByBundle.delete(bundleId);
+      }
+      settle();
+    };
+  }
+
+  /**
+   * Waits until no agent invocation of a persona other than `persona` is live
+   * on `bundle`, so swapping the coordinator's single policy never changes
+   * the rules under a turn that is still calling tools. Serial states never
+   * overlap, so in practice this only waits for a drained fan-out lane whose
+   * in-flight turn is still running when the run reaches a state of another
+   * persona. The wait is unbounded by design (failing open would evaluate
+   * that turn's calls under the wrong policy); aborting the workflow ends it
+   * (the run's stop signal releases the wait, which then throws, and the
+   * container teardown ends the turn).
+   */
+  private async waitForOtherPersonaTurns(
+    instance: WorkflowInstance,
+    bundle: DockerInfrastructure,
+    persona: string,
+  ): Promise<void> {
+    let reported = false;
+    for (;;) {
+      this.throwIfStopping(instance, `a policy swap to persona "${persona}"`);
+      const others = [...(instance.liveAgentTurnsByBundle.get(bundle.bundleId) ?? [])].filter(
+        (turn) => turn.persona !== persona,
+      );
+      if (others.length === 0) return;
+      if (!reported) {
+        reported = true;
+        const personas = [...new Set(others.map((turn) => turn.persona))].sort().join(', ');
+        const message =
+          `waiting for ${others.length} in-flight agent turn(s) of persona ${personas} to finish before loading ` +
+          `persona "${persona}" onto the shared coordinator`;
+        writeStderr(`[workflow] ${message}`);
+        instance.tab.write(`[policy] ${message}`);
+      }
+      await this.untilSettledOrStopping(
+        instance,
+        others.map((turn) => turn.ended),
+      );
+    }
+  }
+
+  /**
+   * Waits for `promises` to settle, or for the run to begin stopping,
+   * whichever comes first. The abort listener is removed again, so a long run
+   * that waits often does not accumulate listeners on its signal.
+   */
+  private async untilSettledOrStopping(
+    instance: WorkflowInstance,
+    promises: readonly Promise<unknown>[],
+  ): Promise<void> {
+    const signal = instance.stopController.signal;
+    if (signal.aborted) return;
+    let onAbort: () => void = () => {};
+    const stopping = new Promise<void>((resolveStopping) => {
+      onAbort = resolveStopping;
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+    try {
+      await Promise.race([Promise.allSettled(promises), stopping]);
+    } finally {
+      signal.removeEventListener('abort', onAbort);
+    }
+  }
+
+  /**
    * Tears down every bundle this workflow owns. Walks
    * `instance.bundlesByScope.values()` in parallel via `Promise.allSettled`
    * so failures in one bundle's teardown do not block the others. The
@@ -1241,10 +2439,14 @@ export class WorkflowOrchestrator implements WorkflowController {
    * test or CLI layer), which is the intended signal.
    */
   private destroyWorkflowInfrastructure(instance: WorkflowInstance): Promise<void> {
-    // Set BEFORE any short-circuit: an in-flight `ensureBundleForScope`
-    // that resumes from its `await factory(...)` must observe this flag
-    // and tear down its own orphan rather than publishing into the map.
-    instance.aborted = true;
+    // Signal BEFORE any short-circuit: an in-flight `ensureBundleForScope`
+    // that resumes from its `await factory(...)` must observe the stop and
+    // tear down its own orphan rather than publishing into the map. Every
+    // stop path passes here, so any leftover work stops as well: a host
+    // deterministic command still running (a drained lane's, a replayed
+    // state's) is killed and no new one starts, and a drained lane's
+    // in-flight turn stops at its next check.
+    instance.stopController.abort();
 
     // Join semantics: the first caller starts the teardown; concurrent
     // and later callers await the SAME promise. This is what lets the
@@ -1259,19 +2461,36 @@ export class WorkflowOrchestrator implements WorkflowController {
 
   /** Body of the bundle teardown; only ever started once per instance. */
   private async runBundleTeardown(instance: WorkflowInstance): Promise<void> {
+    try {
+      await this.destroyAllBundles(instance);
+    } finally {
+      // The run's agent slots go back once its containers are gone. A mint
+      // still in flight keeps them until it has cleaned up its orphan (it
+      // releases them itself when it finishes).
+      this.releaseBundleSlotsIfIdle(instance);
+    }
+  }
+
+  /** Destroys every bundle in `instance.bundlesByScope` (see {@link destroyWorkflowInfrastructure}). */
+  private async destroyAllBundles(instance: WorkflowInstance): Promise<void> {
     if (instance.bundlesByScope.size === 0) return;
 
     // Snapshot and clear BEFORE the awaits so a concurrent caller sees
     // an empty map and bails out. See JSDoc for the rationale.
     const bundles = [...instance.bundlesByScope.values()];
     instance.bundlesByScope.clear();
+    // No state can commit through a bundle that is going away.
+    instance.commitChannelsByBundle.clear();
 
     const destroy = this.deps.destroyWorkflowInfrastructure ?? (await this.loadDefaultInfrastructureTeardown());
 
     await Promise.allSettled(
       bundles.map(async (infra) => {
         try {
-          await destroy(infra);
+          // What the final host-mount scan found left behind in the bundle's
+          // agent-writable mounts, after its container was removed.
+          const privilegedFiles = teardownPrivilegedFiles(await destroy(infra));
+          if (privilegedFiles !== undefined) this.recordHostPrivilegedFiles(instance, privilegedFiles);
         } catch (err) {
           writeStderr(
             `[workflow] destroyDockerInfrastructure failed for ${instance.id} (bundle ${infra.bundleId}): ${toErrorMessage(err)}`,
@@ -1310,14 +2529,33 @@ export class WorkflowOrchestrator implements WorkflowController {
     return this.deps.userConfig.snapshot.enabled;
   }
 
+  /**
+   * Commits the `snapshotOnStop` snapshot of every live scope, one at a time.
+   * With `budgetMs` (a caller that must exit by a deadline), each commit's
+   * timeout is what is left of the budget and the scopes it no longer covers
+   * stop without a snapshot, so a signal-driven shutdown is never force-exited
+   * in the middle of a commit. Commits of all workflows in this process are
+   * also serialized, and each is skipped (logged, resume starts fresh) when the
+   * container exceeds `snapshot.maxBytes` or the disk lacks room for it; see
+   * `commitContainerSnapshot`.
+   *
+   * A scope with no live bundle at this stop (not reached since the run was
+   * resumed, or a mint that the abort undid) still holds exactly the state of
+   * the snapshot it was resumed from, so that snapshot is carried forward
+   * instead of being dropped (and then removed as superseded).
+   */
   private async snapshotResumableScopes(
     instance: WorkflowInstance,
+    budgetMs?: number,
   ): Promise<Readonly<Record<string, ContainerSnapshotRef>> | undefined> {
     if (!this.shouldSnapshotOnStop(instance)) return undefined;
     const entries = [...instance.bundlesByScope.entries()];
-    if (entries.length === 0) return undefined;
-
     const snapshots: Record<string, ContainerSnapshotRef> = {};
+    for (const [scope, snapshot] of Object.entries(instance.containerSnapshots ?? {})) {
+      if (!instance.bundlesByScope.has(scope)) snapshots[scope] = snapshot;
+    }
+
+    const deadline = budgetMs === undefined ? undefined : Date.now() + Math.max(0, budgetMs);
     for (const [scope, infra] of entries) {
       // Container snapshots require image commit/management APIs. Key off the
       // runtime capability so new runtimes do not need orchestrator changes.
@@ -1328,17 +2566,48 @@ export class WorkflowOrchestrator implements WorkflowController {
         );
         continue;
       }
+      const remainingMs = deadline === undefined ? undefined : deadline - Date.now();
+      if (remainingMs !== undefined && remainingMs < MIN_SNAPSHOT_COMMIT_MS) {
+        writeStderr(
+          `[workflow] The shutdown deadline leaves no time to snapshot ${instance.id} scope "${scope}"; ` +
+            'stopping it without a snapshot (resume starts it fresh).',
+        );
+        continue;
+      }
+      // Resume uses a snapshot only under the agent image build it was taken
+      // from, so one whose build is unknown could never be used.
+      const agentBuildHash = infra.imageResolution?.buildHash;
+      if (agentBuildHash === undefined) {
+        writeStderr(
+          `[workflow] The agent image build of ${instance.id} scope "${scope}" is unknown; ` +
+            'stopping it without a snapshot (resume starts it fresh).',
+        );
+        continue;
+      }
       try {
         snapshots[scope] = await commitContainerSnapshot({
           docker: infra.docker,
           workflowId: instance.id,
           scope,
           containerId: infra.containerId,
+          baseDir: this.deps.baseDir,
+          agentBuildHash,
+          // Resume under agentSudo: false uses only a snapshot recorded as sudo-off.
+          ...(infra.agentSudo === undefined ? {} : { agentSudo: infra.agentSudo }),
+          maxBytes: this.deps.userConfig.snapshot.maxBytes,
+          ...(remainingMs !== undefined ? { timeoutMs: remainingMs } : {}),
         });
       } catch (err) {
-        writeStderr(
-          `[workflow] Failed to snapshot container for ${instance.id} scope "${scope}": ${toErrorMessage(err)}`,
-        );
+        if (isContainerSnapshotSkippedError(err)) {
+          writeStderr(
+            `[workflow] Skipping the container snapshot of ${instance.id} scope "${scope}": ${err.message}; ` +
+              'resume starts it fresh.',
+          );
+        } else {
+          writeStderr(
+            `[workflow] Failed to snapshot container for ${instance.id} scope "${scope}": ${toErrorMessage(err)}`,
+          );
+        }
       }
     }
     return Object.keys(snapshots).length > 0 ? snapshots : undefined;
@@ -1355,12 +2624,21 @@ export class WorkflowOrchestrator implements WorkflowController {
     return createDockerManager();
   }
 
+  /**
+   * Removes snapshot images the run's checkpoint no longer references. Only
+   * images labeled as this run's own snapshots are touched (see
+   * `removeContainerSnapshotImages`): a reference can name any image.
+   */
   private async removeSnapshotImagesAfterTeardown(
+    instance: WorkflowInstance,
     docker: ContainerRuntime,
     snapshots: Readonly<Record<string, ContainerSnapshotRef>> | undefined,
   ): Promise<void> {
     if (!snapshots || Object.keys(snapshots).length === 0) return;
-    await removeContainerSnapshotImages(docker, snapshots).catch((err: unknown) => {
+    await removeContainerSnapshotImages(docker, snapshots, {
+      workflowId: instance.id,
+      baseDir: this.deps.baseDir,
+    }).catch((err: unknown) => {
       writeStderr(`[workflow] Failed to remove container snapshot image(s): ${toErrorMessage(err)}`);
     });
   }
@@ -1370,13 +2648,19 @@ export class WorkflowOrchestrator implements WorkflowController {
    * machineState/context (which point at the last non-terminal save point) so
    * resume re-enters that state instead of the terminal snapshot. Shared by the
    * abort() and handleWorkflowComplete() stop paths.
+   *
+   * Returns whether the checkpoint was saved. Only then do `containerSnapshots`
+   * become the run's restore snapshots and may the ones they replace be
+   * removed: after a failed save the checkpoint on disk still references the
+   * old images (the new ones are left to the orphan sweep).
    */
   private saveTerminalCheckpoint(
     instance: WorkflowInstance,
     finalStatus: WorkflowStatus,
     containerSnapshots: Readonly<Record<string, ContainerSnapshotRef>> | undefined,
     existing: WorkflowCheckpoint | undefined,
-  ): void {
+    usageSettlementPending = false,
+  ): boolean {
     try {
       const terminalCheckpoint = this.buildCheckpoint(
         instance,
@@ -1387,21 +2671,40 @@ export class WorkflowOrchestrator implements WorkflowController {
       const checkpoint = existing
         ? { ...terminalCheckpoint, machineState: existing.machineState, context: existing.context }
         : terminalCheckpoint;
-      this.deps.checkpointStore.save(instance.id, checkpoint);
+      this.deps.checkpointStore.save(
+        instance.id,
+        usageSettlementPending ? { ...checkpoint, usageSettlementPending: true } : checkpoint,
+      );
     } catch (err) {
-      writeStderr(`[workflow] Failed to save terminal checkpoint for ${instance.id}: ${toErrorMessage(err)}`);
+      this.reportCheckpointSaveFailure(instance, 'terminal checkpoint', err);
+      return false;
     }
+    instance.containerSnapshots = containerSnapshots;
+    this.reportCheckpointSaveRecovered(instance);
+    return true;
   }
 
+  /**
+   * The snapshots a stop supersedes: those that both the checkpoint on disk
+   * (`previous`) and this leg's restore set (`restored`, the instance's
+   * snapshots before the stop) reference and the stop's new snapshots
+   * (`next`) do not. Normally the two agree, since every save records the
+   * restore set. Requiring both keeps a reference this leg never used (one a
+   * resume ignored, see `WorkflowResumeOptions.ignoreContainerSnapshots`) out
+   * of the removal, even when the resume checkpoint that dropped it was not
+   * saved.
+   */
   private snapshotsSupersededBy(
     previous: Readonly<Record<string, ContainerSnapshotRef>> | undefined,
+    restored: Readonly<Record<string, ContainerSnapshotRef>> | undefined,
     next: Readonly<Record<string, ContainerSnapshotRef>> | undefined,
   ): Readonly<Record<string, ContainerSnapshotRef>> | undefined {
-    if (!previous) return undefined;
+    if (!previous || !restored) return undefined;
+    const restoredImages = new Set(Object.values(restored).map((snapshot) => snapshot.image));
     const nextImages = new Set(Object.values(next ?? {}).map((snapshot) => snapshot.image));
     const superseded: Record<string, ContainerSnapshotRef> = {};
     for (const [scope, snapshot] of Object.entries(previous)) {
-      if (!nextImages.has(snapshot.image)) {
+      if (restoredImages.has(snapshot.image) && !nextImages.has(snapshot.image)) {
         superseded[scope] = snapshot;
       }
     }
@@ -1455,10 +2758,41 @@ export class WorkflowOrchestrator implements WorkflowController {
       // to the default `./audit.jsonl` against process.cwd().
       config.allowedDirectory = input.workspacePath;
       config.auditLogPath = getBundleAuditLogPath(input.workflowId, input.bundleId);
-      config.mcpServers = filterMcpServersByPolicy(config.mcpServers, input.requiredServers);
+      // With taint escalation enabled, the coordinator also replays the
+      // audit logs of the bundles a resumed run's earlier legs minted.
+      config.taintReplayAuditLogPaths = input.taintReplayAuditLogPaths ?? [];
+      // The bundle's budget gate takes its limits from this config: apply
+      // the run's effective budget, as each state's session config does.
+      if (input.resourceBudget !== undefined) {
+        config.userConfig = { ...config.userConfig, resourceBudget: input.resourceBudget };
+      }
+      // Human approvals feed the approval history under the policy in
+      // effect: the bundle starts on the global policy, and the
+      // coordinator's loadPolicy moves the scope to each persona it loads.
+      config.approvalHistoryScope = GLOBAL_APPROVAL_SCOPE;
+      const servers = filterMcpServersByPolicy(config.mcpServers, input.requiredServers);
+      // The orchestrator never asks for memory (getRequiredServersForScope),
+      // but the bundle must not get it even if the required set or the
+      // server configuration names it: see withoutMemoryServer.
+      if (Object.hasOwn(servers, MEMORY_SERVER_NAME)) {
+        writeStderr(
+          `[workflow] not starting the "${MEMORY_SERVER_NAME}" server in shared-container scope "${input.scope}": ` +
+            `one bundle-wide memory server would give every persona in the scope the same database`,
+        );
+      }
+      config.mcpServers = withoutMemoryServer(servers);
       applyAllowedDirectoryToMcpArgs(config.mcpServers, input.workspacePath);
+      // The bundle coordinator narrows every persona policy it loads with
+      // the run's task scope (validated by the orchestrator; the sandbox
+      // loads it again and refuses the bundle if it no longer validates).
+      if (input.taskPolicyDir !== undefined) config.taskPolicyDir = input.taskPolicyDir;
+      // A read-only scope: read-only workspace mount, no nested Docker, and a
+      // coordinator that confines changes to the scope's output directories.
+      const bundleConfig = input.readOnlyWorkspace ? applyReadOnlyWorkspace(config, input.readOnlyWorkspace) : config;
       return createDockerInfrastructure(
-        config,
+        // Escalated tool calls reach the workflow's human route (the
+        // in-process handler below); see withWorkflowEscalationRouting.
+        withWorkflowEscalationRouting(bundleConfig, bundleEscalationDir),
         { kind: 'docker', agent: input.agentId },
         bundleDir,
         input.workspacePath,
@@ -1477,65 +2811,222 @@ export class WorkflowOrchestrator implements WorkflowController {
           workflowRunId: input.workflowId,
         },
         input.workflowScriptsDir,
-        input.baseImageOverride ? { baseImageOverride: input.baseImageOverride } : undefined,
+        {
+          workflowRunDir: input.workflowRunDir,
+          ...(input.baseImageOverride
+            ? {
+                baseImageOverride: input.baseImageOverride,
+                baseImageAgentBuildHash: input.baseImageAgentBuildHash,
+                ...(input.baseImageAgentSudo === undefined ? {} : { baseImageAgentSudo: input.baseImageAgentSudo }),
+              }
+            : {}),
+          onEscalation: input.onEscalation,
+          onHostPrivilegedFiles: (notice) => {
+            const instance = this.workflows.get(input.workflowId);
+            if (instance) this.recordHostPrivilegedFiles(instance, notice);
+            else writeStderr(formatSessionNotice(notice));
+          },
+          // Fan-out lanes in this scope each get their own circuit-breaker
+          // window on the bundle's coordinator; this bounds their total.
+          maxLanes: input.maxLanes,
+          ...(input.workflowCommit ? { workflowCommit: input.workflowCommit } : {}),
+        },
       );
     };
   }
 
   /** Lazy-loads the default `destroyDockerInfrastructure` helper. */
-  private async loadDefaultInfrastructureTeardown(): Promise<(infra: DockerInfrastructure) => Promise<void>> {
+  private async loadDefaultInfrastructureTeardown(): Promise<(infra: DockerInfrastructure) => Promise<unknown>> {
     const { destroyDockerInfrastructure } = await import('../docker/docker-infrastructure.js');
     return destroyDockerInfrastructure;
   }
 
   // -----------------------------------------------------------------------
-  // Token-stream accumulation (workflow-scoped totalTokens counter)
+  // Run-wide usage (metrics bus) and the workflow spend ceiling
   // -----------------------------------------------------------------------
   //
-  // The token-stream bus is global (see `getTokenStreamBus()` in
-  // `src/docker/token-stream-bus.ts`), so the orchestrator subscribes with
-  // `subscribeAll()` and filters inside the listener by the workflow's own
-  // session-ID set. Per-workflow rather than per-agent: `ctx.totalTokens`
-  // is a workflow-level cumulative sum, so one long-lived subscription is
-  // cheaper (one bus listener, one unsubscribe on completion) than
-  // subscribing and unsubscribing on every `agent_started` /
-  // `agent_session_ended` pair.
+  // The metrics bus is global (`getLlmMetricsEventBus()`): the MITM of every
+  // bundle publishes each completed LLM exchange on it once. Each run keeps
+  // one subscription for its lifetime and its meter keeps only the exchanges
+  // that belong to the run (attributed to the run id, or to one of its
+  // bundles). This replaces the earlier token-stream counter, which added up
+  // only `message_end.outputTokens`: no input or cache tokens, and nothing at
+  // all for OpenAI-format streams.
 
   /**
-   * Subscribes the workflow to the global token-stream bus. Accumulates
-   * `message_end.outputTokens` into `instance.tokens.outputTokens` for any
-   * event whose session ID is in `instance.tokens.sessionIds`. The set is managed
-   * by `executeAgentState` (added before `agent_started`, removed in the
-   * `finally` block after `agent_session_ended`).
-   *
-   * Installed synchronously so the subscription is live before any agent
-   * state runs — no window where bus events go unobserved.
+   * Subscribes the run's usage meter to the metrics bus. Installed
+   * synchronously before any state runs, so no exchange goes unobserved.
    */
-  private setupTokenSubscription(instance: WorkflowInstance): void {
+  private setupUsageSubscription(instance: WorkflowInstance): void {
     // Defensive: re-entry by resume-after-crash should not double-subscribe.
-    if (instance.tokens.unsubscribe) return;
-    instance.tokens.unsubscribe = getTokenStreamBus().subscribeAll((sessionId, event) => {
-      if (event.kind !== 'message_end') return;
-      if (!instance.tokens.sessionIds.has(sessionId)) return;
-      instance.tokens.outputTokens += event.outputTokens;
+    if (instance.unsubscribeUsage) return;
+    instance.unsubscribeUsage = getLlmMetricsEventBus().subscribe((exchange) => {
+      instance.usage.observeExchange(exchange);
     });
   }
 
   /**
-   * Tears down the token-stream bus subscription. Idempotent: safe to
-   * call from both normal completion and abort paths.
+   * Tears down the metrics-bus subscription. Idempotent: safe to call from
+   * both normal completion and abort paths.
    */
-  private teardownTokenSubscription(instance: WorkflowInstance): void {
-    if (instance.tokens.unsubscribe) {
+  private teardownUsageSubscription(instance: WorkflowInstance): void {
+    if (instance.unsubscribeUsage) {
       try {
-        instance.tokens.unsubscribe();
+        instance.unsubscribeUsage();
       } catch {
         // Unsubscribe is best-effort; errors here should never prevent
         // workflow teardown from completing.
       }
-      instance.tokens.unsubscribe = undefined;
+      instance.unsubscribeUsage = undefined;
     }
-    instance.tokens.sessionIds.clear();
+  }
+
+  /**
+   * Refuses to start `stateId` once the run has reached its
+   * `settings.workflowBudget` (see `findWorkflowBudgetBreach`). Runs before
+   * every agent state, deterministic state and fan-out batch, including each
+   * step of a fan-out lane, so the ceiling is checked again at every state
+   * boundary rather than only between top-level states.
+   *
+   * On a breach the instance is stamped (once) and a
+   * `WorkflowBudgetExhaustedError` is thrown. The machine routes that error
+   * to the abort-preserving terminal (`isResumableWorkflowStop`); inside a
+   * fan-out lane it lands on the lane's `errored` terminal, drains the
+   * other lanes, and `upstreamFailureAfterFanOut` re-raises it at the
+   * barrier. Either way `handleWorkflowComplete` reports `aborted` and keeps
+   * the checkpoint, so the run resumes once the limit is raised.
+   */
+  private assertWithinWorkflowBudget(workflowId: WorkflowId, stateId: string): void {
+    const instance = this.workflows.get(workflowId);
+    const limits = instance?.definition.settings?.workflowBudget;
+    if (!instance || limits === undefined) return;
+    const breach = findWorkflowBudgetBreach(limits, instance.usage.snapshot());
+    if (!breach) return;
+    const error = new WorkflowBudgetExhaustedError({
+      stateId,
+      limitField: breach.limitField,
+      used: breach.used,
+      limit: breach.limit,
+      detail: breach.message,
+    });
+    if (!instance.workflowBudgetExhausted) {
+      const definitionCopy = resolve(this.deps.baseDir, workflowId, 'definition.json');
+      instance.workflowBudgetExhausted = {
+        breach,
+        reason:
+          `${error.message}. Resumable: raise or remove settings.workflowBudget.${breach.limitField} in ${definitionCopy}, ` +
+          `then run "ironcurtain workflow resume ${workflowId}".`,
+      };
+      writeStderr(`[workflow] ${error.message}`);
+      instance.tab.write(`[budget] ${error.message}`);
+      instance.messageLog.append({
+        ...this.logBase(instance),
+        type: 'error',
+        error: error.message,
+        context: `workflow budget check before "${stateId}"`,
+      });
+    }
+    throw error;
+  }
+
+  /** Runs a state's service once the workflow budget check has passed. */
+  private async invokeWithinWorkflowBudget<T>(
+    workflowId: WorkflowId,
+    stateId: string,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    this.assertWithinWorkflowBudget(workflowId, stateId);
+    return run();
+  }
+
+  // -----------------------------------------------------------------------
+  // Workspace selection
+  // -----------------------------------------------------------------------
+
+  /** The run's directory under this orchestrator's base directory. */
+  private runDirOf(workflowId: WorkflowId): string {
+    return resolve(this.deps.baseDir, workflowId);
+  }
+
+  /** The workspace a run gets when the caller supplies none. */
+  private defaultWorkspacePath(workflowId: WorkflowId): string {
+    return resolve(this.runDirOf(workflowId), RUN_WORKSPACE_DIRNAME);
+  }
+
+  private protectedPathsForWorkspaceValidation(): readonly string[] {
+    return this.deps.protectedPaths ?? loadConfig().protectedPaths;
+  }
+
+  /**
+   * Resolves the workspace a resumed run uses. `recorded` is the checkpoint's
+   * path after {@link rebaseRunLocalPaths}, so a run-local workspace already
+   * points into this run directory even when the IronCurtain home moved.
+   *
+   * - No recorded path (checkpoints from before workspaces were recorded):
+   *   the default workspace, created if needed.
+   * - The derived default: must exist, and needs no validation as long as it
+   *   is what `start()` created, a real directory inside a real run
+   *   directory. One that is a symlink, or lies below a symlinked run
+   *   directory, points wherever its author chose (a copied or foreign base
+   *   directory can hold one), so it is validated like any other path.
+   * - Any other path was supplied by a user at start (or arrived in an
+   *   imported checkpoint), and the directory may have changed since, so it is
+   *   validated again exactly like a fresh `--workspace` and its canonical form
+   *   is used.
+   *
+   * A recorded workspace that no longer exists fails with
+   * `WORKFLOW_WORKSPACE_MISSING`; it is never recreated empty, which would let
+   * a long run continue silently without any of its earlier work (and, for a
+   * stale path, outside the active home). Any other rejected path makes the
+   * run not resumable.
+   */
+  private resolveResumeWorkspace(
+    workflowId: WorkflowId,
+    recorded: string | undefined,
+    recordedOnDisk: string | undefined,
+  ): string {
+    const defaultWorkspace = this.defaultWorkspacePath(workflowId);
+    if (recorded === undefined) mkdirSync(defaultWorkspace, { recursive: true });
+    const missing = (path: string): WorkflowResumeError => {
+      const moved = recordedOnDisk !== undefined && recordedOnDisk !== path ? ` (recorded as ${recordedOnDisk})` : '';
+      return new WorkflowResumeError(
+        'WORKFLOW_WORKSPACE_MISSING',
+        `Cannot resume workflow ${workflowId}: its workspace ${path}${moved} does not exist. ` +
+          'Restore the directory, or create it empty to resume without the earlier workspace contents.',
+      );
+    };
+    const isDefault = recorded === undefined || recorded === defaultWorkspace;
+    if (isDefault) {
+      if (!isDirectory(defaultWorkspace)) throw missing(defaultWorkspace);
+      if (isRealDirectory(this.runDirOf(workflowId)) && isRealDirectory(defaultWorkspace)) return defaultWorkspace;
+    }
+    const candidate = isDefault ? defaultWorkspace : recorded;
+    try {
+      return validateWorkspacePath(candidate, this.protectedPathsForWorkspaceValidation());
+    } catch (err) {
+      if (isWorkspaceValidationError(err) && err.code === 'WORKSPACE_NOT_FOUND') throw missing(candidate);
+      throw new WorkflowResumeError(
+        'WORKFLOW_NOT_RESUMABLE',
+        `Cannot resume workflow ${workflowId}: workspace failed validation: ${toErrorMessage(err)}`,
+      );
+    }
+  }
+
+  /**
+   * The task scope a resumed `--task-scoped` run keeps. Validated again: a
+   * scope that no longer validates refuses the resume instead of letting
+   * the run continue unscoped.
+   */
+  private resolveResumeTaskScope(workflowId: WorkflowId, recorded: string | undefined): string | undefined {
+    if (recorded === undefined) return undefined;
+    try {
+      return validateTaskScopeDir(recorded);
+    } catch (err) {
+      throw new WorkflowResumeError(
+        'WORKFLOW_NOT_RESUMABLE',
+        `Cannot resume workflow ${workflowId}: its task scope failed validation: ${toErrorMessage(err)}`,
+      );
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -1547,14 +3038,33 @@ export class WorkflowOrchestrator implements WorkflowController {
   // (b) leaves a hook for future async bootstrap work without another
   // interface change.
   // eslint-disable-next-line @typescript-eslint/require-await
-  async start(definitionPath: string, taskDescription: string, workspacePath?: string): Promise<WorkflowId> {
+  async start(
+    definitionPath: string,
+    taskDescription: string,
+    workspacePath?: string,
+    options?: WorkflowStartOptions,
+  ): Promise<WorkflowId> {
+    this.assertAcceptingRuns('start a workflow');
     const raw = parseDefinitionFile(definitionPath);
     const definition = validateDefinition(raw);
     this.validatePersonas(definition);
     validateWorkflowSkillReferences(definition, getWorkflowPackageDir(definitionPath));
+    this.assertAgentSlotDemandFits(definition);
+    // A task scope must validate before anything is created; the run keeps
+    // its canonical path from here on.
+    const taskPolicyDir =
+      options?.taskPolicyDir === undefined ? undefined : validateTaskScopeDir(options.taskPolicyDir);
     const workflowId = createWorkflowId();
 
-    const resolvedWorkspace = workspacePath ?? resolve(this.deps.baseDir, workflowId, 'workspace');
+    // A caller-supplied workspace (CLI --workspace, the workflows.start RPC)
+    // goes through the same validator as `start -w` before anything is
+    // created, and the run keeps its canonical form from here on. The
+    // default workspace is derived by the orchestrator under its own base
+    // directory, so it needs no validation.
+    const resolvedWorkspace =
+      workspacePath === undefined
+        ? this.defaultWorkspacePath(workflowId)
+        : validateWorkspacePath(workspacePath, this.protectedPathsForWorkspaceValidation());
 
     // Reject if any active workflow already uses this workspace path
     for (const instance of this.workflows.values()) {
@@ -1565,18 +3075,61 @@ export class WorkflowOrchestrator implements WorkflowController {
 
     mkdirSync(resolvedWorkspace, { recursive: true });
 
+    // Cross-process ownership, before anything is written into the workspace:
+    // a run in another process (or another orchestrator) on the same
+    // workspace realpath refuses this start. Held until terminalReady.
+    const locks = this.claimRunLocks(workflowId, resolvedWorkspace);
+    try {
+      return this.startClaimedRun(
+        workflowId,
+        definitionPath,
+        definition,
+        taskDescription,
+        resolvedWorkspace,
+        taskPolicyDir,
+        locks,
+      );
+    } catch (err) {
+      this.releaseRunLocks(locks);
+      throw err;
+    }
+  }
+
+  /**
+   * Body of {@link start} once the run and workspace locks are held.
+   * `taskPolicyDir` is the run's validated, canonical task scope, or
+   * undefined for an unscoped run.
+   */
+  private startClaimedRun(
+    workflowId: WorkflowId,
+    definitionPath: string,
+    definition: WorkflowDefinition,
+    taskDescription: string,
+    resolvedWorkspace: string,
+    taskPolicyDir: string | undefined,
+    locks: WorkflowInstance['locks'],
+  ): WorkflowId {
+    // A reused --workspace may hold entries an earlier run's agent planted
+    // (in Docker mode it is a read-write bind mount): `.workflow` or the task
+    // description as a symlink to a host file, `.gitignore` as a FIFO or a link
+    // to /dev/zero. Build the workflow-owned tree and touch `.gitignore` only
+    // through the no-follow helpers, which move such entries aside or skip them.
     const artifactDir = resolve(resolvedWorkspace, WORKFLOW_ARTIFACT_DIR);
-    mkdirSync(artifactDir, { recursive: true });
-    const taskDir = resolve(artifactDir, 'task');
-    mkdirSync(taskDir, { recursive: true });
-    writeFileSync(resolve(taskDir, 'description.md'), taskDescription);
+    const workspaceWarnings = [...prepareWorkflowArtifactDir(resolvedWorkspace, taskDescription).warnings];
+    const gitignore = ensureWorkflowGitignored(resolvedWorkspace);
+    if (gitignore.status === 'skipped') {
+      workspaceWarnings.push(
+        `left ${resolve(resolvedWorkspace, '.gitignore')} unchanged (${gitignore.reason}); ` +
+          `add "${WORKFLOW_ARTIFACT_DIR}/" to it yourself if the workspace is a git repository`,
+      );
+    }
+    for (const warning of workspaceWarnings) writeStderr(`[workflow] Warning: ${warning}`);
 
-    ensureWorkflowGitignored(resolvedWorkspace);
-
-    // Copy definition to baseDir for resume portability
-    const metaDir = resolve(this.deps.baseDir, workflowId);
+    // Copy the validated definition into the run directory so resume does
+    // not depend on the original file (durable, atomic, format-stamped).
+    const metaDir = this.runDirOf(workflowId);
     mkdirSync(metaDir, { recursive: true });
-    writeFileSync(resolve(metaDir, 'definition.json'), JSON.stringify(definition, null, 2));
+    writeRunDefinition(metaDir, definition);
 
     // Stage the workflow package's `skills/` tree into the run dir so
     // resume is independent of whether the original package path still
@@ -1593,6 +3146,7 @@ export class WorkflowOrchestrator implements WorkflowController {
     const providedMachine = this.provideActors(machine, workflowId, definition, roundMachinesByState);
     const actor = createActor(providedMachine);
     const tab = this.deps.createWorkflowTab(definition.name, workflowId);
+    for (const warning of workspaceWarnings) tab.write(`[warning] ${warning}`);
     const messageLog = new MessageLog(resolve(this.deps.baseDir, workflowId, 'messages.jsonl'));
 
     const instance: WorkflowInstance = {
@@ -1602,12 +3156,14 @@ export class WorkflowOrchestrator implements WorkflowController {
       definitionPath,
       workflowSkillsDir,
       workflowScriptsDir,
+      taskPolicyDir,
       containerSnapshots: undefined,
       actor,
       roundMachinesByState,
       gateStateNames,
       terminalStateNames,
       activeSessions: new Set(),
+      sessionClosures: new WeakMap(),
       artifactDir,
       workspacePath: resolvedWorkspace,
       tab,
@@ -1619,12 +3175,16 @@ export class WorkflowOrchestrator implements WorkflowController {
       bundlesByScope: new Map(),
       policyDirByPersona: new Map(),
       currentPersonaByBundle: new Map(),
+      liveAgentTurnsByBundle: new Map(),
       mintedServersByBundle: new Map(),
-      aborted: false,
-      tokens: {
-        outputTokens: 0,
-        sessionIds: new Set(),
-      },
+      bundleMintsInFlight: 0,
+      sessionSlots: new Map(),
+      commitChannelsByBundle: new Map(),
+      pendingEscalations: new Map(),
+      stopController: new AbortController(),
+      fanOutChildren: new Set(),
+      locks,
+      usage: new WorkflowUsageMeter(workflowId),
     };
 
     // Under `sharedContainer: true`, bundles are minted lazily by
@@ -1636,7 +3196,8 @@ export class WorkflowOrchestrator implements WorkflowController {
     // before any Docker resource is touched.
 
     this.workflows.set(workflowId, instance);
-    this.setupTokenSubscription(instance);
+    this.setupUsageSubscription(instance);
+    instance.usage.setRunning(isExecutableState(definition.states[definition.initial]));
     this.emitLifecycleEvent({ kind: 'started', workflowId, name: definition.name, taskDescription });
     this.subscribeToActor(instance);
     // Persist the initial executable state before it can transition directly
@@ -1647,21 +3208,22 @@ export class WorkflowOrchestrator implements WorkflowController {
     return workflowId;
   }
 
-  // Intentionally has no await: the instance must be installed before a
-  // second resume call can observe an opening in the active-workflow guard.
-  // eslint-disable-next-line @typescript-eslint/require-await
-  async resume(workflowId: WorkflowId, options?: { useCurrentBudget?: boolean }): Promise<void> {
-    const existing = this.workflows.get(workflowId);
-    if (existing && (!existing.finalStatus || !existing.terminalReady)) {
-      throw new WorkflowResumeError('WORKFLOW_ALREADY_ACTIVE', `Workflow ${workflowId} is already active`);
+  /** Loads a checkpoint `resume()` can use, or throws the matching `WorkflowResumeError`. */
+  private loadResumableCheckpoint(workflowId: WorkflowId): WorkflowCheckpoint {
+    if (!isSafeWorkflowId(workflowId)) {
+      throw new WorkflowResumeError(
+        'WORKFLOW_INVALID_ID',
+        `Invalid workflow ID ${JSON.stringify(workflowId)}: use 1-128 letters, digits, "_" or "-"`,
+      );
     }
-
     let checkpoint: WorkflowCheckpoint | undefined;
     try {
       checkpoint = this.deps.checkpointStore.load(workflowId);
     } catch (err) {
+      // A newer format is refused as such: reporting it as corruption would
+      // send the user looking for damage that is not there.
       throw new WorkflowResumeError(
-        'WORKFLOW_CHECKPOINT_CORRUPTED',
+        isWorkflowRunFileTooNewError(err) ? 'WORKFLOW_CHECKPOINT_TOO_NEW' : 'WORKFLOW_CHECKPOINT_CORRUPTED',
         `Failed to load checkpoint for workflow ${workflowId}: ${toErrorMessage(err)}`,
       );
     }
@@ -1671,19 +3233,90 @@ export class WorkflowOrchestrator implements WorkflowController {
     if (!isCheckpointResumable(checkpoint)) {
       throw new WorkflowResumeError('WORKFLOW_NOT_RESUMABLE', `Workflow ${workflowId} has already completed`);
     }
+    return checkpoint;
+  }
 
-    const definitionCopyPath = resolve(this.deps.baseDir, workflowId, 'definition.json');
-    const definitionPath = existsSync(definitionCopyPath) ? definitionCopyPath : checkpoint.definitionPath;
-    let definition: WorkflowDefinition;
+  // Intentionally has no await: the instance must be installed before a
+  // second resume call can observe an opening in the active-workflow guard.
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async resume(workflowId: WorkflowId, options?: WorkflowResumeOptions): Promise<void> {
+    this.assertAcceptingRuns('resume a workflow');
+    const existing = this.workflows.get(workflowId);
+    if (existing && (!existing.finalStatus || !existing.terminalReady)) {
+      throw new WorkflowResumeError('WORKFLOW_ALREADY_ACTIVE', `Workflow ${workflowId} is already active`);
+    }
+
+    // Side-effect-free pre-check: a missing, corrupt or completed run is
+    // refused before anything (the run lock included) touches the disk.
+    this.loadResumableCheckpoint(workflowId);
+
+    // Cross-process ownership: a run that is live in another process (or in
+    // another orchestrator of this one) is refused instead of executed twice.
+    // A crashed holder's lock is reclaimed. Held until terminalReady.
+    const locks: WorkflowInstance['locks'] = {};
     try {
-      // Runtime copies are always JSON; original user files may be YAML.
-      definition = validateDefinition(parseDefinitionFile(definitionPath));
+      locks.run = claimWorkflowRunLock(this.deps.baseDir, workflowId);
     } catch (err) {
+      if (isWorkflowLockBusyError(err)) {
+        throw new WorkflowResumeError('WORKFLOW_ALREADY_ACTIVE', `Cannot resume: ${err.message}`);
+      }
+      throw err;
+    }
+    try {
+      this.resumeClaimedRun(workflowId, locks, options);
+    } catch (err) {
+      this.releaseRunLocks(locks);
+      throw err;
+    }
+  }
+
+  /**
+   * Body of {@link resume} once the run lock is held. Claims the workspace lock
+   * itself (adding it to `locks`) before the first workspace write.
+   */
+  private resumeClaimedRun(
+    workflowId: WorkflowId,
+    locks: WorkflowInstance['locks'],
+    options: WorkflowResumeOptions | undefined,
+  ): void {
+    // The authoritative read, under the run lock: another process may have
+    // advanced or finished the run between the pre-check and the claim.
+    // Run-local paths follow the run directory: after a move of the
+    // IronCurtain home they point here, not at the old location.
+    const loadedCheckpoint = this.loadResumableCheckpoint(workflowId);
+    const checkpoint = rebaseRunLocalPaths(loadedCheckpoint, workflowId, this.runDirOf(workflowId));
+
+    const definitionCopyPath = runDefinitionPath(this.runDirOf(workflowId));
+    const hasDefinitionCopy = existsSync(definitionCopyPath);
+    const allowPackageRecovery = isOwnWorkflowRunsDirectory(this.deps.baseDir);
+    if (!hasDefinitionCopy && !allowPackageRecovery) {
       throw new WorkflowResumeError(
         'WORKFLOW_CHECKPOINT_CORRUPTED',
-        `Failed to load workflow definition for ${workflowId}: ${toErrorMessage(err)}`,
+        'An external workflow run requires its own definition.json copy',
       );
     }
+    const definitionPath = hasDefinitionCopy ? definitionCopyPath : checkpoint.definitionPath;
+    let definition: WorkflowDefinition;
+    try {
+      // The run copy carries a format stamp (checked and removed here);
+      // original user files may be YAML.
+      definition = validateDefinition(
+        hasDefinitionCopy ? readRunDefinitionRaw(definitionPath) : parseDefinitionFile(definitionPath),
+      );
+    } catch (err) {
+      // Name the file: a run recorded before a validation rule existed (a
+      // host deterministic state without host: true, say) resumes only after
+      // this copy is fixed, and editing the workflow's source changes nothing.
+      throw new WorkflowResumeError(
+        isWorkflowRunFileTooNewError(err) ? 'WORKFLOW_CHECKPOINT_TOO_NEW' : 'WORKFLOW_CHECKPOINT_CORRUPTED',
+        `Failed to load workflow definition ${definitionPath} for ${workflowId}: ${toErrorMessage(err)}`,
+      );
+    }
+    // As in start(): refuse, before anything is created, a shared-container
+    // run that needs more agent slots than the cap now allows (the cap may
+    // have been lowered since the run started); its first mint could never
+    // be served.
+    this.assertAgentSlotDemandFits(definition);
 
     const restored = (() => {
       try {
@@ -1726,12 +3359,41 @@ export class WorkflowOrchestrator implements WorkflowController {
       }
     })();
 
-    const workspacePath = checkpoint.workspacePath ?? resolve(this.deps.baseDir, workflowId, 'workspace');
+    const workspacePath = this.resolveResumeWorkspace(
+      workflowId,
+      checkpoint.workspacePath,
+      loadedCheckpoint.workspacePath,
+    );
+    const taskPolicyDir = this.resolveResumeTaskScope(workflowId, checkpoint.taskPolicyDir);
     const artifactDir = resolve(workspacePath, WORKFLOW_ARTIFACT_DIR);
-    // Ensure artifact dir exists (backward compat with pre-workspace checkpoints)
-    mkdirSync(artifactDir, { recursive: true });
+    // The workspace may be held by another run (an imported checkpoint points
+    // at its source run's workspace, and `--workspace` can name any
+    // directory). Claimed before the first write into it.
+    try {
+      locks.workspace = claimWorkflowWorkspaceLock(
+        this.deps.workspaceLockDir ?? getWorkflowWorkspaceLocksDir(),
+        workspacePath,
+      );
+    } catch (err) {
+      if (isWorkflowLockBusyError(err)) {
+        throw new WorkflowResumeError(
+          'WORKFLOW_ALREADY_ACTIVE',
+          `Cannot resume workflow ${workflowId}: ${err.message}`,
+        );
+      }
+      throw err;
+    }
+    // Re-validate the workflow-owned tree before any host-side artifact work:
+    // while the run was paused an agent (or a process it left behind) may have
+    // replaced `.workflow` or `.workflow/task` with a symlink into a host
+    // directory. Such entries are moved aside and recreated, and the task
+    // description is rewritten from the checkpoint. This also creates the tree
+    // for pre-workspace checkpoints.
+    const workspaceWarnings = prepareWorkflowArtifactDir(workspacePath, restored.taskDescription).warnings;
+    for (const warning of workspaceWarnings) writeStderr(`[workflow] Warning: ${warning}`);
 
     const tab = this.deps.createWorkflowTab(definition.name, workflowId);
+    for (const warning of workspaceWarnings) tab.write(`[warning] ${warning}`);
     // Append to existing log file (resume must not overwrite)
     const messageLog = new MessageLog(resolve(this.deps.baseDir, workflowId, 'messages.jsonl'));
 
@@ -1750,13 +3412,19 @@ export class WorkflowOrchestrator implements WorkflowController {
       checkpointedStagedDir: checkpoint.workflowSkillsDir,
       packageDir: getWorkflowPackageDir(checkpoint.definitionPath),
       runMetaDir,
+      allowPackageRecovery,
     });
     const workflowScriptsDir = resolveWorkflowScriptsDirOnResume({
       workflowId,
       checkpointedStagedDir: checkpoint.workflowScriptsDir,
       packageDir: getWorkflowPackageDir(checkpoint.definitionPath),
       runMetaDir,
+      allowPackageRecovery,
     });
+    // The scopes' restore snapshots, unless the caller cannot vouch for the
+    // checkpoint's references (see WorkflowResumeOptions): then they are
+    // neither restored nor, since the resume checkpoint drops them, removed.
+    const restoreSnapshots = options?.ignoreContainerSnapshots ? undefined : checkpoint.containerSnapshots;
 
     const instance: WorkflowInstance = {
       id: workflowId,
@@ -1767,15 +3435,17 @@ export class WorkflowOrchestrator implements WorkflowController {
           ? resolveWorkflowResourceBudget(definition.settings)
           : checkpoint.resourceBudget,
       definition,
-      definitionPath: checkpoint.definitionPath,
+      definitionPath: allowPackageRecovery ? checkpoint.definitionPath : definitionCopyPath,
       workflowSkillsDir,
       workflowScriptsDir,
-      containerSnapshots: checkpoint.containerSnapshots,
+      taskPolicyDir,
+      containerSnapshots: restoreSnapshots,
       actor: restored.actor,
       roundMachinesByState: restored.roundMachinesByState,
       gateStateNames: restored.gateStateNames,
       terminalStateNames: restored.terminalStateNames,
       activeSessions: new Set(),
+      sessionClosures: new WeakMap(),
       artifactDir,
       workspacePath,
       tab,
@@ -1785,37 +3455,64 @@ export class WorkflowOrchestrator implements WorkflowController {
       stateEnteredAt: Date.now(),
       messageLog,
       bundlesByScope: new Map(),
+      // Listed before this leg mints any bundle (taint escalation replays
+      // them). Only shared-container runs mint bundles.
+      ...(this.shouldUseSharedContainer(definition)
+        ? { priorBundleAuditLogPaths: listPriorBundleAuditLogPaths(workflowId) }
+        : {}),
       policyDirByPersona: new Map(),
       currentPersonaByBundle: new Map(),
+      liveAgentTurnsByBundle: new Map(),
       mintedServersByBundle: new Map(),
-      aborted: false,
-      tokens: {
-        // Resume picks up the checkpointed totalTokens as the accumulator's
-        // starting point so post-resume message_end events keep adding to
-        // the running total instead of resetting it.
-        outputTokens: restored.totalTokens,
-        sessionIds: new Set(),
-      },
+      bundleMintsInFlight: 0,
+      sessionSlots: new Map(),
+      commitChannelsByBundle: new Map(),
+      pendingEscalations: new Map(),
+      stopController: new AbortController(),
+      fanOutChildren: new Set(),
+      locks,
+      // Resume continues from the checkpointed usage, so totals and the
+      // workflow budget span every leg of the run instead of resetting.
+      usage: new WorkflowUsageMeter(workflowId, workflowUsageFromCheckpoint(checkpoint)),
     };
+
+    if (restored.stateDefinition.type === 'human_gate') {
+      // A checkpoint taken at a gate carries that raise's id; restoring it
+      // keeps a decision made before the restart valid. A legacy checkpoint
+      // without one, or an id that was not minted for this gate of this run,
+      // gets a fresh raise id instead. Either way the id is settled here, so
+      // the resume checkpoint below persists it and a second restart before
+      // the decision keeps it too. An id left beside a non-gate state is
+      // ignored: the run is not waiting at a gate.
+      instance.activeGateId = isGateIdFor(checkpoint.activeGateId, workflowId, restored.restoredState)
+        ? checkpoint.activeGateId
+        : this.mintGateIdFor(instance, restored.restoredState);
+    }
 
     // Under the lazy-mint model there is nothing to create at resume
     // time: `bundlesByScope` starts empty and the first state to execute
     // mints its bundle. When the checkpoint carries snapshot digests,
     // the per-scope mint path uses them as immutable image overrides
-    // after an imageExists guard; missing images degrade to fresh.
+    // when they were taken under the agent image build the bundle
+    // resolves now; other builds and missing images degrade to fresh.
     if (this.shouldUseSharedContainer(definition)) {
-      const restoredScopes = Object.keys(checkpoint.containerSnapshots ?? {});
+      const restoredScopes = Object.keys(restoreSnapshots ?? {});
+      const ignoredSnapshots =
+        restoreSnapshots === undefined && Object.keys(checkpoint.containerSnapshots ?? {}).length > 0;
       const snapshotNote =
         restoredScopes.length > 0
           ? ` Snapshot restore available for scope(s): ${restoredScopes.join(', ')}.`
-          : ' No container snapshots recorded; scopes will start fresh.';
+          : ignoredSnapshots
+            ? ' The container snapshots this checkpoint records are not used; scopes will start fresh.'
+            : ' No container snapshots recorded; scopes will start fresh.';
       writeStderr(
         `[workflow] Resuming ${workflowId} in shared-container mode: bundles will be re-created lazily per scope.${snapshotNote}`,
       );
     }
 
     this.workflows.set(workflowId, instance);
-    this.setupTokenSubscription(instance);
+    this.setupUsageSubscription(instance);
+    instance.usage.setRunning(isExecutableState(restored.stateDefinition));
     this.emitLifecycleEvent({
       kind: 'started',
       workflowId,
@@ -1840,14 +3537,11 @@ export class WorkflowOrchestrator implements WorkflowController {
       ...(checkpointMtimeMs !== undefined ? { checkpointMtimeMs } : {}),
       ...(checkpointFingerprint !== undefined ? { checkpointFingerprint } : {}),
     });
-    // Preserve restore-image references until the next stop can replace and
-    // remove them. The resumed checkpoint clears the previous finalStatus;
-    // the marker's fingerprint above still identifies that stale terminal save.
-    this.saveCheckpoint(
-      instance,
-      restored.actor.getSnapshot() as { value: unknown; context: unknown },
-      checkpoint.containerSnapshots,
-    );
+    // Every save of this leg keeps the restore-image references (the
+    // instance's) until the next stop can replace and remove them. The resumed
+    // checkpoint clears the previous finalStatus; the marker's fingerprint
+    // above still identifies that stale terminal save.
+    this.saveCheckpoint(instance, restored.actor.getSnapshot() as { value: unknown; context: unknown });
     restored.actor.start();
 
     // XState v5's resolveState() restores *to* a state but does not *enter* it.
@@ -1864,6 +3558,21 @@ export class WorkflowOrchestrator implements WorkflowController {
    * a checkpoint. XState does not re-trigger invocations when an actor is
    * started from a persisted snapshot, so we run the service ourselves and
    * send the result event to the actor.
+   *
+   * Resume is at-least-once: the checkpoint is written when a state is
+   * entered, so the restored state runs again from its start even if the
+   * stopped run had already done part of it. The inputs come from the same
+   * builders the machine's invokes use (lane-templated deterministic argv
+   * and result path included), and a replayed agent state is flagged
+   * `resumeReplay` so its prompt tells the agent to inspect the workspace and
+   * not repeat external actions. A fan-out batch is re-run through
+   * `runFanOutSegment`, which reconstructs already-recorded lanes from the
+   * durable run store instead of re-running them. A lane that had not
+   * recorded is re-spawned from its first member with the machine's ordinary
+   * inputs and deliberately no resume notice: the re-run regenerates the
+   * lane's inputs (evolve's `sample` writes a new round context), so telling
+   * a lane agent to keep an earlier attempt's files could mix that work into
+   * a round it no longer matches.
    */
   private replayInvokeForRestoredState(
     workflowId: WorkflowId,
@@ -1877,36 +3586,33 @@ export class WorkflowOrchestrator implements WorkflowController {
     const snapshot = instance.actor.getSnapshot() as { context: WorkflowContext };
     const context = snapshot.context;
 
-    // Build the service promise based on state type
-    let servicePromise: Promise<unknown>;
-    if (stateDef.type === 'agent') {
-      servicePromise =
-        stateDef.fanOut !== undefined
-          ? this.runFanOutSegment(
-              workflowId,
-              { stateId, stateConfig: stateDef, context },
-              definition,
-              instance.roundMachinesByState,
-            )
-          : this.executeAgentState(workflowId, { stateId, stateConfig: stateDef, context }, definition);
-    } else if (stateDef.fanOut !== undefined) {
-      servicePromise = this.runFanOutSegment(
-        workflowId,
-        { stateId, stateConfig: stateDef, context },
-        definition,
-        instance.roundMachinesByState,
-      );
-    } else {
-      servicePromise = this.executeDeterministicState(workflowId, {
-        stateId,
-        commands: stateDef.run,
-        context,
-        container: stateDef.container ?? false,
-        containerScope: stateDef.containerScope,
-        timeoutMs: stateDef.timeoutMs,
-        resultFile: stateDef.resultFile,
-      });
-    }
+    // Build the service promise based on state type, from the same invoke
+    // inputs the machine builds. Like every invoke, the replayed state first
+    // checks the run-wide budget (provideActors), so the re-run notice below
+    // is written only once the state really runs again.
+    const runService = (): Promise<unknown> => {
+      if (stateDef.fanOut !== undefined) {
+        return this.runFanOutSegment(
+          workflowId,
+          buildFanOutInvokeInput(stateId, stateDef, context),
+          definition,
+          instance.roundMachinesByState,
+        );
+      }
+      if (stateDef.type === 'agent') {
+        instance.tab.write(`[agent] Re-running "${stateId}" from its start after resume`);
+        return this.executeAgentState(
+          workflowId,
+          { ...buildAgentInvokeInput(stateId, stateDef, context), resumeReplay: true },
+          definition,
+        );
+      }
+      // No invoke signal here: the instance's stopController is what kills
+      // a replayed host command when the run stops. The builder carries the
+      // state's `host: true` acknowledgement, which the host runner requires.
+      return this.executeDeterministicState(workflowId, buildDeterministicInvokeInput(stateId, stateDef, context));
+    };
+    const servicePromise = this.invokeWithinWorkflowBudget(workflowId, stateId, runService);
 
     // Feed the result back to the actor as an XState internal invoke event.
     // These event types don't exist in our WorkflowEvent union, so we cast
@@ -1921,12 +3627,18 @@ export class WorkflowOrchestrator implements WorkflowController {
       });
   }
 
+  /**
+   * Runs under the base directory that `resume()` would accept now: a
+   * resumable checkpoint, not active here, and not running in another
+   * process (its run lock held by a live owner).
+   */
   listResumable(): WorkflowId[] {
     const runs = discoverWorkflowRuns(this.deps.baseDir);
     const activeIds = new Set(this.listActive());
     const resumable: WorkflowId[] = [];
     for (const run of runs) {
       if (!run.hasCheckpoint || activeIds.has(run.workflowId)) continue;
+      if (isWorkflowRunLockHeld(this.deps.baseDir, run.workflowId)) continue;
       // FileCheckpointStore.load() re-throws on JSON.parse failure (it only
       // swallows ENOENT). A single corrupt checkpoint.json would otherwise
       // poison the whole list and break `workflow inspect` discovery + the
@@ -1953,13 +3665,13 @@ export class WorkflowOrchestrator implements WorkflowController {
 
     if (instance.finalStatus) return instance.finalStatus;
 
-    if (instance.activeGateId) {
+    if (instance.activeGateId !== undefined) {
       const gateName = instance.currentState;
       const stateDef = instance.definition.states[gateName];
       if (stateDef.type === 'human_gate') {
         return {
           phase: 'waiting_human',
-          gate: this.buildGateRequest(id, gateName, stateDef),
+          gate: this.buildGateRequest(id, gateName, stateDef, instance.activeGateId),
         };
       }
     }
@@ -1977,9 +3689,11 @@ export class WorkflowOrchestrator implements WorkflowController {
 
     const snapshot = instance.actor.getSnapshot() as { context: WorkflowContext };
     const ctx = snapshot.context;
+    const usage = instance.usage.snapshot();
 
     return {
-      budget: this.getInstanceBudget(instance),
+      budget: this.getInstanceBudget(instance, usage),
+      usage,
       definition: instance.definition,
       transitionHistory: [...instance.transitionHistory],
       workspacePath: instance.workspacePath,
@@ -1987,7 +3701,9 @@ export class WorkflowOrchestrator implements WorkflowController {
         taskDescription: ctx.taskDescription,
         round: ctx.round,
         maxRounds: ctx.maxRounds,
-        totalTokens: ctx.totalTokens,
+        // Live run-wide total; the machine context only catches up when an
+        // agent state or fan-out batch finishes.
+        totalTokens: usage.totalTokens,
         visitCounts: { ...ctx.visitCounts },
       },
     };
@@ -1998,12 +3714,23 @@ export class WorkflowOrchestrator implements WorkflowController {
     return instance ? this.getInstanceBudget(instance) : undefined;
   }
 
-  private getInstanceBudget(instance: WorkflowInstance): WorkflowBudget {
+  /**
+   * The budget view: the saved per-session limits, one active (or the last)
+   * session's usage, and the run-wide ceiling and usage. The ceiling always
+   * comes from the run's definition, never from a saved budget.
+   */
+  private getInstanceBudget(
+    instance: WorkflowInstance,
+    workflowUsage: WorkflowUsage = instance.usage.snapshot(),
+  ): WorkflowBudget {
     const session = instance.activeSessions.values().next().value;
+    const workflowLimits = instance.definition.settings?.workflowBudget;
     return {
-      ...instance.resourceBudget,
+      ...persistedWorkflowBudget(instance.resourceBudget),
       activeSessionCount: instance.activeSessions.size,
       ...(session ? { usage: workflowBudgetUsage(session.getBudgetStatus()) } : {}),
+      ...(workflowLimits !== undefined ? { workflowLimits } : {}),
+      workflowUsage,
     };
   }
 
@@ -2014,37 +3741,53 @@ export class WorkflowOrchestrator implements WorkflowController {
     });
   }
 
+  /**
+   * Applies a human decision to the gate the workflow is waiting at.
+   *
+   * Validation runs before anything is mutated (see
+   * `assertGateResolutionAllowed`): the decision must quote the id of the
+   * raise currently up, the event must be one the gate's definition
+   * transitions on, and feedback events must carry feedback. A refused
+   * decision throws `GateResolutionError`, leaves the gate up with the same
+   * id and logs nothing, so a stale approval from an earlier visit, a second
+   * decider racing the first, or an event the gate cannot route never
+   * dismisses the gate or forges a `gate_resolved` record.
+   */
   resolveGate(id: WorkflowId, event: HumanGateEvent): void {
-    // FORCE_REVISION and REPLAN loop back to an earlier state with the
-    // feedback injected into the next agent's prompt (via context.humanPrompt).
-    // Without feedback the agent has no signal for what to change and the
-    // re-entry prompt ("Revise it to address the human feedback above")
-    // references content that does not exist. Require non-empty feedback at
-    // the source so every entry point (CLI, web UI, programmatic) fails fast.
-    if (event.type === 'FORCE_REVISION' || event.type === 'REPLAN') {
-      if (!event.prompt || event.prompt.trim().length === 0) {
-        throw new Error(`Feedback is required for ${event.type} events`);
-      }
-    }
-
     const instance = this.workflows.get(id);
-    if (!instance) return;
-
-    const gateId = instance.activeGateId;
-    if (!gateId) {
-      // No active gate -- prevent double-resolution
-      return;
+    if (!instance) {
+      throw new GateResolutionError('WORKFLOW_NOT_FOUND', `Workflow ${id} not found`);
     }
 
-    // Clear before sending to prevent concurrent double-resolution
+    const gateName = instance.currentState;
+    const stateDef = instance.definition.states[gateName];
+    assertGateResolutionAllowed(
+      {
+        workflowId: instance.id,
+        // A run aborted while waiting keeps its gate id (the terminal
+        // checkpoint carries it so a resume re-raises the same gate), but a
+        // terminal run has nothing left to decide.
+        activeGateId: instance.finalStatus === undefined ? instance.activeGateId : undefined,
+        gate: stateDef.type === 'human_gate' ? stateDef : undefined,
+      },
+      event,
+    );
+    // Equal to `instance.activeGateId` once the assertion above has passed.
+    const gateId = event.gateId;
+
+    // Clear before sending so a concurrent second decision for the same raise
+    // fails the active-gate check instead of being applied twice.
     instance.activeGateId = undefined;
+    this.clearGateIdleTimer(instance);
     this.deps.dismissGate(instance.id, gateId);
 
     instance.messageLog.append({
       ...this.logBase(instance),
       type: 'gate_resolved',
+      gateId,
       event: event.type,
       prompt: event.prompt ?? null,
+      resolvedBy: event.resolvedBy,
     });
 
     const xstateEventName = `HUMAN_${event.type}` as const;
@@ -2054,7 +3797,275 @@ export class WorkflowOrchestrator implements WorkflowController {
     });
   }
 
-  async abort(id: WorkflowId): Promise<void> {
+  // -----------------------------------------------------------------------
+  // Tool-call escalations (policy `escalate` decisions during agent states)
+  // -----------------------------------------------------------------------
+
+  listToolCallEscalations(id: WorkflowId): readonly WorkflowToolCallEscalation[] {
+    const instance = this.workflows.get(id);
+    if (!instance) return [];
+    return [...instance.pendingEscalations.values()].map((pending) => pending.escalation);
+  }
+
+  resolveToolCallEscalation(
+    id: WorkflowId,
+    escalationId: string,
+    decision: WorkflowToolCallEscalationDecision,
+  ): boolean {
+    const instance = this.workflows.get(id);
+    if (!instance) return false;
+    // A run that has reached a terminal status is being torn down: its
+    // pending escalations are about to be withdrawn, and an approval landing
+    // in that window must not run the call.
+    if (instance.finalStatus) return false;
+    const pending = instance.pendingEscalations.get(escalationId);
+    if (!pending) return false;
+    // Remove before settling so a concurrent second resolution, or the
+    // session's own resolved callback, finds nothing left to act on.
+    instance.pendingEscalations.delete(escalationId);
+    // A human-only escalation is approved once: the pipeline offers it no
+    // whitelist candidate, so a selection is dropped rather than passed on.
+    pending.settle(pending.escalation.humanOnly === true ? { decision: decision.decision } : decision);
+    this.recordToolCallEscalationOutcome(instance, pending.escalation, decision.decision);
+    return true;
+  }
+
+  /**
+   * In-process escalation handler bound to a shared-container bundle's
+   * coordinator. The coordinator parks the tool call until the returned
+   * promise settles:
+   *   - a human decision (`resolveToolCallEscalation`) resolves it;
+   *   - `details.signal` aborts when the coordinator stops waiting
+   *     (escalation timeout, bundle teardown or a policy swap); the
+   *     escalation is then reported as expired and the promise is ignored;
+   *   - the orchestrator withdraws it (the agent turn that raised it ended,
+   *     or the run is over) by rejecting with `EscalationWithdrawnError`,
+   *     which the pipeline denies as cancelled, not as a human denial.
+   *
+   * An escalation raised while no agent turn is live on the bundle is
+   * withdrawn at once and never offered to a human. Such a call does not
+   * come from an agent turn (a process left running in the shared
+   * container, or a command a deterministic state runs there), nothing
+   * waits on its result, and an approval would run its side effect under
+   * whatever state comes next. The same reasoning withdraws a bundle's
+   * pending escalations when its last live turn ends
+   * (`withdrawIdleBundleEscalations`).
+   */
+  private handleCoordinatorEscalation(
+    instance: WorkflowInstance,
+    bundleId: string,
+    request: ToolCallRequest,
+    reason: string,
+    context: Readonly<Record<string, string>> | undefined,
+    whitelistCandidates: readonly WhitelistCandidateIpc[] | undefined,
+    details: EscalationPromptDetails,
+  ): Promise<EscalationResult> {
+    if (details.signal.aborted || instance.finalStatus) {
+      return Promise.reject(new EscalationWithdrawnError('the workflow run is over'));
+    }
+    if (!instance.liveAgentTurnsByBundle.has(bundleId)) {
+      return Promise.reject(new EscalationWithdrawnError('no agent turn is live on this container'));
+    }
+    return new Promise<EscalationResult>((settleDecision, rejectDecision) => {
+      const escalation: WorkflowToolCallEscalation = {
+        escalationId: details.escalationId,
+        workflowId: instance.id,
+        stateId: instance.currentState,
+        ...(details.persona !== undefined ? { persona: details.persona } : {}),
+        serverName: request.serverName,
+        toolName: request.toolName,
+        arguments: request.arguments,
+        reason,
+        ...(context ? { context } : {}),
+        ...(whitelistCandidates ? { whitelistCandidates } : {}),
+        ...(details.humanOnly ? { humanOnly: true as const } : {}),
+        ...this.escalationReviewContext(instance, details),
+        receivedAt: new Date().toISOString(),
+      };
+      const onAbort = (): void => this.expireToolCallEscalation(instance, escalation.escalationId, 'wait ended');
+      details.signal.addEventListener('abort', onAbort, { once: true });
+      this.registerToolCallEscalation(instance, {
+        escalation,
+        bundleId,
+        settle: (decision) => {
+          details.signal.removeEventListener('abort', onAbort);
+          settleDecision(decision);
+        },
+        withdraw: (detail) => {
+          details.signal.removeEventListener('abort', onAbort);
+          rejectDecision(new EscalationWithdrawnError(detail));
+        },
+      });
+    });
+  }
+
+  /**
+   * Escalation surfaced by a session's file-IPC watcher (builtin and
+   * per-state-container workflows, or a bundle whose coordinator has no
+   * in-process hook). Decisions go back through `session.resolveEscalation`,
+   * which writes the response file the coordinator polls for.
+   */
+  private handleSessionEscalation(
+    instance: WorkflowInstance,
+    stateId: string,
+    persona: string,
+    sessionRef: { current?: Session },
+    request: EscalationRequest,
+  ): void {
+    if (instance.pendingEscalations.has(request.escalationId)) return;
+    const escalation: WorkflowToolCallEscalation = {
+      escalationId: request.escalationId,
+      workflowId: instance.id,
+      stateId,
+      persona,
+      serverName: request.serverName,
+      toolName: request.toolName,
+      arguments: request.arguments,
+      reason: request.reason,
+      ...(request.context ? { context: request.context } : {}),
+      ...(request.whitelistCandidates ? { whitelistCandidates: request.whitelistCandidates } : {}),
+      ...(request.humanOnly === true ? { humanOnly: true as const } : {}),
+      ...this.escalationReviewContext(instance, request),
+      receivedAt: new Date().toISOString(),
+    };
+    this.registerToolCallEscalation(instance, {
+      escalation,
+      owner: sessionRef,
+      settle: (decision) => {
+        const session = sessionRef.current;
+        if (!session) return;
+        const options =
+          decision.whitelistSelection !== undefined ? { whitelistSelection: decision.whitelistSelection } : {};
+        session.resolveEscalation(escalation.escalationId, decision.decision, options).catch((err: unknown) => {
+          // The coordinator may already have expired the request file;
+          // the session reports that as an expiry, nothing else to do.
+          writeStderr(`[workflow] resolveEscalation(${escalation.escalationId}) failed: ${toErrorMessage(err)}`);
+        });
+      },
+    });
+  }
+
+  /**
+   * The reviewer context of a workflow tool-call escalation: the human's
+   * last message and the agent's justification as the pipeline attached
+   * them, and the workflow's task (the human's own text) as the task
+   * summary. A state's prompt is system-generated, so a session's own task
+   * summary never stands in for the workflow's.
+   */
+  private escalationReviewContext(
+    instance: WorkflowInstance,
+    source: Pick<EscalationRequest, 'lastTrustedUserMessage' | 'agentJustification'>,
+  ): Pick<WorkflowToolCallEscalation, 'lastTrustedUserMessage' | 'taskSummary' | 'agentJustification'> {
+    const { context } = instance.actor.getSnapshot() as { context: WorkflowContext };
+    const task = typeof context.taskDescription === 'string' ? context.taskDescription.trim() : '';
+    return {
+      ...(source.lastTrustedUserMessage !== undefined ? { lastTrustedUserMessage: source.lastTrustedUserMessage } : {}),
+      ...(task !== '' ? { taskSummary: boundReviewerText(task, MAX_REVIEWER_CONTEXT_CHARS) } : {}),
+      ...(source.agentJustification !== undefined ? { agentJustification: source.agentJustification } : {}),
+    };
+  }
+
+  private registerToolCallEscalation(instance: WorkflowInstance, pending: PendingToolCallEscalation): void {
+    const { escalation } = pending;
+    instance.pendingEscalations.set(escalation.escalationId, pending);
+    // The reason can quote agent-chosen values (a git remote); the tab is a
+    // terminal in CLI runs.
+    instance.tab.write(
+      `[escalation] ${toDisplayText(`${escalation.serverName}/${escalation.toolName}`)}: ${toDisplayText(escalation.reason, { maxLength: 300 })} (id ${escalation.escalationId})`,
+    );
+    instance.messageLog.append({
+      ...this.logBase(instance),
+      type: 'tool_call_escalation',
+      escalationId: escalation.escalationId,
+      serverName: escalation.serverName,
+      toolName: escalation.toolName,
+      reason: escalation.reason,
+      outcome: 'raised',
+    });
+    this.emitLifecycleEvent({ kind: 'tool_call_escalation_raised', workflowId: instance.id, escalation });
+  }
+
+  private recordToolCallEscalationOutcome(
+    instance: WorkflowInstance,
+    escalation: WorkflowToolCallEscalation,
+    outcome: WorkflowToolCallEscalationOutcome,
+  ): void {
+    instance.tab.write(`[escalation ${outcome}] ${toDisplayText(`${escalation.serverName}/${escalation.toolName}`)}`);
+    instance.messageLog.append({
+      ...this.logBase(instance),
+      type: 'tool_call_escalation',
+      escalationId: escalation.escalationId,
+      serverName: escalation.serverName,
+      toolName: escalation.toolName,
+      reason: escalation.reason,
+      outcome,
+    });
+    this.emitLifecycleEvent({
+      kind: 'tool_call_escalation_resolved',
+      workflowId: instance.id,
+      escalationId: escalation.escalationId,
+      outcome,
+    });
+  }
+
+  /**
+   * Ends one pending escalation without a decision (escalation timeout,
+   * coordinator cancellation, end of the turn or session that raised it,
+   * workflow abort). A coordinator escalation that is still being waited
+   * for is withdrawn with `detail`. No-op when it is no longer pending.
+   */
+  private expireToolCallEscalation(instance: WorkflowInstance, escalationId: string, detail: string): void {
+    const pending = instance.pendingEscalations.get(escalationId);
+    if (!pending) return;
+    instance.pendingEscalations.delete(escalationId);
+    pending.withdraw?.(detail);
+    this.recordToolCallEscalationOutcome(instance, pending.escalation, 'expired');
+  }
+
+  private expireToolCallEscalationsWhere(
+    instance: WorkflowInstance,
+    detail: string,
+    predicate: (pending: PendingToolCallEscalation) => boolean,
+  ): void {
+    for (const pending of [...instance.pendingEscalations.values()]) {
+      if (predicate(pending)) this.expireToolCallEscalation(instance, pending.escalation.escalationId, detail);
+    }
+  }
+
+  /**
+   * Withdraws the escalations a bundle's coordinator raised once no agent
+   * turn is live on that bundle: the turn that raised them ended (finished,
+   * timed out, crashed or was drained) and its call can no longer be
+   * answered to anyone. Leaving them pending would let a late approval run
+   * the side effect during a later state, possibly under the same persona
+   * (no policy swap, so nothing else would cancel it).
+   */
+  private withdrawIdleBundleEscalations(instance: WorkflowInstance, bundleId: string): void {
+    if (instance.liveAgentTurnsByBundle.has(bundleId)) return;
+    this.expireToolCallEscalationsWhere(
+      instance,
+      'the agent turn that raised it has ended',
+      (pending) => pending.bundleId === bundleId,
+    );
+  }
+
+  /**
+   * The session reports a decision made through another route (its own
+   * transport, Signal). Our `resolveToolCallEscalation` path removes the
+   * entry first, so this only records decisions we did not make.
+   */
+  private noteSessionEscalationResolved(
+    instance: WorkflowInstance,
+    escalationId: string,
+    decision: 'approved' | 'denied',
+  ): void {
+    const pending = instance.pendingEscalations.get(escalationId);
+    if (!pending) return;
+    instance.pendingEscalations.delete(escalationId);
+    this.recordToolCallEscalationOutcome(instance, pending.escalation, decision);
+  }
+
+  async abort(id: WorkflowId, options: WorkflowStopOptions = {}): Promise<void> {
     const instance = this.workflows.get(id);
     if (!instance) return;
 
@@ -2063,70 +4074,140 @@ export class WorkflowOrchestrator implements WorkflowController {
       instance.finalStatus?.phase === 'aborted' ||
       instance.finalStatus?.phase === 'failed'
     ) {
-      // A terminal transition is already in flight (e.g. a natural completion
-      // racing this abort). Wait for its teardown instead of starting a second
-      // one. `teardownPromise` is only set by the fire-and-forget completion
-      // path; awaiting `undefined` is a no-op on the abort-vs-abort race.
-      await instance.teardownPromise;
+      // A terminal transition is already in flight: a natural completion, or
+      // another abort (a user abort that a shutdown overtakes). Join it rather
+      // than starting a second one or returning while it is still committing
+      // its snapshot: a caller that then tears the run down or exits (as
+      // `shutdownAll()` and the daemon do) would cut it short.
+      // `teardownPromise` covers a terminal claimed outside both paths. The
+      // first stop reports its own failure; joining only waits for it.
+      await (instance.terminalHandling ?? instance.teardownPromise)?.catch(() => {});
       return;
     }
+
+    const reason = options.reason ?? DEFAULT_WORKFLOW_ABORT_REASON;
 
     // Claim the terminal synchronously, BEFORE the first await below, so a
     // natural completion firing during session close sees `finalStatus` set
     // and bails at its own guard. This is the single-flight gate that
     // guarantees exactly-once snapshot + teardown across abort/complete.
-    instance.finalStatus = {
-      phase: 'aborted',
-      reason: 'Workflow aborted by user',
-    };
+    const finalStatus: Extract<WorkflowStatus, { phase: 'aborted' }> = { phase: 'aborted', reason };
+    instance.finalStatus = finalStatus;
+    this.clearGateIdleTimer(instance);
 
-    const closePromises: Promise<void>[] = [];
-    for (const session of instance.activeSessions) {
-      closePromises.push(session.close().catch(() => {}));
-    }
-    await Promise.allSettled(closePromises);
-    // Closing a borrowed session can leave its turn pending. Preserve the
-    // sampled usage before clearing sessions and writing the terminal checkpoint.
-    instance.resourceBudget = this.getInstanceBudget(instance);
-    instance.activeSessions.clear();
-
+    // Stop everything in flight, still before the first await: work that is
+    // suspended in an await (a session being created, a bundle being minted,
+    // a turn, a fan-out lane) observes the signal when it resumes, closes
+    // what it just created and starts nothing new, and a running host
+    // deterministic command is killed now rather than after the sessions
+    // close below (its result would be discarded anyway). Fan-out lanes are
+    // free-standing root actors, so they are stopped explicitly; stopping the
+    // run's own actor aborts its in-flight invoke and means no transition (a
+    // gate raise, a next state) can follow the abort.
+    instance.stopController.abort();
+    for (const lane of [...instance.fanOutChildren]) lane.stop();
     instance.actor.stop();
+    // Stop the active-time clock (after the actor, whose last snapshot must
+    // not restart it): the time from here to a resume is not running time.
+    // The meter keeps counting a still-pending session's spend live, so the
+    // terminal checkpoint written by finishAbort includes it.
+    instance.usage.setRunning(false);
 
+    // Nobody can answer an escalation of an aborted run: withdraw every
+    // pending one (each call is denied as cancelled) in the same tick that
+    // claimed the terminal status, before any await below lets a decision
+    // in. `resolveToolCallEscalation` refuses from here on, and the sweep
+    // after the session closes (finishAbort) catches anything surfaced
+    // meanwhile.
+    this.expireToolCallEscalationsWhere(instance, 'the workflow was aborted', () => true);
+
+    instance.terminalHandling = this.finishAbort(instance, finalStatus, options);
+    await instance.terminalHandling;
+  }
+
+  /**
+   * The rest of {@link abort} once the run's terminal is claimed and its work
+   * told to stop: close the sessions, withdraw what they surfaced meanwhile,
+   * snapshot, write the terminal checkpoint, tear down and release the locks.
+   */
+  private async finishAbort(
+    instance: WorkflowInstance,
+    finalStatus: Extract<WorkflowStatus, { phase: 'aborted' }>,
+    options: WorkflowStopOptions,
+  ): Promise<void> {
+    const { id } = instance;
+    const { reason } = finalStatus;
     let previousCheckpoint: WorkflowCheckpoint | undefined;
     try {
       previousCheckpoint = this.deps.checkpointStore.load(id);
     } catch (err) {
       writeStderr(`[workflow] Failed to load existing checkpoint during abort for ${id}: ${toErrorMessage(err)}`);
     }
-    const containerSnapshots = await this.snapshotResumableScopes(instance);
-    this.saveTerminalCheckpoint(instance, instance.finalStatus, containerSnapshots, previousCheckpoint);
-    this.appendTerminalControl(instance);
+    // A forced shutdown may interrupt an owned session close or snapshot
+    // commit. Keep the earlier restore images, and mark its usage incomplete
+    // before either await so resume cannot mistake that subtotal for final.
+    this.saveTerminalCheckpoint(instance, finalStatus, instance.containerSnapshots, previousCheckpoint, true);
+    // A cancelled invocation may never reach its own finally. Retain the
+    // selected session's last display sample before joined closes remove it.
+    const budgetSession = instance.activeSessions.values().next().value;
+    instance.resourceBudget = persistedWorkflowBudget(this.getInstanceBudget(instance));
+    await Promise.allSettled(
+      [...instance.activeSessions].map((session) => this.closeWorkflowSession(instance, session)),
+    );
+    // The closed sessions' environments are gone: return their agent slots
+    // now rather than when their (possibly stuck) invocations unwind.
+    for (const lease of instance.sessionSlots.values()) lease.release();
+    instance.sessionSlots.clear();
+    this.expireToolCallEscalationsWhere(instance, 'the workflow was aborted', () => true);
+    // Prefer its settled reading, retaining the last good sample if the
+    // closed session no longer exposes status. Run-wide accounting is sampled
+    // independently by closeWorkflowSession and the bundle teardown below.
+    if (budgetSession !== undefined) {
+      try {
+        instance.resourceBudget = {
+          ...instance.resourceBudget,
+          usage: workflowBudgetUsage(budgetSession.getBudgetStatus()),
+        };
+      } catch {
+        // The pre-close display sample remains available.
+      }
+    }
+    instance.activeSessions.clear();
 
-    // Release the token-stream bus subscription before the async infra
-    // teardown so no late events land against a finalized workflow.
-    this.teardownTokenSubscription(instance);
-
+    // This leg's restore snapshots, before a saved terminal checkpoint replaces them.
+    const restoredSnapshots = instance.containerSnapshots;
+    const containerSnapshots = await this.snapshotResumableScopes(instance, options.snapshotBudgetMs);
+    const saved = this.saveTerminalCheckpoint(instance, finalStatus, containerSnapshots, previousCheckpoint, true);
     // Tear down workflow-scoped Docker infrastructure after all sessions
     // are closed. Error-tolerant (see destroyWorkflowInfrastructure).
-    const snapshotsToRemove = this.snapshotsSupersededBy(previousCheckpoint?.containerSnapshots, containerSnapshots);
+    // Superseded snapshots go only once the checkpoint replacing them is on
+    // disk: after a failed save, the one there still references them.
+    const snapshotsToRemove = saved
+      ? this.snapshotsSupersededBy(previousCheckpoint?.containerSnapshots, restoredSnapshots, containerSnapshots)
+      : undefined;
     const cleanupDocker = snapshotsToRemove ? await this.dockerForSnapshotCleanup(instance) : undefined;
     await this.destroyWorkflowInfrastructure(instance);
+    // Proxy teardown settles exchanges that were still in flight. Persist
+    // those final charges before releasing the run's subscription and locks.
+    this.saveTerminalCheckpoint(instance, finalStatus, containerSnapshots, previousCheckpoint);
+    this.appendTerminalControl(instance);
+    this.teardownUsageSubscription(instance);
     if (cleanupDocker) {
-      await this.removeSnapshotImagesAfterTeardown(cleanupDocker, snapshotsToRemove);
+      await this.removeSnapshotImagesAfterTeardown(instance, cleanupDocker, snapshotsToRemove);
     }
 
     // Intentionally leave the checkpoint in place: a user-triggered abort
     // should remain resumable via `workflow resume`. The checkpoint is only
     // removed on successful completion (see handleWorkflowComplete).
 
-    instance.tab.write('[aborted]');
+    instance.tab.write(`[aborted] ${reason}`);
     instance.tab.close();
-    instance.terminalReady = true;
+    this.markTerminalReady(instance);
 
     this.emitLifecycleEvent({
       kind: 'failed',
       workflowId: id,
-      error: 'Workflow aborted by user',
+      error: reason,
       phase: 'aborted',
     });
   }
@@ -2135,15 +4216,44 @@ export class WorkflowOrchestrator implements WorkflowController {
     this.lifecycleCallbacks.push(callback);
   }
 
-  async shutdownAll(): Promise<void> {
+  /** Joins session teardown, keeping it visible to abort until its last usage sample. */
+  private closeWorkflowSession(instance: WorkflowInstance, session: Session): Promise<void> {
+    const existing = instance.sessionClosures.get(session);
+    if (existing !== undefined) return existing;
+    instance.usage.sessionEnded(session);
+    const closing = (async () => {
+      try {
+        await session.close();
+      } catch (err) {
+        writeStderr(`[workflow] session.close() failed for ${instance.id}: ${toErrorMessage(err)}`);
+      } finally {
+        instance.usage.sessionClosed(session);
+        instance.activeSessions.delete(session);
+        const slot = instance.sessionSlots.get(session);
+        instance.sessionSlots.delete(session);
+        slot?.release();
+      }
+    })();
+    instance.sessionClosures.set(session, closing);
+    return closing;
+  }
+
+  async shutdownAll(options: WorkflowStopOptions = {}): Promise<void> {
+    // Final: a start or resume that races the shutdown (a web request in
+    // flight, a CLI command) is refused rather than left running after the
+    // id list below was taken.
+    this.shuttingDown = true;
     const ids = [...this.workflows.keys()];
     // Abort runs full teardown (including destroyWorkflowInfrastructure) for
-    // workflows not yet in a terminal state. For already-terminal workflows,
-    // abort() early-returns — so we follow up with an explicit destroy pass
-    // to defend against any case where a terminal transition skipped infra
-    // teardown (e.g., tests forcing finalStatus directly). The destroy call
-    // is idempotent when instance.bundlesByScope is empty.
-    await Promise.allSettled(ids.map((id) => this.abort(id)));
+    // workflows not yet in a terminal state. For a workflow whose terminal
+    // handling is already in flight (a user abort, a completion still
+    // snapshotting), abort() joins it, so the destroy pass below never runs
+    // under its snapshot commit. For other already-terminal workflows abort()
+    // early-returns, so we follow up with an explicit destroy pass to defend
+    // against any case where a terminal transition skipped infra teardown
+    // (e.g., tests forcing finalStatus directly). The destroy call is
+    // idempotent when instance.bundlesByScope is empty.
+    await Promise.allSettled(ids.map((id) => this.abort(id, options)));
     await Promise.allSettled(
       ids.map((id) => {
         const instance = this.workflows.get(id);
@@ -2178,31 +4288,50 @@ export class WorkflowOrchestrator implements WorkflowController {
     definition: WorkflowDefinition,
     roundMachinesByState: ReadonlyMap<string, AnyStateMachine>,
   ): AnyStateMachine {
+    // Every service checks the run-wide `settings.workflowBudget` before it
+    // starts (assertWithinWorkflowBudget). Child round machines are provided
+    // through here too, so each step of a fan-out lane is checked as well.
+    // Barrier-internal deterministic work (sample_batch, cognition promotion,
+    // stop signals) calls executeDeterministicState directly and is not
+    // checked: it finishes a batch whose lanes already ran.
     return machine.provide({
       actors: {
-        agentService: fromPromise<AgentInvokeResult, AgentInvokeInput>(async ({ input }) => {
+        // `signal` aborts when the invoking actor is stopped — for a fan-out
+        // lane, when the batch drains it; for any state, when abort() stops
+        // the root actor. It detaches an agent invocation (see
+        // executeAgentState) and kills a running deterministic command: a
+        // host command's process group (see runDeterministicHost), a
+        // container command's processes (see runDeterministicInContainer).
+        // The run's own stop signal is consulted inside each executor as well.
+        agentService: fromPromise<AgentInvokeResult, AgentInvokeInput>(async ({ input, signal }) => {
           try {
-            return await this.executeAgentState(workflowId, input, definition);
-          } catch (err) {
-            writeStderr(`[workflow] agentService invoke rejected for "${input.stateId}": ${toErrorMessage(err)}`);
-            throw err;
-          }
-        }),
-        deterministicService: fromPromise<DeterministicInvokeResult, DeterministicInvokeInput>(async ({ input }) => {
-          try {
-            return await this.executeDeterministicState(workflowId, input);
-          } catch (err) {
-            writeStderr(
-              `[workflow] deterministicService invoke rejected for "${input.stateId}": ${toErrorMessage(err)}`,
+            return await this.invokeWithinWorkflowBudget(workflowId, input.stateId, () =>
+              this.executeAgentState(workflowId, input, definition, signal),
             );
+          } catch (err) {
+            this.reportInvokeRejection(workflowId, 'agentService', input.stateId, err);
             throw err;
           }
         }),
+        deterministicService: fromPromise<DeterministicInvokeResult, DeterministicInvokeInput>(
+          async ({ input, signal }) => {
+            try {
+              return await this.invokeWithinWorkflowBudget(workflowId, input.stateId, () =>
+                this.executeDeterministicState(workflowId, input, signal),
+              );
+            } catch (err) {
+              this.reportInvokeRejection(workflowId, 'deterministicService', input.stateId, err);
+              throw err;
+            }
+          },
+        ),
         fanOutService: fromPromise<FanOutInvokeResult, FanOutInvokeInput>(async ({ input }) => {
           try {
-            return await this.runFanOutSegment(workflowId, input, definition, roundMachinesByState);
+            return await this.invokeWithinWorkflowBudget(workflowId, input.stateId, () =>
+              this.runFanOutSegment(workflowId, input, definition, roundMachinesByState),
+            );
           } catch (err) {
-            writeStderr(`[workflow] fanOutService invoke rejected for "${input.stateId}": ${toErrorMessage(err)}`);
+            this.reportInvokeRejection(workflowId, 'fanOutService', input.stateId, err);
             throw err;
           }
         }),
@@ -2210,9 +4339,25 @@ export class WorkflowOrchestrator implements WorkflowController {
     }) as AnyStateMachine;
   }
 
+  /**
+   * Logs a rejected invocation, except one rejected because its run is
+   * stopping: an abort stops every executor on purpose, and its stopped actor
+   * ignores the rejection.
+   */
+  private reportInvokeRejection(workflowId: WorkflowId, service: string, stateId: string, err: unknown): void {
+    const instance = this.workflows.get(workflowId);
+    if (instance && this.isStopping(instance)) return;
+    writeStderr(`[workflow] ${service} invoke rejected for "${stateId}": ${toErrorMessage(err)}`);
+  }
+
   /** Subscribes to actor snapshot changes for lifecycle events, gates, and checkpointing. */
   private subscribeToActor(instance: WorkflowInstance): void {
     const { actor, gateStateNames, definition, id: workflowId } = instance;
+    // The current state's visit count as last seen. A transition back onto the
+    // same state re-enters it (`reenter: true`, see machine-builder.ts) without
+    // changing the state value; for an agent state the entry's visit count
+    // (`incrementVisitCount`) is what shows the new visit.
+    let lastVisits = visitCountOf(actor.getSnapshot() as { context: unknown }, instance.currentState);
 
     actor.subscribe((rawSnapshot: unknown) => {
       const snapshot = rawSnapshot as {
@@ -2224,44 +4369,31 @@ export class WorkflowOrchestrator implements WorkflowController {
       const stateValue = String(snapshot.value);
       const previousState = instance.currentState;
       const now = Date.now();
+      // Active time runs while the run is in an agent, deterministic or
+      // fan-out state; a gate, a terminal or a stopped actor stops the clock.
+      // Updated before the checkpoint below so it records the time up to
+      // this transition.
+      const enteredState = definition.states[stateValue] as WorkflowDefinition['states'][string] | undefined;
+      instance.usage.setRunning(
+        snapshot.status === 'active' && enteredState !== undefined && isExecutableState(enteredState),
+        now,
+      );
+      const visits = visitCountOf(snapshot, stateValue);
+      const reentered = stateValue === previousState && visits !== lastVisits;
+      lastVisits = visits;
 
-      // Record transition and checkpoint only on actual state changes
-      if (stateValue !== previousState) {
-        const duration = instance.stateEnteredAt ? now - instance.stateEnteredAt : 0;
-
-        const stateType = definition.states[previousState].type;
-        let agentMessage: string | undefined;
-        if (stateType === 'human_gate') {
-          agentMessage = truncateForTransition(snapshot.context.humanPrompt ?? snapshot.context.previousAgentOutput);
-        } else if (stateType === 'agent') {
-          agentMessage = truncateForTransition(snapshot.context.previousAgentOutput);
-        }
-        // deterministic and terminal: no agentMessage (leave undefined)
-
-        instance.transitionHistory.push({
-          from: previousState,
-          to: stateValue,
-          event: 'transition',
-          timestamp: new Date(now).toISOString(),
-          duration_ms: duration,
-          agentMessage,
-        });
-        instance.stateEnteredAt = now;
-
-        // Skip checkpointing transitions into terminal states. On successful
-        // completion `handleWorkflowComplete` removes the checkpoint anyway;
-        // on abort we want the surviving checkpoint to point at the last
-        // non-terminal state so `resume()` can restart the run meaningfully.
-        if (!this.isTerminalStateValue(definition, stateValue)) {
-          this.saveCheckpoint(instance, snapshot);
-        }
-
-        instance.messageLog.append({
-          ...this.logBase(instance),
-          type: 'state_transition',
-          from: previousState,
-          event: stateValue,
-        });
+      // Record transition and checkpoint only on actual state changes, a
+      // state re-entering itself included (each loop iteration is resumable).
+      if (stateValue !== previousState || reentered) {
+        this.recordTransition(instance, snapshot, previousState, stateValue, now);
+      } else if (definition.states[stateValue].type === 'human_gate' && instance.activeGateId === undefined) {
+        // At a gate with no raise in effect and no state change: the workflow
+        // starts at a gate, or a decision's transition targets the gate it was
+        // made at. Either way this is a new raise. Mint its id and persist it,
+        // so a restart re-raises under this id and never under the one just
+        // resolved (still in the last checkpoint).
+        instance.activeGateId = this.mintGateIdFor(instance, stateValue);
+        this.saveCheckpoint(instance, snapshot);
       }
 
       instance.currentState = stateValue;
@@ -2307,6 +4439,65 @@ export class WorkflowOrchestrator implements WorkflowController {
     });
   }
 
+  /**
+   * Records one transition (`from` may equal `to`: a state re-entering
+   * itself) in the transition history and the message log, and checkpoints
+   * it unless it entered a terminal state.
+   */
+  private recordTransition(
+    instance: WorkflowInstance,
+    snapshot: { value: unknown; context: WorkflowContext },
+    from: string,
+    to: string,
+    now: number,
+  ): void {
+    const { definition } = instance;
+    const duration = instance.stateEnteredAt ? now - instance.stateEnteredAt : 0;
+
+    const stateType = definition.states[from].type;
+    let agentMessage: string | undefined;
+    if (stateType === 'human_gate') {
+      agentMessage = truncateForTransition(snapshot.context.humanPrompt ?? snapshot.context.previousAgentOutput);
+    } else if (stateType === 'agent') {
+      agentMessage = truncateForTransition(snapshot.context.previousAgentOutput);
+    }
+    // deterministic and terminal: no agentMessage (leave undefined)
+
+    instance.transitionHistory.push({
+      from,
+      to,
+      event: 'transition',
+      timestamp: new Date(now).toISOString(),
+      duration_ms: duration,
+      agentMessage,
+    });
+    instance.stateEnteredAt = now;
+
+    // Every entry into a gate state is a new raise with its own id. Mint
+    // it here, ahead of the checkpoint below, so a resume from that
+    // checkpoint re-raises the gate under the id deciders already saw.
+    // Only a real transition mints: no-op snapshots and status polls
+    // must not rotate the id out from under a pending decision.
+    if (definition.states[to].type === 'human_gate') {
+      instance.activeGateId = this.mintGateIdFor(instance, to);
+    }
+
+    // Skip checkpointing transitions into terminal states. On successful
+    // completion `handleWorkflowComplete` removes the checkpoint anyway;
+    // on abort we want the surviving checkpoint to point at the last
+    // non-terminal state so `resume()` can restart the run meaningfully.
+    if (!this.isTerminalStateValue(definition, to)) {
+      this.saveCheckpoint(instance, snapshot);
+    }
+
+    instance.messageLog.append({
+      ...this.logBase(instance),
+      type: 'state_transition',
+      from,
+      event: to,
+    });
+  }
+
   // -----------------------------------------------------------------------
   // Checkpointing
   // -----------------------------------------------------------------------
@@ -2331,9 +4522,17 @@ export class WorkflowOrchestrator implements WorkflowController {
     finalStatus?: WorkflowStatus,
     containerSnapshots?: Readonly<Record<string, ContainerSnapshotRef>>,
   ): WorkflowCheckpoint {
+    const usage = instance.usage.snapshot();
     return {
+      // Paths below this directory (the default workspace, the staged
+      // skills and scripts) are rebased onto wherever the run directory is
+      // found on resume (see `rebaseRunLocalPaths`).
+      runDir: this.runDirOf(instance.id),
       machineState: snapshot.value,
-      resourceBudget: this.getInstanceBudget(instance),
+      // Saved once each: the per-session budget record, and the run-wide
+      // usage resume continues from (also the source of past-run displays).
+      resourceBudget: persistedWorkflowBudget(this.getInstanceBudget(instance, usage)),
+      usage,
       context: snapshot.context as WorkflowContext,
       timestamp: new Date().toISOString(),
       transitionHistory: [...instance.transitionHistory],
@@ -2345,27 +4544,118 @@ export class WorkflowOrchestrator implements WorkflowController {
       // keep the checkpoint shape tight for the common case.
       ...(instance.workflowSkillsDir !== undefined ? { workflowSkillsDir: instance.workflowSkillsDir } : {}),
       ...(instance.workflowScriptsDir !== undefined ? { workflowScriptsDir: instance.workflowScriptsDir } : {}),
+      // A resumed task-scoped run keeps its task scope.
+      ...(instance.taskPolicyDir !== undefined ? { taskPolicyDir: instance.taskPolicyDir } : {}),
       ...(containerSnapshots !== undefined && Object.keys(containerSnapshots).length > 0 ? { containerSnapshots } : {}),
       ...(finalStatus !== undefined ? { finalStatus } : {}),
+      // Persisted so a resume at a gate keeps the per-raise id a decider may
+      // already hold (see `WorkflowCheckpoint.activeGateId`).
+      ...(instance.activeGateId !== undefined ? { activeGateId: instance.activeGateId } : {}),
     };
   }
 
-  private saveCheckpoint(
-    instance: WorkflowInstance,
-    snapshot: { value: unknown; context: unknown },
-    containerSnapshots?: Readonly<Record<string, ContainerSnapshotRef>>,
-  ): void {
-    const checkpoint = this.buildCheckpoint(instance, snapshot, undefined, containerSnapshots);
+  /**
+   * Saves a non-terminal checkpoint. It records the scopes' restore snapshots
+   * (`instance.containerSnapshots`): a transition must not drop them, or a
+   * crash after it would resume the scopes from fresh containers and the next
+   * stop would not find them on disk to remove as superseded.
+   */
+  private saveCheckpoint(instance: WorkflowInstance, snapshot: { value: unknown; context: unknown }): void {
+    const checkpoint = this.buildCheckpoint(instance, snapshot, undefined, instance.containerSnapshots);
     try {
       this.deps.checkpointStore.save(instance.id, checkpoint);
     } catch (err) {
-      writeStderr(`[workflow] Failed to save checkpoint for ${instance.id}: ${toErrorMessage(err)}`);
+      this.reportCheckpointSaveFailure(instance, 'checkpoint', err);
+      return;
     }
+    this.reportCheckpointSaveRecovered(instance);
+  }
+
+  /**
+   * Makes a failed checkpoint save visible beyond stderr. The run continues
+   * (the previous checkpoint is still on disk, and stopping a healthy run
+   * over a full disk would lose more), but a later resume restarts from that
+   * older point, so the failure goes to the workflow tab and the message log
+   * too: on the first failure of a streak and then whenever the streak
+   * doubles (2, 4, 8, ...), which keeps a persistent failure loud without
+   * flooding the log on every transition.
+   */
+  private reportCheckpointSaveFailure(instance: WorkflowInstance, what: string, err: unknown): void {
+    const failures = (instance.checkpointSaveFailures ?? 0) + 1;
+    instance.checkpointSaveFailures = failures;
+    const message = `Failed to save ${what} for ${instance.id}: ${toErrorMessage(err)}`;
+    writeStderr(`[workflow] ${message}`);
+    if ((failures & (failures - 1)) !== 0) return;
+    const streak =
+      failures === 1
+        ? 'a resume would restart from the last saved checkpoint'
+        : `${failures} saves in a row have failed; a resume would restart from the last saved checkpoint`;
+    instance.tab.write(`[warning] ${message} (${streak})`);
+    try {
+      instance.messageLog.append({
+        ...this.logBase(instance),
+        type: 'error',
+        error: `${message} (${streak})`,
+        context: CHECKPOINT_SAVE_ERROR_CONTEXT,
+      });
+    } catch {
+      // The log lives on the same filesystem; when it is full or gone too,
+      // stderr and the tab above are all that is left.
+    }
+  }
+
+  /** Clears a failure streak once a save succeeds again, and says so. */
+  private reportCheckpointSaveRecovered(instance: WorkflowInstance): void {
+    const failures = instance.checkpointSaveFailures ?? 0;
+    if (failures === 0) return;
+    instance.checkpointSaveFailures = 0;
+    const message = `Checkpoint saves for ${instance.id} succeed again after ${failures} failure(s)`;
+    writeStderr(`[workflow] ${message}`);
+    instance.tab.write(`[info] ${message}`);
   }
 
   // -----------------------------------------------------------------------
   // Agent state execution
   // -----------------------------------------------------------------------
+
+  /**
+   * Runs one agent-state invocation ({@link runAgentState}) and, in
+   * shared-container mode, keeps it registered as a live turn on its bundle
+   * until it has fully finished — session closed included — so a policy swap
+   * to another persona waits for it (see {@link waitForOtherPersonaTurns}).
+   *
+   * `signal` is the invoking actor's abort signal. It aborts when that actor
+   * is stopped, which for a fan-out lane means the batch drained it: the
+   * lane already settled as `drained` and nothing will read this
+   * invocation's result. A detached invocation therefore starts no session
+   * and no further turn, and does not stamp the run as quota-exhausted or
+   * transiently failed. Absent on the resume replay path.
+   *
+   * The run's own stop signal (`instance.stopController`, see `abort()`)
+   * detaches the invocation the same way, on every path including the
+   * replay one, and is re-checked after every await: a session that
+   * `createSession` hands back after the abort is closed at once, and a turn
+   * that returns after it is not processed.
+   */
+  private async executeAgentState(
+    workflowId: WorkflowId,
+    input: AgentInvokeInput,
+    definition: WorkflowDefinition,
+    signal?: AbortSignal,
+  ): Promise<AgentInvokeResult> {
+    const liveTurn: { release?: () => void; bundleId?: string } = {};
+    try {
+      return await this.runAgentState(workflowId, input, definition, signal, liveTurn);
+    } finally {
+      liveTurn.release?.();
+      // Escalations raised by this turn's tool calls cannot be answered to
+      // anyone once the last live turn on the bundle is gone.
+      const instance = this.workflows.get(workflowId);
+      if (instance && liveTurn.bundleId !== undefined) {
+        this.withdrawIdleBundleEscalations(instance, liveTurn.bundleId);
+      }
+    }
+  }
 
   // TODO(refactor): this method is ~230 lines and carries three
   // invocation-scoped closures (`logReceived`, `logAgentRetry`,
@@ -2385,14 +4675,31 @@ export class WorkflowOrchestrator implements WorkflowController {
   // `AgentInvocationError` wrapping so the conversation-id recovery
   // semantics survive the move. Worth doing as its own PR; do NOT
   // fold it into a feature change.
-  private async executeAgentState(
+  private async runAgentState(
     workflowId: WorkflowId,
     input: AgentInvokeInput,
     definition: WorkflowDefinition,
+    signal: AbortSignal | undefined,
+    liveTurn: { release?: () => void; bundleId?: string },
   ): Promise<AgentInvokeResult> {
     const { stateId, stateConfig, context } = input;
     const instance = this.workflows.get(workflowId);
     if (!instance) throw new Error(`Workflow ${workflowId} not found`);
+
+    // See executeAgentState: a drained fan-out lane's invocation is detached,
+    // and so is every invocation of a run that is stopping.
+    const runStopping = (): boolean => this.isStopping(instance);
+    const detached = (): boolean => runStopping() || signal?.aborted === true;
+    const throwIfDetached = (): void => {
+      this.throwIfStopping(instance, `agent state "${stateId}"`);
+      if (signal?.aborted === true) {
+        throw new Error(`Agent state "${stateId}" was drained with its fan-out batch; not starting another turn`);
+      }
+    };
+
+    // Nothing, not even the artifact versioning below, touches the workspace
+    // once the run is stopping.
+    throwIfDetached();
 
     const settings = definition.settings ?? {};
 
@@ -2400,17 +4707,26 @@ export class WorkflowOrchestrator implements WorkflowController {
     const visitCount = context.visitCounts[stateId] ?? 0;
     if (visitCount > 1) {
       const unversioned = new Set(settings.unversionedArtifacts ?? []);
-      snapshotArtifacts(instance.artifactDir, stateConfig.outputs, visitCount, unversioned);
+      snapshotArtifacts(instance.artifactDir, stateConfig.outputs, visitCount, unversioned, instance.workspacePath);
     }
+
+    // A read-only state (`workspaceAccess: read-only`) may write only its
+    // output directories, through the filesystem MCP tool: make them real
+    // directories now. Its own session gets the read-only workspace below; in
+    // shared-container mode the scope's bundle was (or will be) minted with it.
+    const readOnlyWorkspace = readOnlyWorkspaceForState(stateConfig);
+    if (readOnlyWorkspace) this.prepareReadOnlyOutputs(instance, readOnlyWorkspace);
 
     instance.tab.write(`[agent] Starting "${stateId}" (persona: ${stateConfig.persona})`);
 
-    const command = buildAgentCommand(stateId, stateConfig, context, definition);
-
+    // The state's own harness (`dockerAgent`), else the workflow's. In
+    // shared-container mode this is also the harness its scope's bundle is
+    // minted for: every agent state of a scope resolves to the same one
+    // (validation; `ensureBundleForScope` refuses to mint a mixed scope).
     const mode: SessionMode =
       settings.mode === 'builtin'
         ? { kind: 'builtin' }
-        : { kind: 'docker', agent: (settings.dockerAgent ?? 'claude-code') as AgentId };
+        : { kind: 'docker', agent: toAgentId(resolveStateDockerAgent(stateConfig, settings)) };
 
     const effectiveModel = stateConfig.model ?? settings.model;
 
@@ -2431,41 +4747,66 @@ export class WorkflowOrchestrator implements WorkflowController {
       try {
         bundle = await this.ensureBundleForScope(instance, scope);
       } catch (err) {
-        const errMsg = toErrorMessage(err);
-        writeStderr(`[workflow] ensureBundleForScope failed for "${stateId}" (scope=${scope}): ${errMsg}`);
-        instance.tab.write(`[error] Infrastructure setup failed for "${stateId}": ${errMsg}`);
-        instance.messageLog.append({
-          ...this.logBase(instance),
-          type: 'error',
-          error: errMsg,
-          context: `ensureBundleForScope "${stateId}" (scope: ${scope})`,
-        });
+        // A mint refused or undone by an abort is not an infrastructure
+        // failure; the stopped run must not log one after its terminal marker.
+        if (!runStopping()) {
+          const errMsg = toErrorMessage(err);
+          writeStderr(`[workflow] ensureBundleForScope failed for "${stateId}" (scope=${scope}): ${errMsg}`);
+          instance.tab.write(`[error] Infrastructure setup failed for "${stateId}": ${errMsg}`);
+          instance.messageLog.append({
+            ...this.logBase(instance),
+            type: 'error',
+            error: errMsg,
+            context: `ensureBundleForScope "${stateId}" (scope: ${scope})`,
+          });
+        }
         throw err;
       }
+
+      // Fail closed: a read-only state never runs in a bundle that was not
+      // built read-only (a factory that ignored the scope's access).
+      if (readOnlyWorkspace && bundle.readOnlyWorkspace === undefined) {
+        throw new Error(
+          `Agent state "${stateId}" is read-only but the bundle for scope "${scope}" was not built with a read-only workspace`,
+        );
+      }
+
+      // Register as live BEFORE the detach check and the policy cycle, in
+      // the same synchronous run: either this lane was already drained (it
+      // bails out below without touching the coordinator), or any later swap
+      // to another persona sees this invocation and waits for it to finish.
+      // executeAgentState releases the registration once the session closed.
+      liveTurn.release = this.registerLiveAgentTurn(instance, bundle.bundleId, stateConfig.persona);
+      liveTurn.bundleId = bundle.bundleId;
+      throwIfDetached();
 
       try {
         await this.cyclePolicy(instance, stateConfig.persona, bundle);
       } catch (err) {
-        const errMsg = toErrorMessage(err);
-        writeStderr(`[workflow] cyclePolicy failed for "${stateId}": ${errMsg}`);
-        instance.tab.write(`[error] Policy cycle failed for "${stateId}": ${errMsg}`);
-        instance.messageLog.append({
-          ...this.logBase(instance),
-          type: 'error',
-          error: errMsg,
-          context: `cyclePolicy for "${stateId}" (persona: ${stateConfig.persona})`,
-        });
+        if (!runStopping()) {
+          const errMsg = toErrorMessage(err);
+          writeStderr(`[workflow] cyclePolicy failed for "${stateId}": ${errMsg}`);
+          instance.tab.write(`[error] Policy cycle failed for "${stateId}": ${errMsg}`);
+          instance.messageLog.append({
+            ...this.logBase(instance),
+            type: 'error',
+            error: errMsg,
+            context: `cyclePolicy for "${stateId}" (persona: ${stateConfig.persona})`,
+          });
+        }
         throw err;
       }
+      throwIfDetached();
     }
 
     // Agent-CLI conversation identity for this invocation. Decision table
     // (docs/designs/workflow-session-identity.md §3):
     //   - freshSession:false AND prior entry in agentConversationsByState -> reuse
     //   - otherwise -> mint fresh via createAgentConversationId()
-    // The Docker adapter decides --session-id vs --resume by probing
-    // conversationStateDir for `<agentConversationId>.jsonl`; a minted-fresh
-    // id has no prior file, a reused one does.
+    // The Docker session decides between starting and resuming the
+    // conversation by probing for it (`findStoredConversation`: Claude Code's
+    // `<agentConversationId>.jsonl`, or the host record of the Codex thread /
+    // Goose session); a minted-fresh id has none, a reused one does.
     const priorConversationId =
       stateConfig.freshSession === false ? context.agentConversationsByState[stateId] : undefined;
     const agentConversationId: AgentConversationId = priorConversationId ?? createAgentConversationId();
@@ -2498,6 +4839,20 @@ export class WorkflowOrchestrator implements WorkflowController {
     // `instance.definitionPath` here. Computing it per-state would
     // re-introduce the resume-fragility bug fixed by staging at start.
     const workflowSkillsDir = instance.workflowSkillsDir;
+    if (
+      workflowSkillsDir !== undefined &&
+      validatedWorkflowStagedDirectory(this.runDirOf(workflowId), workflowSkillsDir, 'skills') === undefined
+    ) {
+      throw new WorkflowResumeError('WORKFLOW_NOT_RESUMABLE', 'Invalid workflow-skills staging directory');
+    }
+
+    // The commit channel this invocation's agent reaches through its
+    // coordinator's workflow_commit tool: the borrowed bundle's, or a
+    // channel of its own that the session hands to the coordinator it
+    // builds. Whether the coordinator really offers the tool is known once
+    // the session exists (the channel is then attached).
+    const sessionCommitChannel = bundle ? undefined : new WorkflowCommitChannel();
+    const commitChannel = bundle ? instance.commitChannelsByBundle.get(bundle.bundleId) : sessionCommitChannel;
 
     // Workflow context for the session. Always emitted for workflow
     // runs (so the orchestrator's identity isn't ambiguous), even when
@@ -2509,9 +4864,30 @@ export class WorkflowOrchestrator implements WorkflowController {
       personaId: stateConfig.persona,
       ...(bundle ? { infrastructure: bundle } : {}),
       ...(workflowStateDir ? { stateDir: workflowStateDir, stateSlug } : {}),
+      ...(sessionCommitChannel ? { workflowCommit: sessionCommitChannel } : {}),
       ...resolveWorkflowSkillsOptions(stateConfig.skills, workflowSkillsDir),
+      // A session that builds its own environment applies the state's
+      // read-only workspace itself; a borrowed bundle already carries it.
+      ...(readOnlyWorkspace && !bundle ? { readOnlyWorkspace } : {}),
     };
 
+    throwIfDetached();
+    // A session that brings its own environment (no shared bundle: a
+    // per-state container, or a builtin sandbox) takes an agent slot for its
+    // lifetime and waits here while the daemon-wide cap is reached. A
+    // borrowed session runs in its bundle, whose slots the run already holds.
+    let sessionSlot: AgentSlotLease | undefined;
+    if (!bundle) {
+      sessionSlot = await this.acquireSessionSlot(instance, stateId, signal);
+      if (detached()) sessionSlot.release();
+      throwIfDetached();
+    }
+    // Escalations this session surfaces through its file-IPC watcher
+    // (builtin and per-state-container workflows, or a bundle without the
+    // in-process hook) join the workflow's human route. The holder is
+    // filled once the session exists; decisions reach the session lazily
+    // through it.
+    const sessionRef: { current?: Session } = {};
     let session: Session;
     try {
       session = await this.deps.createSession({
@@ -2519,35 +4895,104 @@ export class WorkflowOrchestrator implements WorkflowController {
         mode,
         agentConversationId,
         workspacePath: instance.workspacePath,
+        // Narrows this state's persona policy (a borrowed bundle's
+        // coordinator already carries the same scope).
+        ...(instance.taskPolicyDir !== undefined ? { taskPolicyDir: instance.taskPolicyDir } : {}),
         systemPromptAugmentation: definition.settings?.systemPrompt,
+        // State model over workflow model; the factory puts `--model` above
+        // both and buildSessionConfig the state persona's agentModelId below.
         ...(effectiveModel != null ? { agentModelOverride: effectiveModel } : {}),
-        resourceBudgetOverrides: instance.resourceBudget.limits,
+        // The workflow's own limits override the state persona's
+        // resourceBudget; the limits the run inherited sit below it.
+        ...workflowSessionBudgetOptions(instance.resourceBudget),
+        onEscalation: (request) =>
+          this.handleSessionEscalation(instance, stateId, stateConfig.persona, sessionRef, request),
+        onEscalationResolved: (escalationId, decision) =>
+          this.noteSessionEscalationResolved(instance, escalationId, decision),
+        // Only the escalation that expired: the session's others stay pending.
+        onEscalationExpired: (escalationId) =>
+          this.expireToolCallEscalationsWhere(
+            instance,
+            'the escalation expired',
+            (p) => p.owner === sessionRef && p.escalation.escalationId === escalationId,
+          ),
+        // A stale policy, and setuid or root-owned files the agent left in
+        // its host mounts (after turns; at the end for a state that owns its
+        // container).
+        onDiagnostic: (event) => this.reportSessionNotice(instance, event),
         // The nested record colocates the borrowed bundle, per-state
         // artifact dir, and workflow-bundled skills. `buildSessionConfig`
         // enforces the borrow-mode invariant (stateDir requires
         // infrastructure) at runtime.
         ...(Object.keys(workflowOptions).length > 0 ? { workflow: workflowOptions } : {}),
       });
+      sessionRef.current = session;
     } catch (err) {
-      const errMsg = toErrorMessage(err);
-      writeStderr(`[workflow] Session creation failed for "${stateId}": ${errMsg}`);
-      instance.tab.write(`[error] Session creation failed for "${stateId}": ${errMsg}`);
-      instance.messageLog.append({
-        ...this.logBase(instance),
-        type: 'error',
-        error: errMsg,
-        context: `session creation for "${stateId}"`,
-      });
+      sessionSlot?.release();
+      if (!runStopping()) {
+        const errMsg = toErrorMessage(err);
+        writeStderr(`[workflow] Session creation failed for "${stateId}": ${errMsg}`);
+        instance.tab.write(`[error] Session creation failed for "${stateId}": ${errMsg}`);
+        instance.messageLog.append({
+          ...this.logBase(instance),
+          type: 'error',
+          error: errMsg,
+          context: `session creation for "${stateId}"`,
+        });
+      }
       throw new AgentInvocationError({ stateId, agentConversationId: currentConversationId, cause: err });
     }
 
+    // The run may have been aborted (or this lane drained) while the session
+    // was being created: abort() closed only the sessions that existed when it
+    // ran, so this one is closed here, before it is registered or sent a turn.
+    // Like the `finally` below, anything its watcher surfaced meanwhile can no
+    // longer be answered.
+    if (detached()) {
+      await session.close().catch((closeErr: unknown) => {
+        writeStderr(`[workflow] session.close() failed for "${stateId}": ${toErrorMessage(closeErr)}`);
+      });
+      // Its own environment is gone with it: return its agent slot.
+      sessionSlot?.release();
+      this.expireToolCallEscalationsWhere(instance, 'the agent session ended', (p) => p.owner === sessionRef);
+      throwIfDetached();
+    }
+
     instance.activeSessions.add(session);
+    if (sessionSlot) instance.sessionSlots.set(session, sessionSlot);
+    // Counted live from here (tokens from the metrics bus or the session,
+    // cost from the session, and at least what its bundle's budget gate
+    // charged) and settled in the finally block below. A borrowed session's
+    // cost is part of the shared bundle's; any other Docker session owns its
+    // bundle.
+    instance.usage.sessionStarted(session, mode.kind, bundle?.bundleId);
+
+    // The commit-tool protocol applies when the agent's coordinator offers
+    // workflow_commit (its channel is attached): the invocation is opened
+    // here and closed in the `finally` below, so a commit is accepted only
+    // while this invocation runs. Otherwise the agent ends its final message
+    // with the YAML status block, which is parsed instead. (`when` clauses
+    // route on `verdict` only, see validate.ts, which a commit carries.)
+    const validVerdicts = getValidVerdicts(stateConfig.transitions);
+    const invocation: WorkflowCommitInvocation | undefined = commitChannel?.isAttached
+      ? commitChannel.open({ stateId, ...(validVerdicts ? { validVerdicts } : {}) })
+      : undefined;
+    const commitPrompt: WorkflowCommitPrompt | undefined = invocation ? { invocationId: invocation.id } : undefined;
+    // A resume replay re-runs the state from its start; every prompt that
+    // opens a conversation for it (the first turn and a fresh replacement
+    // after recovery exhaustion) carries the resume notice. Every prompt of
+    // the invocation carries its commit protocol.
+    const promptOptions: AgentPromptOptions = {
+      resumeReplay: input.resumeReplay === true,
+      ...(commitPrompt ? { commit: commitPrompt } : {}),
+    };
 
     try {
       instance.tab.write(`[agent] Sending command to "${stateId}"...`);
 
       const { messageLog } = instance;
-      const statusInstructions = buildStatusInstructions(stateConfig.transitions);
+      const command = buildAgentCommand(stateId, stateConfig, context, definition, promptOptions);
+      const statusInstructions = buildStatusInstructions(stateConfig.transitions, commitPrompt);
 
       const logReceived = (text: string, output: AgentOutput | undefined) => {
         messageLog.append({
@@ -2572,6 +5017,13 @@ export class WorkflowOrchestrator implements WorkflowController {
         });
       };
 
+      const rotateConversation = (): boolean => {
+        const rotated = session.rotateAgentConversationId?.();
+        if (!rotated) return false;
+        currentConversationId = rotated;
+        return true;
+      };
+
       // Uniform agent-turn entrypoint: every prompt and reprompt must flow
       // through here so the quota-exhaustion / transient-failure
       // short-circuits apply to ALL of them. Retrying or reprompting a turn
@@ -2586,13 +5038,54 @@ export class WorkflowOrchestrator implements WorkflowController {
       // Sessions without `sendMessageDetailed` (e.g., built-in in-process
       // sessions) degrade cleanly to `sendMessage`, which cannot produce
       // either signal — the short-circuits simply never fire for them.
+      //
+      // A detached invocation (a drained fan-out lane) sends no further turn,
+      // and a turn that was already in flight when it was drained does not
+      // stamp the run: its lane already settled as `drained`, so the error
+      // reaches no onError edge, and a stamp left behind would make a run
+      // that later completes report `aborted` (handleWorkflowComplete).
+      // A turn that returns after the run began stopping is not processed at
+      // all: its terminal checkpoint is (being) written already.
+      //
+      // Every turn goes out as system-generated (WORKFLOW_AGENT_TURN): the
+      // session then clears the auto-approver's trusted user context instead
+      // of recording this prompt, which carries upstream agents' output.
+      //
+      // Commit-tool protocol: an upstream failure (quota or transient) that
+      // ends a turn after the state committed through workflow_commit, with
+      // every required output in place, lost only the end of that turn. The
+      // commit stands, exactly as through a hard failure: the turn is
+      // returned as one, which every caller below handles by keeping the
+      // commit, rotating the conversation and never handing the failed
+      // turn's text on. The structured log entry is still written; the run
+      // is not stamped, since the state did not fail. Without a commit, or
+      // with an output still missing (the turn that would produce it could
+      // not run either), the run stops resumably as before.
+      const commitSurvivesUpstreamFailure = (): boolean =>
+        invocation?.committed() !== undefined && this.findMissingArtifacts(instance, stateConfig).length === 0;
       const sendAgentTurn = async (msg: string): Promise<AgentTurnResult> => {
-        const result = session.sendMessageDetailed
-          ? await session.sendMessageDetailed(msg)
-          : { text: await session.sendMessage(msg), hardFailure: false };
+        throwIfDetached();
+        let result: AgentTurnResult;
+        try {
+          result = session.sendMessageDetailed
+            ? await session.sendMessageDetailed(msg, WORKFLOW_AGENT_TURN)
+            : { text: await session.sendMessage(msg, WORKFLOW_AGENT_TURN), hardFailure: false };
+        } catch (err) {
+          // A turn stopped at its per-turn wall-clock limit, or by the
+          // bundle's budget gate, is never retried (the session already
+          // killed the agent's processes). Its CLI may have left a partial
+          // transcript, so persist a fresh conversation id: a later
+          // `freshSession: false` visit must not resume it.
+          if (isStoppedTurnBudgetExhaustion(err)) rotateConversation();
+          throw err;
+        }
+        this.throwIfStopping(instance, `another step of agent state "${stateId}"`);
         if (result.quotaExhausted) {
           const { resetAt, rawMessage } = result.quotaExhausted;
-          logReceived(result.text, undefined);
+          const commitStands = commitSurvivesUpstreamFailure();
+          // A turn whose commit stands is logged once by its caller, with
+          // the committed verdict.
+          if (!commitStands) logReceived(result.text, undefined);
           messageLog.append({
             ...this.logBase(instance),
             type: 'quota_exhausted',
@@ -2600,12 +5093,13 @@ export class WorkflowOrchestrator implements WorkflowController {
             resetAt: resetAt?.toISOString(),
             rawMessage,
           });
+          if (commitStands) return { text: result.text, hardFailure: true };
           // Stamp the instance before throwing so `handleWorkflowComplete`
           // can force an abort-preserving terminal regardless of which
           // state the onError target resolves to — protects checkpoint
           // retention for workflow definitions whose error target happens
           // to be a normal terminal (e.g. `done`).
-          instance.quotaExhausted = { resetAt, rawMessage };
+          if (!detached()) instance.quotaExhausted = { resetAt, rawMessage };
           throw new WorkflowQuotaExhaustedError({ stateId, resetAt, rawMessage });
         }
         if (result.transientFailure) {
@@ -2625,7 +5119,8 @@ export class WorkflowOrchestrator implements WorkflowController {
             kind,
             rawMessage,
           });
-          instance.transientFailure = { kind, rawMessage };
+          if (commitSurvivesUpstreamFailure()) return { text: result.text, hardFailure: true };
+          if (!detached()) instance.transientFailure = { kind, rawMessage };
           throw new WorkflowTransientFailureError({ stateId, kind, rawMessage });
         }
         return result;
@@ -2639,16 +5134,18 @@ export class WorkflowOrchestrator implements WorkflowController {
       });
 
       // Shared-container mode: the MITM is long-lived across agents. Flip
-      // its routing id so this agent's events land under its own session id
-      // (matching what the bridge registers below). Optional-chain because
-      // builtin/per-state-container workflows have no shared `infra`.
+      // its token-stream routing id so this agent's live events land under
+      // its own session id (matching what the observe bridge registers on
+      // `agent_started`). Optional-chain because builtin/per-state-container
+      // workflows have no shared `infra`.
       const agentSessionId = session.getInfo().id;
-      // Per-lane token ATTRIBUTION is best-effort under fan-out: N lanes share one
-      // long-lived MITM, so setTokenSessionId is racy across concurrent lanes and a
-      // given event may be attributed to whichever lane's session id is currently
-      // flipped. The AGGREGATE — instance.tokens.outputTokens, summed over every
-      // registered sessionId below — is authoritative for budget and the
-      // fan-out merge (mergeRecordedFanOutContext); the per-lane split is not.
+      // Token-stream routing is best-effort under fan-out: N lanes share one
+      // long-lived MITM, so setTokenSessionId is racy across concurrent lanes
+      // and a live event may be routed to whichever lane flipped last. It only
+      // feeds live displays. Accounting does not use it: the run's usage meter
+      // counts the metrics-bus exchanges attributed to this run or its bundles
+      // (each exchange carries the invocation it belongs to), which is what
+      // `settings.workflowBudget` and the fan-out merge read.
       bundle?.setTokenSessionId(agentSessionId);
       // Trajectory-capture lifecycle: brackets the agent's run with a
       // begin/end pair on the bundle. The matching `endCaptureSession`
@@ -2663,7 +5160,6 @@ export class WorkflowOrchestrator implements WorkflowController {
           fsmState: stateId,
         });
       }
-      instance.tokens.sessionIds.add(agentSessionId);
 
       this.emitLifecycleEvent({
         kind: 'agent_started',
@@ -2699,17 +5195,26 @@ export class WorkflowOrchestrator implements WorkflowController {
         if (incompleteOutputExcerpts.length > MAX_RECOVERY_EXCERPTS) incompleteOutputExcerpts.shift();
       };
 
-      const rotateConversation = (): boolean => {
-        const rotated = session.rotateAgentConversationId?.();
-        if (!rotated) return false;
-        currentConversationId = rotated;
-        return true;
-      };
+      // Admit the state's primary turn with the same host-derived check the
+      // recovery turns use, so no turn is launched against a session whose
+      // budget is already visibly exhausted (interim host-side enforcement
+      // for container mode; see session/budget-admission.ts).
+      const admissionReason = cumulativeBudgetExhaustionReason(session);
+      if (admissionReason) throw new Error(`Cannot start agent turn for "${stateId}": ${admissionReason}`);
 
       for (let attempt = 0; attempt <= MAX_HARD_RETRIES; attempt++) {
         const result = await sendAgentTurn(command);
         if (!result.hardFailure) {
           rememberResponse(result.text);
+          break;
+        }
+        if (invocation?.committed()) {
+          // The agent committed through workflow_commit before its CLI
+          // failed: the recorded commit is the state's result, and nothing
+          // is re-run. The failed turn's text is logged, never handed on, and
+          // the broken conversation is not resumed later.
+          latestResponseText = result.text;
+          rotateConversation();
           break;
         }
 
@@ -2728,11 +5233,36 @@ export class WorkflowOrchestrator implements WorkflowController {
         rotateConversation();
       }
 
-      const validVerdicts = getValidVerdicts(stateConfig.transitions);
       const routesOnStatus = stateConfig.transitions.some((transition) => transition.when !== undefined);
-      type CommitResult = ParseResult | { readonly kind: 'invalid'; readonly output: AgentOutput };
+      type CommitResult =
+        | ParseResult
+        | { readonly kind: 'invalid'; readonly output: AgentOutput }
+        /** Commit-tool protocol: the invocation has no accepted workflow_commit yet. */
+        | { readonly kind: 'uncommitted' };
+      /** Set when the state committed through workflow_commit with a handoff for the next state. */
+      let committedHandoff: string | undefined;
 
+      // Commit-tool protocol: the recorded commit is the state's result and
+      // the turn's text is never parsed (a YAML block in it means nothing);
+      // the channel already refused verdicts the state does not route on.
+      // YAML protocol: the final status block of the turn's text.
       const evaluateCommit = (text: string): CommitResult => {
+        if (invocation) {
+          const committed = invocation.committed();
+          if (!committed) return { kind: 'uncommitted' };
+          committedHandoff = committed.handoff ?? undefined;
+          return {
+            kind: 'ok',
+            output: {
+              completed: true,
+              verdict: committed.verdict,
+              confidence: 'high',
+              escalation: null,
+              testCount: null,
+              notes: committed.notes,
+            },
+          };
+        }
         const parsed = tryParseAgentStatus(text);
         if (parsed.kind !== 'ok') return parsed;
         if (validVerdicts && !validVerdicts.has(parsed.output.verdict)) {
@@ -2742,6 +5272,13 @@ export class WorkflowOrchestrator implements WorkflowController {
       };
 
       const commitRetry = (result: Exclude<CommitResult, { readonly kind: 'ok' }>) => {
+        if (result.kind === 'uncommitted' && commitPrompt) {
+          return {
+            reason: 'missing_commit' as const,
+            details: 'Turn ended without an accepted workflow_commit call for this invocation',
+            message: buildMissingCommitReprompt(commitPrompt, statusInstructions),
+          };
+        }
         if (result.kind === 'invalid') {
           return {
             reason: 'invalid_verdict' as const,
@@ -2760,6 +5297,7 @@ export class WorkflowOrchestrator implements WorkflowController {
       };
 
       const commitFailureDescription = (result: Exclude<CommitResult, { readonly kind: 'ok' }>): string => {
+        if (result.kind === 'uncommitted') return 'no accepted workflow_commit call';
         if (result.kind === 'invalid') {
           return `invalid verdict "${result.output.verdict}" (expected one of: ${[...(validVerdicts ?? [])].join(', ')})`;
         }
@@ -2783,15 +5321,21 @@ export class WorkflowOrchestrator implements WorkflowController {
         const retry = commitRetry(commit);
         logAgentRetry(retry.reason, retry.details, retry.message);
         const result = await sendAgentTurn(retry.message);
-        if (result.hardFailure) {
+        if (result.hardFailure && !invocation?.committed()) {
           logReceived(result.text, undefined);
           logAgentRetry('upstream_stall', 'Status recovery turn exited without producing output', retry.message);
           recoveryConversationRotated = rotateConversation();
           recoveryFailure = 'Status recovery failed because the agent conversation hard-failed';
           break;
         }
-
-        rememberResponse(result.text);
+        // A hard failure after an accepted commit: the commit stands, and the
+        // failed turn's text is logged but never handed on.
+        if (result.hardFailure) {
+          recoveryConversationRotated = rotateConversation();
+          latestResponseText = result.text;
+        } else {
+          rememberResponse(result.text);
+        }
         commit = evaluateCommit(result.text);
         logReceived(result.text, commit.kind === 'ok' ? commit.output : undefined);
       }
@@ -2801,9 +5345,15 @@ export class WorkflowOrchestrator implements WorkflowController {
         if (budgetReason) {
           recoveryFailure = `Replacement execution skipped: ${budgetReason}`;
         } else if (recoveryConversationRotated || rotateConversation()) {
-          const replacementPrompt = buildAgentReplacementCommand(stateId, stateConfig, context, definition, {
-            incompleteOutputExcerpts,
-          });
+          // The replacement runs the same invocation: same id, same channel.
+          const replacementPrompt = buildAgentReplacementCommand(
+            stateId,
+            stateConfig,
+            context,
+            definition,
+            { incompleteOutputExcerpts },
+            promptOptions,
+          );
           const retry = commitRetry(commit);
           logAgentRetry(
             retry.reason,
@@ -2811,12 +5361,15 @@ export class WorkflowOrchestrator implements WorkflowController {
             replacementPrompt,
           );
           const replacement = await sendAgentTurn(replacementPrompt);
-          if (replacement.hardFailure) {
+          if (replacement.hardFailure && !invocation?.committed()) {
             logReceived(replacement.text, undefined);
             rotateConversation();
             recoveryFailure = 'Fresh replacement execution hard-failed';
           } else {
-            rememberResponse(replacement.text);
+            // A hard failure after an accepted commit: the commit stands, and
+            // the failed turn's text is logged but never handed on.
+            if (replacement.hardFailure) rotateConversation();
+            else rememberResponse(replacement.text);
             commit = evaluateCommit(replacement.text);
             logReceived(replacement.text, commit.kind === 'ok' ? commit.output : undefined);
             if (commit.kind !== 'ok') {
@@ -2850,21 +5403,35 @@ export class WorkflowOrchestrator implements WorkflowController {
         );
       }
 
-      const missingArtifacts = this.findMissingArtifacts(stateConfig, instance.artifactDir);
+      const missingArtifacts = this.findMissingArtifacts(instance, stateConfig);
       if (missingArtifacts.length > 0) {
-        const artifactRetryMsg = buildArtifactReprompt(missingArtifacts, stateConfig.transitions);
+        const artifactRetryMsg = buildArtifactReprompt(
+          missingArtifacts,
+          stateConfig.transitions,
+          commitPrompt ? { ...commitPrompt, committed: invocation?.committed() !== undefined } : undefined,
+          artifactRepromptReadOnly(stateConfig, definition),
+        );
         logAgentRetry('missing_artifacts', `Missing: ${missingArtifacts.join(', ')}`, artifactRetryMsg);
 
         const budgetReason = cumulativeBudgetExhaustionReason(session);
         if (budgetReason) throw new Error(`Cannot retry missing artifacts: ${budgetReason}`);
         const artifactResult = await sendAgentTurn(artifactRetryMsg);
         if (artifactResult.hardFailure) {
-          logReceived(artifactResult.text, undefined);
           rotateConversation();
-          throw new Error('Missing-artifact recovery turn hard-failed');
+          // An accepted workflow_commit stands through a hard failure; the
+          // artifacts this turn was for are re-checked below either way.
+          if (!invocation?.committed()) {
+            logReceived(artifactResult.text, undefined);
+            throw new Error('Missing-artifact recovery turn hard-failed');
+          }
         }
         const retryResponse = artifactResult.text;
-        rememberResponse(retryResponse);
+        // Like every other hard failure that a commit survives, the failed
+        // turn's text is logged below but never handed on: without a
+        // committed handoff the next state keeps the earlier response.
+        if (!artifactResult.hardFailure) rememberResponse(retryResponse);
+        // Commit-tool protocol: the invocation's commit (made earlier, or
+        // in this turn when the state had none) is read again.
         const retryCommit = evaluateCommit(retryResponse);
         if (retryCommit.kind === 'ok') {
           logReceived(retryResponse, retryCommit.output);
@@ -2872,14 +5439,19 @@ export class WorkflowOrchestrator implements WorkflowController {
         } else {
           logReceived(retryResponse, undefined);
         }
-        const stillMissing = this.findMissingArtifacts(stateConfig, instance.artifactDir);
+        const stillMissing = this.findMissingArtifacts(instance, stateConfig);
         if (stillMissing.length > 0) {
           throw new Error(`Missing artifacts after retry: ${stillMissing.join(', ')}`);
         }
       }
 
-      const outputHash = computeOutputHash(stateConfig.outputs, instance.artifactDir, instance.workspacePath);
-      const artifacts = collectArtifactPaths(stateConfig.outputs, instance.artifactDir);
+      // The hash only feeds the `isStalled` guard. For every other state the
+      // walk (the whole workspace when `outputs` is empty) would be pure cost
+      // on the daemon's event loop, so it is skipped.
+      const outputHash = usesStallGuard(stateConfig)
+        ? computeOutputHash(stateConfig.outputs, instance.artifactDir, instance.workspacePath)
+        : OUTPUT_HASH_NOT_COMPUTED;
+      const artifacts = collectArtifactPaths(stateConfig.outputs, instance.artifactDir, instance.workspacePath);
 
       instance.tab.write(
         `[agent] "${stateId}" completed: verdict=${agentOutput.verdict}, artifacts=${Object.keys(artifacts).join(',') || 'none'}`,
@@ -2898,13 +5470,14 @@ export class WorkflowOrchestrator implements WorkflowController {
         agentConversationId: currentConversationId,
         artifacts,
         outputHash,
-        responseText,
-        // Snapshot the workflow's cumulative output-token count AT THE
-        // END of this agent's turn. The XState assign action uses this
-        // value to update ctx.totalTokens; it reflects every `message_end`
-        // the bus subscriber has seen so far, including all earlier
-        // agents in the workflow.
-        totalTokens: instance.tokens.outputTokens,
+        // A committed handoff is what the state chose to pass on; without
+        // one, the latest substantive response is.
+        responseText: committedHandoff ?? responseText,
+        // Snapshot the run-wide total tokens AT THE END of this agent's
+        // turn. The XState assign action uses this value to update
+        // ctx.totalTokens; it covers every session of the run so far,
+        // including all earlier agents and concurrent lanes.
+        totalTokens: instance.usage.snapshot().totalTokens,
       };
     } catch (err) {
       // Quota exhaustion / transient upstream failure already produced
@@ -2913,8 +5486,9 @@ export class WorkflowOrchestrator implements WorkflowController {
       // event and make `workflow inspect` surface a duplicate red error
       // line alongside the structured signal. Suppress the generic entry
       // when the cause is a `WorkflowQuotaExhaustedError` or
-      // `WorkflowTransientFailureError`.
-      if (!isWorkflowQuotaExhaustedError(err) && !isWorkflowTransientFailureError(err)) {
+      // `WorkflowTransientFailureError`, and for a detached (drained)
+      // invocation, whose failure nothing consumes.
+      if (!detached() && !isWorkflowQuotaExhaustedError(err) && !isWorkflowTransientFailureError(err)) {
         instance.messageLog.append({
           ...this.logBase(instance),
           type: 'error',
@@ -2924,8 +5498,12 @@ export class WorkflowOrchestrator implements WorkflowController {
       }
       throw new AgentInvocationError({ stateId, agentConversationId: currentConversationId, cause: err });
     } finally {
+      // No commit is accepted for this invocation once it is over.
+      invocation?.close();
       instance.resourceBudget = { ...instance.resourceBudget, usage: workflowBudgetUsage(session.getBudgetStatus()) };
-      instance.activeSessions.delete(session);
+      // The session's watcher stops with the session; anything it still
+      // had pending can no longer be answered.
+      this.expireToolCallEscalationsWhere(instance, 'the agent session ended', (p) => p.owner === sessionRef);
       const endedSessionId = session.getInfo().id;
       // Trajectory-capture lifecycle: end the capture session FIRST so
       // the `session-end` manifest entry is durable even if
@@ -2939,15 +5517,12 @@ export class WorkflowOrchestrator implements WorkflowController {
           writeStderr(`[workflow] endCaptureSession failed for "${stateId}": ${toErrorMessage(err)}`);
         });
       }
-      await session.close().catch((closeErr: unknown) => {
-        writeStderr(`[workflow] session.close() failed for "${stateId}": ${toErrorMessage(closeErr)}`);
-      });
+      await this.closeWorkflowSession(instance, session);
       // session.close() drains in-flight streams that captured the
       // agent's session id at attach time; they keep posting under it
       // until they finish, regardless of setTokenSessionId(undefined).
       // The clear here only governs future attachments.
       bundle?.setTokenSessionId(undefined);
-      instance.tokens.sessionIds.delete(endedSessionId);
       // Pairs 1:1 with agent_started; emitted unconditionally in finally
       // so success, failure, and abort paths all clean up the bridge.
       this.emitLifecycleEvent({
@@ -2984,14 +5559,25 @@ export class WorkflowOrchestrator implements WorkflowController {
    * container exists before any child's first `container:true` step. N children
    * racing their first container step would each see an empty `bundlesByScope`
    * and mint a SEPARATE container, defeating `sharedContainer` (§6.2 / §8.1;
-   * cross-ref the `ensureBundleForScope` check-then-act race comment).
+   * cross-ref the `ensureBundleForScope` check-then-act race comment). The same
+   * preflight installs the segment's single persona policy once and refuses a
+   * multi-lane segment whose agent members use different personas (§8.2:
+   * homogeneity is load-bearing — one coordinator, one active policy).
    *
-   * Never throws: every failure path — workflow gone, misconfigured segment,
-   * unsupported worker count, missing child machine — funnels through
-   * {@link fanOutErrorResult}, which yields a `result_file_error` verdict that
-   * the parent `workers` state routes to its `failed` edge. (The `fanOutService`
-   * wrapper in {@link provideActors} would also catch a thrown error, but the
-   * uniform result keeps the parent transition table verdict-driven.)
+   * Never throws for configuration failures: workflow gone, misconfigured
+   * segment, mixed personas, unsupported worker count, missing child machine —
+   * all funnel through {@link fanOutErrorResult}, which yields a
+   * `result_file_error` verdict that the parent `workers` state routes to its
+   * `failed` edge, and reports the reason (so do a failed reconstruction,
+   * lane preparation or barrier step, and a rejected lane). (The
+   * `fanOutService` wrapper in {@link provideActors} would
+   * also catch a thrown error, but the uniform result keeps the parent
+   * transition table verdict-driven.) The one deliberate exception is a lane's
+   * resumable upstream failure (quota exhaustion / transient stall), re-thrown
+   * by {@link upstreamFailureAfterFanOut} so the parent's `onError` lands on
+   * the abort-preserving terminal instead of a verdict edge that may lead to a
+   * human gate. Infrastructure failures (bundle mint, control-server attach)
+   * also propagate, exactly as they do for a serial agent state.
    */
   private async runFanOutSegment(
     workflowId: WorkflowId,
@@ -3001,34 +5587,66 @@ export class WorkflowOrchestrator implements WorkflowController {
   ): Promise<FanOutInvokeResult> {
     const instance = this.workflows.get(workflowId);
     if (!instance) {
-      return this.fanOutErrorResult(input, `workflow ${workflowId} not found`);
+      return this.fanOutErrorResult(undefined, input, 'configuration', `workflow ${workflowId} not found`);
     }
+    // An aborted run starts no batch, and every await below re-checks: abort()
+    // stops the lanes it finds registered, so none may start after it ran.
+    const batchName = `fan-out "${input.stateId}"`;
+    this.throwIfStopping(instance, batchName);
 
     const fanOut = input.stateConfig.fanOut;
     const segment = input.stateConfig.segment ?? [];
     if (fanOut === undefined || segment.length === 0) {
-      return this.fanOutErrorResult(input, `State "${input.stateId}" is not a configured fan-out segment.`);
+      return this.fanOutErrorResult(
+        instance,
+        input,
+        'configuration',
+        `State "${input.stateId}" is not a configured fan-out segment.`,
+      );
     }
 
     const workers = resolveFanOutWorkers(fanOut, definition.settings);
     if (!Number.isInteger(workers) || workers < 1) {
-      return this.fanOutErrorResult(input, `State "${input.stateId}" resolved to invalid worker count ${workers}.`);
+      return this.fanOutErrorResult(
+        instance,
+        input,
+        'configuration',
+        `State "${input.stateId}" resolved to invalid worker count ${workers}.`,
+      );
+    }
+    // Validation enforces the same bound; this is the runtime guard for a
+    // definition that bypassed it.
+    if (workers > MAX_FAN_OUT_LANES) {
+      return this.fanOutErrorResult(
+        instance,
+        input,
+        'configuration',
+        `State "${input.stateId}" resolved to ${workers} lanes; at most ${MAX_FAN_OUT_LANES} are supported.`,
+      );
     }
 
     const roundMachine = roundMachinesByState.get(input.stateId);
     if (!roundMachine) {
       return this.fanOutErrorResult(
+        instance,
         input,
+        'configuration',
         `No child round machine is registered for fan-out state "${input.stateId}".`,
       );
     }
 
-    // PRECONDITION: mint the shared-container bundle once, before any child.
-    await this.preMintFanOutScopeBundle(instance, input.stateId, segment);
+    // PRECONDITION: mint the shared-container bundle and install the segment's
+    // single persona once, before any child; refuse a segment that cannot
+    // safely share one coordinator.
+    const preflightError = await this.preMintFanOutScopeBundle(instance, input.stateId, segment, workers);
+    this.throwIfStopping(instance, batchName);
+    if (preflightError !== undefined) {
+      return this.fanOutErrorResult(instance, input, 'preflight', preflightError);
+    }
 
     const reconstruction = this.reconstructFanOutBatchFromDb(instance, definition, segment, workers);
     if (reconstruction.kind === 'error') {
-      return this.fanOutErrorResult(input, reconstruction.error);
+      return this.fanOutErrorResult(instance, input, 'batch reconstruction', reconstruction.error);
     }
     const missingLanes =
       reconstruction.kind === 'ready'
@@ -3042,8 +5660,9 @@ export class WorkflowOrchestrator implements WorkflowController {
           : undefined,
       lanes: missingLanes,
     });
+    this.throwIfStopping(instance, batchName);
     if (preparedLaneResults.error !== undefined) {
-      return this.fanOutErrorResult(input, preparedLaneResults.error);
+      return this.fanOutErrorResult(instance, input, 'lane preparation', preparedLaneResults.error);
     }
 
     instance.tab.write(`[fanout] Starting "${input.stateId}" with ${workers} worker${workers === 1 ? '' : 's'}`);
@@ -3061,12 +5680,15 @@ export class WorkflowOrchestrator implements WorkflowController {
     // in-flight peer's eventual `recorded` would be thrown away anyway — draining
     // stops that wasted LLM spend instead of letting peers run to completion.
     //
-    // WHY stop-at-boundary, NOT AbortSignal: there is no AbortSignal threaded
-    // into the executor layer (FSM-M3), so a lane can only be stopped at a state
-    // boundary via `actor.stop()`; an already-dispatched external service call
-    // may still finish out-of-band, which is why {@link waitForRoundChild}'s
-    // drain resolves the lane's outcome the moment it stops rather than awaiting
-    // the in-flight call.
+    // WHY stop-at-boundary: a drained lane is stopped at a state boundary via
+    // `actor.stop()`. That aborts the in-flight invoke's signal, which detaches
+    // an agent invocation (no further turn, no stamp; see executeAgentState)
+    // and kills a running deterministic command (a host command's process
+    // group, a container command's processes by marker; see
+    // executeDeterministicState), but an already-dispatched agent turn still
+    // finishes out-of-band (FSM-M3), which is why {@link waitForRoundChild}'s
+    // drain resolves the lane's outcome the moment it stops rather than
+    // awaiting the in-flight call.
     //
     // Skip edges: the trigger lane itself is skipped (it already settled with its
     // own blocked/errored outcome), and any `isSettled()` peer is skipped — a peer
@@ -3118,16 +5740,33 @@ export class WorkflowOrchestrator implements WorkflowController {
       lanePromises[index] = waiter.promise;
     }
 
-    for (const child of childActors) {
-      child.actor.start();
+    // Registered on the instance (in the same synchronous run that starts
+    // them) so abort() can stop every lane: they are root actors of their
+    // own, which stopping the run's actor does not reach.
+    for (const child of childActors) instance.fanOutChildren.add(child);
+    let settled: PromiseSettledResult<RoundChildOutcome>[];
+    try {
+      for (const child of childActors) {
+        child.actor.start();
+      }
+      settled = await Promise.allSettled(lanePromises);
+    } finally {
+      for (const child of childActors) instance.fanOutChildren.delete(child);
     }
-
-    const settled = await Promise.allSettled(lanePromises);
+    // Lanes stopped by an abort settle as drained; their batch is not joined
+    // and no barrier step runs for it.
+    this.throwIfStopping(instance, `the barrier of ${batchName}`);
     let result = this.joinFanOutBatch(instance, input, settled);
+    const upstreamFailure = this.upstreamFailureAfterFanOut(instance, input.stateId);
+    if (upstreamFailure !== undefined) {
+      this.logFanOutJoin(instance, input.stateId, workers, result, settled);
+      instance.tab.write(`[fanout] "${input.stateId}" halted: ${upstreamFailure.message}`);
+      throw upstreamFailure;
+    }
     if (workers > 1 && result.verdict === 'recorded') {
       const promotion = await this.promoteBarrierCognition(workflowId, definition, segment, result.context, settled);
       if (promotion.error !== undefined) {
-        return this.fanOutErrorResult(input, promotion.error);
+        return this.fanOutErrorResult(instance, input, 'cognition promotion', promotion.error);
       }
       if (promotion.result?.payload !== undefined) {
         result = {
@@ -3145,7 +5784,7 @@ export class WorkflowOrchestrator implements WorkflowController {
       // the canonical bare file inline (byte-identical backward compat), so we skip.
       const stopSignalsError = await this.computeBarrierStopSignals(workflowId, definition, segment, input.context);
       if (stopSignalsError !== undefined) {
-        return this.fanOutErrorResult(input, stopSignalsError);
+        return this.fanOutErrorResult(instance, input, 'stop signals', stopSignalsError);
       }
     }
     this.logFanOutJoin(instance, input.stateId, workers, result, settled);
@@ -3314,55 +5953,177 @@ export class WorkflowOrchestrator implements WorkflowController {
   }
 
   /**
-   * Mints the fan-out segment's shared-container bundle ONCE, before any child
-   * actor starts (the load-bearing precondition of {@link runFanOutSegment}).
+   * Shared-container preflight for a fan-out segment: mints the segment's ONE
+   * scope bundle and installs its ONE persona policy before any child actor
+   * starts (the load-bearing precondition of {@link runFanOutSegment}).
    *
-   * The mint precondition: only when the workflow actually uses a shared
-   * container (`shouldUseSharedContainer`) AND at least one segment member runs
-   * in-container. A segment with no container members needs no bundle and
-   * returns early.
+   * Returns `undefined` when the segment may start, or an error message for a
+   * segment that must not run — the caller turns it into
+   * {@link fanOutErrorResult} so misconfiguration surfaces as a
+   * `result_file_error` verdict, never as N half-started lanes.
+   * Infrastructure failures (bundle mint, control-server attach) still throw,
+   * as they do for a serial agent state.
    *
-   * `ensureBundleForScope` is an unguarded check-then-act across awaits (its own
-   * doc flags the lazy-mint race): N children each hitting their first
-   * `container:true` step would each see `bundlesByScope.get(scope)` undefined
-   * and mint a SEPARATE container. Calling it once here, serially, closes that
-   * window — every child then borrows the already-minted bundle. Cross-ref the
-   * race comment on `ensureBundleForScope`.
+   * Skipped entirely outside shared-container mode: there each lane's session
+   * builds its own coordinator, so there is nothing to share and nothing to
+   * guard. A segment with no container members needs no bundle either.
    *
-   * The multi-scope throw is a guardrail, not a supported path: this slice
-   * keeps the whole segment under one `containerScope` (single-policy
-   * homogeneity, §8.2). A segment spanning >1 scope is out of slice scope and
-   * fails fast rather than minting the wrong bundle.
+   * WHY mint here, serially: `ensureBundleForScope` is an unguarded
+   * check-then-act across awaits (its own doc flags the lazy-mint race). N
+   * children each hitting their first `container:true` step would each see
+   * `bundlesByScope.get(scope)` undefined and mint a SEPARATE container.
+   * Calling it once here closes that window — every child then borrows the
+   * already-minted bundle.
+   *
+   * WHY one scope: this slice keeps the whole segment under one
+   * `containerScope` (§8.2). A segment spanning >1 scope is refused here (and
+   * statically by `validateFanOutLaneConcurrency`) rather than minting the
+   * wrong bundle.
+   *
+   * WHY one persona, cycled once, BEFORE the lanes: every lane borrows this
+   * bundle's single coordinator, and `cyclePolicy` hot-swaps that
+   * coordinator's one active policy. With `workers > 1` and agent members of
+   * different personas, lane 0 entering its second member would swap the
+   * policy out from under lane 1's still-running first member — tool calls
+   * evaluated and audited under the wrong persona (a silent policy bypass one
+   * way, spurious denials the other). Heterogeneous multi-lane segments are
+   * therefore refused; the validator rejects them statically too, this is the
+   * runtime guard for definitions that bypass validation. For the homogeneous
+   * case the one persona is installed here, once, so every lane's own
+   * `cyclePolicy` call hits the `currentPersonaByBundle` short-circuit instead
+   * of N concurrent `loadPolicy` RPCs racing the cache's read-then-set window.
    */
   private async preMintFanOutScopeBundle(
     instance: WorkflowInstance,
     fanOutStateId: string,
     segment: readonly string[],
-  ): Promise<void> {
-    if (!this.shouldUseSharedContainer(instance.definition)) return;
+    workers: number,
+  ): Promise<string | undefined> {
+    if (!this.shouldUseSharedContainer(instance.definition)) return undefined;
 
     const scopes = new Set<string>();
+    const agentPersonas: Array<{ readonly memberId: string; readonly persona: string }> = [];
     for (const memberId of segment) {
       const member = instance.definition.states[memberId];
       if (member.type === 'agent') {
         scopes.add(member.containerScope ?? DEFAULT_CONTAINER_SCOPE);
+        agentPersonas.push({ memberId, persona: member.persona });
       } else if (member.type === 'deterministic' && member.container === true) {
         scopes.add(member.containerScope ?? DEFAULT_CONTAINER_SCOPE);
       }
     }
 
-    if (scopes.size === 0) return;
+    if (scopes.size === 0) return undefined;
     if (scopes.size > 1) {
-      throw new Error(
-        `fan-out state "${fanOutStateId}" spans multiple container scopes (${[...scopes].join(', ')}); ` +
-          'multi-scope fan-out is out of scope for this implementation slice.',
+      return (
+        `fan-out state "${fanOutStateId}" spans multiple container scopes (${[...scopes].sort().join(', ')}); ` +
+        'a fan-out segment must run entirely within one containerScope.'
       );
     }
 
-    // size is exactly 1 here (the 0 and >1 cases returned/threw above), so the
+    const personas = new Set(agentPersonas.map((entry) => entry.persona));
+    if (workers > 1 && personas.size > 1) {
+      const described = agentPersonas.map((entry) => `${entry.memberId}: ${entry.persona}`).join(', ');
+      return (
+        `fan-out state "${fanOutStateId}" runs ${workers} concurrent lanes on one shared coordinator, but its agent ` +
+        `members use different personas (${described}); concurrent lanes would evaluate tool calls under each ` +
+        `other's policies. Use one persona for every agent member of the segment, or run it with a single lane.`
+      );
+    }
+
+    // size is exactly 1 here (the 0 and >1 cases returned above), so the
     // single-element destructure yields the one scope.
     const [scope] = [...scopes];
-    await this.ensureBundleForScope(instance, scope);
+    const bundle = await this.ensureBundleForScope(instance, scope);
+
+    // Exactly one persona across the segment's agent members (a
+    // deterministic-only segment has none to install; a serial workers:1
+    // segment with several personas cycles per state as usual).
+    if (personas.size !== 1) return undefined;
+    const [persona] = [...personas];
+    try {
+      await this.cyclePolicy(instance, persona, bundle);
+    } catch (err) {
+      return (
+        `fan-out state "${fanOutStateId}": policy cycle for persona "${persona}" failed before any lane started: ` +
+        toErrorMessage(err)
+      );
+    }
+    return undefined;
+  }
+
+  /**
+   * Surfaces why a fan-out batch failed on stderr, on the tab and in the
+   * message log, whose entry's context names the fan-out state and the
+   * failed stage. {@link fanOutErrorResult} carries the reason only in
+   * `errors`, which the parent's verdict routing never reads (it keeps only
+   * the result's context), so without this the reason would be invisible to
+   * `workflow inspect`.
+   *
+   * A reason can carry container output (a failed barrier step's stderr), so
+   * it is bounded, and the stderr line is made display-safe (the tab escapes
+   * what it shows). A stopping run reports nothing: its stopped actor ignores
+   * the result, and no entry may follow its terminal marker. Without an
+   * instance (the run is gone) only stderr is left.
+   */
+  private reportFanOutFailure(
+    instance: WorkflowInstance | undefined,
+    fanOutStateId: string,
+    stage: FanOutFailureStage,
+    message: string,
+  ): void {
+    if (instance !== undefined && this.isStopping(instance)) return;
+    const reason = truncateForTransition(message) ?? 'no reason given';
+    const outcome = `${stage === 'configuration' || stage === 'preflight' ? 'refused' : 'failed'} (${stage})`;
+    writeStderr(`[workflow] fan-out "${fanOutStateId}" ${outcome}: ${toDisplayText(reason)}`);
+    if (instance === undefined) return;
+    instance.tab.write(`[error] Fan-out "${fanOutStateId}" ${outcome}: ${reason}`);
+    instance.messageLog.append({
+      ...this.logBase(instance),
+      type: 'error',
+      error: reason,
+      context: `fan-out "${fanOutStateId}" ${stage}`,
+    });
+  }
+
+  /**
+   * Re-raises a lane's resumable stop at the fan-out barrier: an upstream
+   * failure (quota / transient) or a lane step the workflow budget refused.
+   *
+   * Inside a lane the failure lands on the child's `errored` terminal and the
+   * join folds it into a `result_file_error` verdict, which the parent routes
+   * like any failed batch — possibly to a human gate or `failed`. That would
+   * strand the stamp on the instance (`handleWorkflowComplete` would later
+   * misreport a successful run as `aborted`) and let a human APPROVE past a
+   * turn that never ran. Throwing the dedicated error instead makes the
+   * parent's `onError` take its `__isResumableStop` branch straight to the
+   * abort-preserving terminal, with the checkpoint still pointing at the
+   * fan-out state so `workflow resume` re-enters the batch (recorded lanes
+   * are reconstructed from the DB, missing lanes re-run).
+   *
+   * The stamps can only have been set by THIS batch: any earlier stamp would
+   * already have ended the run, and they are in-process only (a resumed run
+   * starts clean, and checks the workflow budget again before its first
+   * state).
+   */
+  private upstreamFailureAfterFanOut(instance: WorkflowInstance, fanOutStateId: string): Error | undefined {
+    if (instance.quotaExhausted) {
+      return new WorkflowQuotaExhaustedError({ stateId: fanOutStateId, ...instance.quotaExhausted });
+    }
+    if (instance.transientFailure) {
+      return new WorkflowTransientFailureError({ stateId: fanOutStateId, ...instance.transientFailure });
+    }
+    if (instance.workflowBudgetExhausted) {
+      const { breach } = instance.workflowBudgetExhausted;
+      return new WorkflowBudgetExhaustedError({
+        stateId: fanOutStateId,
+        limitField: breach.limitField,
+        used: breach.used,
+        limit: breach.limit,
+        detail: breach.message,
+      });
+    }
+    return undefined;
   }
 
   private buildFanOutLaneContext(
@@ -3422,8 +6183,10 @@ export class WorkflowOrchestrator implements WorkflowController {
     const runDirRelative = this.containerPathToWorkspaceRelative(runDir);
     if (!runDirRelative) return { kind: 'unavailable' };
 
-    const nodesPath = resolve(instance.workspacePath, runDirRelative, 'database_data', 'nodes.json');
-    const nodes = this.readEvolveNodes(nodesPath);
+    const nodes = this.readEvolveNodes(
+      instance.workspacePath,
+      posix.join(runDirRelative, 'database_data', 'nodes.json'),
+    );
     if (nodes.error !== undefined) return { kind: 'error', error: nodes.error };
 
     const expectedLanes = Array.from({ length: workers }, (_, index) => index);
@@ -3525,13 +6288,25 @@ export class WorkflowOrchestrator implements WorkflowController {
    * read or JSON-parse failure ⇒ an `error`, which aborts the fan-out: a corrupt
    * DB is NOT safe to treat as empty (we would re-run lanes that may already be
    * recorded), so the missing-vs-corrupt distinction is load-bearing.
+   *
+   * The file lives in the agent-writable workspace, so it is read through
+   * {@link readUntrustedRegularFileBelow}: a FIFO, a symlink (to /dev/zero or
+   * anywhere else), a symlinked directory leading out of the workspace, or a
+   * file over {@link MAX_EVOLVE_NODES_BYTES} is a read error (fail closed),
+   * never a blocking or unbounded read in the daemon.
    */
-  private readEvolveNodes(nodesPath: string): { entries: ReadonlyArray<readonly [string, unknown]>; error?: string } {
-    if (!existsSync(nodesPath)) return { entries: [] };
+  private readEvolveNodes(
+    workspacePath: string,
+    nodesRelativePath: string,
+  ): { entries: ReadonlyArray<readonly [string, unknown]>; error?: string } {
+    const nodesPath = resolve(workspacePath, nodesRelativePath);
     let raw: string;
     try {
-      raw = readFileSync(nodesPath, 'utf-8');
+      raw = readUntrustedRegularFileBelow(workspacePath, nodesRelativePath, {
+        maxBytes: MAX_EVOLVE_NODES_BYTES,
+      }).bytes.toString('utf-8');
     } catch (err) {
+      if (err instanceof UntrustedFileError && err.code === 'NOT_FOUND') return { entries: [] };
       return { entries: [], error: `could not read evolve nodes DB ${nodesPath}: ${errorMessage(err)}` };
     }
 
@@ -3779,6 +6554,7 @@ export class WorkflowOrchestrator implements WorkflowController {
       commands: [command],
       context,
       container: state.container ?? false,
+      host: state.host,
       containerScope: state.containerScope,
       timeoutMs: state.timeoutMs,
       resultFile: workspaceRelativeResultFile,
@@ -3929,13 +6705,28 @@ export class WorkflowOrchestrator implements WorkflowController {
         actor.stop();
         // Resolve directly after stop(): the stopped actor will not enter its
         // next state, while any already-started external promise may still finish
-        // out-of-band (there is no AbortSignal in the executor layer, FSM-M3).
+        // out-of-band (nothing interrupts an in-flight agent turn, FSM-M3; a
+        // deterministic command is killed, but its promise settles later).
+        // stop() aborts the in-flight invoke's signal, so a drained
+        // agent invocation starts no further turn and stamps nothing, and
+        // cyclePolicy waits for its in-flight turn before swapping the shared
+        // coordinator to another persona (executeAgentState).
         finishOutcome({
           index,
           status: 'drained',
           context,
           drainedBy: { index: trigger.index, status: trigger.status, reason: trigger.reason },
         });
+      },
+      stop: () => {
+        if (settled) return;
+        const { context } = actor.getSnapshot() as { context: WorkflowContext };
+        // Same mechanics as a drain, for an abort: the stopped lane enters no
+        // further state and its in-flight invoke is detached; with no peer
+        // trigger the outcome is a bare `drained`, which an aborted run never
+        // joins (runFanOutSegment bails once the batch settles).
+        actor.stop();
+        finishOutcome({ index, status: 'drained', context });
       },
     };
   }
@@ -3959,8 +6750,8 @@ export class WorkflowOrchestrator implements WorkflowController {
    * For `workers: 1`, the recorded path still promotes the single child context
    * exactly. For N>1, the recorded path folds lane contexts into a parent batch
    * context: child artifacts/conversations merge, parent visit counts remain
-   * authoritative for the single-active-state spine, and total tokens fan in
-   * from the orchestrator's workflow-level token accumulator.
+   * authoritative for the single-active-state spine, and total tokens come
+   * from the run's usage meter (every lane's exchanges).
    */
   private joinFanOutBatch(
     instance: WorkflowInstance,
@@ -3969,7 +6760,7 @@ export class WorkflowOrchestrator implements WorkflowController {
   ): FanOutInvokeResult {
     const rejected = settled.find((result) => result.status === 'rejected');
     if (rejected?.status === 'rejected') {
-      return this.fanOutErrorResult(input, toErrorMessage(rejected.reason));
+      return this.fanOutErrorResult(instance, input, 'join', toErrorMessage(rejected.reason));
     }
 
     const children = settled.map((result) => {
@@ -4026,10 +6817,12 @@ export class WorkflowOrchestrator implements WorkflowController {
 
     const drained = children.find((child) => child.status === 'drained');
     if (drained) {
+      const errors = `fan-out child ${drained.index} was drained without a blocked or errored trigger`;
+      this.reportFanOutFailure(instance, input.stateId, 'join', errors);
       return {
         passed: false,
         verdict: DETERMINISTIC_RESULT_ERROR_VERDICT,
-        errors: `fan-out child ${drained.index} was drained without a blocked or errored trigger`,
+        errors,
         context: this.promoteFanOutContext(instance, input.context, drained.context),
         children: childSummaries,
       };
@@ -4100,7 +6893,7 @@ export class WorkflowOrchestrator implements WorkflowController {
    * errored-only join branches). WHAT it folds:
    * - the worst lane's context (`source`) promoted back onto the spine via
    *   {@link promoteFanOutContext} (lane marker stripped, parent visit counts
-   *   restored, tokens from the accumulator);
+   *   restored, tokens from the run's usage meter);
    * - an AGGREGATED multi-lane summary of every blocked/errored lane written to
    *   `previousAgentOutput` (this is what the orchestrator reads on APPROVE→resume
    *   and the human reads in the gate banner);
@@ -4162,10 +6955,10 @@ export class WorkflowOrchestrator implements WorkflowController {
    * is exactly one lane). Strips the per-lane `lane` marker so the parent never
    * carries a lane identity, restores the parent's authoritative `visitCounts`
    * (the single-active-state spine owns visit accounting; a lane's own counts
-   * are a within-batch detail, §7.5), and reads `totalTokens` from the
-   * instance-level token accumulator (the aggregate over all lanes' registered
-   * sessionIds, which is the budget-authoritative figure, NOT the lane's local
-   * sum). The `lane === undefined` branch is the no-fan-out / `workers: 1` case:
+   * are a within-batch detail, §7.5), and reads `totalTokens` from the run's
+   * usage meter (every exchange of every lane and earlier state, the figure
+   * `settings.workflowBudget` is checked against, NOT the lane's local copy).
+   * The `lane === undefined` branch is the no-fan-out / `workers: 1` case:
    * there is no lane marker to strip, so only the token figure is refreshed.
    */
   private promoteFanOutContext(
@@ -4173,17 +6966,18 @@ export class WorkflowOrchestrator implements WorkflowController {
     parentContext: WorkflowContext,
     laneContext: WorkflowContext,
   ): WorkflowContext {
+    const totalTokens = instance.usage.snapshot().totalTokens;
     if (laneContext.lane === undefined) {
       return {
         ...laneContext,
-        totalTokens: instance.tokens.outputTokens,
+        totalTokens,
       };
     }
     const withoutLane = this.withoutLaneContext(laneContext);
     return {
       ...withoutLane,
       visitCounts: parentContext.visitCounts,
-      totalTokens: instance.tokens.outputTokens,
+      totalTokens,
     };
   }
 
@@ -4214,10 +7008,10 @@ export class WorkflowOrchestrator implements WorkflowController {
    *   by one state entry; it has no meaning fanned across N lanes and must not
    *   survive the batch (a stale prompt would mis-route the next orchestrator
    *   turn).
-   * - `totalTokens`: read from the instance-level accumulator (the aggregate over
-   *   all lanes' registered MITM sessionIds), NOT summed from the children here —
-   *   the accumulator is the budget-authoritative figure and already includes
-   *   every lane's spend.
+   * - `totalTokens`: read from the run's usage meter (every exchange attributed
+   *   to the run or its bundles), NOT summed from the children here — the meter
+   *   already includes every lane's spend, and summing lane copies would count
+   *   the shared pre-batch total N times.
    * - `artifacts` / `previousOutputHashes` / `agentConversationsByState`: shallow
    *   last-writer-wins merge over the parent baseline (lanes write disjoint,
    *   lane-scoped keys, so collisions are not expected; the parent baseline is
@@ -4260,7 +7054,7 @@ export class WorkflowOrchestrator implements WorkflowController {
         parentContext.reviewHistory,
       ),
       round: parentContext.round + roundDelta,
-      totalTokens: instance.tokens.outputTokens,
+      totalTokens: instance.usage.snapshot().totalTokens,
       humanPrompt: null,
     };
   }
@@ -4329,6 +7123,13 @@ export class WorkflowOrchestrator implements WorkflowController {
    * "nothing measurable" contract: when no lane yielded a hashable candidate
    * (every lane skipped), there is no diversity to report and the caller logs no
    * duplicate stats at all (distinct from a measured `duplicateRate: 0`).
+   *
+   * `step_name` comes from a result file the lane's container wrote, so only
+   * the bridge's own `step_<batch>(_lane_<k>)?` spelling is joined into a host
+   * path, and each candidate is streamed through the hash by
+   * {@link hashUntrustedRegularFileBelow} (no-follow, non-blocking, capped at
+   * {@link MAX_EVOLVE_CANDIDATE_BYTES}). A candidate that is a symlink, FIFO,
+   * oversized or outside the workspace is skipped and noted on the tab.
    */
   private computeFanOutCandidateDuplicateStats(
     instance: WorkflowInstance,
@@ -4345,16 +7146,22 @@ export class WorkflowOrchestrator implements WorkflowController {
     for (const child of children) {
       if (child.status !== 'recorded') continue;
       const stepName = child.context.lastDeterministicResult?.payload?.step_name;
-      if (typeof stepName !== 'string' || stepName.length === 0) continue;
+      if (typeof stepName !== 'string' || !EVOLVE_LANE_STEP_RE.test(stepName)) continue;
       // Path layout owned by the Python bridge — see EVOLVE_STEP_CODE_PATH_SEGMENTS.
-      const candidatePath = resolve(
-        instance.workspacePath,
-        ...EVOLVE_STEP_CODE_PATH_SEGMENTS,
-        stepName,
-        EVOLVE_STEP_CODE_FILENAME,
-      );
-      if (!existsSync(candidatePath)) continue;
-      hashes.push(createHash('sha256').update(readFileSync(candidatePath)).digest('hex'));
+      const candidateRelativePath = [...EVOLVE_STEP_CODE_PATH_SEGMENTS, stepName, EVOLVE_STEP_CODE_FILENAME].join('/');
+      try {
+        hashes.push(
+          hashUntrustedRegularFileBelow(instance.workspacePath, candidateRelativePath, {
+            maxBytes: MAX_EVOLVE_CANDIDATE_BYTES,
+          }),
+        );
+      } catch (err) {
+        if (!(err instanceof UntrustedFileError && err.code === 'NOT_FOUND')) {
+          instance.tab.write(
+            `[fanout] duplicate stats skipped candidate ${candidateRelativePath}: ${err instanceof UntrustedFileError ? err.code : errorMessage(err)}`,
+          );
+        }
+      }
     }
 
     if (hashes.length === 0) return undefined;
@@ -4371,9 +7178,17 @@ export class WorkflowOrchestrator implements WorkflowController {
   /**
    * The single terminal error channel from {@link runFanOutSegment} to the
    * parent: a `result_file_error` verdict carrying `message`, which the parent
-   * `workers` state routes to its `failed` edge.
+   * `workers` state routes to its `failed` edge. The reason is reported here
+   * too ({@link reportFanOutFailure}), since nothing downstream reads
+   * `errors`; `instance` is undefined only when the run is gone.
    */
-  private fanOutErrorResult(input: FanOutInvokeInput, message: string): FanOutInvokeResult {
+  private fanOutErrorResult(
+    instance: WorkflowInstance | undefined,
+    input: FanOutInvokeInput,
+    stage: FanOutFailureStage,
+    message: string,
+  ): FanOutInvokeResult {
+    this.reportFanOutFailure(instance, input.stateId, stage, message);
     return {
       passed: false,
       verdict: DETERMINISTIC_RESULT_ERROR_VERDICT,
@@ -4386,30 +7201,49 @@ export class WorkflowOrchestrator implements WorkflowController {
   // Deterministic state execution
   // -----------------------------------------------------------------------
 
+  /**
+   * Runs a deterministic state's commands: in the scope's shared container
+   * when `container` is set, otherwise on the host (which requires the
+   * state's `host: true`). `signal` is the XState invoke signal when there is
+   * one; it and the run's stop signal (the instance's `stopController`) both
+   * kill a running host command's process group, and the host runner starts
+   * no further command once either has fired (the state then resolves as
+   * failed, which a stopped run's actor ignores). Both signals reach the
+   * container path too: a running container command is stopped inside the
+   * container when either fires (see {@link runDeterministicInContainer}), a
+   * stopping run starts no command, the run's signal is re-checked before
+   * every container command and after the last one (a stopped run's result
+   * file is not read), and a stopped invoke starts no further command.
+   */
   private async executeDeterministicState(
     workflowId: WorkflowId,
     input: DeterministicInvokeInput,
+    signal?: AbortSignal,
   ): Promise<DeterministicInvokeResult> {
     const preparedResult = input.context.lane?.preparedResults?.[input.stateId];
     if (preparedResult !== undefined) {
       return preparedResult;
     }
 
-    if (!input.container) {
-      return this.runDeterministicHost(input.commands);
-    }
-
     const instance = this.workflows.get(workflowId);
     if (!instance) {
       return { passed: false, errors: `workflow ${workflowId} not found` };
     }
+    const what = `deterministic state "${input.stateId}"`;
+    this.throwIfStopping(instance, what);
+
+    if (!input.container) {
+      return this.runDeterministicHost(instance, input, signal);
+    }
+
     if (!this.shouldUseSharedContainer(instance.definition)) {
       return { passed: false, errors: `State "${input.stateId}" requires shared-container Docker execution.` };
     }
 
     const scope = input.containerScope ?? DEFAULT_CONTAINER_SCOPE;
     const bundle = await this.ensureBundleForScope(instance, scope);
-    const base = await this.runDeterministicInContainer(bundle, input);
+    const base = await this.runDeterministicInContainer(instance, bundle, input, signal);
+    this.throwIfStopping(instance, `the rest of ${what}`);
     return this.applyResultFile(instance, input, base);
   }
 
@@ -4433,26 +7267,27 @@ export class WorkflowOrchestrator implements WorkflowController {
     }
 
     const resultPath = resolve(instance.workspacePath, input.resultFile);
-    // Symlink-safe containment: a container can plant a symlink inside the shared
-    // workspace, and this read happens host-side — so resolve both sides to their
-    // canonical real paths before comparing (same posture as the policy engine,
-    // see resolveRealPath / CLAUDE.md). A lexical resolve()/relative() check would
-    // follow such a symlink and read off-workspace on the host.
+    // Diagnostic pre-check: name a symlink that points off-workspace as an
+    // escape. realpath only resolves the link; nothing is opened here.
     if (!isWithinDirectory(resultPath, instance.workspacePath)) {
       return appendError(`result file ${input.resultFile} escapes the workspace`);
     }
 
-    if (!existsSync(resultPath)) {
-      return appendError(`result file ${input.resultFile} not found`);
-    }
-
-    // Split read vs parse so a read failure (EISDIR/EPERM/...) is not mislabeled
-    // as a JSON syntax error.
+    // The authoritative read. The container can swap the file (or a directory
+    // above it) at any moment, so the read goes through one no-follow,
+    // non-blocking, size-capped descriptor whose location is re-checked against
+    // the workspace: a FIFO, a symlink (to /dev/zero or anywhere), a directory
+    // swapped for a symlink after the check above, or an oversized file is a
+    // routable result-file error, never a hang or an off-workspace read in the
+    // daemon. Read and parse failures stay distinct so a read failure is not
+    // mislabeled as a JSON syntax error.
     let raw: string;
     try {
-      raw = readFileSync(resultPath, 'utf8');
+      raw = readUntrustedRegularFileBelow(instance.workspacePath, input.resultFile, {
+        maxBytes: MAX_RESULT_FILE_BYTES,
+      }).bytes.toString('utf8');
     } catch (err) {
-      return appendError(`result file ${input.resultFile} could not be read: ${errorMessage(err)}`);
+      return appendError(describeResultFileReadError(input.resultFile, err));
     }
 
     let parsed: unknown;
@@ -4490,16 +7325,24 @@ export class WorkflowOrchestrator implements WorkflowController {
    * failures, and shape the `{ passed, testCount, errors }` result. Host vs.
    * container execution differ only in `runCommand` — keep that the only fork so
    * the pass/fail and test-count semantics cannot drift between the two paths.
+   * Once `signal` (the run's stop signal, passed by the container path) aborts,
+   * no further command starts. The host path passes none: its runner refuses
+   * to start a command once the run stops and reports that as the command's
+   * failure.
    */
   private async reduceDeterministicCommands(
     commands: readonly (readonly string[])[],
     runCommand: (cmd: readonly string[]) => Promise<{ stdout: string; error?: string }>,
+    signal?: AbortSignal,
   ): Promise<DeterministicInvokeResult> {
     let totalTestCount = 0;
     const allErrors: string[] = [];
 
     for (const cmdArray of commands) {
       if (cmdArray.length === 0) continue;
+      if (signal?.aborted) {
+        throw new Error('Workflow is stopping; not starting the next deterministic command');
+      }
       const { stdout, error } = await runCommand(cmdArray);
       if (error !== undefined) {
         allErrors.push(error);
@@ -4519,56 +7362,159 @@ export class WorkflowOrchestrator implements WorkflowController {
     };
   }
 
-  private async runDeterministicHost(commands: readonly (readonly string[])[]): Promise<DeterministicInvokeResult> {
-    return this.reduceDeterministicCommands(commands, async (cmdArray) => {
-      const [binary, ...args] = cmdArray;
-      try {
-        const { stdout } = await execFileAsync(binary, args);
-        return { stdout };
-      } catch (err) {
-        const execErr = err as { code?: number; stderr?: string; stdout?: string };
-        return { stdout: '', error: execErr.stderr ?? execErr.stdout ?? String(err) };
-      }
+  /**
+   * Host execution of a `host: true` deterministic state (see
+   * host-command-runner.ts for the process bounds). Each command runs with
+   * the run workspace as its working directory, stdin closed, its own process
+   * group, and `timeoutMs` (default: the container path's 10 minutes). The
+   * group is killed on timeout and when the run stops or the invoke is
+   * stopped (a drained fan-out lane).
+   *
+   * Validation refuses an unacknowledged host state; this re-checks it so a
+   * definition that bypassed validation cannot run workspace code on the host
+   * either. The refusal throws, routing to the state's error target: it is a
+   * configuration error, not a failed check.
+   */
+  private async runDeterministicHost(
+    instance: WorkflowInstance,
+    input: DeterministicInvokeInput,
+    invokeSignal: AbortSignal | undefined,
+  ): Promise<DeterministicInvokeResult> {
+    if (input.host !== true && input.commands.some((command) => command.length > 0)) {
+      throw new Error(
+        `State "${input.stateId}" would run its commands on the host but does not set host: true; refusing to run them. ` +
+          'Host deterministic commands need the explicit host: true acknowledgement (or run them with container: true).',
+      );
+    }
+    const stopSignal = instance.stopController.signal;
+    const signal = invokeSignal ? AbortSignal.any([stopSignal, invokeSignal]) : stopSignal;
+    const timeoutMs = input.timeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS;
+
+    return this.reduceDeterministicCommands(input.commands, async (cmdArray) => {
+      const result = await runHostCommand(cmdArray, { cwd: instance.workspacePath, timeoutMs, signal });
+      if (hostCommandSucceeded(result)) return { stdout: result.stdout };
+      return { stdout: '', error: describeHostCommandFailure(cmdArray, result) };
     });
   }
 
+  /**
+   * Container execution of a `container: true` deterministic state. Each
+   * command runs in the scope's shared container as the agent user, in the
+   * workspace, with the workflow dependency bins on PATH, under coreutils
+   * `timeout` with `timeoutMs` (default: the 10 minutes of the host path)
+   * and a marker of its own (`runBoundedContainerCommand`, see
+   * docker/turn-timeout.ts). The `docker exec` deadline alone would not do:
+   * it only kills the host CLI client, and `docker exec` forwards no signal,
+   * so a hung command (a test runner and its children) would go on running
+   * in the shared container while the state was routed as failed and the
+   * states after it ran.
+   *
+   * A command that times out, and the command running when the run stops or
+   * the invoke is stopped (a drained fan-out lane), has its processes swept
+   * inside the container before the state goes on, and is reported as that
+   * command's failure. Afterwards no further command starts: the run's stop
+   * makes the reducer throw, and a stopped invoke reports every later
+   * command as not started (its stopped actor ignores the result).
+   */
   private async runDeterministicInContainer(
+    instance: WorkflowInstance,
     bundle: DockerInfrastructure,
     input: DeterministicInvokeInput,
+    invokeSignal: AbortSignal | undefined,
   ): Promise<DeterministicInvokeResult> {
-    return this.reduceDeterministicCommands(input.commands, async (cmdArray) => {
-      // Prepend the workflow venv / node bins to the container's live $PATH so
-      // bare `node` / `python` helpers resolve regardless of base-image arch
-      // (the image's own PATH is preserved — see buildWorkflowExecCommand).
-      const result = await bundle.docker.exec(
-        bundle.containerId,
-        buildWorkflowExecCommand(bundle, cmdArray),
-        input.timeoutMs,
-        'codespace',
-        CONTAINER_WORKSPACE_DIR,
+    const runStop = instance.stopController.signal;
+    const signal = invokeSignal ? AbortSignal.any([runStop, invokeSignal]) : runStop;
+    const timeoutMs = input.timeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS;
+    // Validation enforces the same bound; this guards a definition that
+    // bypassed it (a zero would otherwise disable the host deadline).
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_DETERMINISTIC_TIMEOUT_MS) {
+      throw new Error(
+        `State "${input.stateId}" has timeoutMs ${String(timeoutMs)}; it must be an integer within 1-${MAX_DETERMINISTIC_TIMEOUT_MS}.`,
       );
-      if (result.exitCode !== 0) {
-        return { stdout: '', error: result.stderr || result.stdout || `exit ${result.exitCode}` };
-      }
-      return { stdout: result.stdout };
-    });
+    }
+    // A sudo-off bundle (agentSudo: false) execs by numeric UID only.
+    const execUser = bundle.agentExecUser ?? 'codespace';
+    const stopReason = (): string => (runStop.aborted ? 'the workflow is stopping' : 'its state was stopped');
+
+    return this.reduceDeterministicCommands(
+      input.commands,
+      async (cmdArray) => {
+        const label = describeProgram(cmdArray);
+        if (signal.aborted) return { stdout: '', error: `${label} was not started: ${stopReason()}` };
+        // Prepend the workflow venv / node bins to the container's live $PATH so
+        // bare `node` / `python` helpers resolve regardless of base-image arch
+        // (the image's own PATH is preserved — see buildWorkflowExecCommand).
+        // The wall clock wraps that shell, so it bounds the whole command.
+        const { ending, result } = await runBoundedContainerCommand(
+          bundle.docker,
+          bundle.containerId,
+          buildWorkflowExecCommand(bundle, cmdArray),
+          { maxSeconds: timeoutMs / 1000, execUser, workdir: CONTAINER_WORKSPACE_DIR, signal },
+        );
+        const output = result.stderr || result.stdout;
+        if (ending === 'timed-out') {
+          const message = `${label} timed out after ${timeoutMs} ms; it was stopped inside the container`;
+          return { stdout: '', error: output ? `${message}\n${output}` : message };
+        }
+        if (ending === 'stopped') {
+          return { stdout: '', error: `${label} was stopped inside the container: ${stopReason()}` };
+        }
+        if (result.exitCode !== 0) {
+          return { stdout: '', error: output || `exit ${result.exitCode}` };
+        }
+        return { stdout: result.stdout };
+      },
+      runStop,
+    );
   }
 
   // -----------------------------------------------------------------------
   // Gate handling
   // -----------------------------------------------------------------------
 
+  /**
+   * Per-raise gate id for the entry into `gateName` that was just recorded
+   * in the transition history (or is being restored from a legacy
+   * checkpoint). The visit ordinal counts transitions into the gate so far.
+   */
+  private mintGateIdFor(instance: WorkflowInstance, gateName: string): string {
+    const visit = instance.transitionHistory.filter((t) => t.to === gateName).length;
+    return mintGateId(instance.id, gateName, visit);
+  }
+
+  /**
+   * Raises the gate the machine is sitting at, once per raise.
+   *
+   * Called from the actor subscription for every snapshot that matches a
+   * gate state. The id is always settled before this runs: minted by the
+   * subscription on a transition into the gate (or on a gate snapshot with
+   * no raise in effect), or restored / minted by `resume()`. The first
+   * snapshot for a raise hands it to `deps.raiseGate`; any later snapshot
+   * while still waiting (XState notifies observers for events it drops)
+   * finds the id already raised and does nothing: re-raising would duplicate
+   * the log entry and lifecycle event, and minting again would invalidate a
+   * decision in flight.
+   */
   private handleGateEntry(workflowId: WorkflowId, gateName: string, stateDef: HumanGateStateDefinition): void {
     const instance = this.workflows.get(workflowId);
     if (!instance) return;
 
-    const gateRequest = this.buildGateRequest(workflowId, gateName, stateDef);
-    instance.activeGateId = gateRequest.gateId;
+    if (instance.activeGateId === undefined) {
+      // Defensive only (see above). Without an id the gate could never be
+      // resolved, so mint one rather than leave the run stranded.
+      instance.activeGateId = this.mintGateIdFor(instance, gateName);
+    }
+    const gateId = instance.activeGateId;
+    if (instance.raisedGateId === gateId) return;
+    instance.raisedGateId = gateId;
+
+    const gateRequest = this.buildGateRequest(workflowId, gateName, stateDef, gateId);
 
     instance.messageLog.append({
       ...this.logBase(instance),
       type: 'gate_raised',
-      acceptedEvents: stateDef.acceptedEvents,
+      gateId,
+      acceptedEvents: gateRequest.acceptedEvents,
     });
 
     this.deps.raiseGate(gateRequest);
@@ -4577,20 +7523,88 @@ export class WorkflowOrchestrator implements WorkflowController {
       workflowId,
       gate: gateRequest,
     });
+    this.armGateIdleTimer(instance, gateName, gateId);
+  }
+
+  /**
+   * Arms the idle timer of the raise just handed to the deciders (see
+   * {@link resolveGateIdleTimeoutMinutes}). A run waiting at a gate keeps
+   * its shared containers, their proxies and relays, and its run and
+   * workspace locks; one whose decider is gone (a closed browser, an
+   * agent-driven `workflow run` caller that died) would hold them for the
+   * daemon's lifetime. When the timer fires while the run still waits at
+   * this raise, {@link releaseIdleGate} stops it.
+   */
+  private armGateIdleTimer(instance: WorkflowInstance, gateName: string, gateId: string): void {
+    this.clearGateIdleTimer(instance);
+    // A decider may already have answered from inside `raiseGate`, and a
+    // stopping run decides nothing.
+    if (instance.activeGateId !== gateId || instance.finalStatus !== undefined) return;
+    const minutes = resolveGateIdleTimeoutMinutes(instance.definition.settings, instance.bundlesByScope.size > 0);
+    if (minutes === undefined) return;
+    const timer = setTimeout(
+      () => {
+        if (instance.gateIdleTimer?.timer === timer) instance.gateIdleTimer = undefined;
+        this.releaseIdleGate(instance, gateName, gateId, minutes).catch((err: unknown) => {
+          writeStderr(`[workflow] Gate idle release failed for ${instance.id}: ${toErrorMessage(err)}`);
+        });
+      },
+      Math.max(1, Math.ceil(minutes * 60_000)),
+    );
+    // The timer alone must not keep a process alive.
+    timer.unref();
+    instance.gateIdleTimer = { gateId, timer };
+  }
+
+  private clearGateIdleTimer(instance: WorkflowInstance): void {
+    if (!instance.gateIdleTimer) return;
+    clearTimeout(instance.gateIdleTimer.timer);
+    instance.gateIdleTimer = undefined;
+  }
+
+  /**
+   * Stops a run whose gate went undecided for its idle timeout, through the
+   * ordinary abort path: the abort snapshots `snapshotOnStop` scopes, writes
+   * a terminal checkpoint that keeps the gate state and its raise id (so
+   * `workflow resume` re-raises the same gate, and a decision made against
+   * that id stays valid), destroys every bundle and releases the locks. The
+   * gate is dismissed for the deciders. Nothing happens when the run has
+   * moved on from this raise or is already stopping.
+   */
+  private async releaseIdleGate(
+    instance: WorkflowInstance,
+    gateName: string,
+    gateId: string,
+    minutes: number,
+  ): Promise<void> {
+    if (this.workflows.get(instance.id) !== instance) return;
+    if (instance.finalStatus !== undefined || instance.activeGateId !== gateId) return;
+    const releasesContainer = instance.bundlesByScope.size > 0;
+    const reason =
+      `Gate "${gateName}" waited ${minutes} minute${minutes === 1 ? '' : 's'} without a decision, ` +
+      `so the run was stopped${releasesContainer ? ' and its containers released' : ''}. ` +
+      `Resume it with "ironcurtain workflow resume ${instance.id}" to decide the gate.`;
+    writeStderr(`[workflow] ${reason}`);
+    // abort() claims the terminal before its first await, so no decision can
+    // land between it and the dismissal (resolveGate refuses a terminal run).
+    const stopping = this.abort(instance.id, { reason });
+    this.deps.dismissGate(instance.id, gateId);
+    await stopping;
   }
 
   private buildGateRequest(
     workflowId: WorkflowId,
     gateName: string,
     stateDef: HumanGateStateDefinition,
+    gateId: string,
   ): HumanGateRequest {
     const instance = this.workflows.get(workflowId);
     const presentedArtifacts = new Map<string, string>();
     for (const artifactRef of stateDef.present ?? []) {
       if (instance) {
         const { name } = parseArtifactRef(artifactRef);
-        const dir = resolve(instance.artifactDir, name);
-        if (existsSync(dir)) {
+        const dir = this.resolveOutputDir(instance, name);
+        if (dir !== undefined) {
           presentedArtifacts.set(name, dir);
         }
       }
@@ -4618,10 +7632,12 @@ export class WorkflowOrchestrator implements WorkflowController {
         : '';
 
     return {
-      gateId: `${workflowId}-${gateName}`,
+      gateId,
       workflowId,
       stateName: gateName,
-      acceptedEvents: stateDef.acceptedEvents,
+      // Only events `resolveGate` will accept (declared AND routed), so no
+      // decider is offered a choice that is refused with EVENT_NOT_ACCEPTED.
+      acceptedEvents: acceptedGateEvents(stateDef),
       presentedArtifacts,
       summary: `Waiting for human review at ${gateName}${errorContext}`,
     };
@@ -4676,6 +7692,14 @@ export class WorkflowOrchestrator implements WorkflowController {
           `Transient upstream failure: ${describeTransientFailureKind(instance.transientFailure.kind)} ` +
           `(resumable — run "ironcurtain workflow resume ${workflowId}" once upstream is healthy)\n${excerpt}`,
       };
+    } else if (instance.workflowBudgetExhausted) {
+      // Same checkpoint-preserving abort: the run stopped at its spend
+      // ceiling before a state, whichever terminal the error routed to (a
+      // fan-out batch may even have folded the refused lane into a verdict).
+      instance.finalStatus = {
+        phase: 'aborted',
+        reason: instance.workflowBudgetExhausted.reason,
+      };
     } else if (failedDirectlyFromExecutable) {
       instance.finalStatus = {
         phase: 'failed',
@@ -4701,15 +7725,35 @@ export class WorkflowOrchestrator implements WorkflowController {
       };
     }
 
+    this.clearGateIdleTimer(instance);
+    // Recorded so a stop that lands during the snapshot or teardown below
+    // (an abort, `shutdownAll()`) joins it instead of cutting it short.
+    instance.terminalHandling = this.finishWorkflowComplete(instance, instance.finalStatus);
+    await instance.terminalHandling;
+  }
+
+  /**
+   * The rest of {@link handleWorkflowComplete} once its terminal is claimed:
+   * snapshot (resumable terminals only), terminal checkpoint, teardown, lock
+   * release and the lifecycle event.
+   */
+  private async finishWorkflowComplete(
+    instance: WorkflowInstance,
+    finalStatus: Extract<WorkflowStatus, { phase: 'completed' | 'failed' | 'aborted' }>,
+  ): Promise<void> {
+    const workflowId = instance.id;
     let existing: WorkflowCheckpoint | undefined;
     try {
       existing = this.deps.checkpointStore.load(workflowId);
     } catch (err) {
       writeStderr(`[workflow] Failed to load existing checkpoint for ${workflowId}: ${toErrorMessage(err)}`);
     }
+    this.saveTerminalCheckpoint(instance, finalStatus, instance.containerSnapshots, existing, true);
 
+    // This leg's restore snapshots, before a saved terminal checkpoint replaces them.
+    const restoredSnapshots = instance.containerSnapshots;
     const containerSnapshots =
-      instance.finalStatus.phase === 'completed' ? undefined : await this.snapshotResumableScopes(instance);
+      finalStatus.phase === 'completed' ? undefined : await this.snapshotResumableScopes(instance);
 
     // Persist finalStatus so isCheckpointResumable can later distinguish
     // completed (excluded) from aborted/failed (still resumable). Preserve
@@ -4717,21 +7761,17 @@ export class WorkflowOrchestrator implements WorkflowController {
     // non-terminal state) so resume after abort/failure can re-enter that state
     // instead of immediately re-completing on a terminal snapshot. The
     // fallback path covers legacy runs or an earlier checkpoint write failure.
-    this.saveTerminalCheckpoint(instance, instance.finalStatus, containerSnapshots, existing);
-    this.appendTerminalControl(instance);
-
-    instance.tab.write(`[done] ${instance.finalStatus.phase}`);
+    const saved = this.saveTerminalCheckpoint(instance, finalStatus, containerSnapshots, existing, true);
+    instance.tab.write(`[done] ${finalStatus.phase}`);
     instance.tab.close();
 
-    // Release the token-stream bus subscription. Done eagerly (before the
-    // async destroyWorkflowInfrastructure) because it's a synchronous
-    // callback — idempotent if already cleared by abort().
-    this.teardownTokenSubscription(instance);
-
-    const snapshotsToRemove =
-      instance.finalStatus.phase === 'completed'
-        ? existing?.containerSnapshots
-        : this.snapshotsSupersededBy(existing?.containerSnapshots, containerSnapshots);
+    // Snapshots go only once the terminal checkpoint is on disk. After a
+    // failed save the checkpoint there is the last non-terminal one, which is
+    // still resumable from the snapshots it references, even for a run that
+    // has completed. A completed run supersedes all of them (it records none).
+    const snapshotsToRemove = saved
+      ? this.snapshotsSupersededBy(existing?.containerSnapshots, restoredSnapshots, containerSnapshots)
+      : undefined;
     const cleanupDocker = snapshotsToRemove ? await this.dockerForSnapshotCleanup(instance) : undefined;
 
     // Tear down workflow-scoped Docker infrastructure. Runs asynchronously
@@ -4743,7 +7783,7 @@ export class WorkflowOrchestrator implements WorkflowController {
     instance.teardownPromise = (async () => {
       await this.destroyWorkflowInfrastructure(instance);
       if (cleanupDocker) {
-        await this.removeSnapshotImagesAfterTeardown(cleanupDocker, snapshotsToRemove);
+        await this.removeSnapshotImagesAfterTeardown(instance, cleanupDocker, snapshotsToRemove);
       }
     })().catch((err: unknown) => {
       writeStderr(
@@ -4752,9 +7792,12 @@ export class WorkflowOrchestrator implements WorkflowController {
     });
 
     await instance.teardownPromise;
-    instance.terminalReady = true;
+    this.saveTerminalCheckpoint(instance, finalStatus, containerSnapshots, existing);
+    this.appendTerminalControl(instance);
+    this.teardownUsageSubscription(instance);
+    this.markTerminalReady(instance);
 
-    if (instance.finalStatus.phase === 'completed') {
+    if (finalStatus.phase === 'completed') {
       this.emitLifecycleEvent({
         kind: 'completed',
         workflowId,
@@ -4763,8 +7806,8 @@ export class WorkflowOrchestrator implements WorkflowController {
       this.emitLifecycleEvent({
         kind: 'failed',
         workflowId,
-        error: instance.finalStatus.phase === 'aborted' ? instance.finalStatus.reason : instance.finalStatus.error,
-        phase: instance.finalStatus.phase,
+        error: finalStatus.phase === 'aborted' ? finalStatus.reason : finalStatus.error,
+        phase: finalStatus.phase,
       });
     }
   }
@@ -4773,15 +7816,64 @@ export class WorkflowOrchestrator implements WorkflowController {
   // Artifact helpers
   // -----------------------------------------------------------------------
 
-  private findMissingArtifacts(stateConfig: AgentStateDefinition, artifactDir: string): string[] {
+  private findMissingArtifacts(instance: WorkflowInstance, stateConfig: AgentStateDefinition): string[] {
     const missing: string[] = [];
     for (const output of stateConfig.outputs) {
-      const dir = resolve(artifactDir, output);
-      if (!hasAnyFiles(dir)) {
+      const dir = this.resolveOutputDir(instance, output);
+      if (dir === undefined || !hasAnyFiles(dir)) {
         missing.push(output);
       }
     }
     return missing;
+  }
+
+  /**
+   * The verified `.workflow/<name>` directory of an artifact output, or
+   * `undefined` when it is missing or unsafe to walk (see
+   * {@link resolveArtifactOutputDir}). An unsafe output (a symlinked output or
+   * `.workflow` root, or one resolving outside the workspace) only ever comes
+   * from a misbehaving agent: it counts as missing, so it can neither satisfy a
+   * required-artifact check nor send the host walking a host directory, and it
+   * is reported as a security event.
+   */
+  private resolveOutputDir(instance: WorkflowInstance, name: string): string | undefined {
+    const check = resolveArtifactOutputDir(instance.workspacePath, instance.artifactDir, name);
+    if (check.kind === 'ok') return check.dir;
+    if (check.kind === 'rejected') this.reportRejectedArtifactDir(instance, name, check);
+    return undefined;
+  }
+
+  /**
+   * Logs an unsafe artifact output once per run (keyed by reason and path) to
+   * stderr, the workflow tab and the message log. The path is host-derived
+   * (the artifact dir joined with a definition-declared output name), so it is
+   * safe to print.
+   */
+  private reportRejectedArtifactDir(
+    instance: WorkflowInstance,
+    name: string,
+    check: Extract<ArtifactDirCheck, { kind: 'rejected' }>,
+  ): void {
+    instance.reportedArtifactRejections ??= new Set<string>();
+    const key = `${check.reason}:${check.path}`;
+    if (instance.reportedArtifactRejections.has(key)) return;
+    instance.reportedArtifactRejections.add(key);
+
+    const why =
+      check.reason === 'symlink'
+        ? 'is a symbolic link'
+        : check.reason === 'outside_workspace'
+          ? 'resolves outside the workspace'
+          : 'is not a plain relative name';
+    const message = `artifact output "${name}" treated as missing: ${check.path} ${why}`;
+    writeStderr(`[workflow] SECURITY: workflow ${instance.id}: ${message}`);
+    instance.tab.write(`[security] ${message}`);
+    instance.messageLog.append({
+      ...this.logBase(instance),
+      type: 'error',
+      error: message,
+      context: 'security: unsafe artifact output',
+    });
   }
 
   private artifactHandoffSatisfied(stateConfig: AgentStateDefinition, artifactDir: string): boolean {
@@ -4830,6 +7922,50 @@ export class WorkflowOrchestrator implements WorkflowController {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
+// Bundle sizing helpers (workflow shared-container mode)
+// ---------------------------------------------------------------------------
+
+/**
+ * The container scopes `ensureBundleForScope` can mint for `definition`:
+ * those of its agent states and of its `container: true` deterministic
+ * states (fan-out segments only ever use these). Never empty, so a run
+ * always reserves at least one agent slot for its bundles.
+ */
+function workflowBundleScopes(definition: WorkflowDefinition): ReadonlySet<string> {
+  const scopes = new Set<string>();
+  for (const state of Object.values(definition.states)) {
+    if (state.type === 'agent' || (state.type === 'deterministic' && state.container === true)) {
+      scopes.add(state.containerScope ?? DEFAULT_CONTAINER_SCOPE);
+    }
+  }
+  if (scopes.size === 0) scopes.add(DEFAULT_CONTAINER_SCOPE);
+  return scopes;
+}
+
+/**
+ * The widest fan-out (in lanes) whose segment runs in `scope`, or 1 when no
+ * multi-lane segment does: how many agent lanes the scope's bundle
+ * coordinator should expect at once. A segment's scope is that of its agent
+ * and `container: true` members (exactly one, enforced by validation and
+ * `preMintFanOutScopeBundle`).
+ */
+function maxLanesForScope(definition: WorkflowDefinition, scope: string): number {
+  let maxLanes = 1;
+  for (const state of Object.values(definition.states)) {
+    if (!isExecutableState(state) || state.fanOut === undefined) continue;
+    const runsInScope = (state.segment ?? []).some((memberId) => {
+      const member = definition.states[memberId] as WorkflowStateDefinition | undefined;
+      if (member?.type === 'agent' || (member?.type === 'deterministic' && member.container === true)) {
+        return (member.containerScope ?? DEFAULT_CONTAINER_SCOPE) === scope;
+      }
+      return false;
+    });
+    if (runsInScope) maxLanes = Math.max(maxLanes, resolveFanOutWorkers(state.fanOut, definition.settings));
+  }
+  return maxLanes;
+}
+
+// ---------------------------------------------------------------------------
 // Policy cycling helpers (workflow shared-container mode)
 // ---------------------------------------------------------------------------
 
@@ -4849,6 +7985,31 @@ function resolvePersonaPolicyDir(persona: string): string {
 }
 
 /**
+ * `servers` without the memory server, for a workflow shared-container
+ * bundle. The bundle serves every persona in its scope through one
+ * coordinator, and the memory server is trusted (it bypasses policy), so a
+ * bundle-wide memory server would let every persona read and write one
+ * persona's database. The default infrastructure factory therefore never
+ * starts one, whatever the required set or the server configuration names.
+ */
+function withoutMemoryServer<T>(servers: Readonly<Record<string, T>>): Record<string, T> {
+  return Object.fromEntries(Object.entries(servers).filter(([name]) => name !== MEMORY_SERVER_NAME));
+}
+
+/**
+ * Validates a run's task-scope directory (`--task-scoped`): confined to the
+ * trusted roots and canonicalized like a persona policy dir, then checked
+ * against its record. Returns the canonical path.
+ *
+ * @throws when the directory cannot be enforced.
+ */
+function validateTaskScopeDir(taskPolicyDir: string): string {
+  const canonical = validatePolicyDir(taskPolicyDir);
+  requireTaskScopeDir(canonical);
+  return canonical;
+}
+
+/**
  * Default `startWorkflowControlServer`: reaches through the infra
  * bundle's proxy for its policy-swap target and binds a control server
  * at the workflow-scoped UDS path.
@@ -4862,6 +8023,30 @@ async function defaultStartWorkflowControlServer(input: StartWorkflowControlServ
     );
   }
   await target.startControlServer({ socketPath: input.socketPath });
+}
+
+/**
+ * Shapes a workflow bundle's config for tool-call escalations. The bundle's
+ * coordinator gets the orchestrator's in-process handler
+ * (`CreateWorkflowInfrastructureInput.onEscalation`), which takes precedence
+ * over file IPC; the bundle escalation dir is set as well, so a coordinator
+ * built without the handler still writes its requests where the borrowing
+ * session's watcher picks them up and hands them to the same human route.
+ * Without either, every escalated call would be denied on the spot.
+ *
+ * The auto-approver is switched off: in a workflow its "user message" would
+ * be the orchestrator's prompt, which carries prior agents' output rather
+ * than a human's intent. Exported for tests.
+ */
+export function withWorkflowEscalationRouting(
+  config: IronCurtainConfig,
+  bundleEscalationDir: string,
+): IronCurtainConfig {
+  return {
+    ...config,
+    escalationDir: bundleEscalationDir,
+    userConfig: { ...config.userConfig, autoApprove: { ...config.userConfig.autoApprove, enabled: false } },
+  };
 }
 
 /**
@@ -4945,33 +8130,31 @@ const WORKSPACE_HASH_EXCLUDED_DIRS: ReadonlySet<string> = new Set([
   'venv',
 ]);
 
-/**
- * Recursively collects `relativePath:mtime` entries for all files
- * under `basePath`, excluding directories in WORKSPACE_HASH_EXCLUDED_DIRS.
- */
-function collectFileEntries(basePath: string, relativeTo: string, out: string[]): void {
-  const dirents = readdirSync(resolve(basePath, relativeTo), { withFileTypes: true });
-  for (const dirent of dirents) {
-    const relPath = relativeTo ? `${relativeTo}/${dirent.name}` : dirent.name;
-    if (dirent.isDirectory()) {
-      if (WORKSPACE_HASH_EXCLUDED_DIRS.has(dirent.name)) continue;
-      collectFileEntries(basePath, relPath, out);
-    } else if (dirent.isFile()) {
-      const fullPath = resolve(basePath, relPath);
-      const mtime = statSync(fullPath).mtimeMs;
-      out.push(`${relPath}:${mtime}`);
-    }
-  }
-}
-
 /** Hashes the workspace root file listing (paths + mtimes) into the given hash. */
 function hashWorkspaceRoot(hash: Hash, workspacePath: string): void {
+  // `relativePath:mtime` for every regular file, excluding directories in
+  // WORKSPACE_HASH_EXCLUDED_DIRS at any depth. The walk never follows
+  // symlinks, skips entries that vanish or turn unreadable mid-walk (an agent
+  // renaming a temp file must not fail its own state), and is bounded by
+  // WORKSPACE_HASH_LIMITS.
   const entries: string[] = [];
-  collectFileEntries(workspacePath, '', entries);
+  const { truncated } = walkTreeNoFollow(workspacePath, WORKSPACE_HASH_LIMITS, {
+    enterDirectory: (_fullPath, name) => !WORKSPACE_HASH_EXCLUDED_DIRS.has(name),
+    file: (fullPath, stats) => {
+      entries.push(`${relative(workspacePath, fullPath).split(sep).join('/')}:${stats.mtimeMs}`);
+      return false;
+    },
+  });
   entries.sort();
   for (const entry of entries) {
     hash.update(entry);
   }
+  if (truncated) hash.update('\0truncated');
+}
+
+/** True when a transition of this state routes on the `isStalled` guard, the only reader of `outputHash`. */
+function usesStallGuard(stateConfig: AgentStateDefinition): boolean {
+  return stateConfig.transitions.some((transition) => transition.guard === STALL_GUARD);
 }
 
 /**
@@ -4982,18 +8165,34 @@ function hashWorkspaceRoot(hash: Hash, workspacePath: string): void {
  * and would otherwise trip Node's 2 GiB `readFile` ceiling). Any agent rewrite
  * via fs ops bumps mtime, and same-mtime-same-size collisions in a single ms
  * window are not a concern for workflow change detection.
+ *
+ * Only outputs that pass {@link resolveArtifactOutputDir} are walked (a
+ * symlinked output or `.workflow` root contributes nothing), every walk is
+ * bounded and never follows symlinks, and the sizes and mtimes come from the
+ * walk's own lstat, so a file deleted mid-walk is simply absent from the hash.
+ * The orchestrator calls this only for states with an `isStalled` transition.
  */
 export function computeOutputHash(outputNames: readonly string[], artifactDir: string, workspacePath: string): string {
   const hash = createHash('sha256');
 
   if (outputNames.length > 0) {
     for (const output of outputNames) {
-      const dir = resolve(artifactDir, output);
-      const files = collectFilesRecursive(dir);
+      const check = resolveArtifactOutputDir(workspacePath, artifactDir, output);
+      if (check.kind !== 'ok') continue;
+      const dir = check.dir;
+      const files: { relativePath: string; size: number; mtimeMs: number }[] = [];
+      const { truncated } = walkTreeNoFollow(dir, ARTIFACT_WALK_LIMITS, {
+        file: (fullPath, stats) => {
+          const relativePath = relative(dir, fullPath).split(sep).join('/');
+          files.push({ relativePath, size: stats.size, mtimeMs: stats.mtimeMs });
+          return false;
+        },
+      });
+      files.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
       for (const file of files) {
-        const { size, mtimeMs } = statSync(file.fullPath);
-        hash.update(`${file.relativePath}:${size}:${mtimeMs}`);
+        hash.update(`${file.relativePath}:${file.size}:${file.mtimeMs}`);
       }
+      if (truncated) hash.update(`\0truncated:${output}`);
     }
   } else {
     hashWorkspaceRoot(hash, workspacePath);
@@ -5002,38 +8201,40 @@ export function computeOutputHash(outputNames: readonly string[], artifactDir: s
   return hash.digest('hex');
 }
 
-// ---------------------------------------------------------------------------
-// .gitignore management
-// ---------------------------------------------------------------------------
-
-/** Ensures the workflow artifact directory is listed in the workspace root's .gitignore. */
-function ensureWorkflowGitignored(workspacePath: string): void {
-  const gitignorePath = resolve(workspacePath, '.gitignore');
-  const dirEntry = `${WORKFLOW_ARTIFACT_DIR}/`;
-
-  if (existsSync(gitignorePath)) {
-    const content = readFileSync(gitignorePath, 'utf-8');
-    const lines = content.split('\n');
-    const alreadyListed = lines.some((line) => line.trim() === dirEntry || line.trim() === WORKFLOW_ARTIFACT_DIR);
-    if (!alreadyListed) {
-      const suffix = content.endsWith('\n') ? '' : '\n';
-      appendFileSync(gitignorePath, `${suffix}${dirEntry}\n`);
-    }
-  } else {
-    writeFileSync(gitignorePath, `${dirEntry}\n`);
-  }
-}
-
 /**
- * Collects artifact paths: maps output name -> directory path.
+ * Collects artifact paths: maps output name -> directory path, for outputs
+ * whose directory passes {@link resolveArtifactOutputDir} (a symlinked or
+ * escaping output is never handed on as an artifact).
  */
-export function collectArtifactPaths(outputNames: readonly string[], artifactDir: string): Record<string, string> {
+export function collectArtifactPaths(
+  outputNames: readonly string[],
+  artifactDir: string,
+  workspacePath: string,
+): Record<string, string> {
   const result: Record<string, string> = {};
   for (const output of outputNames) {
-    const dir = resolve(artifactDir, output);
-    if (existsSync(dir)) {
-      result[output] = dir;
+    const check = resolveArtifactOutputDir(workspacePath, artifactDir, output);
+    if (check.kind === 'ok') {
+      result[output] = check.dir;
     }
   }
   return result;
+}
+
+/** The `errors` text for a result file that could not be read (see `applyResultFile`). */
+function describeResultFileReadError(resultFile: string, err: unknown): string {
+  switch (err instanceof UntrustedFileError ? err.code : undefined) {
+    case 'NOT_FOUND':
+      return `result file ${resultFile} not found`;
+    case 'OUTSIDE_ROOT':
+      return `result file ${resultFile} escapes the workspace`;
+    case 'SYMLINK':
+      return `result file ${resultFile} could not be read: it is a symbolic link`;
+    case 'NOT_REGULAR_FILE':
+      return `result file ${resultFile} could not be read: it is not a regular file`;
+    case 'TOO_LARGE':
+      return `result file ${resultFile} could not be read: it is larger than ${MAX_RESULT_FILE_BYTES} bytes`;
+    default:
+      return `result file ${resultFile} could not be read: ${errorMessage(err)}`;
+  }
 }

@@ -61,6 +61,7 @@ import {
   createRegistryEgressGuard,
   type RegistryEgressGuard,
   type RegistryEgressSessionLedger,
+  type RegistryPullProvenance,
 } from './registry-egress-proxy.js';
 
 /**
@@ -102,9 +103,12 @@ export interface CreateDockerWorkloadEgressListenersOptions {
   /** Session CA used to sign the per-host leaf certificates each listener presents. */
   readonly ca: CertificateAuthority;
   /**
-   * Destination-bound transport shared by the listeners. Required: the
-   * production fixed-parent endpoint is an unresolved topology decision, so
-   * this module never invents one.
+   * Destination-bound transport for the registry listener only; the strict
+   * package listener refuses an injected transport and screens its own
+   * destinations. Required, so the caller that owns the bundle topology picks
+   * it: production passes a direct transport. The fixed-parent transport is
+   * not yet wired; it is reserved for the IronCurtain-in-IronCurtain slice
+   * (docs/designs/ironcurtain-in-ironcurtain-hermetic-slice.md).
    */
   readonly outboundTransport: OutboundTransport;
   /** Required when the workload admits registry image ingress. */
@@ -119,6 +123,11 @@ export interface CreateDockerWorkloadEgressListenersOptions {
   readonly packagePolicy?: PackageEgressPolicy;
   /** Required only for strict package mode. */
   readonly packageAuditLogPath?: string;
+  /**
+   * Durable sink for completed registry pulls. Production passes the admitted
+   * lease's append-only provenance log; hermetic tests may omit it.
+   */
+  readonly recordRegistryPullProvenance?: (record: RegistryPullProvenance) => void;
 }
 
 /**
@@ -201,6 +210,9 @@ function registryEgressListenerOptions(options: CreateDockerWorkloadEgressListen
       outboundTransport: transport,
       registryEgress: {
         guard,
+        ...(options.recordRegistryPullProvenance === undefined
+          ? {}
+          : { recordProvenance: options.recordRegistryPullProvenance }),
       },
       ...(options.allowRemoteAddress === undefined ? {} : { allowRemoteAddress: options.allowRemoteAddress }),
       ...(options.requiredProxyAuthorization === undefined

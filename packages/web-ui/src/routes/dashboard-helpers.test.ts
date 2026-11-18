@@ -111,6 +111,16 @@ describe('buildPhaseDistribution', () => {
     expect(segments.every((s) => s.count === 0 && s.pct === 0)).toBe(true);
   });
 
+  it('counts runs live in another process apart from issues and completions', () => {
+    const past = [
+      makePastRun({ workflowId: '1', phase: 'running_elsewhere' }),
+      makePastRun({ workflowId: '2', phase: 'completed' }),
+    ];
+    const byPhase = Object.fromEntries(buildPhaseDistribution([], past).segments.map((s) => [s.phase, s.count]));
+    expect(byPhase.running_elsewhere).toBe(1);
+    expect(computeWorkflowKpis([], past, 0)).toMatchObject({ completed: 1, issues: 0 });
+  });
+
   it('ignores terminal live entries (only running/waiting_human contribute from live)', () => {
     const live = [makeSummary({ workflowId: 'x', phase: 'completed' })];
     const { total } = buildPhaseDistribution(live, []);

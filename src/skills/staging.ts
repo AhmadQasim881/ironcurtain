@@ -1,5 +1,7 @@
-import { cpSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { cpSync, lstatSync, mkdirSync, readdirSync, realpathSync, rmSync } from 'node:fs';
+import { relative, resolve, sep } from 'node:path';
+import { copyRegularFileBelow, ensureDirectoryBelow } from '../hardened-fs.js';
+import { ARTIFACT_WALK_LIMITS, walkTreeNoFollow } from '../workflow/artifacts.js';
 import type { ResolvedSkill } from './types.js';
 
 /** Stable signature for change-detection in `createCachedStager`. */
@@ -41,16 +43,45 @@ export function validateSkillName(name: string): void {
  * inode stable across re-stages.
  */
 export function stageSkillsToBundle(skills: readonly ResolvedSkill[], destDir: string): void {
+  for (const skill of skills) validateSkillName(skill.name);
   const normalizedDestDir = resolve(destDir);
   mkdirSync(normalizedDestDir, { recursive: true });
+  if (!lstatSync(normalizedDestDir).isDirectory()) throw new Error('Skill staging root must be a real directory');
+  const destinationRoot = realpathSync(normalizedDestDir);
   for (const entry of readdirSync(normalizedDestDir)) {
     rmSync(resolve(normalizedDestDir, entry), { recursive: true, force: true });
   }
 
+  let remainingBytes = 256 * 1024 * 1024;
   for (const skill of skills) {
-    validateSkillName(skill.name);
-    const target = resolve(normalizedDestDir, skill.name);
-    cpSync(skill.sourceDir, target, { recursive: true });
+    // User/persona layers are user-maintained and support linked skills.
+    // Workflow packages and external run stages are untrusted sources.
+    if (skill.source !== 'workflow') {
+      cpSync(skill.sourceDir, resolve(destinationRoot, skill.name), { recursive: true });
+      continue;
+    }
+    const sourceRoot = resolve(skill.sourceDir);
+    if (!lstatSync(sourceRoot).isDirectory()) throw new Error('Skill source must be a real directory');
+    if (realpathSync(sourceRoot) !== sourceRoot) throw new Error('Skill source must be a real directory');
+    ensureDirectoryBelow(destinationRoot, skill.name);
+    const outcome = walkTreeNoFollow(sourceRoot, ARTIFACT_WALK_LIMITS, {
+      file: (fullPath, stats) => {
+        const name = relative(sourceRoot, fullPath).split(sep).join('/');
+        remainingBytes -= copyRegularFileBelow(destinationRoot, name, `${skill.name}/${name}`, {
+          sourceRoot,
+          maxBytes: remainingBytes,
+          mode: stats.mode & 0o777,
+          createParents: true,
+        });
+        return false;
+      },
+      enterDirectory: (fullPath) => {
+        const name = relative(sourceRoot, fullPath).split(sep).join('/');
+        ensureDirectoryBelow(destinationRoot, `${skill.name}/${name}`);
+        return true;
+      },
+    });
+    if (outcome.truncated) throw new Error('Skill staging tree exceeds entry or depth limits');
   }
 }
 

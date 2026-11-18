@@ -1,5 +1,7 @@
 # Token Stream Extraction from MITM Proxy
 
+**Status (2026-11-14):** Implemented (`src/docker/sse-extractor.ts`, `src/docker/token-stream-bus.ts`); see the post-ship note on bus ownership.
+
 > **Status note (post-ship):** The bus is now a module-level singleton accessed
 > via `getTokenStreamBus()` — see `docs/designs/token-stream-bus-ownership.md`
 > for the ownership change. This doc's original text described threading the
@@ -12,6 +14,23 @@
 > the `tokenStreamBus` parameter on `prepareDockerInfrastructure()` below are
 > historical — none of those fields exist today.
 
+> **Status note (extractor placement, MITM-9):** The extractor no longer sits
+> in the forwarding pipe. `SseExtractorTransform` parsed the raw upstream
+> bytes as UTF-8 text, so a `content-encoding: gzip` or `br` response
+> (Anthropic's default for `/v1/messages` SSE) produced no events, a multibyte
+> character split across chunks was corrupted, and every forwarded byte paid
+> for the parse. The token stream is now a consumer of the same
+> `ResponseObservationHub` as LLM metrics (`src/docker/llm-observation/`): the
+> hub copies the raw bytes off the forwarding path, decodes them once
+> (gzip, deflate, br), frames SSE once with a `StringDecoder`, and isolates
+> each consumer behind its own resource and exception limits. The forwarding
+> path is always the plain `upstreamRes.pipe(clientRes)`. `sse-extractor.ts`
+> now holds `TokenStreamSseParser` (frames → events), `tokenStreamEventsFromJson`
+> (a decoded non-streaming JSON body → events, OpenRouter `usage.cost`
+> included) and `createTokenStreamConsumer` (the hub consumer). Sections 2
+> (decisions 1, 2 and 9), 4, 5.2, 6, 10.4, 11, 12 and 14 below describe the
+> current design; the migration plan (section 13) is the original history.
+
 ## 1. Overview
 
 This design extracts the live LLM token stream from the MITM TLS proxy during Docker agent sessions and makes it available to multiple consumers through a single shared bus. The primary consumers are: (1) a future `ironcurtain observe <sessionId>` CLI command that tails a session's token output, (2) workflow-level observation that aggregates token streams from all sessions belonging to a workflow, and (3) the existing WebSocket-based web UI for the cinematic Matrix rain visualization described in the brainstorm doc.
@@ -20,9 +39,9 @@ The extraction layer sits inside each MITM proxy, tapping the response bytes as 
 
 ## 2. Key Design Decisions
 
-1. **Tap location: inside `forwardRequest()`, between `upstreamRes` and `clientRes.pipe()`** -- The MITM proxy has three `upstreamRes.pipe(clientRes)` call sites: the `forwardRequest()` path (line 464), the plain HTTP proxy path (line 667), and the `forwardPassthrough()` path (line 924). Only the `forwardRequest()` path is tapped. The other two are passthrough paths: the plain HTTP proxy handles unencrypted traffic to dynamically added domains, and `forwardPassthrough()` handles TLS-terminated passthrough connections. Neither performs provider authentication or credential swap, so neither carries LLM API traffic. The Transform is zero-copy for the forwarding path: it calls `this.push(chunk)` unconditionally and emits a side-channel copy.
+1. **Tap location: a `ResponseObservationHub` consumer on the `forwardRequest()` response, never in the pipe** -- The MITM proxy has three `upstreamRes.pipe(clientRes)` call sites: the `forwardRequest()` path, the plain HTTP proxy path, and the `forwardPassthrough()` path. Only the `forwardRequest()` path is observed. The other two are passthrough paths: the plain HTTP proxy handles unencrypted traffic to dynamically added domains, and `forwardPassthrough()` handles TLS-terminated passthrough connections. Neither performs provider authentication or credential swap, so neither carries LLM API traffic. On the provider path the response is forwarded with a plain `upstreamRes.pipe(clientRes)`; a `data` listener copies each chunk into the response's observation hub, which LLM metrics and the token stream share. The hub decodes the copy once (gzip, deflate, br) and frames SSE once, asynchronously, so the extractor can neither delay nor alter the forwarded bytes.
 
-2. **SSE parsing in the tap, not in the bus** -- The upstream response for streaming LLM APIs uses Server-Sent Events (SSE) over chunked HTTP. SSE lines can split across TCP chunks, so we need a stateful line buffer in the tap. The tap performs minimal parsing: it reassembles SSE `data:` lines and emits structured events. The bus and consumers receive parsed events, not raw bytes. This avoids duplicating SSE parsing in every consumer.
+2. **SSE parsing in the tap, not in the bus** -- The upstream response for streaming LLM APIs uses Server-Sent Events (SSE) over chunked HTTP. SSE lines can split across TCP chunks, and a multibyte character across chunk boundaries; the hub's `SseEventFramer` handles both (a `StringDecoder` feeds it). The token-stream consumer maps the complete frames to structured events. The bus and consumers receive parsed events, not raw bytes. This avoids duplicating SSE parsing in every consumer.
 
 3. **Single shared `TokenStreamBus` created once in the daemon** -- A new module (`src/docker/token-stream-bus.ts`) owns the session-to-stream mapping. The bus is created once at daemon startup and the same instance is passed to every MITM proxy (via `MitmProxyOptions`) and to the `TokenStreamBridge`. Every event carries a `sessionId`, so consumers filter to what they need. The bus does not know about WebSockets, CLI commands, workflows, or the daemon. It exposes a typed subscribe/unsubscribe API. This keeps the MITM proxy's dependency graph clean and eliminates the mismatch between a bus-per-session model and a single bridge consumer.
 
@@ -46,7 +65,7 @@ The extraction layer sits inside each MITM proxy, tapping the response bytes as 
 
 8. **No modification to the `MitmProxy` interface** -- Both `tokenStreamBus` and `sessionId` are injected via `MitmProxyOptions`, keeping the existing `MitmProxy` interface (start/stop/hosts) unchanged. The session ID is already available at proxy construction time (it is a parameter to `prepareDockerInfrastructure()`), so both values are known at construction and no mutable setter is needed. Callers that do not provide a bus get the existing zero-overhead behavior.
 
-9. **Transform error contract** -- The `SseExtractorTransform._transform()` method must **never** throw or call `callback(err)`. The entire body of `_transform()` is wrapped in a try/catch that always calls `callback(null, chunk)`, ensuring the forwarding path to the Docker container is never interrupted by a parsing bug. Errors in SSE parsing result in `raw` fallback events on the side channel; the primary data path is unconditionally pass-through.
+9. **Isolation contract** -- Nothing the extractor does can reach the forwarding path: it runs from the hub's observation pump, not from the pipe. The hub bounds it (decoded bytes, event count, framing limits, callback CPU time) and detaches it on an exception, without affecting forwarding or the metrics consumer. JSON parse failures produce `raw` fallback events, and bus listener errors are swallowed. Past its byte or event cap the consumer keeps receiving only usage-bearing events (usage scan): the live text stops, a `raw`/`truncated` event marks the point, and the final `message_end` (with OpenRouter's cost) still arrives.
 
 ## 3. Data Format
 
@@ -170,13 +189,16 @@ Only subscribed clients receive `session.token_stream` events for that session. 
             ┌────────────┴────────┐       ┌────────────┴────────┐
             │   MITM Proxy (A)    │       │   MITM Proxy (B)    │
             │                     │       │                     │
-            │ Upstream LLM        │       │ Upstream LLM        │
+            │ Upstream LLM ──────►│ Client Res (raw bytes, unmodified)
+            │   │ copy            │       │   │ copy            │
+            │   ▼                 │       │   ▼                 │
+            │ Observation hub     │       │ Observation hub     │
+            │ (decode, frame)     │       │ (decode, frame)     │
             │   │                 │       │   │                 │
             │   ▼                 │       │   ▼                 │
-            │ SseExtractor        │       │ SseExtractor        │
+            │ token-stream        │       │ token-stream        │
+            │ consumer            │       │ consumer            │
             │   │ push(sessA,..) │       │   │ push(sessB,..) │
-            │   ▼                 │       │   ▼                 │
-            │ Client Res          │       │ Client Res          │
             └─────────────────────┘       └─────────────────────┘
 ```
 
@@ -188,14 +210,14 @@ Each MITM proxy receives the same `TokenStreamBus` reference via `MitmProxyOptio
 |--------|----------|---------------|
 | Token stream types | `src/docker/token-stream-types.ts` | `TokenStreamEvent` discriminated union, `TokenStreamListener` callback type |
 | `TokenStreamBus` | `src/docker/token-stream-bus.ts` | Session-keyed pub/sub dispatcher with per-session and global listeners |
-| `SseExtractorTransform` | `src/docker/sse-extractor.ts` | Transform stream: SSE line reassembly + provider-specific parsing |
+| Token-stream extractor | `src/docker/sse-extractor.ts` | `TokenStreamSseParser` (provider-specific frame parsing), `tokenStreamEventsFromJson`, and `createTokenStreamConsumer` (the observation-hub consumer) |
 | Token stream dispatch | `src/web-ui/dispatch/token-stream-dispatch.ts` | JSON-RPC subscribe/unsubscribe handlers |
 
 ### 4.2 Modified Modules
 
 | Module | Change |
 |--------|--------|
-| `src/docker/mitm-proxy.ts` | Accept optional `TokenStreamBus` + `sessionId` in options; interpose `SseExtractorTransform` on SSE responses in `forwardRequest()` only |
+| `src/docker/mitm-proxy.ts` | Attach a token-stream consumer to the response's observation hub (shared with LLM metrics) in `forwardRequest()` only, for SSE responses and non-streaming JSON on LLM endpoints |
 | `src/docker/docker-infrastructure.ts` | Accept optional `TokenStreamBus` parameter; pass to `createMitmProxy` along with `sessionId` (bus is no longer created here) |
 | `src/web-ui/web-event-bus.ts` | Add `session.token_stream` event to `WebEventMap` |
 | `src/web-ui/web-ui-types.ts` | Add `sessions.subscribeTokenStream` and `sessions.unsubscribeTokenStream` to `MethodName` |
@@ -277,67 +299,40 @@ export interface TokenStreamBus {
 export function createTokenStreamBus(): TokenStreamBus;
 ```
 
-### 5.2 SseExtractorTransform
+### 5.2 Token-stream extractor (observation-hub consumer)
 
 ```typescript
 // src/docker/sse-extractor.ts
 
-import { Transform, type TransformCallback } from 'node:stream';
-import type { TokenStreamEvent } from './token-stream-types.js';
-
-export type SseEventCallback = (event: TokenStreamEvent) => void;
-
-/**
- * Provider-specific SSE parser selection.
- * The extractor uses the provider host to determine which parser to use.
- */
-export type SseProvider = 'anthropic' | 'openai' | 'unknown';
-
-/** Maximum length of a single SSE line buffer before truncation (1 MB). */
-export const MAX_SSE_LINE_LENGTH = 1_048_576;
-
-/**
- * A passthrough Transform stream that intercepts SSE data flowing
- * through the MITM proxy without modifying the forwarded bytes.
- *
- * Usage:
- *   upstreamRes.pipe(extractor).pipe(clientRes)
- *
- * The extractor reassembles SSE lines across chunk boundaries,
- * parses provider-specific event formats, and invokes the callback
- * with structured TokenStreamEvents.
- *
- * All data passes through unmodified. The extractor never drops,
- * delays, or modifies chunks. If parsing fails for any event,
- * a `raw` event is emitted and data continues to flow.
- *
- * Safety: The internal line buffer is capped at MAX_SSE_LINE_LENGTH
- * (1 MB). If a line exceeds this limit, the accumulated buffer is
- * truncated: the overlong content is discarded and a `raw` event
- * with `eventType: 'truncated'` is emitted. This prevents a
- * corrupted or malicious upstream from causing unbounded memory growth.
- *
- * When provider is `'unknown'`, all data still passes through to
- * the client unmodified, but no SSE parsing is attempted. Every
- * complete SSE line is emitted as a `raw` event with
- * `eventType: 'unknown_provider'`, preserving visibility without
- * risking incorrect semantic mapping.
- *
- * ERROR CONTRACT: `_transform()` must NEVER throw or call
- * `callback(err)`. The entire body is wrapped in a try/catch
- * that always calls `callback(null, chunk)`. A parsing bug must
- * never interrupt the forwarding path to the Docker container.
- * Errors in SSE parsing produce `raw` fallback events on the
- * side channel; the primary data path is unconditionally
- * pass-through.
- */
-export class SseExtractorTransform extends Transform {
+/** Maps one response's decoded SSE frames to TokenStreamEvents. */
+export class TokenStreamSseParser {
   constructor(provider: SseProvider, onEvent: SseEventCallback);
-
-  _transform(chunk: Buffer, encoding: BufferEncoding, callback: TransformCallback): void;
-  _flush(callback: TransformCallback): void;
+  onFrame(frame: SseEventFrame): void;
 }
+
+/** Events of a decoded non-streaming JSON body (OpenRouter `usage.cost` and cache reads included). */
+export function tokenStreamEventsFromJson(body: Buffer): TokenStreamEvent[];
+
+/**
+ * The token stream's ResponseObservationHub consumer for one response:
+ * `onSseEvent` for an SSE response (usage scan past its caps), or a bounded
+ * `onDecodedChunk` buffer (MAX_JSON_RESPONSE_CAPTURE_BYTES, 2 MB) extracted
+ * at `onEnd` for a JSON body.
+ */
+export function createTokenStreamConsumer(options: {
+  readonly id: string;
+  readonly provider: SseProvider;
+  readonly streaming: boolean;
+  readonly onEvent: SseEventCallback;
+}): ResponseObservationConsumer;
 ```
+
+The parser never sees raw bytes: line endings, multi-line `data:`, split
+UTF-8 and the framing limits are the hub framer's. If a frame's JSON does
+not parse, a `raw` event is emitted. When the provider is `'unknown'`, each
+SSE event is emitted as a `raw` event with `eventType: 'unknown_provider'`
+and the event's data, preserving visibility without risking an incorrect
+semantic mapping.
 
 ### 5.3 MitmProxyOptions Extension
 
@@ -387,42 +382,36 @@ There are three `upstreamRes.pipe(clientRes)` call sites in `mitm-proxy.ts`:
 
 Only the `forwardRequest()` path is tapped because it is the only path that carries LLM API traffic. The other two are passthrough paths for dynamically added domains -- they do not perform provider authentication, credential swap, or endpoint filtering, so they never carry streaming LLM responses. Tapping them would produce no useful events and add unnecessary overhead.
 
-The tap point is in `forwardRequest()` inside `createMitmProxy()`, at the response handler for upstream LLM API requests (around line 461-464). Currently:
+The tap point is the response handler of `forwardRequest()` inside `createMitmProxy()`. The response is always forwarded with a plain pipe; observation consumers are attached to one hub per response:
 
 ```typescript
-clientRes.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers);
-clientRes.flushHeaders();
-clientRes.socket?.setNoDelay(true);
+const consumers: ResponseObservationConsumer[] = [];
+if (metricsObserver) consumers.push(metricsObserver.responseConsumer(frameSse));
+const sidAtAttach = tokenSessionId;
+if (sidAtAttach && (isEventStream || isLlmJson)) {
+  consumers.push(
+    createTokenStreamConsumer({
+      id: 'token-stream',
+      provider: resolveSseProvider(targetHost, path),
+      streaming: isEventStream,
+      onEvent: (event) => getTokenStreamBus().push(sidAtAttach, event),
+    }),
+  );
+}
+if (consumers.length > 0) {
+  const hub = new ResponseObservationHub({ contentEncoding, frameSse, consumers });
+  upstreamRes.on('data', (chunk) => hub.write(chunk)); // copies; never backpressures
+  // upstream 'end' → hub.end(); abort/error/incomplete close → hub.abort()
+}
+clientRes.writeHead(finalStatus, upstreamRes.headers);
 upstreamRes.pipe(clientRes);
 ```
 
-With the tap:
+The token-stream consumer is attached when:
+1. A token session id is set (`initialTokenSessionId` / `setTokenSessionId`), read once per response so a mid-flight flip cannot split one stream
+2. The response is SSE (`text/event-stream`), or a non-streaming `application/json` body on an LLM messages endpoint
 
-```typescript
-clientRes.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers);
-clientRes.flushHeaders();
-clientRes.socket?.setNoDelay(true);
-
-const contentType = upstreamRes.headers['content-type'] ?? '';
-if (tokenBus && sessionId && contentType.includes('text/event-stream')) {
-  const provider = resolveProvider(targetHost);
-  const extractor = new SseExtractorTransform(provider, (event) => {
-    tokenBus.push(sessionId, event);
-  });
-  upstreamRes.pipe(extractor).pipe(clientRes);
-} else {
-  upstreamRes.pipe(clientRes);
-}
-```
-
-Here `tokenBus` and `sessionId` are captured from `options.tokenStreamBus` and `options.sessionId` respectively at `createMitmProxy()` call time. Both are `readonly` and immutable for the proxy's lifetime.
-
-The condition gates on:
-1. A `TokenStreamBus` was provided in options (feature opt-in)
-2. A `sessionId` was provided in options (proxy is associated with a session)
-3. The response Content-Type is `text/event-stream` (SSE stream, not a regular JSON response)
-
-Non-streaming responses (e.g., `/v1/messages/count_tokens`, `/api/hello`) flow through the existing direct pipe path with zero overhead.
+Other responses (e.g., `/v1/messages/count_tokens`) get no token-stream consumer; without any consumer no hub is created.
 
 ### 6.2 SSE Parsing
 
@@ -453,19 +442,19 @@ data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[{"delta":
 data: [DONE]
 ```
 
-The `SseExtractorTransform` maintains a line buffer and a current event type. When it encounters a complete `data:` line, it:
+For each complete SSE event the hub delivers, `TokenStreamSseParser`:
 1. Attempts to parse the JSON
 2. Maps the provider-specific structure to a `TokenStreamEvent`
 3. Invokes the callback
 4. On parse failure, emits a `raw` event (no data loss)
 
-**Line buffer safety**: The line buffer is capped at `MAX_SSE_LINE_LENGTH` (1 MB). If a line exceeds this limit (e.g., from a corrupted upstream or a response that does not use newlines), the accumulated buffer is discarded and a `raw` event with `eventType: 'truncated'` is emitted. The extractor then resumes scanning for the next newline. Data always passes through to the client unmodified regardless of truncation -- only the side-channel parsing is affected.
+**Resource limits**: The hub's framer bounds lines (2 MiB) and events (4 MiB), and the consumer has its own decoded-byte (32 MiB) and event-count (100,000) caps. Past any of them the consumer continues in usage-scan mode: only events that can carry usage or a terminal (`usage`, `message_stop`, `[DONE]`) are delivered, and one `raw` event with `eventType: 'truncated'` marks the point where the live text stopped. Data always reaches the client unmodified -- only the side channel is affected.
 
-**Unknown provider behavior**: When the provider is `'unknown'`, the extractor still passes all data through unmodified, but no semantic SSE parsing is attempted. Complete SSE lines (terminated by `\n`) are emitted as `raw` events with `eventType: 'unknown_provider'`. This preserves visibility in the bus and web UI without risking incorrect semantic mapping to `text_delta` or `tool_use` events.
+**Unknown provider behavior**: When the provider is `'unknown'`, no semantic parsing is attempted: each SSE event is emitted as a `raw` event with `eventType: 'unknown_provider'` and the event's data. This preserves visibility in the bus and web UI without risking incorrect semantic mapping to `text_delta` or `tool_use` events.
 
-### 6.3 Chunked Transfer Encoding
+### 6.3 Chunked Transfer and Content Encoding
 
-HTTP chunked transfer encoding is handled transparently by Node.js's `http.IncomingMessage` -- the stream events deliver the decoded payload, not the raw chunked frames. The `Transform` stream receives clean SSE text, not `\r\nXX\r\n` chunk framing. No special handling is needed.
+HTTP chunked transfer encoding is handled transparently by Node.js's `http.IncomingMessage` -- the stream events deliver the decoded payload, not the raw chunked frames. Content encoding is not: providers compress responses (`content-encoding: gzip` is Anthropic's default), and the forwarded bytes stay compressed for the agent's SDK to decode. The observation hub decodes its copy (gzip, deflate, br; bounded, fail-open), so the extractor always parses plain text. An unsupported encoding detaches the observers, never the response.
 
 ## 7. Token Stream Bus (Implementation)
 
@@ -516,7 +505,7 @@ Since all MITM proxies run in the same event loop as the daemon (they are not se
 
 ### 7.2 Backpressure
 
-The bus does not apply backpressure to the proxy. The proxy must continue forwarding data to the Docker container regardless of consumer state. If a listener is slow, it receives events synchronously and any blocking would stall the event loop (which is why listeners must be non-blocking). For the WebSocket consumer, events are batched and sent asynchronously -- the listener callback only enqueues into a send buffer.
+The bus does not apply backpressure to the proxy. The proxy must continue forwarding data to the Docker container regardless of consumer state. If a listener is slow, it receives events synchronously and any blocking would stall the event loop (which is why listeners must be non-blocking). For the WebSocket consumer, events are batched and sent asynchronously -- the listener callback only enqueues into a send buffer. A WebSocket client whose send buffer is above the shared 4 MiB backpressure threshold (`src/web-ui/ws-backpressure.ts`) is left out of a batch rather than queued behind: token deltas are display-only, so a stalled tab loses them instead of growing the daemon's heap.
 
 ## 8. CLI Consumer (`ironcurtain observe`)
 
@@ -810,7 +799,7 @@ ironcurtain observe --workflow <name>
 ```
 DockerAgentSession.close()
   └── mitmProxy.stop()
-      └── SseExtractorTransform streams end naturally (no more push() calls)
+      └── in-flight responses end or abort; their observation hubs settle (no more push() calls)
 
 SessionManager.end(label)
   └── eventBus.emit('session.ended', { label, reason })
@@ -853,7 +842,7 @@ The `DockerInfrastructure` interface does **not** gain a `tokenStreamBus` field.
 
 2. **Workflow-level observation**: A workflow observer uses `subscribeAll()` and applies client-side filtering by workflow membership. When the workflow engine launches a new session, its events automatically appear to the global listener -- no re-subscription or bus-swapping needed. Alternatively, the observer can use per-session `subscribe()` calls for each known session in the workflow. The bus is unaware of workflows; the filtering predicate lives entirely in the consumer.
 
-3. **New providers**: Adding a Google streaming parser requires implementing a new case in `SseExtractorTransform` that handles Google's newline-delimited JSON format. The `SseProvider` union type is extended with `'google'`.
+3. **New providers**: Adding a Google streaming parser requires a new case in `TokenStreamSseParser` for Google's `streamGenerateContent?alt=sse` payloads. The `SseProvider` union type is extended with `'google'`.
 
 4. **Persistent recording**: A future audit consumer could subscribe to the bus and write events to a JSONL file for offline analysis. Since the bus delivers only live events, the recorder would capture the stream from the point it subscribes forward.
 
@@ -865,16 +854,15 @@ The `DockerInfrastructure` interface does **not** gain a `tokenStreamBus` field.
 
 ### 12.1 Unit Tests
 
-**SseExtractorTransform** (`test/sse-extractor.test.ts`):
+**Token-stream extractor** (`test/sse-extractor.test.ts`, frames from a real `SseEventFramer`, consumers through a real hub):
 - Feed Anthropic SSE format, verify correct `TokenStreamEvent` sequence
-- Feed OpenAI SSE format, verify correct events
-- Feed chunks that split SSE lines mid-line, verify reassembly
+- Feed OpenAI SSE format, verify correct events (including OpenRouter `usage.cost` on `message_end`)
+- Feed chunks that split SSE lines mid-line, and a multibyte character across chunks, verify reassembly
 - Feed malformed JSON, verify `raw` fallback event
-- Verify all data passes through unmodified (compare input/output buffers)
-- Feed non-SSE content type, verify no events emitted and data passes through
-- Feed a line exceeding `MAX_SSE_LINE_LENGTH`, verify `raw` event with `eventType: 'truncated'` and data passthrough continues
-- Feed with `provider: 'unknown'`, verify all lines emitted as `raw` with `eventType: 'unknown_provider'`
-- **Error contract**: mock `onEvent` callback to throw, verify `_transform()` still calls `callback(null, chunk)` and data passes through unmodified
+- gzip, br and deflate SSE and JSON bodies through the consumer produce the same events as plain ones
+- A JSON body over the extraction cap emits nothing; an SSE stream over the event cap emits one `truncated` marker and still its final `message_end`
+- Feed with `provider: 'unknown'`, verify each event emitted as `raw` with `eventType: 'unknown_provider'`
+- **Error contract**: mock `onEvent` callback to throw, verify later events are still delivered
 
 **TokenStreamBus** (`test/token-stream-bus.test.ts`):
 - Subscribe before push, verify live delivery
@@ -907,6 +895,7 @@ The `DockerInfrastructure` interface does **not** gain a `tokenStreamBus` field.
 - Verify the response reaches the client unmodified
 - Verify the bus received parsed events keyed by the correct sessionId
 - Verify non-SSE responses do not produce events
+- **Compressed responses**: gzip and br SSE and JSON responses produce events, and the client receives the compressed bytes unchanged; a throwing bus listener does not affect forwarding
 - **Shared bus, multiple proxies**: create two MITM proxies sharing the same bus with different session IDs, verify events from each proxy are keyed correctly and do not cross-contaminate
 
 ### 12.3 Dependency Substitution
@@ -956,12 +945,12 @@ The `TokenStreamBus` interface enables clean test doubles. Tests for the daemon 
 
 ## 14. Security Considerations
 
-1. **No credential leakage** -- The tap intercepts the *response* stream from the LLM, not the request stream. API keys are in request headers, not response bodies. The `SseExtractorTransform` never sees credentials.
+1. **No credential leakage** -- The tap observes the *response* stream from the LLM, not the request stream. API keys are in request headers, not response bodies. The token-stream extractor never sees credentials.
 
 2. **Auth-gated access** -- Both the WebSocket server and control socket require authentication. The `observe` CLI command must provide a valid auth token to connect. There is no unauthenticated path to the token stream.
 
 3. **No cross-session leakage** -- Although all sessions share a single `TokenStreamBus`, per-session subscription requires a valid session label resolved through the `SessionManager`. The bus is keyed by `SessionId` (a branded UUID), and the bridge only subscribes to specific session IDs on behalf of authenticated clients. A client cannot subscribe to a session they cannot see through the existing `sessions.list` method. The `subscribeAll()` method delivers events from all sessions, but is gated behind the same authenticated WebSocket connection -- only authenticated daemon clients (CLI `observe --all`, web UI) can use it. There is no unauthenticated global broadcast.
 
-4. **Memory safety** -- The bus holds no event data; it is a pure dispatcher. Memory consumption is bounded by the number of active listeners, which is proportional to the number of connected consumers (not event volume). Ended sessions have their listener sets removed immediately. The SSE line buffer is capped at 1 MB (`MAX_SSE_LINE_LENGTH`) to prevent a corrupted or malicious upstream from causing unbounded memory growth in the extractor.
+4. **Memory safety** -- The bus holds no event data; it is a pure dispatcher. Memory consumption is bounded by the number of active listeners, which is proportional to the number of connected consumers (not event volume). Ended sessions have their listener sets removed immediately. The extractor holds no stream: the observation hub bounds its queued input, the decoded bytes, the framer's lines and events, and each consumer's bytes, event count and callback CPU time, so a corrupted or malicious upstream cannot grow its memory without bound. A non-streaming JSON body is buffered only up to 2 MB.
 
 5. **Content sensitivity** -- The token stream may contain sensitive data (the LLM's reasoning about user tasks). This is the same data the agent already sees inside the Docker container, and the same data visible in the audit log. The web UI already displays conversation history and diagnostic events. The token stream adds real-time visibility but does not expose new categories of information.

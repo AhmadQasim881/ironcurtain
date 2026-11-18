@@ -9,6 +9,7 @@
   import { Badge } from '$lib/components/ui/badge/index.js';
   import { Spinner } from '$lib/components/ui/spinner/index.js';
   import { renderMarkdown } from '$lib/markdown.js';
+  import { ESCALATION_ARM_DELAY_MS } from './escalation-modal.svelte';
   import WorkspaceBrowser from './workspace-browser.svelte';
 
   let {
@@ -17,8 +18,11 @@
     workflowId,
     stateDescription,
     refreshSignal = '',
+    layoutSignal = '',
+    reviewAvailable = true,
     onResolve,
     fetchArtifacts,
+    fetchArtifactFile,
     fetchFileTree,
     fetchFileContent,
   }: {
@@ -28,8 +32,19 @@
     stateDescription?: string;
     // Forwarded to the embedded workspace browser so the Files tab auto-refreshes.
     refreshSignal?: string | number;
-    onResolve: (event: string, prompt?: string) => void | Promise<void>;
+    /** Changes to surrounding review surfaces restart the approval delay. */
+    layoutSignal?: string;
+    /** A failed detail refresh keeps the gate visible but cannot approve stale review data. */
+    reviewAvailable?: boolean;
+    // Receives the id of the gate this panel displayed, so the decision is
+    // bound to the raise the user reviewed rather than whatever the workflow
+    // is waiting at by the time the click lands.
+    onResolve: (gateId: string, event: string, prompt?: string) => void | Promise<void>;
+    // Lists an artifact's files (names and sizes). Contents are loaded one
+    // file at a time through `fetchArtifactFile` when the reviewer opens
+    // them, so a large artifact never arrives as a single oversized reply.
     fetchArtifacts?: (workflowId: string, artifactName: string) => Promise<ArtifactContentDto>;
+    fetchArtifactFile?: (workflowId: string, artifactName: string, path: string) => Promise<FileContentResponseDto>;
     fetchFileTree?: (workflowId: string, path?: string) => Promise<FileTreeResponseDto>;
     fetchFileContent?: (workflowId: string, path: string) => Promise<FileContentResponseDto>;
   } = $props();
@@ -46,12 +61,129 @@
   let feedbackEvent = $state<FeedbackEvent | null>(null);
   let confirmAbort = $state(false);
   let resolving = $state(false);
+  let actionRow = $state<HTMLDivElement>();
+  const reviewSnapshot = $derived(
+    JSON.stringify([gate, workflowId, workflowName, stateDescription, refreshSignal, layoutSignal, reviewAvailable]),
+  );
+  let armedSnapshot = $state<string | null>(null);
+  const armed = $derived(armedSnapshot === reviewSnapshot && reviewAvailable);
+  let pressBeganUnarmed = false;
+  let pressSnapshot: string | null = null;
+  let armingEpoch = 0;
+  let pressEpoch: number | null = null;
+  let checkPlacement: (() => void) | undefined;
 
-  // Artifact loading
+  // Bind arming and any second-step forms to the exact review on screen.
+  $effect(() => {
+    void reviewSnapshot;
+    feedbackText = '';
+    feedbackEvent = null;
+    confirmAbort = false;
+  });
+
+  $effect(() => {
+    const snapshot = reviewSnapshot;
+    const row = actionRow;
+    armedSnapshot = null;
+    if (!row || !reviewAvailable || !hasEvent('APPROVE')) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let frame: number;
+    let focused = document.hasFocus();
+    const placement = (): string => {
+      const { x, y, width, height } = row.getBoundingClientRect();
+      return JSON.stringify([x, y, width, height]);
+    };
+    let lastPlacement = placement();
+    const disarm = (): void => {
+      clearTimeout(timer);
+      armedSnapshot = null;
+      armingEpoch += 1;
+    };
+    const restart = (): void => {
+      disarm();
+      if (!focused || document.visibilityState === 'hidden') return;
+      timer = setTimeout(() => {
+        if (placement() !== lastPlacement) {
+          lastPlacement = placement();
+          restart();
+        } else if (focused && document.visibilityState !== 'hidden') {
+          armedSnapshot = snapshot;
+        }
+      }, ESCALATION_ARM_DELAY_MS);
+    };
+    const check = (): void => {
+      const next = placement();
+      if (next !== lastPlacement) {
+        lastPlacement = next;
+        restart();
+      }
+    };
+    checkPlacement = check;
+    // Position can change when an ancestor moves without resizing this row.
+    // Measure one small rectangle per frame, and again at the input boundary.
+    const observePlacement = (): void => {
+      check();
+      frame = requestAnimationFrame(observePlacement);
+    };
+    const onFocus = (): void => {
+      focused = true;
+      restart();
+    };
+    const onBlur = (): void => {
+      focused = false;
+      disarm();
+    };
+    const onVisibility = (): void => {
+      if (document.visibilityState === 'hidden') disarm();
+      else restart();
+    };
+    window.addEventListener('focus', onFocus);
+    window.addEventListener('blur', onBlur);
+    document.addEventListener('visibilitychange', onVisibility);
+    restart();
+    frame = requestAnimationFrame(observePlacement);
+    return () => {
+      clearTimeout(timer);
+      cancelAnimationFrame(frame);
+      checkPlacement = undefined;
+      window.removeEventListener('focus', onFocus);
+      window.removeEventListener('blur', onBlur);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  });
+
+  function beginPointerPress(): void {
+    checkPlacement?.();
+    pressBeganUnarmed = !armed;
+    pressSnapshot = armed ? reviewSnapshot : null;
+    pressEpoch = armingEpoch;
+  }
+
+  function beginMousePress(): void {
+    checkPlacement?.();
+    // Compatibility mouse events on touch release must not clear the mark.
+    if (!armed) pressBeganUnarmed = true;
+  }
+
+  function beginKeyPress(event: KeyboardEvent): void {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    checkPlacement?.();
+    pressBeganUnarmed = !armed || event.repeat;
+    pressSnapshot = armed ? reviewSnapshot : null;
+    pressEpoch = armingEpoch;
+  }
+
+  // Artifact listings (per artifact name) and lazily loaded file contents
+  // (per `fileKey`). A listing carries names and sizes only; a file's content
+  // is fetched when its row is opened and cached for the panel's lifetime.
   let artifactContents = $state<Map<string, ArtifactContentDto>>(new Map());
   let artifactLoading = $state<Set<string>>(new Set());
   let artifactErrors = $state<Set<string>>(new Set());
   let selectedArtifact = $state<string | null>(null);
+  let expandedFiles = $state<Set<string>>(new Set());
+  let fileContents = $state<Map<string, FileContentResponseDto>>(new Map());
+  let fileLoading = $state<Set<string>>(new Set());
+  let fileErrors = $state<Map<string, string>>(new Map());
 
   const hasArtifactsTab = $derived(gate.presentedArtifacts.length > 0 && fetchArtifacts != null);
   const hasFilesTab = $derived(fetchFileTree != null && fetchFileContent != null);
@@ -60,25 +192,35 @@
     return gate.acceptedEvents.includes(event);
   }
 
-  async function handleApprove(): Promise<void> {
+  async function handleApprove(event: MouseEvent): Promise<void> {
+    checkPlacement?.();
+    if (!armed || resolving || !hasEvent('APPROVE') || pressBeganUnarmed) return;
+    // A pointer click whose press predates this panel has no recorded start.
+    // Assistive/programmatic activation (detail 0) does not require a pointer.
+    if (event.detail > 0 && pressEpoch === null) return;
+    if (pressSnapshot !== null && pressSnapshot !== reviewSnapshot) return;
+    if (pressEpoch !== null && pressEpoch !== armingEpoch) return;
+    const gateId = gate.gateId;
     resolving = true;
     try {
-      await onResolve('APPROVE');
+      await onResolve(gateId, 'APPROVE');
     } finally {
       resolving = false;
     }
   }
 
   async function handleFeedbackEvent(eventType: FeedbackEvent): Promise<void> {
+    if (resolving || !hasEvent(eventType)) return;
     if (feedbackEvent !== eventType) {
       feedbackEvent = eventType;
       return;
     }
     const trimmed = feedbackText.trim();
     if (!trimmed) return;
+    const gateId = gate.gateId;
     resolving = true;
     try {
-      await onResolve(eventType, trimmed);
+      await onResolve(gateId, eventType, trimmed);
     } finally {
       resolving = false;
       feedbackText = '';
@@ -87,13 +229,15 @@
   }
 
   async function handleAbort(): Promise<void> {
+    if (resolving || !hasEvent('ABORT')) return;
     if (!confirmAbort) {
       confirmAbort = true;
       return;
     }
     resolving = true;
+    const gateId = gate.gateId;
     try {
-      await onResolve('ABORT');
+      await onResolve(gateId, 'ABORT');
     } finally {
       resolving = false;
       confirmAbort = false;
@@ -101,10 +245,12 @@
   }
 
   function cancelAbort(): void {
+    if (resolving) return;
     confirmAbort = false;
   }
 
   function cancelFeedback(): void {
+    if (resolving) return;
     feedbackEvent = null;
     feedbackText = '';
   }
@@ -116,14 +262,19 @@
     return feedbackEvent ? handleFeedbackEvent(feedbackEvent) : Promise.resolve();
   }
 
+  function fileKey(artifact: string, path: string): string {
+    return `${artifact}\u0000${path}`;
+  }
+
   async function loadArtifact(name: string): Promise<void> {
     if (artifactContents.has(name) || artifactErrors.has(name) || !fetchArtifacts) return;
     const newLoading = new Set(artifactLoading);
     newLoading.add(name);
     artifactLoading = newLoading;
+    let listing: ArtifactContentDto | undefined;
     try {
-      const content = await fetchArtifacts(workflowId, name);
-      artifactContents = new Map(artifactContents).set(name, content);
+      listing = await fetchArtifacts(workflowId, name);
+      artifactContents = new Map(artifactContents).set(name, listing);
     } catch {
       const newErrors = new Set(artifactErrors);
       newErrors.add(name);
@@ -132,11 +283,56 @@
     const done = new Set(artifactLoading);
     done.delete(name);
     artifactLoading = done;
+    // Open the first file so the common single-document artifact (plan.md)
+    // is readable without another click; every other file loads on demand.
+    if (listing && listing.files.length > 0) void openFile(name, listing.files[0].path);
+  }
+
+  async function openFile(artifact: string, path: string): Promise<void> {
+    const key = fileKey(artifact, path);
+    if (!expandedFiles.has(key)) expandedFiles = new Set(expandedFiles).add(key);
+    if (!fetchArtifactFile || fileContents.has(key) || fileLoading.has(key)) return;
+    fileLoading = new Set(fileLoading).add(key);
+    try {
+      const content = await fetchArtifactFile(workflowId, artifact, path);
+      fileContents = new Map(fileContents).set(key, content);
+      if (fileErrors.has(key)) {
+        const next = new Map(fileErrors);
+        next.delete(key);
+        fileErrors = next;
+      }
+    } catch (err) {
+      fileErrors = new Map(fileErrors).set(key, err instanceof Error ? err.message : String(err));
+    } finally {
+      const done = new Set(fileLoading);
+      done.delete(key);
+      fileLoading = done;
+    }
+  }
+
+  function toggleFile(artifact: string, path: string): void {
+    const key = fileKey(artifact, path);
+    if (expandedFiles.has(key)) {
+      const next = new Set(expandedFiles);
+      next.delete(key);
+      expandedFiles = next;
+      return;
+    }
+    void openFile(artifact, path);
   }
 
   function selectArtifact(name: string): void {
     selectedArtifact = name;
     loadArtifact(name);
+  }
+
+  // A failed listing (e.g. the socket dropped mid-request) is not retried on
+  // its own; the reviewer can ask for it again.
+  function retryArtifact(name: string): void {
+    const next = new Set(artifactErrors);
+    next.delete(name);
+    artifactErrors = next;
+    void loadArtifact(name);
   }
 
   // Auto-select first artifact when switching to artifacts tab
@@ -154,6 +350,12 @@
 
   function isMarkdown(path: string): boolean {
     return path.endsWith('.md');
+  }
+
+  function formatSize(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / 1048576).toFixed(1)} MB`;
   }
 </script>
 
@@ -234,27 +436,73 @@
       {/if}
 
       {#if selectedArtifact}
-        {#if artifactLoading.has(selectedArtifact)}
+        {@const artifact = selectedArtifact}
+        {#if artifactLoading.has(artifact)}
           <div class="flex items-center justify-center py-4">
             <Spinner size="sm" />
           </div>
-        {:else if artifactErrors.has(selectedArtifact)}
-          <p class="text-sm text-destructive">Failed to load artifact.</p>
+        {:else if artifactErrors.has(artifact)}
+          <div class="flex items-center gap-2">
+            <p class="text-sm text-destructive">Failed to load artifact.</p>
+            <button
+              type="button"
+              class="text-xs text-primary hover:underline"
+              onclick={() => retryArtifact(artifact)}
+              data-testid="artifact-retry"
+            >
+              Retry
+            </button>
+          </div>
         {:else}
-          {@const ac = artifactContents.get(selectedArtifact)}
+          {@const ac = artifactContents.get(artifact)}
           {#if ac && ac.files.length > 0}
             <div class="space-y-3">
+              {#if ac.truncated}
+                <p class="text-xs text-warning" data-testid="artifact-truncated">
+                  Listing truncated: only the first {ac.files.length} files are shown. Browse the rest in the Files tab.
+                </p>
+              {/if}
               {#each ac.files as file (file.path)}
+                {@const key = fileKey(artifact, file.path)}
+                {@const open = expandedFiles.has(key)}
+                {@const fc = fileContents.get(key)}
                 <div class="border border-border rounded overflow-hidden">
-                  <div class="px-3 py-1.5 bg-muted/30 border-b border-border text-xs font-mono text-muted-foreground">
-                    {file.path}
-                  </div>
-                  {#if isMarkdown(file.path)}
-                    <div class="p-3 prose-markdown text-sm">
-                      {@html renderMarkdown(file.content)}
-                    </div>
-                  {:else}
-                    <pre class="p-3 text-xs overflow-x-auto"><code>{file.content}</code></pre>
+                  <button
+                    type="button"
+                    onclick={() => toggleFile(artifact, file.path)}
+                    class="w-full flex items-center gap-2 px-3 py-1.5 bg-muted/30 text-xs font-mono text-muted-foreground
+                      text-left hover:text-foreground transition-colors {open ? 'border-b border-border' : ''}"
+                    aria-expanded={open}
+                    data-testid="artifact-file-toggle"
+                  >
+                    <span class="shrink-0">{open ? '▾' : '▸'}</span>
+                    <span class="truncate">{file.path}</span>
+                    <span class="ml-auto shrink-0 text-[10px]" data-testid="artifact-file-size"
+                      >{formatSize(file.size)}</span
+                    >
+                  </button>
+                  {#if open}
+                    {#if fileLoading.has(key)}
+                      <div class="flex items-center justify-center py-3">
+                        <Spinner size="xs" />
+                      </div>
+                    {:else if fileErrors.has(key)}
+                      <p class="p-3 text-sm text-destructive">Failed to load file: {fileErrors.get(key)}</p>
+                    {:else if fc?.error}
+                      <p class="p-3 text-sm text-muted-foreground">{fc.error}</p>
+                    {:else if fc?.binary}
+                      <p class="p-3 text-sm text-muted-foreground italic">Binary file -- cannot display</p>
+                    {:else if fc?.content != null}
+                      {#if isMarkdown(file.path)}
+                        <div class="p-3 prose-markdown text-sm">
+                          {@html renderMarkdown(fc.content)}
+                        </div>
+                      {:else}
+                        <pre class="p-3 text-xs overflow-x-auto"><code>{fc.content}</code></pre>
+                      {/if}
+                    {:else}
+                      <p class="p-3 text-sm text-muted-foreground">File contents are not available here.</p>
+                    {/if}
                   {/if}
                 </div>
               {/each}
@@ -295,7 +543,7 @@
         >
           {feedbackSubmitLabel}
         </Button>
-        <Button variant="ghost" size="sm" onclick={cancelFeedback}>Cancel</Button>
+        <Button variant="ghost" size="sm" onclick={cancelFeedback} disabled={resolving}>Cancel</Button>
       </div>
     </div>
   {/if}
@@ -307,17 +555,30 @@
         Are you sure you want to abort this workflow? This action cannot be undone.
       </p>
       <div class="flex gap-2">
-        <Button variant="destructive" size="sm" onclick={handleAbort} loading={resolving}>Confirm Abort</Button>
-        <Button variant="ghost" size="sm" onclick={cancelAbort}>Cancel</Button>
+        <Button variant="destructive" size="sm" onclick={handleAbort} disabled={resolving} loading={resolving}
+          >Confirm Abort</Button
+        >
+        <Button variant="ghost" size="sm" onclick={cancelAbort} disabled={resolving}>Cancel</Button>
       </div>
     </div>
   {/if}
 
   <!-- Action buttons -->
   {#if feedbackEvent === null && !confirmAbort}
-    <div class="flex flex-wrap gap-2 pt-1">
+    <div bind:this={actionRow} class="flex flex-wrap gap-2 pt-1">
       {#if hasEvent('APPROVE')}
-        <Button variant="success" onclick={handleApprove} disabled={resolving} loading={resolving}>Approve</Button>
+        <Button
+          variant="success"
+          onclick={handleApprove}
+          onpointerdown={beginPointerPress}
+          onmousedown={beginMousePress}
+          onkeydown={beginKeyPress}
+          aria-disabled={!armed || resolving || !reviewAvailable}
+          title={armed ? undefined : 'Approval is available after this review remains visible and in place for 750ms.'}
+          class={!armed ? 'opacity-50' : ''}
+          disabled={resolving || !reviewAvailable}
+          loading={resolving}>Approve</Button
+        >
       {/if}
       {#if hasEvent('FORCE_REVISION')}
         <Button variant="default" onclick={() => handleFeedbackEvent('FORCE_REVISION')} disabled={resolving}>

@@ -24,6 +24,7 @@ import {
   DEFAULT_RESOURCE_BUDGET,
   buildBudgetPreview,
   buildRunBudget,
+  buildRunUsage,
   validateResourceBudget,
   type ResourceBudgetFixture,
   type WorkflowBudgetFixture,
@@ -87,6 +88,7 @@ interface MockResumableSession {
 
 interface MockWhitelistCandidate {
   description: string;
+  patternKey?: string;
 }
 
 interface MockEscalation {
@@ -97,8 +99,17 @@ interface MockEscalation {
   arguments: Record<string, unknown>;
   reason: string;
   whitelistCandidates?: MockWhitelistCandidate[];
+  /** Reviewer context (see EscalationReviewContext in src/lib/types.ts). */
+  lastTrustedUserMessage?: { text: string; sentAt?: string };
+  taskSummary?: string;
+  agentJustification?: string;
+  /** Whitelist-pattern group; the canned escalation always shares one. */
+  groupKey?: string;
   receivedAt: string;
 }
+
+/** Group key of the canned write escalation: every one of them shares the pattern. */
+const MOCK_WRITE_GROUP_KEY = '["filesystem","write_file",[["directory","write-path","/etc"]]]';
 
 // ---------------------------------------------------------------------------
 // State
@@ -380,6 +391,7 @@ const CANNED_JOBS = [
       summary: 'No vulnerabilities found. All dependencies up to date.',
     },
     isRunning: false,
+    consecutiveFailures: 0,
   },
   {
     job: {
@@ -392,6 +404,7 @@ const CANNED_JOBS = [
     nextRun: new Date(Date.now() + 259200_000).toISOString(),
     lastRun: null,
     isRunning: false,
+    consecutiveFailures: 0,
   },
   {
     job: {
@@ -405,11 +418,12 @@ const CANNED_JOBS = [
     lastRun: {
       startedAt: new Date(Date.now() - 172800_000).toISOString(),
       completedAt: new Date(Date.now() - 172800_000 + 120_000).toISOString(),
-      outcome: { kind: 'failure', message: 'API rate limit exceeded' },
+      outcome: { kind: 'error', phase: 'session', message: 'API rate limit exceeded' },
       budget: { totalTokens: 8200, stepCount: 5, elapsedSeconds: 120, estimatedCostUsd: 0.03 },
       summary: null,
     },
     isRunning: false,
+    consecutiveFailures: 3,
   },
 ];
 
@@ -417,6 +431,8 @@ interface MockPersonaListItem {
   name: string;
   description: string;
   compiled: boolean;
+  /** Mirrors PersonaListDto.stale: set when a compiled policy no longer matches the constitution. */
+  stale?: 'constitution' | 'engine';
   memory?: boolean;
 }
 
@@ -463,6 +479,8 @@ interface MockRuleDelta {
   removed: number;
   broadenedDomains: string[];
   outOfWorkspacePaths: string[];
+  unconstrainedAllows: string[];
+  escalateBreadth: string[];
 }
 
 interface MockCompileOperation {
@@ -523,6 +541,8 @@ interface MockPersonaDetail {
   servers?: string[];
   hasPolicy: boolean;
   policyRuleCount?: number;
+  /** Mirrors PersonaDetailDto.stale. */
+  stale?: 'constitution' | 'engine';
   memory: boolean;
   allowBroadPolicy: boolean;
 }
@@ -594,6 +614,12 @@ let CANNED_PERSONA_DETAILS: Record<string, MockPersonaDetail> = {
     allowBroadPolicy: false,
   },
 };
+
+/**
+ * `personas.listServers`: the daemon lists its configured MCP servers (the
+ * package's built-ins in package order, then the user's own servers).
+ */
+const CANNED_PERSONA_SERVERS: readonly string[] = ['filesystem', 'git', 'fetch', 'github', 'google-workspace', 'notes'];
 
 // Deep snapshots of the original persona list + details so resetState can
 // restore them after create/delete/edit mutate the in-memory copies.
@@ -1146,11 +1172,13 @@ function buildWorkflowDetailDto(wf: MockWorkflow, gate?: MockGate) {
     });
   }
 
+  const usage = buildRunUsage(15000 + Math.floor(Math.random() * 10000));
   return {
     ...wf,
     budget: wf.budget?.recorded
       ? wf.budget
       : buildRunBudget(wf.name, resourceBudgetSettings, resourceBudgetConfigured, 'legacy'),
+    usage,
     description: `Mock workflow: ${wf.name}`,
     stateGraph: graph,
     transitionHistory,
@@ -1158,7 +1186,7 @@ function buildWorkflowDetailDto(wf: MockWorkflow, gate?: MockGate) {
       taskDescription: `Execute the ${wf.name} workflow`,
       round: 1,
       maxRounds: 3,
-      totalTokens: 15000 + Math.floor(Math.random() * 10000),
+      totalTokens: usage.totalTokens,
       visitCounts: { [wf.currentState]: 1 },
     },
     gate: gate ?? undefined,
@@ -1218,11 +1246,11 @@ function buildPastRunFixtures(): MockPastRun[] {
     },
     {
       workflowId: 'wf-past-failed',
-      name: 'vuln-discovery',
+      name: 'design-and-code',
       phase: 'failed',
-      currentState: 'analyze',
-      lastState: 'analyze',
-      taskDescription: 'Audit auth middleware for CVE-2024-XXXX exposure',
+      currentState: 'review',
+      lastState: 'review',
+      taskDescription: 'Review the session middleware changes',
       round: 1,
       maxRounds: 4,
       totalTokens: 12300,
@@ -1262,17 +1290,17 @@ function buildPastRunFixtures(): MockPastRun[] {
     },
     {
       workflowId: 'wf-past-interrupted',
-      name: 'vuln-discovery',
+      name: 'design-and-code',
       phase: 'interrupted',
-      currentState: 'fuzz',
-      lastState: 'fuzz',
-      taskDescription: 'Fuzz the new JSON-RPC dispatch surface',
+      currentState: 'implement',
+      lastState: 'implement',
+      taskDescription: 'Add pagination to the JSON-RPC client',
       round: 2,
       maxRounds: 5,
       totalTokens: 33600,
       error: 'Daemon restarted while workflow was active; checkpoint left without finalStatus.',
       timestamp: new Date(Date.now() - 172800_000).toISOString(),
-      workspacePath: '/home/user/projects/jsonrpc-fuzz',
+      workspacePath: '/home/user/projects/jsonrpc-client',
     },
     // Legacy / pre-B3b completed run: checkpoint.json was deleted on completion,
     // so the discovery scan synthesizes the row from messages.jsonl + the workflow
@@ -1577,12 +1605,23 @@ function buildEscalationDto(esc: MockEscalation) {
   };
 }
 
+/** Resolves a mock escalation: broadcasts the decision and resumes its session. */
+function resolveMockEscalation(esc: MockEscalation, decision: string): void {
+  escalations.delete(esc.escalationId);
+  broadcast('escalation.resolved', { escalationId: esc.escalationId, decision });
+  const session = sessions.get(esc.sessionLabel);
+  if (session) {
+    session.status = 'ready';
+    broadcast('session.updated', buildSessionDto(session));
+  }
+}
+
 /**
  * Raise the canned "write to protected system path" escalation for a session and
  * broadcast it. Shared by the turn simulation and both PTY input paths (raw
  * keystrokes and trusted prompt) so the "escalate" trigger stays identical.
  */
-function raiseWriteEscalation(label: number): void {
+function raiseWriteEscalation(label: number, trustedMessage?: string): void {
   const escalationId = `esc-${Date.now()}`;
   const esc: MockEscalation = {
     escalationId,
@@ -1595,6 +1634,13 @@ function raiseWriteEscalation(label: number): void {
       { description: 'Allow filesystem.write_file within /etc/' },
       { description: 'Allow filesystem.write_file for this exact path: /etc/hosts' },
     ],
+    // Reviewer context: the trusted prompt that triggered it (when sent through
+    // the trusted-message bar) and a canned, untrusted agent justification.
+    ...(trustedMessage !== undefined
+      ? { lastTrustedUserMessage: { text: trustedMessage, sentAt: new Date().toISOString() } }
+      : {}),
+    agentJustification: 'Updating the hosts file so the test server resolves locally.',
+    groupKey: MOCK_WRITE_GROUP_KEY,
     receivedAt: new Date().toISOString(),
   };
   escalations.set(escalationId, esc);
@@ -1733,6 +1779,8 @@ function simulateCompile(op: MockCompileOperation): void {
             removed: 0,
             broadenedDomains: [],
             outOfWorkspacePaths: [],
+            unconstrainedAllows: [],
+            escalateBreadth: ['escalate-fetch-other-urls: *'],
           }
         : undefined;
       live.result = { success: true, ruleCount, ...(ruleDelta ? { ruleDelta } : {}) };
@@ -1741,12 +1789,17 @@ function simulateCompile(op: MockCompileOperation): void {
       // event sees a real terminal record.
       activeCompiles.delete(op.operationId);
       recordRecentCompile(live);
-      // Flip the persona's compiled flag so the list badge updates on refresh.
+      // Flip the persona's compiled flag (and clear staleness) so the list
+      // badge updates on refresh.
       const persona = CANNED_PERSONAS.find((p) => p.name === live.name);
-      if (persona) persona.compiled = true;
+      if (persona) {
+        persona.compiled = true;
+        delete persona.stale;
+      }
       if (pd) {
         pd.hasPolicy = true;
         pd.policyRuleCount = ruleCount;
+        delete pd.stale;
       }
       broadcast('persona.compile.done', {
         name: live.name,
@@ -1865,7 +1918,13 @@ function handleMethod(ws: WebSocket, method: string, params: Record<string, unkn
     }
 
     case 'sessions.ptyResize': {
-      // Last-writer-wins; the mock has no real PTY to resize.
+      // Mirror the daemon's bounded schema (src/pty/pty-size.ts: cols 2..1000,
+      // rows 1..500). Last-writer-wins; the mock has no real PTY to resize.
+      const cols = params.cols as number;
+      const rows = params.rows as number;
+      if (!Number.isInteger(cols) || cols < 2 || cols > 1000 || !Number.isInteger(rows) || rows < 1 || rows > 500) {
+        return errorResult('INVALID_PARAMS', 'PTY size out of range (cols 2..1000, rows 1..500)');
+      }
       return { resized: true };
     }
 
@@ -1878,7 +1937,7 @@ function handleMethod(ws: WebSocket, method: string, params: Record<string, unkn
       const text = params.text as string;
       const promptSession = sessions.get(label);
       if (!promptSession) return errorResult('SESSION_NOT_FOUND', `Session #${label} not found`);
-      if (text.toLowerCase().includes('escalate')) raiseWriteEscalation(label);
+      if (text.toLowerCase().includes('escalate')) raiseWriteEscalation(label, text);
       broadcast('session.pty_output', { label, data: b64(`\r\n> ${text}\r\n`) });
       return { accepted: true };
     }
@@ -1908,9 +1967,13 @@ function handleMethod(ws: WebSocket, method: string, params: Record<string, unkn
       const label = params.label as number;
       stopPtyFrames(label);
       sessions.delete(label);
-      // Clean up any escalations belonging to this session
+      // Clean up any escalations belonging to this session. Like the daemon,
+      // announce each one as expired BEFORE session.ended so cards never
+      // outlive their session.
       for (const [id, esc] of escalations) {
-        if (esc.sessionLabel === label) escalations.delete(id);
+        if (esc.sessionLabel !== label) continue;
+        escalations.delete(id);
+        broadcast('escalation.expired', { escalationId: id, sessionLabel: label });
       }
       broadcast('session.ended', { label, reason: 'user_ended' });
       return undefined;
@@ -1945,16 +2008,30 @@ function handleMethod(ws: WebSocket, method: string, params: Record<string, unkn
       const decision = params.decision as string;
       const esc = escalations.get(escalationId);
       if (!esc) return errorResult('ESCALATION_NOT_FOUND', `Escalation ${escalationId} not found`);
-      escalations.delete(escalationId);
-      broadcast('escalation.resolved', { escalationId, decision });
-
-      // Resume the session that was waiting on this escalation
-      const session = sessions.get(esc.sessionLabel);
-      if (session) {
-        session.status = 'ready';
-        broadcast('session.updated', buildSessionDto(session));
-      }
+      resolveMockEscalation(esc, decision);
       return undefined;
+    }
+
+    case 'escalations.approveGroup': {
+      // Mirrors src/web-ui/dispatch/escalation-dispatch.ts: refused, nothing
+      // approved, unless the ids are exactly the group's pending members.
+      const groupKey = params.groupKey as string;
+      const ids = params.escalationIds as string[];
+      const members = [...escalations.values()].filter((esc) => esc.groupKey === groupKey);
+      const reviewed = new Set(ids);
+      if (
+        members.length === 0 ||
+        reviewed.size !== ids.length ||
+        members.length !== reviewed.size ||
+        !members.every((esc) => reviewed.has(esc.escalationId))
+      ) {
+        return errorResult(
+          'ESCALATION_GROUP_CHANGED',
+          "The group's escalations changed since they were listed; nothing was approved.",
+        );
+      }
+      for (const esc of members) resolveMockEscalation(esc, 'approved');
+      return { approved: members.map((esc) => esc.escalationId), failed: [] };
     }
 
     case 'jobs.list':
@@ -2012,6 +2089,11 @@ function handleMethod(ws: WebSocket, method: string, params: Record<string, unkn
 
     case 'personas.list':
       return CANNED_PERSONAS;
+
+    // Read, ungated (as in the daemon): the configured servers the create
+    // form's picker offers, here the package's built-ins plus one user server.
+    case 'personas.listServers':
+      return CANNED_PERSONA_SERVERS;
 
     case 'personas.get': {
       const pName = params.name as string;
@@ -2138,6 +2220,11 @@ function handleMethod(ws: WebSocket, method: string, params: Record<string, unkn
         return errorResult('PERSONA_EXISTS', `Persona "${cName}" already exists`);
       }
       const cServers = Array.isArray(params.servers) ? (params.servers as string[]) : undefined;
+      // Like the daemon: only configured servers (PERSONA_UNKNOWN_SERVERS, INVALID_PARAMS over WS).
+      const unknownServers = (cServers ?? []).filter((server) => !CANNED_PERSONA_SERVERS.includes(server));
+      if (unknownServers.length > 0) {
+        return errorResult('INVALID_PARAMS', `Unknown MCP server(s): ${unknownServers.join(', ')}`);
+      }
       const cMemory = params.memoryEnabled === undefined ? true : params.memoryEnabled === true;
       const cConstitution = typeof params.constitution === 'string' ? params.constitution : '';
       const newDetail: MockPersonaDetail = {
@@ -2164,9 +2251,15 @@ function handleMethod(ws: WebSocket, method: string, params: Record<string, unkn
       const ed = CANNED_PERSONA_DETAILS[eName];
       if (!ed) return errorResult('PERSONA_NOT_FOUND', `Persona "${eName}" not found`);
       ed.constitution = typeof eConstitution === 'string' ? eConstitution : '';
-      broadcast('personas.changed', {});
       // stale is true iff the persona had a compiled policy that no longer
-      // matches the (now-changed) constitution.
+      // matches the (now-changed) constitution. Like the daemon, list and
+      // detail reads report it from then on, until a compile clears it.
+      if (ed.hasPolicy) {
+        ed.stale = 'constitution';
+        const listItem = CANNED_PERSONAS.find((p) => p.name === eName);
+        if (listItem) listItem.stale = 'constitution';
+      }
+      broadcast('personas.changed', {});
       return { stale: ed.hasPolicy };
     }
 
@@ -2530,18 +2623,31 @@ function handleMethod(ws: WebSocket, method: string, params: Record<string, unkn
       }
       const resolveWfId = params.workflowId as string;
       const resolveEvent = params.event as string;
+      const resolveGateId = params.gateId as string | undefined;
       const resolveWf = workflows.get(resolveWfId);
       if (!resolveWf) return errorResult('WORKFLOW_NOT_FOUND', `Workflow ${resolveWfId} not found`);
       if (resolveWf.phase !== 'waiting_human') {
         return errorResult('WORKFLOW_NOT_AT_GATE', `Workflow ${resolveWfId} is not waiting at a gate`);
       }
-      // Dismiss gate and resume
-      for (const [gateId, gate] of workflowGates) {
-        if (gate.workflowId === resolveWfId) {
-          workflowGates.delete(gateId);
-          broadcast('workflow.gate_dismissed', { workflowId: resolveWfId, gateId });
-        }
+      // Mirror the daemon's gate binding: the decision must name the gate
+      // currently up for this workflow and an event that gate accepts.
+      const activeGate = [...workflowGates.values()].find((gate) => gate.workflowId === resolveWfId);
+      if (!activeGate) {
+        return errorResult('WORKFLOW_NOT_AT_GATE', `Workflow ${resolveWfId} is not waiting at a gate`);
       }
+      if (resolveGateId !== activeGate.gateId) {
+        // Like the daemon, do not name the active id: the client re-reads the gate.
+        return errorResult(
+          'GATE_MISMATCH',
+          `Gate ${String(resolveGateId)} is not the active gate of workflow ${resolveWfId}; re-read the gate`,
+        );
+      }
+      if (!activeGate.acceptedEvents.includes(resolveEvent)) {
+        return errorResult('EVENT_NOT_ACCEPTED', `Gate ${activeGate.gateId} does not accept ${resolveEvent}`);
+      }
+      // Dismiss gate and resume
+      workflowGates.delete(activeGate.gateId);
+      broadcast('workflow.gate_dismissed', { workflowId: resolveWfId, gateId: activeGate.gateId });
 
       if (resolveEvent === 'ABORT') {
         resolveWf.lastState = resolveWf.currentState;
@@ -2679,11 +2785,13 @@ function handleMethod(ws: WebSocket, method: string, params: Record<string, unkn
 
     case 'workflows.fileTree': {
       const relPath = (params.path as string) ?? '';
-      if (relPath === 'src') return CANNED_FILE_TREE_SRC;
-      if (relPath === '.workflow') return CANNED_FILE_TREE_WORKFLOW;
-      if (relPath === '') return CANNED_FILE_TREE;
+      // The daemon caps a listing at 2,000 entries and reports `truncated`;
+      // the canned trees are small, so it is always false here.
+      if (relPath === 'src') return { ...CANNED_FILE_TREE_SRC, truncated: false };
+      if (relPath === '.workflow') return { ...CANNED_FILE_TREE_WORKFLOW, truncated: false };
+      if (relPath === '') return { ...CANNED_FILE_TREE, truncated: false };
       // Sub-paths return empty
-      return { entries: [] };
+      return { entries: [], truncated: false };
     }
 
     case 'workflows.fileContent': {
@@ -2693,11 +2801,37 @@ function handleMethod(ws: WebSocket, method: string, params: Record<string, unkn
       return fc;
     }
 
+    // Listing only (names + sizes), mirroring `ArtifactContentDto`; the panel
+    // fetches each file through `workflows.artifactFile`.
     case 'workflows.artifacts': {
       const artName = params.artifactName as string;
       const art = CANNED_ARTIFACTS[artName];
       if (!art) return errorResult('ARTIFACT_NOT_FOUND', `Artifact "${artName}" not found`);
-      return art;
+      return {
+        files: art.files.map((f) => ({ path: f.path, size: Buffer.byteLength(f.content, 'utf8') })),
+        truncated: false,
+      };
+    }
+
+    case 'workflows.artifactFile': {
+      const artName = params.artifactName as string;
+      const filePath = params.path as string;
+      const art = CANNED_ARTIFACTS[artName];
+      if (!art) return errorResult('ARTIFACT_NOT_FOUND', `Artifact "${artName}" not found`);
+      const file = art.files.find((f) => f.path === filePath);
+      if (!file) return errorResult('INVALID_PARAMS', 'File not found');
+      return { content: file.content, language: filePath.endsWith('.md') ? 'markdown' : 'text' };
+    }
+
+    // The canned message-log fixtures are never truncated, so no page entry
+    // carries a `ref`; a stale/forged ref fails like the daemon's would.
+    case 'workflows.messageLogEntry': {
+      const wfId = params.workflowId as string | undefined;
+      const ref = params.ref;
+      if (typeof wfId !== 'string' || wfId.length === 0 || typeof ref !== 'string') {
+        return errorResult('INVALID_PARAMS', 'workflowId and ref are required');
+      }
+      return errorResult('INVALID_PARAMS', 'Unknown message-log entry reference');
     }
 
     case '__reset': {

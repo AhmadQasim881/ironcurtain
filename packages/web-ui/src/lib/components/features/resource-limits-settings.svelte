@@ -181,8 +181,9 @@
             </div>
           </div>
           <p class="text-xs text-muted-foreground leading-relaxed">
-            Built-in agents enforce all limits per turn. Container batch agents enforce the timeout; workflows also
-            check token, step, and cost usage before recovery turns. Interactive terminals are unaffected.
+            Built-in agents enforce all limits per turn. Container agents enforce the timeout per turn, and the token
+            and cost limits at the proxy for each agent container (a shared workflow container counts all of its states
+            together, an interactive terminal its whole session). Container cost is a list-price estimate.
           </p>
           <p class="text-xs text-muted-foreground leading-relaxed">
             Changes apply to new sessions and workflow runs. Existing workflow runs keep their saved limits unless

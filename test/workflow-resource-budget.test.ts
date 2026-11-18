@@ -1,12 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { resolveWorkflowResourceBudget, legacyWorkflowBudget } from '../src/workflow/resource-budget.js';
+import {
+  resolveWorkflowResourceBudget,
+  legacyWorkflowBudget,
+  persistedWorkflowBudget,
+  workflowBudgetUsage,
+} from '../src/workflow/resource-budget.js';
 import { validateDefinition } from '../src/workflow/validate.js';
 import { WorkflowOrchestrator } from '../src/workflow/orchestrator.js';
 import { FileCheckpointStore } from '../src/workflow/checkpoint.js';
 import type { WorkflowDefinition } from '../src/workflow/types.js';
-import type { SessionOptions } from '../src/session/types.js';
+import type { BudgetStatus, SessionOptions } from '../src/session/types.js';
 import { configDispatch } from '../src/web-ui/dispatch/config-dispatch.js';
 import { workflowDispatch, type WorkflowDispatchContext } from '../src/web-ui/dispatch/workflow-dispatch.js';
 import { WebEventBus } from '../src/web-ui/web-event-bus.js';
@@ -18,7 +23,13 @@ import {
   readConfig,
   type ConfigTestEnv,
 } from './helpers/config-test-setup.js';
-import { MockSession, approvedResponse, createDeps, writeDefinitionFile } from './workflow/test-helpers.js';
+import {
+  MockSession,
+  approvedResponse,
+  createDeps,
+  mockBudgetStatus,
+  writeDefinitionFile,
+} from './workflow/test-helpers.js';
 
 const definition: WorkflowDefinition = {
   name: 'budget-test',
@@ -107,6 +118,34 @@ describe('workflow resource budget validation and resolution', () => {
     expect(resolveWorkflowResourceBudget(settings, {}).sources.maxSessionSeconds).toBe('workflow');
   });
 
+  it('carries the sampled session token tracking status into the budget usage', () => {
+    const usage = workflowBudgetUsage({
+      ...mockBudgetStatus({ tokenTrackingAvailable: true, inputTokens: 900, outputTokens: 100 }),
+      tokenTrackingStatus: 'partial',
+      observedExchanges: 7,
+      incompleteExchanges: 2,
+    });
+    expect(usage).toMatchObject({
+      totalTokens: 1000,
+      tokenTrackingAvailable: true,
+      tokenTrackingStatus: 'partial',
+      observedExchanges: 7,
+      incompleteExchanges: 2,
+    });
+  });
+
+  it('never saves the run-wide ceiling or usage views inside the budget record', () => {
+    const budget = resolveWorkflowResourceBudget({ workflowBudget: { maxEstimatedCostUsd: 3 } }, {});
+    expect(budget.workflowLimits).toEqual({ maxEstimatedCostUsd: 3 });
+    const saved = persistedWorkflowBudget({
+      ...budget,
+      workflowUsage: { totalTokens: 1 } as NonNullable<typeof budget.workflowUsage>,
+    });
+    expect(saved).not.toHaveProperty('workflowLimits');
+    expect(saved).not.toHaveProperty('workflowUsage');
+    expect(saved).toMatchObject({ recorded: true, limits: budget.limits });
+  });
+
   it('marks legacy limits as current fallback and leaves usage unavailable', () => {
     seedConfig(env.testHome, { resourceBudget: { maxEstimatedCostUsd: 9 } });
     expect(legacyWorkflowBudget()).toMatchObject({
@@ -115,6 +154,34 @@ describe('workflow resource budget validation and resolution', () => {
       sources: { maxEstimatedCostUsd: 'global' },
     });
     expect(legacyWorkflowBudget().usage).toBeUndefined();
+  });
+
+  it('carries where a session cost comes from, so an unknown cost does not read as $0.00', () => {
+    const status: BudgetStatus = {
+      totalInputTokens: 10,
+      totalOutputTokens: 5,
+      totalTokens: 15,
+      stepCount: 1,
+      elapsedSeconds: 5,
+      estimatedCostUsd: 0,
+      limits: USER_CONFIG_DEFAULTS.resourceBudget,
+      lastTurn: null,
+      cumulative: {
+        totalInputTokens: 10,
+        totalOutputTokens: 5,
+        totalTokens: 15,
+        stepCount: 1,
+        activeSeconds: 5,
+        estimatedCostUsd: 0,
+      },
+      tokenTrackingAvailable: true,
+    };
+    expect(workflowBudgetUsage({ ...status, costSource: 'unknown' })).toMatchObject({
+      estimatedCostUsd: 0,
+      costSource: 'unknown',
+    });
+    // A builtin session prices every step itself and reports no source.
+    expect(workflowBudgetUsage(status)).not.toHaveProperty('costSource');
   });
 });
 
@@ -356,10 +423,11 @@ describe('fixed workflow run budget snapshots', () => {
         }),
       );
     const first = makeOrchestrator();
-    const path = writeDefinitionFile(env.testHome, {
+    const withSettings: WorkflowDefinition = {
       ...definition,
       settings: { mode: 'builtin', resourceBudget: { maxSteps: 40 } },
-    });
+    };
+    const path = writeDefinitionFile(env.testHome, withSettings);
     const id = await first.start(path, 'Task');
     await vi.waitFor(() => expect(first.getStatus(id)?.phase).toBe('waiting_human'));
     expect(store.load(id)?.resourceBudget).toMatchObject({
@@ -379,7 +447,12 @@ describe('fixed workflow run budget snapshots', () => {
       recorded: true,
       limits: { maxEstimatedCostUsd: 25, maxSteps: 40 },
     });
-    expect(options[0].resourceBudgetOverrides).toMatchObject({ maxEstimatedCostUsd: 12, maxSteps: 40 });
+    // The workflow's own limit is an explicit override (above the state
+    // persona's resourceBudget); the saved inherited limits are the baseline
+    // below it (WP-126, session/model-budget-precedence.ts).
+    expect(options[0].resourceBudgetOverrides).toEqual({ maxSteps: 40 });
+    expect(options[0].resourceBudgetBaseline).toMatchObject({ maxEstimatedCostUsd: 12 });
+    expect(options[0].resourceBudgetBaseline).not.toHaveProperty('maxSteps');
     expect(readFileSync(resolve(baseDir, id, 'messages.jsonl'), 'utf8')).toContain('"useCurrentBudget":true');
     await refreshed.abort(id);
   });

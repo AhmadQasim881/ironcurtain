@@ -17,7 +17,11 @@ import type {
   PersonaCompileResultDto,
   ErrorCode,
 } from './web-ui-types.js';
-import type { HumanGateRequestDto } from '../workflow/types.js';
+import type {
+  HumanGateRequestDto,
+  WorkflowToolCallEscalation,
+  WorkflowToolCallEscalationOutcome,
+} from '../workflow/types.js';
 import type { DiagnosticEvent } from '../session/types.js';
 import type { RunRecord } from '../cron/types.js';
 import type { TokenStreamEvent } from '../docker/token-stream-types.js';
@@ -34,8 +38,11 @@ export interface WebEventMap {
    * Ordering contract: emitted only AFTER the session has been removed from
    * its manager (SessionManager / PtySessionManager), so a client that lists
    * sessions on receipt never sees the ended session. All emitters must
-   * preserve this (see `endManagedSession` in dispatch/session-dispatch.ts
-   * and `handleExit` in pty-session-manager.ts).
+   * preserve this (see `endManagedSession` in web-session-teardown.ts, the
+   * single teardown path for turn-based web sessions, and `handleExit` in
+   * pty-session-manager.ts). Emitted exactly once per session; any
+   * `escalation.expired` for the session's still-pending escalations
+   * precedes it.
    */
   'session.ended': { label: number; reason: string };
   'session.updated': SessionDto;
@@ -54,6 +61,13 @@ export interface WebEventMap {
   'job.failed': { jobId: string; error: string };
   'job.list_changed': Record<string, never>;
   'daemon.status': DaemonStatusDto;
+  /**
+   * Sent by `WebUiServer.sendToSubscribers` to one client, ahead of its next
+   * event, after it was skipped for event frames while its send buffer was
+   * over the backpressure threshold: the client should refetch its state as
+   * after a reconnect. Never emitted on the bus.
+   */
+  'daemon.resync': { reason: 'backpressure' };
 
   // Workflow events
   'workflow.started': { workflowId: string; name: string; taskDescription: string };
@@ -62,6 +76,20 @@ export interface WebEventMap {
   'workflow.failed': { workflowId: string; error: string; phase?: 'failed' | 'aborted' };
   'workflow.gate_raised': { workflowId: string; gate: HumanGateRequestDto };
   'workflow.gate_dismissed': { workflowId: string; gateId: string };
+  /**
+   * A tool call that policy escalated inside a workflow agent state waits
+   * for a human. Distinct from `escalation.created` (session escalations
+   * keyed by session label): workflow escalations are keyed by workflow and
+   * resolved via `workflows.resolveEscalation` (or `escalations.resolve`
+   * with the same id). `workflow await` treats it as a decision point.
+   */
+  'workflow.escalation_raised': { workflowId: string; escalation: WorkflowToolCallEscalation };
+  /** Pairs with `workflow.escalation_raised`; `expired` means nobody decided before the timeout. */
+  'workflow.escalation_resolved': {
+    workflowId: string;
+    escalationId: string;
+    outcome: WorkflowToolCallEscalationOutcome;
+  };
   'workflow.agent_started': {
     workflowId: string;
     stateId: string;
@@ -118,8 +146,9 @@ export interface WebEventMap {
 
   // Persona CRUD change notification (Phase 1c). Emitted by the mutation
   // methods (create / editConstitution / setMemory / delete /
-  // setBroadPolicyOptIn) so connected clients refresh the persona list,
-  // mirroring `job.list_changed`. Carries no payload.
+  // setBroadPolicyOptIn / clone / rename / restoreTrash / purgeTrash) so
+  // connected clients refresh the persona list and trash, mirroring
+  // `job.list_changed`. Carries no payload.
   'personas.changed': Record<string, never>;
 
   // Config change notification. Emitted by `config.setModelProviders` after a

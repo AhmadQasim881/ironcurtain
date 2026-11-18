@@ -157,8 +157,10 @@ export async function provisionAppleVmDockerWorkload(options: {
     throw new Error('selected agent inner Docker build hash differs from the prepared artifact');
   }
   // The archive is needed only through verification/load/reinspection. Retire
-  // the lease hard link before agent release so watchdog disk accounting does
-  // not keep charging the multi-gigabyte artifact to the live bundle.
+  // the lease hard link before agent release so the live bundle holds no
+  // reference to the shared multi-gigabyte cache inode. (The watchdog no longer
+  // measures host staging: it charges growth of the VM's rootfs image above
+  // the activation baseline, so this trusted load is not billed either way.)
   unlinkSync(artifact.archivePath);
   return {
     preflight,

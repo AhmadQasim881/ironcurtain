@@ -1,5 +1,7 @@
 # Golden Trace Pipeline: Memory Corruption (v0)
 
+**Status (2026-11-15):** Partial: of this plan only the verbatim capture of section 2 is built, at the MITM proxy (`src/docker/trajectory-capture.ts`, opt-in `--capture-traces`; see `TRAJECTORIES.md`). The exploitation workflow, the Code Mode capture and the offline pipeline stages are not. The src/agent/ module named for the Code Mode wrapper no longer exists: the builtin agent calls `generateText` in `src/session/agent-session.ts`.
+
 Concrete pipeline plan for turning IronCurtain exploitation workflow runs into SFT-ready golden traces and RL-ready flag schemas. Companion to `sft-and-rl-with-ironcurtain.md`, which covers goals and rationale.
 
 ## Scope (v0)

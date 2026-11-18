@@ -5,9 +5,21 @@
  * checkpoint, and transition machinery.
  */
 
-import { cpSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import {
+  cpSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { resolve } from 'node:path';
 import { getIronCurtainHome } from '../config/paths.js';
+import { loadConfig } from '../config/index.js';
+import { readUntrustedRegularFileBelow, UntrustedFileError } from '../hardened-fs.js';
+import { validateWorkspacePath } from '../session/workspace-validation.js';
 import { formatHelp, type CommandSpec } from '../cli-help.js';
 import { type LintMode } from './lint-integration.js';
 import { createInitialContext } from './machine-builder.js';
@@ -15,14 +27,19 @@ import { resolveWorkflowPath, getWorkflowPackageDir } from './discovery.js';
 import { buildAgentCommand } from './prompt-builder.js';
 import { parseAgentStatus, AgentStatusParseError } from './status-parser.js';
 import { parseArtifactRef } from './validate.js';
-import { stageWorkflowSkillsAtStart } from './orchestrator.js';
-import { parseArgsStrict, runCliPreflightLint } from './cli-shared.js';
+import { WORKFLOW_AGENT_TURN, stageWorkflowSkillsAtStart } from './orchestrator.js';
+import { checkedModelOverride, parseArgsStrict, runCliPreflightLint } from './cli-shared.js';
 import type { AgentStateDefinition, WorkflowContext, WorkflowDefinition, WorkflowStateDefinition } from './types.js';
 import { WORKFLOW_ARTIFACT_DIR, resolveWorkflowSkillsOptions } from './types.js';
-import { resolveWorkflowResourceBudget } from './resource-budget.js';
+import { resolveWorkflowResourceBudget, workflowSessionBudgetOptions } from './resource-budget.js';
+import { prepareWritableOutputDirs } from './artifacts.js';
+import { readOnlyWorkspaceForState } from './workspace-access.js';
+import { copyWorkflowResourceDirectory } from './staged-directories.js';
 
 import {
   createWorkflowSessionFactory,
+  displayBlock,
+  displayLine,
   writeStderr,
   writeStdout,
   BOLD,
@@ -41,7 +58,7 @@ import {
 } from './run-state-debug-capture.js';
 import { bundleIdFromSessionId, createAgentConversationId } from '../session/types.js';
 import type { Session, SessionMode } from '../session/types.js';
-import type { AgentId } from '../docker/agent-adapter.js';
+import { resolveStateDockerAgent, toAgentId } from './agent-harness.js';
 
 function printCaptureLocations(target: 'stdout' | 'stderr', paths: RunStateCapturePaths): void {
   const write = target === 'stdout' ? writeStdout : writeStderr;
@@ -83,10 +100,10 @@ export const runStateSpec: CommandSpec = {
     { flag: 'help', short: 'h', description: 'Show this help message' },
   ],
   examples: [
-    'ironcurtain workflow run-state vuln-discovery review --artifacts ~/src/libtiff/.workflow',
-    'ironcurtain workflow run-state vuln-discovery review --workspace ~/src/libtiff --artifacts ~/src/libtiff/.workflow',
-    'ironcurtain workflow run-state vuln-discovery review --artifacts ~/src/libtiff/.workflow --directive "focus on the PIXARLOG finding"',
-    'ironcurtain workflow run-state vuln-discovery review --artifacts ~/src/libtiff/.workflow --mode builtin',
+    'ironcurtain workflow run-state design-and-code review --artifacts ~/src/calendar/.workflow',
+    'ironcurtain workflow run-state design-and-code review --workspace ~/src/calendar --artifacts ~/src/calendar/.workflow',
+    'ironcurtain workflow run-state design-and-code review --artifacts ~/src/calendar/.workflow --directive "check the date parser tests"',
+    'ironcurtain workflow run-state design-and-code review --artifacts ~/src/calendar/.workflow --mode builtin',
   ],
 };
 
@@ -177,7 +194,18 @@ function parseRunStateArgs(args: string[]): ParsedArgs | 'help' {
   }
 
   const workspaceRaw = values.workspace as string | undefined;
-  const workspaceSrc = workspaceRaw != null ? resolve(workspaceRaw) : undefined;
+  let workspaceSrc: string | undefined;
+  if (workspaceRaw != null) {
+    // The source tree is copied wholesale into the agent's staged workspace,
+    // so it must pass the same checks as a workspace the agent would get
+    // directly (`--workspace ~` would otherwise copy every credential store).
+    try {
+      workspaceSrc = validateWorkspacePath(workspaceRaw, loadConfig().protectedPaths);
+    } catch (err) {
+      writeStderr(`${RED}Invalid --workspace: ${err instanceof Error ? err.message : String(err)}${RESET}`);
+      process.exit(2);
+    }
+  }
 
   return {
     definitionRef,
@@ -188,7 +216,7 @@ function parseRunStateArgs(args: string[]): ParsedArgs | 'help' {
     outputDir: values.output != null ? resolve(values.output as string) : undefined,
     mode,
     taskDescription,
-    modelOverride: values.model as string | undefined,
+    modelOverride: checkedModelOverride(values.model, 2),
     noLint: values['no-lint'] === true,
   };
 }
@@ -292,6 +320,7 @@ function stageWorkspace(
   workspaceSrc: string | undefined,
 ): StagedWorkspace {
   assertDirectory(artifactsSrc, '--artifacts');
+  const artifactsRoot = realpathSync(artifactsSrc);
   if (workspaceSrc != null) assertDirectory(workspaceSrc, '--workspace');
   let existingEntries: string[] = [];
   try {
@@ -324,12 +353,13 @@ function stageWorkspace(
   }
 
   const missing: string[] = [];
+  const selectedInputs = new Set<string>();
   for (const inputRef of inputs) {
     const { name, isOptional } = parseArtifactRef(inputRef);
-    const srcPath = resolve(artifactsSrc, name);
+    const srcPath = resolve(artifactsRoot, name);
     let srcStat;
     try {
-      srcStat = statSync(srcPath);
+      srcStat = lstatSync(srcPath);
     } catch {
       if (!isOptional) missing.push(`${name} (looked up at ${srcPath})`);
       continue;
@@ -342,13 +372,23 @@ function stageWorkspace(
       writeStderr(`${RED}Required input ${name} at ${srcPath} is not a directory${RESET}`);
       process.exit(2);
     }
-    cpSync(srcPath, resolve(artifactDir, name), { recursive: true });
+    selectedInputs.add(name);
   }
 
   if (missing.length > 0) {
     writeStderr(`${RED}Missing required inputs:${RESET}`);
     for (const m of missing) writeStderr(`  ${RED}- ${m}${RESET}`);
     process.exit(2);
+  }
+  try {
+    copyWorkflowResourceDirectory(artifactsRoot, workspacePath, WORKFLOW_ARTIFACT_DIR, {
+      rootDirectories: selectedInputs,
+    });
+  } catch (err) {
+    throw new Error(
+      `Cannot safely stage workflow inputs: ${displayLine(err instanceof Error ? err.message : String(err))}`,
+      { cause: err },
+    );
   }
 
   return { outputDir, workspacePath, artifactDir };
@@ -358,14 +398,33 @@ function stageWorkspace(
 // Task description resolution
 // ---------------------------------------------------------------------------
 
+/** Largest `task/description.md` taken from `--artifacts`. */
+const MAX_TASK_DESCRIPTION_BYTES = 1024 * 1024;
+
+/**
+ * The task: `--task`/`--task-file`, else `<artifacts>/task/description.md`.
+ * `--artifacts` is usually a run's `.workflow`, which the agent wrote, so that
+ * file is read only as a regular file inside it: never through a symlink (a
+ * planted link would make a host file, a key say, the agent's task), never by
+ * a blocking open (a FIFO would hang the CLI), and never past the size cap.
+ */
 function resolveTaskDescription(parsed: ParsedArgs): string {
   if (parsed.taskDescription != null) return parsed.taskDescription.trim();
 
   const candidate = resolve(parsed.artifactsDir, 'task', 'description.md');
   try {
-    return readFileSync(candidate, 'utf-8').trim();
-  } catch {
-    writeStderr(`${YELLOW}Warning: no task description found (tried ${candidate}); using placeholder.${RESET}`);
+    return readUntrustedRegularFileBelow(parsed.artifactsDir, 'task/description.md', {
+      maxBytes: MAX_TASK_DESCRIPTION_BYTES,
+    })
+      .bytes.toString('utf8')
+      .trim();
+  } catch (err) {
+    const refused = err instanceof UntrustedFileError && err.code !== 'NOT_FOUND';
+    writeStderr(
+      refused
+        ? `${YELLOW}Warning: not reading ${displayLine(candidate)}: not a regular file inside --artifacts, or over ${MAX_TASK_DESCRIPTION_BYTES} bytes; using placeholder.${RESET}`
+        : `${YELLOW}Warning: no task description found (tried ${displayLine(candidate)}); using placeholder.${RESET}`,
+    );
     return '(no task description provided)';
   }
 }
@@ -395,11 +454,46 @@ function buildContext(
 // Mode + session creation
 // ---------------------------------------------------------------------------
 
-function resolveMode(definition: WorkflowDefinition, override: 'builtin' | 'docker' | undefined): SessionMode {
+/**
+ * Session mode for the one state run-state executes: `--mode` beats
+ * `settings.mode`, and a Docker run uses the state's own harness
+ * (`dockerAgent`), else the workflow's — the same resolution the
+ * orchestrator applies (agent-harness.ts).
+ */
+export function resolveRunStateMode(
+  definition: WorkflowDefinition,
+  stateConfig: AgentStateDefinition,
+  override: 'builtin' | 'docker' | undefined,
+): SessionMode {
   const settings = definition.settings ?? {};
   const effective = override ?? settings.mode ?? 'docker';
   if (effective === 'builtin') return { kind: 'builtin' };
-  return { kind: 'docker', agent: (settings.dockerAgent ?? 'claude-code') as AgentId };
+  return { kind: 'docker', agent: toAgentId(resolveStateDockerAgent(stateConfig, settings)) };
+}
+
+// ---------------------------------------------------------------------------
+// Result rendering
+// ---------------------------------------------------------------------------
+
+/**
+ * The result block printed after the state ran: the verdict and notes from the
+ * agent's `agent_status` block, or why there is none. All of it is
+ * agent-written (the parse error quotes the response), so control and
+ * invisible format characters are shown as visible escapes; the notes keep
+ * their line breaks.
+ */
+export function formatAgentResult(responseText: string): string {
+  try {
+    const parsedStatus = parseAgentStatus(responseText);
+    if (!parsedStatus) return '(no agent_status block)';
+    const verdict = `verdict=${displayLine(parsedStatus.verdict)}`;
+    return parsedStatus.notes ? `${verdict}\nnotes: ${displayBlock(parsedStatus.notes)}` : verdict;
+  } catch (err) {
+    if (err instanceof AgentStatusParseError) {
+      return `(malformed agent_status: ${displayBlock(err.message)})`;
+    }
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -424,15 +518,23 @@ export async function runRunState(args: string[]): Promise<void> {
   const context = buildContext(definition, taskDescription, parsed.stateId, parsed.directive);
   const command = buildAgentCommand(parsed.stateId, stateConfig, context, definition);
 
-  const mode = resolveMode(definition, parsed.mode);
+  const mode = resolveRunStateMode(definition, stateConfig, parsed.mode);
   const settings = definition.settings ?? {};
   const effectiveModel = stateConfig.model ?? settings.model;
 
   const sessionFactory = createWorkflowSessionFactory(parsed.modelOverride);
 
+  // A read-only state runs read-only here too, as the orchestrator runs it.
+  const readOnlyWorkspace = readOnlyWorkspaceForState(stateConfig);
+  if (readOnlyWorkspace) {
+    for (const warning of prepareWritableOutputDirs(staged.workspacePath, readOnlyWorkspace.writablePaths)) {
+      writeStderr(`${YELLOW}Warning: ${displayLine(warning)}${RESET}`);
+    }
+  }
+
   writeStdout(`${BOLD}${CYAN}Running state "${parsed.stateId}" from ${definition.name}${RESET}`);
   writeStdout(`${DIM}Workspace: ${staged.workspacePath}${RESET}`);
-  writeStdout(`${DIM}Mode: ${mode.kind}${RESET}`);
+  writeStdout(`${DIM}Mode: ${mode.kind === 'docker' ? `docker (${mode.agent})` : mode.kind}${RESET}`);
   if (parsed.directive)
     writeStdout(`${DIM}Directive: ${parsed.directive.length} bytes from synthetic "debug" agent${RESET}`);
   writeStdout('');
@@ -446,15 +548,19 @@ export async function runRunState(args: string[]): Promise<void> {
       workspacePath: staged.workspacePath,
       ...(definition.settings?.systemPrompt ? { systemPromptAugmentation: definition.settings.systemPrompt } : {}),
       ...(effectiveModel != null ? { agentModelOverride: effectiveModel } : {}),
-      resourceBudgetOverrides: resolveWorkflowResourceBudget(settings).limits,
+      // The workflow's own limits over the persona's, the inherited ones below.
+      ...workflowSessionBudgetOptions(resolveWorkflowResourceBudget(settings)),
       workflow: {
         stateId: parsed.stateId,
         personaId: stateConfig.persona,
         ...resolveWorkflowSkillsOptions(stateConfig.skills, workflowSkillsDir),
+        ...(readOnlyWorkspace ? { readOnlyWorkspace } : {}),
       },
     });
   } catch (err) {
-    writeStderr(`${RED}Session creation failed: ${err instanceof Error ? err.message : String(err)}${RESET}`);
+    writeStderr(
+      `${RED}Session creation failed: ${displayBlock(err instanceof Error ? err.message : String(err))}${RESET}`,
+    );
     process.exit(1);
   }
 
@@ -467,23 +573,27 @@ export async function runRunState(args: string[]): Promise<void> {
   let invocationFailed = false;
   let invocationError: unknown;
   try {
-    responseText = await session.sendMessage(command);
+    // A workflow prompt (here with the debug directive) is system-generated,
+    // never trusted user context for the auto-approver.
+    responseText = await session.sendMessage(command, WORKFLOW_AGENT_TURN);
   } catch (err) {
     invocationFailed = true;
     invocationError = err;
   } finally {
-    if (capturePaths) await captureContainerLogs(capturePaths);
+    if (capturePaths) await captureContainerLogs(session, capturePaths);
     await session
       .close()
       .catch((err: unknown) =>
-        writeStderr(`[run-state] session.close() failed: ${err instanceof Error ? err.message : String(err)}`),
+        writeStderr(
+          `[run-state] session.close() failed: ${displayBlock(err instanceof Error ? err.message : String(err))}`,
+        ),
       );
     if (capturePaths) captureConversationLogs(capturePaths);
   }
 
   if (invocationFailed) {
     writeStderr(
-      `${RED}Agent invocation failed: ${invocationError instanceof Error ? invocationError.message : String(invocationError)}${RESET}`,
+      `${RED}Agent invocation failed: ${displayBlock(invocationError instanceof Error ? invocationError.message : String(invocationError))}${RESET}`,
     );
     if (capturePaths) printCaptureLocations('stderr', capturePaths);
     process.exit(1);
@@ -493,23 +603,9 @@ export async function runRunState(args: string[]): Promise<void> {
   const outputFile = resolve(outputDir, 'agent-output.md');
   writeFileSync(outputFile, responseText, 'utf-8');
 
-  let verdictLine: string;
-  try {
-    const parsedStatus = parseAgentStatus(responseText);
-    verdictLine = parsedStatus
-      ? `verdict=${parsedStatus.verdict}` + (parsedStatus.notes ? `\nnotes: ${parsedStatus.notes}` : '')
-      : '(no agent_status block)';
-  } catch (err) {
-    if (err instanceof AgentStatusParseError) {
-      verdictLine = `(malformed agent_status: ${err.message})`;
-    } else {
-      throw err;
-    }
-  }
-
   writeStdout('');
   writeStdout(`${BOLD}${GREEN}Result${RESET}`);
-  writeStdout(verdictLine);
+  writeStdout(formatAgentResult(responseText));
   writeStdout('');
   writeStdout(`${DIM}Workspace: ${staged.workspacePath}${RESET}`);
   writeStdout(`${DIM}Agent output: ${outputFile}${RESET}`);

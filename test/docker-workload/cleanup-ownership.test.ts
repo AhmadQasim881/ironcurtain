@@ -1,5 +1,5 @@
 import { createLegacyDockerWorkloadLease as createDockerWorkloadLease } from '../helpers/legacy-docker-workload-lease.js';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -11,11 +11,18 @@ import {
   observeDockerWorkloadOuterResource,
   requestDockerWorkloadOuterResource,
   revokeDockerWorkloadLease,
+  type DockerWorkloadCleanupProof,
 } from '../../src/docker-workload/bundle-lease.js';
 import {
+  DockerWorkloadCleanupPreconditionError,
   performSerializedDockerWorkloadCleanup,
+  tryAcquireDockerWorkloadLifecycleClaim,
   tryHeartbeatDockerWorkloadLease,
 } from '../../src/docker-workload/cleanup-ownership.js';
+import {
+  createDockerWorkloadEmergencyReserve,
+  DOCKER_WORKLOAD_EMERGENCY_RESERVE_FILE,
+} from '../../src/docker-workload/emergency-reserve.js';
 import { captureCleanupProof, removeExactBundleState } from '../../src/docker-workload/bundle-cleanup.js';
 import { getBundleRuntimeRootForHome } from '../../src/config/paths.js';
 import { createMockDocker } from '../helpers/docker-mocks.js';
@@ -110,13 +117,13 @@ describe('Docker-workload lifecycle ownership', () => {
       now: initial,
     });
     revokeDockerWorkloadLease(leasePath, generation, initial);
-    const cleanup = {
-      exactOuterResourcesAbsent: true as const,
-      stateRootAbsent: true as const,
+    const cleanup: DockerWorkloadCleanupProof = {
+      exactOuterResourcesAbsent: true,
+      stateRootAbsent: true,
       inventories: [
         { capturedAt: '2026-07-20T12:00:00.000Z', ownedResourceIds: [] },
         { capturedAt: '2026-07-20T12:00:00.100Z', ownedResourceIds: [] },
-      ] as const,
+      ],
     };
     closeDockerWorkloadLease(leasePath, generation, cleanup, new Date('2026-07-20T12:00:00.100Z'));
     const listContainers = vi.fn(async () => []);
@@ -359,6 +366,157 @@ describe('Docker-workload lifecycle ownership', () => {
     });
   });
 
+  it('records a bounded incident and rethrows the original error when a 100-container inventory fails', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'docker-workload-cleanup-long-error-'));
+    temporaryDirectories.push(directory);
+    const controlDir = join(directory, 'control');
+    const leasePath = join(controlDir, 'lease.json');
+    const stateRoot = join(directory, 'state');
+    const workspaceRoot = join(directory, 'workspace');
+    mkdirSync(controlDir, { mode: 0o700 });
+    mkdirSync(stateRoot, { mode: 0o700 });
+    mkdirSync(workspaceRoot, { mode: 0o700 });
+    const target = lstatSync(stateRoot);
+    const generation = 'generation-cleanup-long-error-001';
+    createDockerWorkloadLease(leasePath, {
+      leaseId: 'lease-cleanup-long-error-001',
+      bundleId: 'bundle-cleanup-long-error-001',
+      generation,
+      runtimeKind: 'docker',
+      paths: {
+        workspaceRoot,
+        stateRoot,
+        runtimeRoot: join(stateRoot, 'runtime'),
+        apiRoot: join(stateRoot, 'api'),
+        exchangeRoot: join(stateRoot, 'exchange'),
+        stagingRoot: join(stateRoot, 'staging'),
+      },
+      bindings: {
+        catalogSha256: '2'.repeat(64),
+        innerDockerCatalogSha256: '7'.repeat(64),
+        profileSha256: '3'.repeat(64),
+        watchdogPolicySha256: '5'.repeat(64),
+        toolchainDigest: '6'.repeat(64),
+      },
+      cleanupInventoryGapMs: 100,
+    });
+    requestDockerWorkloadOuterResource(leasePath, generation, {
+      requestId: 'agent-container',
+      kind: 'container',
+      role: 'agent',
+      requestedName: 'ic-dw-agent',
+      ownershipLabelKey: 'com.ironcurtain.docker-workload.generation',
+    });
+    observeDockerWorkloadOuterResource(leasePath, generation, 'agent-container', 'f'.repeat(64));
+    activateDockerWorkloadLease(leasePath, generation);
+    // Node's execFile message repeats the whole argv before the daemon's
+    // stderr: an inspect of every container on a 100-container host.
+    const hostIds = Array.from({ length: 101 }, (_, index) => index.toString(16).padStart(64, '0'));
+    const inventoryError = Object.assign(
+      new Error(
+        `Command failed: docker --host unix:///var/run/docker.sock container inspect ${hostIds.join(' ')}\nError response from daemon: simulated daemon failure`,
+      ),
+      { code: 1, stdout: '', stderr: 'Error response from daemon: simulated daemon failure' },
+    );
+    expect(inventoryError.message.length).toBeGreaterThan(4096);
+    const runtime = {
+      ...createMockDocker(),
+      async listContainers(): Promise<never> {
+        throw inventoryError;
+      },
+    };
+    let currentMs = Date.parse('2026-07-20T12:00:00.000Z');
+
+    // The original failure, not a lease-schema error, reaches the caller.
+    await expect(
+      performSerializedDockerWorkloadCleanup({
+        runtime,
+        leasePath,
+        generation,
+        targetDevice: target.dev,
+        targetInode: target.ino,
+        gapMs: 100,
+        clock: () => new Date(currentMs),
+        sleep: async (milliseconds) => {
+          currentMs += milliseconds;
+        },
+        waitForOwner: true,
+      }),
+    ).rejects.toBe(inventoryError);
+    const lease = loadDockerWorkloadLease(leasePath);
+    expect(lease).toMatchObject({ status: 'incident', incident: { code: 'docker-workload-cleanup-failed' } });
+    const detail = lease.incident?.detail ?? '';
+    expect(detail.length).toBeLessThanOrEqual(4096);
+    expect(detail).toMatch(/^Command failed: docker --host unix:\/\/\/var\/run\/docker\.sock container inspect /u);
+    expect(detail).toMatch(/characters omitted/u);
+    expect(detail).toMatch(/Error response from daemon: simulated daemon failure$/u);
+  });
+
+  it('keeps the original cleanup failure primary when recording the incident also fails', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'docker-workload-cleanup-record-failure-'));
+    temporaryDirectories.push(directory);
+    const controlDir = join(directory, 'control');
+    const leasePath = join(controlDir, 'lease.json');
+    const stateRoot = join(directory, 'state');
+    const workspaceRoot = join(directory, 'workspace');
+    mkdirSync(controlDir, { mode: 0o700 });
+    mkdirSync(stateRoot, { mode: 0o700 });
+    mkdirSync(workspaceRoot, { mode: 0o700 });
+    const target = lstatSync(stateRoot);
+    const generation = 'generation-cleanup-record-failure-001';
+    createDockerWorkloadLease(leasePath, {
+      leaseId: 'lease-cleanup-record-failure-001',
+      bundleId: 'bundle-cleanup-record-failure-001',
+      generation,
+      runtimeKind: 'apple-container',
+      paths: {
+        workspaceRoot,
+        stateRoot,
+        runtimeRoot: join(stateRoot, 'runtime'),
+        apiRoot: join(stateRoot, 'api'),
+        exchangeRoot: join(stateRoot, 'exchange'),
+        stagingRoot: join(stateRoot, 'staging'),
+      },
+      bindings: {
+        catalogSha256: '2'.repeat(64),
+        innerDockerCatalogSha256: '7'.repeat(64),
+        profileSha256: '3'.repeat(64),
+        watchdogPolicySha256: '5'.repeat(64),
+        toolchainDigest: '6'.repeat(64),
+      },
+      cleanupInventoryGapMs: 100,
+    });
+    const inventoryError = new Error('authoritative Apple inventory unavailable');
+    const runtime = {
+      ...createMockDocker(),
+      async listContainers(): Promise<never> {
+        // The lease becomes unreadable before the failure can be recorded.
+        chmodSync(leasePath, 0o644);
+        throw inventoryError;
+      },
+    };
+    let currentMs = Date.parse('2026-07-20T12:00:00.000Z');
+
+    const failure = performSerializedDockerWorkloadCleanup({
+      runtime,
+      leasePath,
+      generation,
+      targetDevice: target.dev,
+      targetInode: target.ino,
+      gapMs: 100,
+      clock: () => new Date(currentMs),
+      sleep: async (milliseconds) => {
+        currentMs += milliseconds;
+      },
+      waitForOwner: true,
+    });
+    await expect(failure).rejects.toMatchObject({
+      cause: inventoryError,
+      errors: [inventoryError, expect.objectContaining({ message: expect.stringMatching(/owner-only/u) })],
+    });
+    await expect(failure).rejects.toThrow(/^authoritative Apple inventory unavailable \(recording this failure/u);
+  });
+
   it('blocks a heartbeat after stale revalidation until cleanup has durably closed the lease', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'docker-workload-cleanup-owner-'));
     temporaryDirectories.push(directory);
@@ -447,5 +605,101 @@ describe('Docker-workload lifecycle ownership', () => {
       status: 'closed',
       coordinator: { heartbeatAt: initialHeartbeat },
     });
+  });
+});
+
+describe('Docker-workload cleanup under disk pressure', () => {
+  function pressureFixture(label: string) {
+    const directory = mkdtempSync(join(tmpdir(), `docker-workload-cleanup-${label}-`));
+    temporaryDirectories.push(directory);
+    const controlDir = join(directory, 'control');
+    const leasePath = join(controlDir, 'lease.json');
+    const stateRoot = join(directory, 'state');
+    mkdirSync(controlDir, { mode: 0o700 });
+    mkdirSync(stateRoot, { mode: 0o700 });
+    const generation = `generation-cleanup-${label}-001`;
+    createDockerWorkloadLease(leasePath, {
+      leaseId: `lease-cleanup-${label}-001`,
+      bundleId: `bundle-cleanup-${label}-001`,
+      generation,
+      runtimeKind: 'docker',
+      paths: {
+        workspaceRoot: join(directory, 'workspace'),
+        stateRoot,
+        runtimeRoot: join(stateRoot, 'runtime'),
+        apiRoot: join(stateRoot, 'api'),
+        exchangeRoot: join(stateRoot, 'exchange'),
+        stagingRoot: join(stateRoot, 'staging'),
+      },
+      bindings: { watchdogPolicySha256: '5'.repeat(64) },
+      cleanupInventoryGapMs: 100,
+    });
+    createDockerWorkloadEmergencyReserve(controlDir, 64 * 1024);
+    const stats = lstatSync(stateRoot);
+    const runtime = {
+      ...createMockDocker(),
+      listContainers: () => Promise.resolve([]),
+      listNetworks: () => Promise.resolve([]),
+    };
+    const clock = { ms: Date.parse('2026-07-20T12:00:00.000Z') };
+    const options = {
+      runtime,
+      leasePath,
+      generation,
+      targetDevice: stats.dev,
+      targetInode: stats.ino,
+      gapMs: 100,
+      clock: () => new Date(clock.ms),
+      sleep: (milliseconds: number) => {
+        clock.ms += milliseconds;
+        return Promise.resolve();
+      },
+      waitForOwner: true,
+    };
+    return { controlDir, leasePath, options };
+  }
+
+  it('adopts a held lifecycle claim, runs the pre-ledger hook first, and then frees the reserve', async () => {
+    const fixture = pressureFixture('adopted-claim');
+    const held = tryAcquireDockerWorkloadLifecycleClaim({ leasePath: fixture.leasePath });
+    const order: string[] = [];
+    const reserveHeld = (): boolean => existsSync(join(fixture.controlDir, DOCKER_WORKLOAD_EMERGENCY_RESERVE_FILE));
+    const result = await performSerializedDockerWorkloadCleanup({
+      ...fixture.options,
+      claim: held,
+      beforeLeaseMutation: () => {
+        order.push(`hook:${loadDockerWorkloadLease(fixture.leasePath).status}:reserve=${reserveHeld()}`);
+        return Promise.resolve();
+      },
+      onRevoking: (from) => {
+        order.push(`first-write:${from}:reserve=${reserveHeld()}`);
+      },
+    });
+    expect(result.alreadyClosed).toBe(false);
+    // The hook (the supervisor's write-free revocation) ran before the first
+    // lease write while the reserve was still held, so a bundle that was still
+    // writing could not take it; the reserve was freed before that write.
+    expect(order).toEqual(['hook:admitting:reserve=true', 'first-write:admitting:reserve=false']);
+    expect(loadDockerWorkloadLease(fixture.leasePath).status).toBe('closed');
+    // The adopted claim was released, so a new owner can take the lifecycle.
+    tryAcquireDockerWorkloadLifecycleClaim({ leasePath: fixture.leasePath }).release();
+  });
+
+  it('keeps the reserve for a lease whose revalidation refuses cleanup', async () => {
+    const fixture = pressureFixture('refused');
+    const hook = vi.fn(() => Promise.resolve());
+    await expect(
+      performSerializedDockerWorkloadCleanup({
+        ...fixture.options,
+        waitForOwner: false,
+        revalidate: () => {
+          throw new DockerWorkloadCleanupPreconditionError('coordinator heartbeat refreshed before cleanup ownership');
+        },
+        beforeLeaseMutation: hook,
+      }),
+    ).rejects.toThrow(/heartbeat refreshed/u);
+    expect(hook).not.toHaveBeenCalled();
+    expect(existsSync(join(fixture.controlDir, DOCKER_WORKLOAD_EMERGENCY_RESERVE_FILE))).toBe(true);
+    expect(loadDockerWorkloadLease(fixture.leasePath).status).toBe('admitting');
   });
 });

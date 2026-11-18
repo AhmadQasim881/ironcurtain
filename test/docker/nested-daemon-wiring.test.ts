@@ -23,6 +23,7 @@ import {
   ledgerOuterResourceCreate,
   resolveNestedDockerAgentWiring,
   stopDockerWorkloadEgress,
+  type DockerWorkloadEgressCollection,
   type PreContainerInfrastructure,
 } from '../../src/docker/docker-infrastructure.js';
 import { nestedDaemonAgentEnv, resolveNestedDaemonBundle } from '../../src/docker-workload/session-daemon.js';
@@ -72,7 +73,13 @@ import {
   DOCKER_BUILDX_STATE_DIRECTORY,
   getDockerBuildShimStagingContract,
 } from '../../src/docker/docker-build-shim.js';
-import { createMockAdapter, createMockCA, createMockMitmProxy, createMockProxy } from '../helpers/docker-mocks.js';
+import {
+  createMockAdapter,
+  createMockCA,
+  createMockMitmProxy,
+  createMockProxy,
+  testTcpTransportCredentials,
+} from '../helpers/docker-mocks.js';
 import {
   ADMISSION_CONFIGURATION,
   QUALIFIED_DOCKER_INFO,
@@ -149,6 +156,45 @@ async function admitBundle(options?: {
   runtime.setLeasePath(handle.leasePath);
   await handle.attestWatchdog();
   return { clock, runtime, supervisor, handle, audit };
+}
+
+/** Registry (and, in Packages mode, package) egress endpoints for an admitted network mode. */
+function egressFixture(
+  networkAccess: 'offline' | 'images' | 'packages' | undefined,
+  runtimeKind: ContainerRuntimeKind,
+  socketsDir: string,
+): DockerWorkloadEgressCollection | undefined {
+  if (networkAccess !== 'images' && networkAccess !== 'packages') return undefined;
+  const registry = {
+    listener: createMockMitmProxy(),
+    ...(runtimeKind === 'docker'
+      ? { port: TEST_DESKTOP_REGISTRY_PORT }
+      : { socketPath: join(socketsDir, 'registry-egress.sock') }),
+    snapshot: () => ({ attempts: 0, totalBytes: 0, activeRequests: 0 }),
+  };
+  if (networkAccess === 'images') return { networkAccess, registry };
+  return {
+    networkAccess,
+    registry,
+    packages: {
+      listener: createMockMitmProxy(),
+      ...(runtimeKind === 'docker'
+        ? { port: TEST_DESKTOP_PACKAGE_PORT }
+        : { socketPath: join(socketsDir, 'package-egress.sock') }),
+      snapshot: () => ({
+        attempts: 0,
+        clientAttempts: 0,
+        derivedAttempts: 0,
+        activeClients: 0,
+        activeDirect: 0,
+        activeDerived: 0,
+        activeUpstreams: 0,
+        transferredBytes: 0,
+        rateTokens: 120,
+        stopped: false,
+      }),
+    },
+  };
 }
 
 /** Scripted uds bundle; `dockerWorkload`/`runtimeKind` are what the tests vary. */
@@ -230,7 +276,9 @@ function makeCore(
     useTcp: false,
     socketsDir,
     mitmAddr: { socketPath: '/tmp/test-mitm.sock' },
+    metricsProxyUrl: 'http://127.0.0.1:18080',
     authKind: 'apikey',
+    providerProfileId: 'native',
     setTokenSessionId: () => {},
     restageSkills: () => {},
     beginCaptureSession: () => {},
@@ -263,39 +311,7 @@ function makeCore(
             agent: { memoryMb: 960, cpus: 0.75, pidsLimit: 128 },
           }
         : undefined,
-    dockerWorkloadEgress:
-      overrides.networkAccess === 'images' || overrides.networkAccess === 'packages'
-        ? {
-            networkAccess: overrides.networkAccess,
-            registry: {
-              listener: createMockMitmProxy(),
-              ...(runtimeKind === 'docker'
-                ? { port: TEST_DESKTOP_REGISTRY_PORT }
-                : { socketPath: join(socketsDir, 'registry-egress.sock') }),
-              snapshot: () => ({ attempts: 0, totalBytes: 0, activeRequests: 0 }),
-            },
-            ...(overrides.networkAccess === 'packages'
-              ? {
-                  packages: {
-                    listener: createMockMitmProxy(),
-                    ...(runtimeKind === 'docker'
-                      ? { port: TEST_DESKTOP_PACKAGE_PORT }
-                      : { socketPath: join(socketsDir, 'package-egress.sock') }),
-                    snapshot: () => ({
-                      attempts: 0,
-                      clientAttempts: 0,
-                      activeClients: 0,
-                      activeDirect: 0,
-                      activeUpstreams: 0,
-                      transferredBytes: 0,
-                      rateTokens: 120,
-                      stopped: false,
-                    }),
-                  },
-                }
-              : {}),
-          }
-        : undefined,
+    dockerWorkloadEgress: egressFixture(overrides.networkAccess, runtimeKind, socketsDir),
     dockerBuildShim:
       buildShimContract === undefined
         ? undefined
@@ -412,6 +428,13 @@ function desktopTcpRuntime(
     async start(containerId) {
       lifecycleEvents.push(`start:${containerId}`);
       await runtime.runtime.start(containerId);
+    },
+    async getContainerIp(containerId, networkName) {
+      const name = runtime.containers.find((container) => container.id === containerId)?.name;
+      return (
+        configs.find((config) => config.name === name)?.ipv4Address ??
+        runtime.runtime.getContainerIp(containerId, networkName)
+      );
     },
     async connectNetwork(networkName, containerId) {
       networkConnections.push({ networkName, containerId });
@@ -945,8 +968,10 @@ describe('nested daemon — egress transports', () => {
       snapshot: () => ({
         attempts: observations++,
         clientAttempts: 0,
+        derivedAttempts: 0,
         activeClients: 0,
         activeDirect: 0,
+        activeDerived: 0,
         activeUpstreams: 0,
         transferredBytes: 0,
         rateTokens: 120,
@@ -1369,6 +1394,7 @@ describe('nested daemon — Docker Desktop agent capability', () => {
     const core: PreContainerInfrastructure = {
       ...base,
       topology: 'tcp-sidecar',
+      tcpTransport: testTcpTransportCredentials(),
       useTcp: true,
       proxy: createMockProxy(base.proxy.socketPath, 31_080),
       mitmAddr: { port: 31_083 },
@@ -1380,16 +1406,16 @@ describe('nested daemon — Docker Desktop agent capability', () => {
     const [transport, agent] = tcp.configs;
     const ordinaryNetwork = agent.network;
     const expectedOrdinaryNetwork = getInternalNetworkName(getBundleShortId(BUNDLE_ID as BundleId));
-    expect(transport).toMatchObject({ name: expect.stringContaining('sidecar'), network: 'bridge' });
+    expect(transport).toMatchObject({ name: expect.stringContaining('sidecar'), network: ordinaryNetwork });
     expect(ordinaryNetwork).toBe(expectedOrdinaryNetwork);
     expect(tcp.networkConnections).toEqual([
-      { networkName: ordinaryNetwork, containerId: resources.sidecarContainerId! },
+      { networkName: 'bridge', containerId: resources.sidecarContainerId! },
       { networkName: TEST_DESKTOP_EGRESS_NETWORK, containerId: resources.containerId },
     ]);
     expect(tcp.lifecycleEvents).toEqual([
       expect.stringMatching(/^create:ironcurtain-sidecar-/u),
+      `connect:${resources.sidecarContainerId}:bridge`,
       `start:${resources.sidecarContainerId}`,
-      `connect:${resources.sidecarContainerId}:${ordinaryNetwork}`,
       expect.stringMatching(/^create:ironcurtain-/u),
       `connect:${resources.containerId}:${TEST_DESKTOP_EGRESS_NETWORK}`,
       `start:${resources.containerId}`,
@@ -1455,7 +1481,7 @@ describe('nested daemon — Docker Desktop agent capability', () => {
     const { runtime, handle } = await admitBundle({
       runtimeKind: 'docker',
       exec: (argv) =>
-        argv.some((arg) => arg.includes('IRONCURTAIN_HEALTH/1'))
+        argv.includes('/usr/local/bin/ironcurtain-mcp-bridge.mjs')
           ? { exitCode: 1, stdout: '', stderr: 'scripted transport failure' }
           : respondHealthyAppleVmDaemon(argv),
     });
@@ -1469,6 +1495,7 @@ describe('nested daemon — Docker Desktop agent capability', () => {
     const core: PreContainerInfrastructure = {
       ...base,
       topology: 'tcp-sidecar',
+      tcpTransport: testTcpTransportCredentials(),
       useTcp: true,
       proxy: createMockProxy(base.proxy.socketPath, 31_080),
       mitmAddr: { port: 31_083 },
@@ -1497,6 +1524,7 @@ describe('nested daemon — Docker Desktop agent capability', () => {
     const core: PreContainerInfrastructure = {
       ...base,
       topology: 'tcp-sidecar',
+      tcpTransport: testTcpTransportCredentials(),
       useTcp: true,
       proxy: createMockProxy(base.proxy.socketPath, 31_080),
       mitmAddr: { port: 31_083 },

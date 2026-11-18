@@ -1,5 +1,7 @@
 # MITM stream-delay debug knob
 
+**Status (2026-11-14):** Implemented (`src/docker/stream-delay.ts`); off unless `IRONCURTAIN_MITM_STREAM_DELAY_MS` is set.
+
 A host-side debug affordance for reproducing and testing Claude Code's
 streaming idle / stall behavior (issue #367, "Response stalled mid-stream")
 **without needing a real slow model**. It injects a controllable idle gap into

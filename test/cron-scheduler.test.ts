@@ -158,38 +158,38 @@ describe('cron-scheduler', () => {
       const fields = parseCronExpression('30 * * * *'); // every hour at :30
       const now = new Date(2026, 2, 4, 14, 10, 0);
       const next = getNextFireTime(fields, now);
-      expect(next.getHours()).toBe(14);
-      expect(next.getMinutes()).toBe(30);
+      expect(next?.getHours()).toBe(14);
+      expect(next?.getMinutes()).toBe(30);
     });
 
     it('rolls to the next hour if past the target minute', () => {
       const fields = parseCronExpression('15 * * * *');
       const now = new Date(2026, 2, 4, 14, 20, 0);
       const next = getNextFireTime(fields, now);
-      expect(next.getHours()).toBe(15);
-      expect(next.getMinutes()).toBe(15);
+      expect(next?.getHours()).toBe(15);
+      expect(next?.getMinutes()).toBe(15);
     });
 
     it('rolls to the next day if no match remains today', () => {
       const fields = parseCronExpression('0 9 * * *'); // 9am daily
       const now = new Date(2026, 2, 4, 10, 0, 0);
       const next = getNextFireTime(fields, now);
-      expect(next.getDate()).toBe(5);
-      expect(next.getHours()).toBe(9);
+      expect(next?.getDate()).toBe(5);
+      expect(next?.getHours()).toBe(9);
     });
 
     it('handles every-5-minutes expression', () => {
       const fields = parseCronExpression('*/5 * * * *');
       const now = new Date(2026, 2, 4, 14, 12, 0);
       const next = getNextFireTime(fields, now);
-      expect(next.getMinutes()).toBe(15);
+      expect(next?.getMinutes()).toBe(15);
     });
 
     it('never returns the same minute as "after"', () => {
       const fields = parseCronExpression('* * * * *'); // every minute
       const now = new Date(2026, 2, 4, 14, 30, 0);
       const next = getNextFireTime(fields, now);
-      expect(next.getTime()).toBeGreaterThan(now.getTime());
+      expect(next?.getTime()).toBeGreaterThan(now.getTime());
     });
   });
 

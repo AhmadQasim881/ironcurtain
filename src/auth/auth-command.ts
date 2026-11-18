@@ -9,20 +9,23 @@
  *   ironcurtain auth import <provider> <file>  - import OAuth client credentials
  *   ironcurtain auth <provider>                - authorize a provider (opens browser)
  *   ironcurtain auth <provider> --scopes x,y   - authorize with additional scopes
+ *   ironcurtain auth <provider> --no-browser   - authorize from a headless host (paste the redirect URL)
  *   ironcurtain auth status                    - same as no args
  *   ironcurtain auth revoke <provider>         - revoke and delete stored token
  */
 
-import { copyFileSync, existsSync, chmodSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import * as p from '@clack/prompts';
 import { printHelp, type CommandSpec } from '../cli-help.js';
 import { getOAuthDir, getOAuthTokenPath } from '../config/paths.js';
-import type { OAuthProviderConfig, StoredOAuthToken } from './oauth-provider.js';
-import { loadClientCredentials } from './oauth-provider.js';
+import { toDisplayText } from '../terminal/display-sanitize.js';
+import { writePrivateFileAtomicSync } from '../util/atomic-write.js';
+import type { OAuthClientCredentials, OAuthProviderConfig, StoredOAuthToken } from './oauth-provider.js';
+import { loadClientCredentials, parseClientCredentials } from './oauth-provider.js';
 import { getAllOAuthProviders, printAvailableProviders, resolveProviderOrExit } from './oauth-registry.js';
-import { runOAuthFlow, fetchWithTimeout } from './oauth-flow.js';
+import { runOAuthFlow, fetchWithTimeout, type OAuthFlowOptions, type PasteRedirectRequest } from './oauth-flow.js';
 import { deleteOAuthToken, loadOAuthToken, saveOAuthToken } from './oauth-token-store.js';
 
 // ---------------------------------------------------------------------------
@@ -37,6 +40,7 @@ const authSpec: CommandSpec = {
     'ironcurtain auth import <provider> <file>      # Import client credentials',
     'ironcurtain auth <provider>                    # Authorize (opens browser)',
     'ironcurtain auth <provider> --scopes <scopes>  # Authorize with extra scopes',
+    'ironcurtain auth <provider> --no-browser       # Authorize on a headless host',
     'ironcurtain auth revoke <provider>             # Revoke stored token',
     'ironcurtain auth status                        # Show provider status',
   ],
@@ -48,12 +52,17 @@ const authSpec: CommandSpec = {
   ],
   options: [
     { flag: 'scopes', description: 'Comma-separated scopes for incremental consent', placeholder: '<scopes>' },
+    {
+      flag: 'no-browser',
+      description: 'Print the authorization URL instead of opening a browser, then paste the redirected URL back',
+    },
     { flag: 'help', short: 'h', description: 'Show this help message' },
   ],
   examples: [
     'ironcurtain auth import google ~/Downloads/credentials.json',
     'ironcurtain auth google',
     'ironcurtain auth google --scopes gmail.send,calendar.events',
+    'ironcurtain auth google --no-browser',
     'ironcurtain auth revoke google',
     'ironcurtain auth status',
   ],
@@ -129,9 +138,29 @@ function truncate(value: string, maxLen: number): string {
 // Import credentials
 // ---------------------------------------------------------------------------
 
+/** A downloaded client credentials file is a few hundred bytes; anything this large is not one. */
+const MAX_CREDENTIALS_FILE_BYTES = 1024 * 1024;
+
+/**
+ * Reads the file to import: a regular file (symlinks to one are fine, this is
+ * the user's own path) of plausible size. Throws with a message for the user.
+ */
+function readCredentialsSource(path: string): Buffer {
+  const stats = statSync(path);
+  if (!stats.isFile()) throw new Error(`${path} is not a regular file`);
+  if (stats.size > MAX_CREDENTIALS_FILE_BYTES) {
+    throw new Error(`${path} is ${stats.size} bytes, too large for an OAuth client credentials file`);
+  }
+  return readFileSync(path);
+}
+
 /**
  * Handles `ironcurtain auth import <provider> <credentials-file>`.
  * Shows provider-specific setup guidance when credentials file is not provided.
+ *
+ * The file is validated before anything is written, then replaces the stored
+ * credentials atomically and owner-only (0600, via a temporary file renamed
+ * into place), so a wrong or broken file never destroys working credentials.
  */
 function importCredentials(args: string[]): void {
   const providerId = args[0];
@@ -155,29 +184,41 @@ function importCredentials(args: string[]): void {
 
   const resolvedPath = resolve(credentialsPath);
 
-  // Ensure the oauth directory exists and copy the file
+  // Validate first: the stored credentials are replaced only by a file that
+  // holds a client_id and client_secret.
+  let bytes: Buffer;
+  let credentials: OAuthClientCredentials;
+  try {
+    bytes = readCredentialsSource(resolvedPath);
+    credentials = parseClientCredentials(bytes.toString('utf-8'), resolvedPath);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    process.stdout.write(`Invalid credentials file: ${toDisplayText(message)}\n`);
+    process.stdout.write('Nothing was imported; any previously imported credentials are unchanged.\n');
+    process.exit(1);
+    return;
+  }
+
+  // Ensure the oauth directory exists and store the file
   const oauthDir = getOAuthDir();
   mkdirSync(oauthDir, { recursive: true, mode: 0o700 });
 
   const destPath = resolve(oauthDir, provider.credentialsFilename);
   try {
-    copyFileSync(resolvedPath, destPath);
-    chmodSync(destPath, 0o600);
+    // Atomic and owner-only from the first byte: the bytes go to a 0600
+    // temporary file that is renamed over the old one, so a crash or a full
+    // disk leaves either the old or the new credentials, never a partial or
+    // world-readable file.
+    writePrivateFileAtomicSync(destPath, bytes);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    process.stdout.write(`Failed to import credentials: ${message}\n`);
+    process.stdout.write(`Failed to import credentials: ${toDisplayText(message)}\n`);
     process.exit(1);
-  }
-
-  // Validate by loading the copied credentials
-  const credentials = loadClientCredentials(provider);
-  if (!credentials) {
-    process.stdout.write(`Invalid credentials file: could not extract client_id and client_secret.\n`);
-    process.exit(1);
+    return;
   }
 
   process.stdout.write(`\n  ${provider.displayName} -- Import OAuth Credentials\n\n`);
-  process.stdout.write(`  Found client_id: ${truncate(credentials.clientId, 20)}\n`);
+  process.stdout.write(`  Found client_id: ${toDisplayText(truncate(credentials.clientId, 20))}\n`);
   process.stdout.write(`  Credentials saved to ${destPath}\n\n`);
   process.stdout.write(`  Next step: run 'ironcurtain auth ${provider.id}' to authorize.\n\n`);
 }
@@ -220,8 +261,22 @@ function showStatus(): void {
 // ---------------------------------------------------------------------------
 
 /**
- * Attempts to revoke the token server-side via the provider's revocation
- * endpoint (if configured), then deletes the local token file.
+ * What the provider's revocation endpoint said:
+ *   - `revoked`: it confirmed the revocation (2xx).
+ *   - `already-invalid`: it rejected the token as not valid (`400
+ *     invalid_token`: already revoked or expired), so nothing is left to revoke.
+ *   - `no-endpoint`: the provider has no revocation endpoint.
+ *   - `failed`: anything else (network error, timeout, 5xx, another 4xx); the
+ *     token may well still be valid at the provider.
+ */
+type RevocationOutcome = 'revoked' | 'already-invalid' | 'no-endpoint' | 'failed';
+
+/**
+ * Revokes the stored token at the provider, then deletes the local copy, but
+ * only when the provider confirmed that the token is revoked (or was no
+ * longer valid). Otherwise the token is kept, so it can still be revoked
+ * later, and the command says how; deleting it would leave a live grant with
+ * no local copy to revoke it with, while reporting success.
  */
 async function revokeToken(providerId: string): Promise<void> {
   const provider = resolveProviderOrExit(providerId);
@@ -232,21 +287,48 @@ async function revokeToken(providerId: string): Promise<void> {
     return;
   }
 
-  // Attempt server-side revocation if the provider has a revocation endpoint
-  await revokeTokenRemotely(provider, token);
+  const outcome = await revokeTokenRemotely(provider, token);
+  const tokenPath = getOAuthTokenPath(provider.id);
+  if (outcome === 'failed') {
+    process.stdout.write(
+      `The token was NOT revoked: ${provider.displayName} did not confirm the revocation. ` +
+        `The stored token was kept at ${tokenPath}.\n` +
+        `Run 'ironcurtain auth revoke ${provider.id}' again later` +
+        (provider.manualRevocationUrl ? `, or revoke IronCurtain's access at ${provider.manualRevocationUrl}` : '') +
+        '.\n',
+    );
+    process.exitCode = 1;
+    return;
+  }
 
   deleteOAuthToken(provider.id);
-  process.stdout.write(`Token revoked for ${provider.displayName}.\n`);
-  process.stdout.write(`Deleted: ${getOAuthTokenPath(provider.id)}\n`);
+  if (outcome === 'revoked') {
+    process.stdout.write(`Token revoked for ${provider.displayName}.\n`);
+  } else if (outcome === 'already-invalid') {
+    process.stdout.write(
+      `${provider.displayName} reports the token is no longer valid (already revoked or expired); nothing left to revoke.\n`,
+    );
+  } else {
+    process.stdout.write(
+      `${provider.displayName} has no revocation endpoint, so only the local token was deleted` +
+        (provider.manualRevocationUrl ? `; revoke IronCurtain's access at ${provider.manualRevocationUrl}` : '') +
+        '.\n',
+    );
+  }
+  process.stdout.write(`Deleted: ${tokenPath}\n`);
 }
+
+/** Most of a revocation error body that is worth showing. */
+const REVOCATION_ERROR_DISPLAY_CHARS = 300;
 
 /**
  * Calls the provider's token revocation endpoint to invalidate the token
- * server-side. Best-effort: logs a warning on failure but does not throw.
+ * server-side, and reports what it said. Never throws: a failure is printed
+ * as a warning and returned as `failed`.
  */
-async function revokeTokenRemotely(provider: OAuthProviderConfig, token: StoredOAuthToken): Promise<void> {
+async function revokeTokenRemotely(provider: OAuthProviderConfig, token: StoredOAuthToken): Promise<RevocationOutcome> {
   if (!provider.revocationUrl) {
-    return;
+    return 'no-endpoint';
   }
 
   // Prefer revoking the refresh token (invalidates both access and refresh)
@@ -264,17 +346,32 @@ async function revokeTokenRemotely(provider: OAuthProviderConfig, token: StoredO
       REVOCATION_TIMEOUT_MS,
     );
 
-    if (!response.ok) {
-      const text = await response.text();
-      process.stdout.write(`Warning: Server-side revocation returned ${response.status}: ${text}\n`);
-    }
+    if (response.ok) return 'revoked';
+    const text = await response.text();
+    if (response.status === 400 && isInvalidTokenError(text)) return 'already-invalid';
+    process.stdout.write(
+      `Warning: Server-side revocation returned ${response.status}: ` +
+        `${toDisplayText(text, { maxLength: REVOCATION_ERROR_DISPLAY_CHARS })}\n`,
+    );
+    return 'failed';
   } catch (err) {
     if (err instanceof Error && err.name === 'TimeoutError') {
       process.stdout.write(`Warning: Revocation request timed out after ${REVOCATION_TIMEOUT_MS}ms\n`);
     } else {
       const message = err instanceof Error ? err.message : String(err);
-      process.stdout.write(`Warning: Could not reach revocation endpoint: ${message}\n`);
+      process.stdout.write(`Warning: Could not reach revocation endpoint: ${toDisplayText(message)}\n`);
     }
+    return 'failed';
+  }
+}
+
+/** True for an RFC 7009 `{"error": "invalid_token"}` body (how Google rejects a dead token). */
+function isInvalidTokenError(body: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(body);
+    return typeof parsed === 'object' && parsed !== null && (parsed as { error?: unknown }).error === 'invalid_token';
+  } catch {
+    return false;
   }
 }
 
@@ -318,6 +415,36 @@ function parseScopesArg(args: string[]): readonly string[] | undefined {
   }
 
   return undefined;
+}
+
+/** True when the args after the provider name include `--no-browser`. */
+function hasNoBrowserFlag(args: readonly string[]): boolean {
+  return args.includes('--no-browser');
+}
+
+/**
+ * Headless authorization: prints the authorization URL and asks for the URL
+ * the browser was redirected to after consent. On another machine that
+ * redirect (to 127.0.0.1 on this host) fails to load, but its address is
+ * what the flow needs.
+ */
+async function promptForRedirectUrl(request: PasteRedirectRequest): Promise<string | undefined> {
+  if (request.problem === undefined) {
+    process.stdout.write(
+      '\n  Open this URL in a browser on any machine and approve access:\n\n' +
+        `  ${request.authUrl}\n\n` +
+        '  The browser is then sent to a http://127.0.0.1 address. If that page does not load\n' +
+        '  (the browser runs on another machine), copy the full URL from the address bar and paste it below.\n\n',
+    );
+  } else {
+    p.log.warn(request.problem);
+  }
+  const pasted = await p.text({
+    message: 'Redirected URL (starts with http://127.0.0.1):',
+    signal: request.signal,
+    validate: (value) => (!value?.trim() ? 'Paste the full URL from the address bar' : undefined),
+  });
+  return p.isCancel(pasted) ? undefined : pasted;
 }
 
 /**
@@ -444,9 +571,11 @@ async function authorize(providerId: string, extraArgs: string[]): Promise<void>
     }
   }
 
-  process.stdout.write('  Opening browser for authorization...\n');
+  const noBrowser = hasNoBrowserFlag(extraArgs);
+  const flowOptions: OAuthFlowOptions = noBrowser ? { pasteRedirectUrl: promptForRedirectUrl } : {};
+  if (!noBrowser) process.stdout.write('  Opening browser for authorization...\n');
 
-  const result = await runOAuthFlow(provider, credentials, effectiveScopes);
+  const result = await runOAuthFlow(provider, credentials, effectiveScopes, undefined, flowOptions);
   saveOAuthToken(provider.id, result.token);
 
   const tokenPath = getOAuthTokenPath(provider.id);

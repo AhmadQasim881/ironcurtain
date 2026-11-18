@@ -1,6 +1,7 @@
 # Design: Multi-Provider Model Support
 
-**Status:** Proposed
+**Status (2026-11-14):** Implemented: `provider:model` ids for Anthropic, Google and OpenAI (`src/config/model-id.ts`, `src/config/model-provider.ts`), extended since by named provider profiles (OpenRouter, Z.AI).
+
 **Date:** 2026-02-19
 **Author:** IronCurtain Engineering
 
@@ -413,7 +414,7 @@ src/pipeline/
 - `parseModelId('anthropic:claude-sonnet-4-6')` returns `{ provider: 'anthropic', modelId: 'claude-sonnet-4-6' }`
 - `parseModelId('claude-sonnet-4-6')` returns `{ provider: 'anthropic', modelId: 'claude-sonnet-4-6' }` (backward compat)
 - `parseModelId('google:gemini-2.0-flash')` returns `{ provider: 'google', modelId: 'gemini-2.0-flash' }`
-- `parseModelId('unknown:model')` throws with descriptive error listing known providers
+- `parseModelId('unknown:model')` returns `{ provider: 'anthropic', modelId: 'unknown:model' }` (an unknown prefix is part of the model ID, as in Ollama `name:tag` IDs); the config and workflow validators reject a prefix within two edits of a provider name (`anthropc:`, `opnai:`) with a "did you mean" message, and `~/.ironcurtain/config.json` rejects every unknown prefix
 - `parseModelId('anthropic:')` throws (empty model ID)
 - `createLanguageModel()` returns a `LanguageModel` for each supported provider (mock the provider imports in tests)
 

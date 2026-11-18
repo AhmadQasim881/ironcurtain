@@ -1,0 +1,22 @@
+{
+  "cleanupInventoryGapMs": 500,
+  "coverage": {
+    "apple-container": {
+      "stateClasses": [
+        {
+          "id": "apple-vm-rootfs",
+          "kind": "apple-container-rootfs"
+        }
+      ]
+    }
+  },
+  "hardSafetyBytes": 8589934592,
+  "hostReserveBytes": 2147483648,
+  "maximumOvershootBytes": 1073741824,
+  "policyId": "apple-only-coverage-fixture",
+  "sampleIntervalMs": 5000,
+  "sampleTimeoutMs": 5000,
+  "schemaVersion": 2,
+  "softEvidenceBytes": 4294967296,
+  "staleAfterMs": 30000
+}

@@ -22,7 +22,7 @@ There are three selection surfaces:
 - **`ironcurtain start --provider-profile <name>`** — per-session override for batch and PTY runs.
 - **mux `/new` profile picker** — pick a preset when spawning an interactive session; it is rendered as `<name> → <slug> (OpenRouter)` (or `native → Anthropic / OpenAI / ChatGPT`).
 
-**Caching is preserved.** When a mapped slug is `z-ai/*` and no `providerPreference` is set, the MITM injects a default soft pin `provider: { order: ["z-ai"] }` (D3) plus a stable top-level `session_id` for cache affinity (session affinity is on by default) — so GLM-through-Claude-Code gets implicit prompt caching out of the box, unlike the LiteLLM base-URL path where caching silently drops. **Cost bills accurately.** IronCurtain reads OpenRouter's authoritative `usage.cost` from all three wire formats — Anthropic skin (Claude Code), Chat Completions (Goose), and Responses (Codex) — and prefers it over the CLI's self-report for every agent whenever OpenRouter reports it; the static estimate is only a fallback for turns where no cost is observed. The Anthropic-skin path is live-verified (R6); the Chat/Responses paths are fixture-verified in v0, so Goose/Codex cost is authoritative only where OpenRouter actually returns `usage.cost`.
+**Caching is preserved.** When a mapped slug is `z-ai/*` and no `providerPreference` is set, the MITM injects a default soft pin `provider: { order: ["z-ai"] }` (D3) plus a stable top-level `session_id` for cache affinity (session affinity is on by default) — so GLM-through-Claude-Code gets implicit prompt caching out of the box, unlike the LiteLLM base-URL path where caching silently drops. **Cost bills accurately.** IronCurtain reads OpenRouter's authoritative `usage.cost` from all three wire formats — Anthropic skin (Claude Code), Chat Completions (Goose), and Responses (Codex), streamed or not, compressed or not — and prefers it over the CLI's self-report for every agent whenever OpenRouter reports it; the static estimate is only a fallback for turns where no cost is observed. The Anthropic-skin path is live-verified (R6); the Chat/Responses paths are fixture-verified in v0, so Goose/Codex cost is authoritative only where OpenRouter actually returns `usage.cost`.
 
 The generic base-URL mechanism below (`anthropicBaseUrl` etc. + LiteLLM) **remains the escape hatch** for any other gateway (Bedrock, a regional endpoint, or a non-OpenRouter provider). When an OpenRouter profile is active it takes precedence over `anthropicBaseUrl` for that session; the base-URL override only applies to sessions on the `native` profile.
 
@@ -52,11 +52,13 @@ The equivalent minimal `config.json` — no `modelMap` / `providerPreference` ne
 }
 ```
 
+**Requests are filtered.** On OpenRouter profiles the proxy removes `plugins`, `web_search_options` and `models` from requests and strips `:online` from the model, and it forwards a web-search model (`perplexity/*`, `*-search*`, `*deep-research*`) only when the profile itself names it as a `modelMap` target or `perAgent` model. Anything else gets a local 400 (`IronCurtain proxy refused this request`). See [CONFIG.md](CONFIG.md#model-providers-openrouter-and-zai).
+
 **Errors pass through unchanged (m10).** OpenRouter's HTTP errors — 401 (auth) and 429 (rate/quota) — reach the agent verbatim. Claude Code's quota-reset parsing is tuned to Anthropic/LiteLLM phrasing and may not recognize OpenRouter's 429 wording, so a workflow's quota-exhausted short-circuit degrades to a **generic error** rather than a timed pause. Accepted for v0.
 
 ## Configuration
 
-Set either an environment variable or the corresponding field in `~/.ironcurtain/config.json`. Env vars take precedence.
+Set either an environment variable in the shell that starts IronCurtain or the corresponding field in `~/.ironcurtain/config.json`. Env vars take precedence. Base URLs are never read from a `.env` file, IronCurtain's own `~/.ironcurtain/.env` included: such keys are ignored with a warning, because a base URL decides where your real API key is sent.
 
 | Provider  | Environment variable  | `config.json` field |
 | --------- | --------------------- | ------------------- |
@@ -156,9 +158,9 @@ Z.ai's docs show `ANTHROPIC_AUTH_TOKEN` (bearer), but their endpoint also accept
 
 **API key forwarding.** The MITM forwards the host-side `ANTHROPIC_API_KEY` (or OpenAI/Google equivalent) as the auth header. If your gateway enforces its own auth (e.g. LiteLLM's `master_key`), it must either be unset or match `ANTHROPIC_API_KEY`.
 
-**Endpoint allowlist (Docker Agent Mode).** Only `POST /v1/messages` and `/v1/messages/count_tokens` are forwarded to Anthropic-family targets. LiteLLM serves both by default.
+**Endpoint allowlist (Docker Agent Mode).** The model API endpoints forwarded to Anthropic-family targets are `POST /v1/messages` and `/v1/messages/count_tokens` (besides a few Claude Code housekeeping endpoints). LiteLLM serves both by default. Request bodies are checked against the protocol before they are forwarded, and a body the proxy cannot parse gets a local 400.
 
-**Cost caps bill at the model ID.** `resourceBudget.maxEstimatedCostUsd` uses IronCurtain's cost tables keyed off the model name the agent asked for, not the actual backend. If you route `claude-opus-4-7` to something cheaper, the cost tracker still bills at Opus rates — raise or disable (`null`) the cap accordingly.
+**Cost caps bill at the model ID.** `resourceBudget.maxEstimatedCostUsd` uses IronCurtain's list prices keyed off the model name, not the actual backend. If you route `claude-opus-4-7` to something cheaper, the cost tracker still bills at Opus rates — raise or disable (`null`) the cap, or set the real price with `resourceBudget.modelPricing` ([CONFIG.md](CONFIG.md#resource-limits)). The statistics database records no list-price estimate for traffic sent to a base-URL override.
 
 ## Gotchas
 
@@ -167,13 +169,13 @@ Z.ai's docs show `ANTHROPIC_AUTH_TOKEN` (bearer), but their endpoint also accept
 
 ## Troubleshooting
 
-**"model not found" / 404.** A `model_name` in `config.yaml` doesn't match what IronCurtain sent. Check `agentModelId` (and any persona/workflow/auto-approve overrides) and add the missing ID to `model_list`.
+**"model not found" / 404.** A `model_name` in `config.yaml` doesn't match what IronCurtain sent. Check `agentModelId` (and any persona `agentModelId`, workflow `model` or auto-approve overrides; see [model precedence](CONFIG.md#model-and-limit-precedence)) and add the missing ID to `model_list`.
 
 **401 at the gateway.** The MITM is forwarding your real `ANTHROPIC_API_KEY`; if LiteLLM's `master_key` is set, it must match that value. Simplest fix: unset `master_key`.
 
 **Override isn't taking effect (Docker Agent Mode).** Session logs should show `[docker] Anthropic: upstream override via ANTHROPIC_BASE_URL → http://localhost:4000`. If it's missing, the env var isn't set where IronCurtain was launched. If you see `ignoring invalid ...` instead, the URL is malformed.
 
-**Override isn't taking effect (Code Mode).** `ANTHROPIC_BASE_URL` must be set in the shell that launches `ironcurtain` (or placed in `.env` at the project root).
+**Override isn't taking effect (Code Mode).** `ANTHROPIC_BASE_URL` must be exported in the shell that launches `ironcurtain`, or set as `anthropicBaseUrl` in `~/.ironcurtain/config.json`. A `.env` file never sets it.
 
 ## See also
 

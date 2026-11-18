@@ -2,7 +2,8 @@
  * Tests for src/signal/format.ts and src/signal/markdown-to-signal.ts.
  *
  * These modules have no existing test coverage. Tests cover:
- * - formatEscalationBanner: with/without session label and context
+ * - formatEscalationBanner: session label, reply code and context
+ *   (escaping, cutting and splitting are covered in test/signal/format.test.ts)
  * - formatBudgetMessage: token tracking on/off, null limits
  * - formatBudgetSummary: token tracking on/off
  * - splitMessage: short messages, paragraph/line splits, hard splits
@@ -21,6 +22,7 @@ import {
   formatSessionList,
   prefixWithLabel,
   formatJobList,
+  turnTokenBudgetPercent,
   SIGNAL_MAX_MESSAGE_LENGTH,
 } from '../src/signal/format.js';
 import type { JobListEntry, SessionListEntry } from '../src/signal/format.js';
@@ -47,6 +49,7 @@ function makeBudgetStatus(overrides: Partial<BudgetStatus> = {}): BudgetStatus {
       maxEstimatedCostUsd: 5.0,
       warnThresholdPercent: 80,
     },
+    lastTurn: null,
     cumulative: {
       totalInputTokens: 5000,
       totalOutputTokens: 2000,
@@ -85,54 +88,51 @@ function makeJob(overrides: Partial<JobListEntry['job']> = {}): JobListEntry['jo
 // ---------------------------------------------------------------------------
 
 describe('formatEscalationBanner', () => {
+  /** Header and argument messages of a banner, as one text. */
+  function bannerText(...args: Parameters<typeof formatEscalationBanner>): string {
+    const banner = formatEscalationBanner(...args);
+    return [banner.header, ...banner.argumentMessages].join('\n');
+  }
+
   it('includes tool name, arguments, and reason', () => {
-    const banner = formatEscalationBanner(makeEscalationRequest());
+    const banner = bannerText(makeEscalationRequest(), { label: 1, code: 'AB23' });
     expect(banner).toContain('filesystem/delete_file');
     expect(banner).toContain('/tmp/test.txt');
     expect(banner).toContain('Deletes a file outside sandbox');
   });
 
-  it('does not include session label when omitted', () => {
-    const banner = formatEscalationBanner(makeEscalationRequest());
-    expect(banner).not.toContain('[#');
-    expect(banner).toContain('ESCALATION:');
-  });
-
-  it('includes session label when provided', () => {
-    const banner = formatEscalationBanner(makeEscalationRequest(), 3);
-    expect(banner).toContain('[#3]');
-    expect(banner).toContain('ESCALATION [#3]:');
+  it('includes the session label and the reply code in the header', () => {
+    const { header } = formatEscalationBanner(makeEscalationRequest(), { label: 3, code: 'AB23' });
+    expect(header).toContain('ESCALATION [#3] code AB23');
   });
 
   it('includes session label 0 (falsy but valid)', () => {
-    const banner = formatEscalationBanner(makeEscalationRequest(), 0);
-    expect(banner).toContain('[#0]');
+    const { header } = formatEscalationBanner(makeEscalationRequest(), { label: 0, code: 'AB23' });
+    expect(header).toContain('[#0]');
   });
 
   it('includes context key-value pairs when present', () => {
     const request = makeEscalationRequest({ context: { branch: 'main', repo: 'provos/ironcurtain' } });
-    const banner = formatEscalationBanner(request);
-    expect(banner).toContain('branch: `main`');
-    expect(banner).toContain('repo: `provos/ironcurtain`');
+    const banner = bannerText(request, { label: 1, code: 'AB23' });
+    expect(banner).toContain('branch: "main"');
+    expect(banner).toContain('repo: "provos/ironcurtain"');
   });
 
   it('omits context section when context is undefined', () => {
     const request = makeEscalationRequest({ context: undefined });
-    const banner = formatEscalationBanner(request);
-    // Only tool, args, reason lines between separators
-    expect(banner).not.toMatch(/\w+: `\w+`.*\n.*\w+: `\w+`/);
+    expect(bannerText(request, { label: 1, code: 'AB23' })).not.toContain('Context:');
   });
 
-  it('includes approve/deny instructions', () => {
-    const banner = formatEscalationBanner(makeEscalationRequest());
-    expect(banner).toContain('approve');
-    expect(banner).toContain('deny');
+  it('includes approve/deny instructions with the code', () => {
+    const { header } = formatEscalationBanner(makeEscalationRequest(), { label: 1, code: 'AB23' });
+    expect(header).toContain('Reply "approve AB23" or "deny AB23"');
   });
 
-  it('formats arguments as JSON', () => {
+  it('formats each argument as JSON', () => {
     const request = makeEscalationRequest({ arguments: { path: '/foo', force: true } });
-    const banner = formatEscalationBanner(request);
-    expect(banner).toContain(JSON.stringify({ path: '/foo', force: true }));
+    const banner = bannerText(request, { label: 1, code: 'AB23' });
+    expect(banner).toContain('path: "/foo"');
+    expect(banner).toContain('force: true');
   });
 });
 
@@ -164,6 +164,35 @@ describe('formatBudgetMessage', () => {
     const lines = msg.split('\n');
     const tokenNaLines = lines.filter((l) => l.includes('Tokens: N/A'));
     expect(tokenNaLines.length).toBe(2); // once in current, once in session totals
+  });
+
+  it('marks partial (lower-bound) token totals instead of presenting them as exact', () => {
+    const msg = formatBudgetMessage(
+      makeBudgetStatus({ tokenTrackingStatus: 'partial', observedExchanges: 8, incompleteExchanges: 2 }),
+    );
+    expect(msg).toContain(`Tokens: ≥${(1500).toLocaleString()} / ${(10000).toLocaleString()} (15%)`);
+    expect(msg).toContain(`Tokens: ≥${(7000).toLocaleString()} (partial: 2 of 8 exchanges incomplete)`);
+  });
+
+  it('says no exchanges were observed yet instead of a zero lower bound', () => {
+    const msg = formatBudgetMessage(
+      makeBudgetStatus({
+        totalTokens: 0,
+        tokenTrackingStatus: 'partial',
+        observedExchanges: 0,
+        incompleteExchanges: 0,
+        cumulative: {
+          totalInputTokens: 0,
+          totalOutputTokens: 0,
+          totalTokens: 0,
+          stepCount: 0,
+          activeSeconds: 0,
+          estimatedCostUsd: 0,
+        },
+      }),
+    );
+    expect(msg.split('\n').filter((line) => line === '  Tokens: no exchanges observed yet')).toHaveLength(2);
+    expect(msg).not.toContain('≥0');
   });
 
   it('shows "no limit" when a limit is null', () => {
@@ -225,6 +254,13 @@ describe('formatBudgetSummary', () => {
     expect(summary).not.toContain('tokens');
     expect(summary).toContain('25 steps');
     expect(summary).toContain('$0.25');
+  });
+
+  it('marks a partial session total in the summary', () => {
+    const summary = formatBudgetSummary(
+      makeBudgetStatus({ tokenTrackingStatus: 'partial', observedExchanges: 4, incompleteExchanges: 1 }),
+    );
+    expect(summary).toContain(`≥${(7000).toLocaleString()} tokens (partial: 1 of 4 exchanges incomplete)`);
   });
 
   it('rounds active seconds', () => {
@@ -338,6 +374,48 @@ describe('formatSessionList', () => {
   it('includes "Active sessions:" header', () => {
     const sessions: SessionListEntry[] = [{ label: 1, turnCount: 1, budgetPercent: 5 }];
     expect(formatSessionList(sessions, 1)).toContain('Active sessions:');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// turnTokenBudgetPercent (/sessions)
+// ---------------------------------------------------------------------------
+
+describe('turnTokenBudgetPercent', () => {
+  const lastTurn = {
+    totalInputTokens: 2500,
+    totalOutputTokens: 500,
+    totalTokens: 3000,
+    stepCount: 4,
+    elapsedSeconds: 30,
+    estimatedCostUsd: 0.02,
+  };
+
+  it('uses the last completed turn while the session is idle (per-turn fields read zero then)', () => {
+    const idle = makeBudgetStatus({ totalTokens: 0, stepCount: 0, lastTurn });
+    expect(turnTokenBudgetPercent(idle, false)).toBe(30);
+  });
+
+  it('uses the turn in progress while the session is processing', () => {
+    const busy = makeBudgetStatus({ totalTokens: 1500, lastTurn });
+    expect(turnTokenBudgetPercent(busy, true)).toBe(15);
+  });
+
+  it('is 0 before any turn has completed', () => {
+    expect(turnTokenBudgetPercent(makeBudgetStatus({ totalTokens: 0, lastTurn: null }), false)).toBe(0);
+  });
+
+  it('never compares session totals with the per-turn limit', () => {
+    // cumulative.totalTokens (7000) would read as 70%.
+    expect(turnTokenBudgetPercent(makeBudgetStatus({ lastTurn }), false)).toBe(30);
+  });
+
+  it('is 0 when the token limit is disabled', () => {
+    const status = makeBudgetStatus({
+      lastTurn,
+      limits: { ...makeBudgetStatus().limits, maxTotalTokens: null },
+    });
+    expect(turnTokenBudgetPercent(status, false)).toBe(0);
   });
 });
 
@@ -509,6 +587,22 @@ describe('formatJobList', () => {
       isRunning: false,
     };
     expect(formatJobList([entry])).toContain('error: Connection refused');
+  });
+
+  it('shows the failure streak reported by the daemon', () => {
+    const past = new Date(Date.now() - 60 * 1000);
+    const failing: JobListEntry = {
+      job: makeJob(),
+      nextRun: null,
+      lastRun: { outcome: { kind: 'error', message: 'Docker is not running' }, startedAt: past.toISOString() },
+      isRunning: false,
+      consecutiveFailures: 3,
+    };
+    expect(formatJobList([failing])).toContain('Failing: 3 consecutive failures');
+    expect(formatJobList([{ ...failing, consecutiveFailures: 100 }])).toContain('Failing: 100+ consecutive failures');
+    expect(formatJobList([{ ...failing, consecutiveFailures: 0 }])).not.toContain('Failing:');
+    // An older daemon omits the field.
+    expect(formatJobList([{ ...failing, consecutiveFailures: undefined }])).not.toContain('Failing:');
   });
 
   it('shows "unknown" for error without message', () => {

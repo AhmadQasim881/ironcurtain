@@ -19,7 +19,7 @@ import { mkdtempSync, mkdirSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createClaudeCodeAdapter } from '../../src/docker/adapters/claude-code.js';
-import { createCodexAdapter } from '../../src/docker/adapters/codex.js';
+import { CODEX_NATIVE_PROVIDER_ID, createCodexAdapter } from '../../src/docker/adapters/codex.js';
 import { createGooseAdapter } from '../../src/docker/adapters/goose.js';
 import { generateFakeKey } from '../../src/docker/fake-keys.js';
 import { DockerAgentSession, type DockerAgentSessionDeps } from '../../src/docker/docker-agent-session.js';
@@ -64,7 +64,11 @@ function openrouterFakeKeys(): Map<string, string> {
 }
 
 /** Builds a resolved openrouter profile with sensible defaults, overridable. */
-function openrouterProfile(overrides: Partial<ResolvedOpenRouterProfile> = {}): ResolvedOpenRouterProfile {
+function openrouterProfile(
+  overrides: Partial<Omit<ResolvedOpenRouterProfile, 'perAgent'>> & {
+    readonly perAgent?: Partial<ResolvedOpenRouterProfile['perAgent']>;
+  } = {},
+): ResolvedOpenRouterProfile {
   const { perAgent: perAgentOverride, ...rest } = overrides;
   const perAgent: Record<DockerAgent, string | undefined> = {
     'claude-code': undefined,
@@ -185,15 +189,15 @@ describe('OpenRouter — Claude Code adapter', () => {
 
   it('B2a: detectCredential returns apikey when the openrouter profile apiKey is non-empty', () => {
     const config = configWithProfile(openrouterProfile());
-    const result = adapter.detectCredential!(config);
-    expect(result.kind).toBe('apikey');
-    if (result.kind !== 'apikey') throw new Error('expected apikey');
+    const result = adapter.detectCredential?.(config);
+    expect(result?.kind).toBe('apikey');
+    if (result?.kind !== 'apikey') throw new Error('expected apikey');
     expect(result.key).toBe(REAL_OPENROUTER_KEY);
   });
 
   it('B2a: detectCredential returns none when the openrouter profile apiKey is empty (feeds m5)', () => {
     const config = configWithProfile(openrouterProfile({ apiKey: '' }));
-    expect(adapter.detectCredential!(config).kind).toBe('none');
+    expect(adapter.detectCredential?.(config)?.kind).toBe('none');
   });
 
   it('detectCredential returns undefined for a native profile (defers to detectAuthMethod)', () => {
@@ -265,18 +269,20 @@ describe('OpenRouter — Codex adapter', () => {
     expect(parsed.model_provider).toBe('openrouter');
   });
 
-  it('generateMcpConfig emits no OpenRouter keys for a native profile (byte-identical to today)', () => {
-    const nativeContent = adapter.generateMcpConfig(
-      '/run/ironcurtain/proxy.sock',
-      configWithProfile({ type: 'native' }),
-    )[0].content;
+  it('generateMcpConfig emits no OpenRouter keys for a native profile (same as no profile)', () => {
+    const nativeFiles = adapter.generateMcpConfig('/run/ironcurtain/proxy.sock', configWithProfile({ type: 'native' }));
     // No config stamped at all → same native output.
     const absentContent = adapter.generateMcpConfig('/run/ironcurtain/proxy.sock', {} as IronCurtainConfig)[0].content;
-    expect(nativeContent).toBe(absentContent);
-    const parsed = parseToml(nativeContent) as Record<string, unknown>;
+    expect(nativeFiles).toHaveLength(1);
+    expect(nativeFiles[0].content).toBe(absentContent);
+    const parsed = parseToml(nativeFiles[0].content) as Record<string, unknown>;
     expect(parsed.model).toBeUndefined();
-    expect(parsed.model_provider).toBeUndefined();
-    expect(parsed.model_providers).toBeUndefined();
+    expect(parsed.model_catalog_json).toBeUndefined();
+    // The native route has only its ChatGPT binding (WebSockets off, WP-123), never an OpenRouter table.
+    expect(parsed.model_provider).toBe(CODEX_NATIVE_PROVIDER_ID);
+    expect(Object.keys(parsed.model_providers as object)).toEqual([CODEX_NATIVE_PROVIDER_ID]);
+    expect(nativeFiles[0].content).not.toContain('openrouter');
+    expect(nativeFiles[0].content).not.toContain('OPENROUTER_API_KEY');
   });
 
   it('buildEnv sets OPENROUTER_API_KEY=fake and drops the Codex OAuth env', () => {
@@ -290,8 +296,8 @@ describe('OpenRouter — Codex adapter', () => {
   });
 
   it('detectCredential returns apikey/none keyed on the openrouter profile apiKey', () => {
-    expect(adapter.detectCredential!(configWithProfile(openrouterProfile())).kind).toBe('apikey');
-    expect(adapter.detectCredential!(configWithProfile(openrouterProfile({ apiKey: '' }))).kind).toBe('none');
+    expect(adapter.detectCredential?.(configWithProfile(openrouterProfile()))?.kind).toBe('apikey');
+    expect(adapter.detectCredential?.(configWithProfile(openrouterProfile({ apiKey: '' })))?.kind).toBe('none');
   });
 });
 
@@ -341,8 +347,8 @@ describe('OpenRouter — Goose adapter', () => {
 
   it('detectCredential returns apikey/none keyed on the openrouter profile apiKey', () => {
     const adapter = createGooseAdapter();
-    expect(adapter.detectCredential!(configWithProfile(openrouterProfile())).kind).toBe('apikey');
-    expect(adapter.detectCredential!(configWithProfile(openrouterProfile({ apiKey: '' }))).kind).toBe('none');
+    expect(adapter.detectCredential?.(configWithProfile(openrouterProfile()))?.kind).toBe('apikey');
+    expect(adapter.detectCredential?.(configWithProfile(openrouterProfile({ apiKey: '' })))?.kind).toBe('none');
   });
 });
 
@@ -722,16 +728,25 @@ describe('OpenRouter — D6 authoritative-cost accumulation', () => {
     expect(session.getBudgetStatus().estimatedCostUsd).toBeCloseTo(0.5, 6);
   });
 
-  it('retains the prior cost (static-estimate slot) when there is no CLI cost and no authoritative sum', async () => {
-    // No total_cost_usd in the envelope and no bus events: neither the
-    // authoritative sum nor the CLI self-report is available, so the cumulative
-    // cost stays at its initial 0 (the Docker session has no token counts to
-    // compute a fresh static estimate).
+  it('reports the cost as unknown when there is no CLI cost, no authoritative sum and no observed cost', async () => {
+    // No total_cost_usd in the envelope, no bus events and no metrics path:
+    // nothing reported a cost, so the session says "unknown" (amount 0)
+    // instead of claiming the turn was free.
     const { exec } = scriptedExec([{ exitCode: 0, stdout: claudeResult(undefined), stderr: '' }]);
     session = await startSession(buildDeps(openrouterProfile(), exec));
 
     await session.sendMessageDetailed('do the thing');
 
-    expect(session.getBudgetStatus().estimatedCostUsd).toBe(0);
+    expect(session.getBudgetStatus()).toMatchObject({ estimatedCostUsd: 0, costSource: 'unknown' });
+  });
+
+  it('labels the summed authoritative OpenRouter cost as a reported cost', async () => {
+    const { exec } = scriptedExec([{ exitCode: 0, stdout: claudeResult(undefined), stderr: '' }]);
+    session = await startSession(buildDeps(openrouterProfile(), exec));
+    getTokenStreamBus().push(TEST_SESSION_ID, messageEndWithCost(0.012));
+
+    await session.sendMessageDetailed('do the thing');
+
+    expect(session.getBudgetStatus()).toMatchObject({ estimatedCostUsd: 0.012, costSource: 'reported' });
   });
 });

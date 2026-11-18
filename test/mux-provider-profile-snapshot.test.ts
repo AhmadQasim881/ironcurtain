@@ -15,7 +15,11 @@ import type {
   ResolvedOpenRouterProfile,
 } from '../src/config/user-config.js';
 
-function openrouterProfile(overrides: Partial<ResolvedOpenRouterProfile> = {}): ResolvedOpenRouterProfile {
+function openrouterProfile(
+  overrides: Partial<Omit<ResolvedOpenRouterProfile, 'perAgent'>> & {
+    readonly perAgent?: Partial<ResolvedOpenRouterProfile['perAgent']>;
+  } = {},
+): ResolvedOpenRouterProfile {
   const { perAgent: perAgentOverride, ...rest } = overrides;
   const perAgent: Record<DockerAgent, string | undefined> = {
     'claude-code': undefined,

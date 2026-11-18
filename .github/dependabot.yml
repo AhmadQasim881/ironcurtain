@@ -5,6 +5,29 @@ updates:
     schedule:
       interval: weekly
     groups:
+      # MCP servers are part of the policy's trusted computing base: their
+      # tool schemas are what src/config/generated/tool-annotations.json
+      # classifies, so a bump is never routine. They are pinned to exact
+      # versions. Before merging a PR that bumps one of them, run `npm test`:
+      # test/annotation-drift.integration.test.ts diffs the shipped
+      # annotations against the installed servers and fails on any drift. If
+      # it does, re-annotate (`ironcurtain annotate-tools --server <name>`),
+      # review the result, promote it with
+      # `scripts/stamp-package-annotations.ts --from ... --server <name>` and
+      # recompile the policy in the same PR. The github container image and
+      # the google-workspace package are pinned in src/config/mcp-servers.json,
+      # which Dependabot does not read: bump those by hand, with the same
+      # checklist and `ironcurtain annotate-tools --check --server github` for
+      # github. annotate-tools never starts google-workspace (tool listings
+      # outside a session do not start a server backed by an IronCurtain OAuth
+      # login), so it can neither check nor re-annotate that server.
+      mcp-servers:
+        patterns:
+          - '@cyanheads/git-mcp-server'
+          - '@modelcontextprotocol/server-filesystem'
+        update-types:
+          - minor
+          - patch
       production:
         dependency-type: production
         # Keep routine updates together, but review breaking majors individually.
@@ -16,7 +39,74 @@ updates:
         update-types:
           - minor
           - patch
+      # Security updates (BLD-9). Dependabot opens them as soon as an advisory
+      # affects package-lock.json, outside the weekly schedule, and groups
+      # them here so the fixes land together. Merge cadence: within 7 days,
+      # critical advisories the same week. The npm audit gate in CI accepts an
+      # advisory only while its reviewed entry in
+      # .github/npm-audit-allowlist.json is current, so an unmerged fix fails
+      # CI once that entry expires. The MCP servers are left out: a security
+      # bump of one is a separate pull request with the mcp-servers checklist
+      # above.
+      #
+      # The web UI's runtime dependencies are bundled into dist/web-ui-static
+      # when IronCurtain is built, so users get their fixes only with a
+      # release: merging a web-ui-security update calls for a patch release,
+      # which rebuilds the bundle. test/dependency-hygiene.test.ts keeps this
+      # group in step with packages/web-ui/package.json. A group takes the
+      # dependencies it matches first, so web-ui-security comes before
+      # security.
+      web-ui-security:
+        applies-to: security-updates
+        patterns:
+          - '@dagrejs/*'
+          - '@fontsource/*'
+          - '@xterm/addon-fit'
+          - '@xterm/xterm'
+          - 'clsx'
+          - 'dompurify'
+          - 'marked'
+          - 'phosphor-svelte'
+          - 'svelte'
+          - 'tailwind-merge'
+      security:
+        applies-to: security-updates
+        patterns:
+          - '*'
+        exclude-patterns:
+          - '@cyanheads/git-mcp-server'
+          - '@modelcontextprotocol/server-filesystem'
   - package-ecosystem: github-actions
     directory: /
+    schedule:
+      interval: weekly
+  # Base and builder images. Dependabot bumps literal FROM lines, and their
+  # digest when they have one (the golang builders of nested-relay and
+  # nested-daemon, the agent bases in docker/, alpine for the transport
+  # sidecar). A changed Dockerfile changes its image build hash, so users'
+  # machines rebuild the image. It does not follow
+  # `FROM ${IRONCURTAIN_DOCKER_SOURCE}` (bump docker:29.2.1-dind-rootless by
+  # hand), go.mod `go` lines, setup-go versions or the build-trust manifest:
+  # a golang bump must move docker/nested-relay/go.mod to the same release in
+  # the same PR, which scripts/check-go-toolchain.ts (run by the test suite)
+  # enforces, and the weekly scheduled-checks workflow reports Go releases
+  # that are out of support or behind their newest patch.
+  - package-ecosystem: docker
+    directory: /docker
+    schedule:
+      interval: weekly
+    ignore:
+      # Built locally from Dockerfile.base or Dockerfile.base.arm64; no registry has it.
+      - dependency-name: ironcurtain-base
+  - package-ecosystem: docker
+    directory: /docker/nested-relay
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /docker/nested-daemon
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /docker/transport-sidecar
     schedule:
       interval: weekly

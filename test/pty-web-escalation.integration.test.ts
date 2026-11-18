@@ -207,10 +207,11 @@ describe.skipIf(!dockerReady)('web-UI PTY escalation forwarding (real container)
     // Force API-key auth so detectAuthMethod doesn't read host OAuth state.
     process.env.IRONCURTAIN_DOCKER_AUTH = 'apikey';
     process.env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${upstream.port}`;
-    // Pin a fake key into the env the child inherits (dotenv won't override an
-    // already-set var), so the host-side credential is fake and MITM's upstream
-    // forward -- redirected to the local responder anyway -- never carries the
-    // developer's real ANTHROPIC_API_KEY from the repo `.env`.
+    // Pin a fake key into the env the child inherits (the trusted-env loader
+    // never overrides an already-set var, and IRONCURTAIN_HOME above points at
+    // an empty temp home), so the host-side credential is fake and MITM's
+    // upstream forward -- redirected to the local responder anyway -- never
+    // carries a developer's real ANTHROPIC_API_KEY.
     process.env.ANTHROPIC_API_KEY = 'sk-ant-api03-fake-test-key-for-pty-webui-integration';
     // Pin Docker so the container is visible to `docker ps` (see file header).
     process.env.IRONCURTAIN_CONTAINER_RUNTIME = 'docker';
@@ -429,8 +430,10 @@ describe.skipIf(!dockerReady)('web-UI PTY escalation forwarding (real container)
   }, 30_000);
 
   it('resolveEscalation writes response-*.json and emits escalation.resolved', async () => {
-    const accepted = manager.resolveEscalation(escalationId, 'approved');
-    expect(accepted).toBe(true);
+    // resolveEscalation returns nothing: it returns normally only when the proxy
+    // still had the request, and throws ESCALATION_EXPIRED (or
+    // ESCALATION_NOT_FOUND) instead of reporting a too-late answer as success.
+    expect(() => manager.resolveEscalation(escalationId, 'approved')).not.toThrow();
 
     const responsePath = join(escalationDir, `response-${escalationId}.json`);
     expect(existsSync(responsePath)).toBe(true);

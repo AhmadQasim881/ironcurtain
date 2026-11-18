@@ -18,7 +18,8 @@ export class SessionError extends Error {
   }
 }
 
-export type SessionErrorCode = 'SESSION_NOT_READY' | 'SESSION_CLOSED' | 'SESSION_INIT_FAILED' | 'BUDGET_EXHAUSTED';
+export type SessionErrorCode =
+  'SESSION_NOT_READY' | 'SESSION_CLOSED' | 'SESSION_INIT_FAILED' | 'BUDGET_EXHAUSTED' | 'ESCALATION_EXPIRED';
 
 export class SessionNotReadyError extends SessionError {
   constructor(currentStatus: string) {
@@ -38,8 +39,38 @@ export class BudgetExhaustedError extends SessionError {
   constructor(
     public readonly dimension: string,
     message: string,
+    /**
+     * True when the host stopped a running container turn to enforce the
+     * budget (wall clock, or the MITM budget gate): the agent CLI may have
+     * left a partial transcript that must not be resumed.
+     */
+    public readonly turnStopped: boolean = false,
   ) {
     super(message, 'BUDGET_EXHAUSTED');
     this.name = 'BudgetExhaustedError';
   }
+}
+
+/**
+ * A human decision reached the escalation directory after the proxy had
+ * already timed the request out: the tool call was denied, whatever the
+ * decision said. `Session.resolveEscalation()` throws this so a late
+ * approval is never acknowledged as approved.
+ */
+export class EscalationExpiredError extends SessionError {
+  constructor(public readonly escalationId: string) {
+    super(
+      `Escalation ${escalationId} expired before the response arrived; the tool call was denied`,
+      'ESCALATION_EXPIRED',
+    );
+    this.name = 'EscalationExpiredError';
+  }
+}
+
+/**
+ * True for an {@link EscalationExpiredError}, matched by its `code` so a
+ * caller in another module need not import the class.
+ */
+export function isEscalationExpiredError(error: unknown): boolean {
+  return error instanceof Error && (error as { code?: unknown }).code === 'ESCALATION_EXPIRED';
 }

@@ -1,11 +1,17 @@
 /**
  * memory_store tool handler.
  * Validates input and delegates to the engine.
+ *
+ * Content and tags that contain a secret value are rejected (memory never keeps
+ * secrets; see utils/secrets.ts), and importance above MAX_AGENT_IMPORTANCE is
+ * stored as that cap. Who wrote the memory is recorded by the engine from the
+ * host-set writer, never from these arguments.
  */
 
 import type { MemoryEngine } from '../engine.js';
 import type { StoreResult } from '../types.js';
-import { MAX_CONTENT_LENGTH, validateTags } from './validation.js';
+import { MAX_CONTENT_LENGTH, capImportance, validateTags } from './validation.js';
+import { assertNoSecret } from '../utils/secrets.js';
 
 export interface StoreInput {
   content: string;
@@ -31,10 +37,13 @@ export function validateStoreInput(args: Record<string, unknown>): StoreInput {
     }
   }
 
+  assertNoSecret(content, 'content');
+  for (const tag of tags ?? []) assertNoSecret(tag, 'a tag');
+
   return {
     content: content.trim(),
     tags,
-    importance,
+    importance: capImportance(importance),
   };
 }
 

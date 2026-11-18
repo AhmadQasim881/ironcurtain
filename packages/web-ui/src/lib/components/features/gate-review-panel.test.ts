@@ -1,7 +1,8 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/svelte';
+import { tick } from 'svelte';
 import GateReviewPanel from './gate-review-panel.svelte';
-import type { HumanGateRequestDto, ArtifactContentDto } from '$lib/types.js';
+import type { HumanGateRequestDto, ArtifactContentDto, FileContentResponseDto } from '$lib/types.js';
 
 // ---------------------------------------------------------------------------
 // Factories
@@ -27,6 +28,33 @@ function makeProps(overrides: Record<string, unknown> = {}) {
     onResolve: vi.fn(),
     ...overrides,
   };
+}
+
+/**
+ * Builds the artifact fetchers from a map of artifact name -> file path ->
+ * content, mirroring the daemon: `fetchArtifacts` returns names and sizes
+ * only, `fetchArtifactFile` returns one file's content.
+ */
+function makeArtifactFetchers(artifacts: Record<string, Record<string, string>>, truncated = false) {
+  const fetchArtifacts = vi.fn(async (_workflowId: string, name: string): Promise<ArtifactContentDto> => ({
+    files: Object.entries(artifacts[name] ?? {}).map(([path, content]) => ({ path, size: content.length })),
+    truncated,
+  }));
+  const fetchArtifactFile = vi.fn(
+    async (_workflowId: string, name: string, path: string): Promise<FileContentResponseDto> => {
+      const content = artifacts[name]?.[path];
+      if (content === undefined) throw new Error(`no such file ${path}`);
+      return { content, language: path.endsWith('.md') ? 'markdown' : 'text' };
+    },
+  );
+  return { fetchArtifacts, fetchArtifactFile };
+}
+
+/** The clickable row for a listed artifact file. */
+function fileToggle(path: string): HTMLElement {
+  const toggle = screen.getByText(path).closest('button');
+  expect(toggle, `expected a row for ${path}`).toBeTruthy();
+  return toggle as HTMLElement;
 }
 
 // ---------------------------------------------------------------------------
@@ -96,13 +124,25 @@ describe('GateReviewPanel', () => {
 
   // ── Approve flow ──────────────────────────────────────────────────
 
+  it('keeps a held gate visible but disables approval while its review is unavailable', async () => {
+    const onResolve = vi.fn();
+    render(GateReviewPanel, { props: makeProps({ onResolve, reviewAvailable: false }) });
+    const approve = screen.getByRole('button', { name: 'Approve' }) as HTMLButtonElement;
+    expect(approve.disabled).toBe(true);
+    await fireEvent.click(approve);
+    expect(onResolve).not.toHaveBeenCalled();
+    expect(screen.getByText('Abort Workflow')).toBeTruthy();
+  });
+
   it('calls onResolve with APPROVE when Approve is clicked', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(document, 'hasFocus').mockReturnValue(true);
     const onResolve = vi.fn();
     render(GateReviewPanel, { props: makeProps({ onResolve }) });
-
+    await vi.advanceTimersByTimeAsync(750);
     await fireEvent.click(screen.getByText('Approve'));
-
-    expect(onResolve).toHaveBeenCalledWith('APPROVE');
+    expect(onResolve).toHaveBeenCalledWith('gate-1', 'APPROVE');
+    vi.useRealTimers();
   });
 
   // ── Replan flow ───────────────────────────────────────────────────
@@ -129,7 +169,7 @@ describe('GateReviewPanel', () => {
 
     await fireEvent.click(screen.getByText('Submit Replan'));
 
-    expect(onResolve).toHaveBeenCalledWith('REPLAN', 'Rethink the design approach');
+    expect(onResolve).toHaveBeenCalledWith('gate-1', 'REPLAN', 'Rethink the design approach');
   });
 
   it('keeps Submit Replan disabled with empty feedback', async () => {
@@ -166,7 +206,7 @@ describe('GateReviewPanel', () => {
 
     await fireEvent.click(screen.getByText('Submit Revision'));
 
-    expect(onResolve).toHaveBeenCalledWith('FORCE_REVISION', 'Add more tests');
+    expect(onResolve).toHaveBeenCalledWith('gate-1', 'FORCE_REVISION', 'Add more tests');
   });
 
   it('does not submit when feedback textarea is empty', async () => {
@@ -213,7 +253,7 @@ describe('GateReviewPanel', () => {
     await fireEvent.click(screen.getByText('Abort Workflow'));
     await fireEvent.click(screen.getByText('Confirm Abort'));
 
-    expect(onResolve).toHaveBeenCalledWith('ABORT');
+    expect(onResolve).toHaveBeenCalledWith('gate-1', 'ABORT');
   });
 
   it('cancels the abort confirmation when Cancel is clicked', async () => {
@@ -274,13 +314,10 @@ describe('GateReviewPanel', () => {
 
   it('loads and displays artifact content with markdown rendering using prose-markdown class', async () => {
     const gate = makeGate({ presentedArtifacts: ['plan'] });
-    const artifactContent: ArtifactContentDto = {
-      files: [{ path: 'plan.md', content: '# My Plan\n\nThis is the **plan**.' }],
-    };
-    const fetchArtifacts = vi.fn().mockResolvedValue(artifactContent);
+    const fetchers = makeArtifactFetchers({ plan: { 'plan.md': '# My Plan\n\nThis is the **plan**.' } });
 
     render(GateReviewPanel, {
-      props: makeProps({ gate, fetchArtifacts }),
+      props: makeProps({ gate, ...fetchers }),
     });
 
     await switchToArtifactsTab();
@@ -289,33 +326,133 @@ describe('GateReviewPanel', () => {
       expect(screen.getByText('plan.md')).toBeTruthy();
     });
 
-    const markdownContainer = screen.getByText('plan.md').closest('.border')?.querySelector('.prose-markdown');
-    expect(markdownContainer).toBeTruthy();
-    expect(markdownContainer?.querySelector('h1')?.textContent).toBe('My Plan');
-    expect(markdownContainer?.querySelector('strong')?.textContent).toBe('plan');
+    // The first file of an artifact is opened eagerly (one fetch for its content).
+    await vi.waitFor(() => {
+      const markdownContainer = screen.getByText('plan.md').closest('.border')?.querySelector('.prose-markdown');
+      expect(markdownContainer).toBeTruthy();
+      expect(markdownContainer?.querySelector('h1')?.textContent).toBe('My Plan');
+      expect(markdownContainer?.querySelector('strong')?.textContent).toBe('plan');
+    });
+    expect(fetchers.fetchArtifactFile).toHaveBeenCalledWith('wf-1', 'plan', 'plan.md');
   });
 
   it('renders non-markdown artifact files as code blocks without prose-markdown', async () => {
     const gate = makeGate({ presentedArtifacts: ['code'] });
-    const artifactContent: ArtifactContentDto = {
-      files: [{ path: 'main.ts', content: 'const x = 1;' }],
-    };
-    const fetchArtifacts = vi.fn().mockResolvedValue(artifactContent);
+    const fetchers = makeArtifactFetchers({ code: { 'main.ts': 'const x = 1;' } });
 
     render(GateReviewPanel, {
-      props: makeProps({ gate, fetchArtifacts }),
+      props: makeProps({ gate, ...fetchers }),
     });
 
     await switchToArtifactsTab();
 
     await vi.waitFor(() => {
-      expect(screen.getByText('main.ts')).toBeTruthy();
+      expect(screen.getByText('const x = 1;').closest('code')).toBeTruthy();
     });
-
-    expect(screen.getByText('const x = 1;').closest('code')).toBeTruthy();
 
     const fileContainer = screen.getByText('main.ts').closest('.border');
     expect(fileContainer?.querySelector('.prose-markdown')).toBeNull();
+  });
+
+  // ── Artifacts tab: listing-only RPC + lazy per-file loading (WP-32) ───
+  //
+  // `workflows.artifacts` returns names and sizes; a file's content is fetched
+  // through `workflows.artifactFile` when its row is opened. The first file
+  // opens eagerly, every other file waits for a click, so an artifact with
+  // many or large files never arrives in one reply.
+
+  it('lists every file with its size but fetches only the first file eagerly', async () => {
+    const gate = makeGate({ presentedArtifacts: ['docs'] });
+    const fetchers = makeArtifactFetchers({
+      docs: { 'readme.md': '# Readme\n\nWelcome.', 'config.json': '{ "key": "value" }' },
+    });
+
+    render(GateReviewPanel, { props: makeProps({ gate, ...fetchers }) });
+    await switchToArtifactsTab();
+
+    await vi.waitFor(() => {
+      expect(screen.getByText('readme.md')).toBeTruthy();
+      expect(screen.getByText('config.json')).toBeTruthy();
+    });
+    const sizes = screen.getAllByTestId('artifact-file-size').map((el) => el.textContent?.trim());
+    // '# Readme\n\nWelcome.' and '{ "key": "value" }' are 18 bytes each.
+    expect(sizes).toEqual(['18 B', '18 B']);
+
+    await vi.waitFor(() => {
+      expect(screen.getByText('readme.md').closest('.border')?.querySelector('h1')?.textContent).toBe('Readme');
+    });
+    expect(fetchers.fetchArtifactFile).toHaveBeenCalledTimes(1);
+    expect(fetchers.fetchArtifactFile).toHaveBeenCalledWith('wf-1', 'docs', 'readme.md');
+    expect(screen.queryByText('{ "key": "value" }')).toBeNull();
+  });
+
+  it('loads a file when its row is clicked and does not refetch it when reopened', async () => {
+    const gate = makeGate({ presentedArtifacts: ['docs'] });
+    const fetchers = makeArtifactFetchers({
+      docs: { 'readme.md': '# Readme', 'config.json': '{ "key": "value" }' },
+    });
+
+    render(GateReviewPanel, { props: makeProps({ gate, ...fetchers }) });
+    await switchToArtifactsTab();
+    await vi.waitFor(() => expect(screen.getByText('config.json')).toBeTruthy());
+
+    await fireEvent.click(fileToggle('config.json'));
+    await vi.waitFor(() => {
+      expect(screen.getByText('{ "key": "value" }').closest('code')).toBeTruthy();
+    });
+    expect(fetchers.fetchArtifactFile).toHaveBeenCalledWith('wf-1', 'docs', 'config.json');
+
+    // Collapse and reopen: the cached content is shown without another fetch.
+    await fireEvent.click(fileToggle('config.json'));
+    expect(screen.queryByText('{ "key": "value" }')).toBeNull();
+    await fireEvent.click(fileToggle('config.json'));
+    await vi.waitFor(() => expect(screen.getByText('{ "key": "value" }')).toBeTruthy());
+    const configCalls = fetchers.fetchArtifactFile.mock.calls.filter((call) => call[2] === 'config.json');
+    expect(configCalls).toHaveLength(1);
+  });
+
+  it('shows a notice when the daemon truncated the artifact listing', async () => {
+    const gate = makeGate({ presentedArtifacts: ['big'] });
+    const fetchers = makeArtifactFetchers({ big: { 'a.txt': 'a', 'b.txt': 'b' } }, true);
+
+    render(GateReviewPanel, { props: makeProps({ gate, ...fetchers }) });
+    await switchToArtifactsTab();
+
+    await vi.waitFor(() => {
+      expect(screen.getByTestId('artifact-truncated').textContent).toContain('Listing truncated');
+    });
+  });
+
+  it('shows a per-file error when a file fails to load, keeping the rest of the listing usable', async () => {
+    const gate = makeGate({ presentedArtifacts: ['docs'] });
+    const fetchers = makeArtifactFetchers({ docs: { 'ok.md': '# Fine', 'broken.txt': 'x' } });
+    fetchers.fetchArtifactFile.mockImplementation(async (_wf: string, _name: string, path: string) => {
+      if (path === 'broken.txt') throw new Error('Connection closed');
+      return { content: '# Fine', language: 'markdown' };
+    });
+
+    render(GateReviewPanel, { props: makeProps({ gate, ...fetchers }) });
+    await switchToArtifactsTab();
+    await vi.waitFor(() => expect(screen.getByText('broken.txt')).toBeTruthy());
+
+    await fireEvent.click(fileToggle('broken.txt'));
+    await vi.waitFor(() => {
+      expect(screen.getByText('Failed to load file: Connection closed')).toBeTruthy();
+    });
+    expect(screen.getByText('ok.md').closest('.border')?.querySelector('h1')?.textContent).toBe('Fine');
+  });
+
+  it("shows the daemon's display message for a file it refused to serve", async () => {
+    const gate = makeGate({ presentedArtifacts: ['docs'] });
+    const fetchers = makeArtifactFetchers({ docs: { 'huge.bin': 'x' } });
+    fetchers.fetchArtifactFile.mockResolvedValue({ error: 'File too large to display (>1MB)' });
+
+    render(GateReviewPanel, { props: makeProps({ gate, ...fetchers }) });
+    await switchToArtifactsTab();
+
+    await vi.waitFor(() => {
+      expect(screen.getByText('File too large to display (>1MB)')).toBeTruthy();
+    });
   });
 
   it('shows error when artifact loading fails', async () => {
@@ -333,19 +470,33 @@ describe('GateReviewPanel', () => {
     });
   });
 
+  it('retries a failed artifact listing on request', async () => {
+    const gate = makeGate({ presentedArtifacts: ['plan'] });
+    const fetchers = makeArtifactFetchers({ plan: { 'plan.md': '# Recovered' } });
+    fetchers.fetchArtifacts.mockRejectedValueOnce(new Error('Connection closed'));
+
+    render(GateReviewPanel, { props: makeProps({ gate, ...fetchers }) });
+    await switchToArtifactsTab();
+    await vi.waitFor(() => expect(screen.getByText('Failed to load artifact.')).toBeTruthy());
+
+    await fireEvent.click(screen.getByTestId('artifact-retry'));
+    await vi.waitFor(() => {
+      expect(screen.getByText('plan.md').closest('.border')?.querySelector('h1')?.textContent).toBe('Recovered');
+    });
+    expect(fetchers.fetchArtifacts).toHaveBeenCalledTimes(2);
+  });
+
   // ── Multiple artifacts selection ──────────────────────────────────
 
   it('allows switching between multiple artifacts', async () => {
     const gate = makeGate({ presentedArtifacts: ['plan', 'tests'] });
-    const fetchArtifacts = vi.fn().mockImplementation((_wfId: string, name: string) => {
-      if (name === 'plan') {
-        return Promise.resolve({ files: [{ path: 'plan.md', content: '# Plan' }] });
-      }
-      return Promise.resolve({ files: [{ path: 'test.ts', content: 'test code' }] });
+    const { fetchArtifacts, fetchArtifactFile } = makeArtifactFetchers({
+      plan: { 'plan.md': '# Plan' },
+      tests: { 'test.ts': 'test code' },
     });
 
     render(GateReviewPanel, {
-      props: makeProps({ gate, fetchArtifacts }),
+      props: makeProps({ gate, fetchArtifacts, fetchArtifactFile }),
     });
 
     await switchToArtifactsTab();
@@ -371,7 +522,7 @@ describe('GateReviewPanel', () => {
 
   it('shows "No files in this artifact." when artifact has zero files', async () => {
     const gate = makeGate({ presentedArtifacts: ['empty-artifact'] });
-    const fetchArtifacts = vi.fn().mockResolvedValue({ files: [] });
+    const fetchArtifacts = vi.fn().mockResolvedValue({ files: [], truncated: false });
 
     render(GateReviewPanel, {
       props: makeProps({ gate, fetchArtifacts }),
@@ -441,7 +592,7 @@ describe('GateReviewPanel', () => {
 
     await fireEvent.click(screen.getByText('Submit Revision'));
 
-    expect(onResolve).toHaveBeenCalledWith('FORCE_REVISION', 'Fix the bug');
+    expect(onResolve).toHaveBeenCalledWith('gate-1', 'FORCE_REVISION', 'Fix the bug');
   });
 
   // ── Artifact tab count display ──────────────────────────────────
@@ -481,15 +632,13 @@ describe('GateReviewPanel', () => {
 
   it('does not re-fetch an already loaded artifact when re-selected', async () => {
     const gate = makeGate({ presentedArtifacts: ['plan', 'tests'] });
-    const fetchArtifacts = vi.fn().mockImplementation((_wfId: string, name: string) => {
-      if (name === 'plan') {
-        return Promise.resolve({ files: [{ path: 'plan.md', content: '# Plan' }] });
-      }
-      return Promise.resolve({ files: [{ path: 'test.ts', content: 'test code' }] });
+    const { fetchArtifacts, fetchArtifactFile } = makeArtifactFetchers({
+      plan: { 'plan.md': '# Plan' },
+      tests: { 'test.ts': 'test code' },
     });
 
     render(GateReviewPanel, {
-      props: makeProps({ gate, fetchArtifacts }),
+      props: makeProps({ gate, fetchArtifacts, fetchArtifactFile }),
     });
 
     await switchToArtifactsTab();
@@ -522,18 +671,14 @@ describe('GateReviewPanel', () => {
 
   // ── Artifact with multiple files ────────────────────────────────
 
-  it('renders all files within a single artifact', async () => {
+  it('renders every file of a single artifact once each row has been opened', async () => {
     const gate = makeGate({ presentedArtifacts: ['docs'] });
-    const artifactContent: ArtifactContentDto = {
-      files: [
-        { path: 'readme.md', content: '# Readme\n\nWelcome.' },
-        { path: 'config.json', content: '{ "key": "value" }' },
-      ],
-    };
-    const fetchArtifacts = vi.fn().mockResolvedValue(artifactContent);
+    const fetchers = makeArtifactFetchers({
+      docs: { 'readme.md': '# Readme\n\nWelcome.', 'config.json': '{ "key": "value" }' },
+    });
 
     render(GateReviewPanel, {
-      props: makeProps({ gate, fetchArtifacts }),
+      props: makeProps({ gate, ...fetchers }),
     });
 
     await switchToArtifactsTab();
@@ -543,23 +688,26 @@ describe('GateReviewPanel', () => {
       expect(screen.getByText('config.json')).toBeTruthy();
     });
 
-    const readmeContainer = screen.getByText('readme.md').closest('.border')?.querySelector('.prose-markdown');
-    expect(readmeContainer).toBeTruthy();
-    expect(readmeContainer?.querySelector('h1')?.textContent).toBe('Readme');
+    await vi.waitFor(() => {
+      const readmeContainer = screen.getByText('readme.md').closest('.border')?.querySelector('.prose-markdown');
+      expect(readmeContainer?.querySelector('h1')?.textContent).toBe('Readme');
+    });
 
-    expect(screen.getByText('{ "key": "value" }').closest('code')).toBeTruthy();
+    // The second file loads on demand.
+    await fireEvent.click(fileToggle('config.json'));
+    await vi.waitFor(() => {
+      expect(screen.getByText('{ "key": "value" }').closest('code')).toBeTruthy();
+    });
   });
 
   // ── Single artifact does not show selector buttons ──────────────
 
   it('does not show artifact selector buttons when there is only one artifact', async () => {
     const gate = makeGate({ presentedArtifacts: ['plan'] });
-    const fetchArtifacts = vi.fn().mockResolvedValue({
-      files: [{ path: 'plan.md', content: '# Plan' }],
-    });
+    const { fetchArtifacts, fetchArtifactFile } = makeArtifactFetchers({ plan: { 'plan.md': '# Plan' } });
 
     render(GateReviewPanel, {
-      props: makeProps({ gate, fetchArtifacts }),
+      props: makeProps({ gate, fetchArtifacts, fetchArtifactFile }),
     });
 
     await switchToArtifactsTab();
@@ -574,5 +722,182 @@ describe('GateReviewPanel', () => {
     const planElements = screen.queryAllByText('plan');
     const selectorButton = planElements.find((el) => el.closest('button') && el.closest('.space-y-3'));
     expect(selectorButton).toBeUndefined();
+  });
+});
+
+describe('gate approval arming', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  async function advance(ms = 750): Promise<void> {
+    await vi.advanceTimersByTimeAsync(ms);
+    await tick();
+  }
+
+  it('requires a full stable 750ms review while abort remains available', async () => {
+    const onResolve = vi.fn();
+    render(GateReviewPanel, { props: makeProps({ onResolve }) });
+    const approve = screen.getByRole('button', { name: 'Approve' });
+    await fireEvent.click(approve);
+    await advance(749);
+    await fireEvent.click(approve);
+    expect(onResolve).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'Abort Workflow' })).toHaveProperty('disabled', false);
+    await advance(1);
+    await fireEvent.pointerDown(approve);
+    await fireEvent.click(approve);
+    expect(onResolve).toHaveBeenCalledExactlyOnceWith('gate-1', 'APPROVE');
+  });
+
+  it.each(['pointer', 'keyboard'])('refuses a %s press begun before arming', async (kind) => {
+    const onResolve = vi.fn();
+    render(GateReviewPanel, { props: makeProps({ onResolve }) });
+    const approve = screen.getByRole('button', { name: 'Approve' });
+    if (kind === 'pointer') await fireEvent.pointerDown(approve);
+    else await fireEvent.keyDown(approve, { key: ' ' });
+    await advance();
+    await fireEvent.mouseDown(approve);
+    await fireEvent.click(approve);
+    expect(onResolve).not.toHaveBeenCalled();
+    await fireEvent.pointerDown(approve);
+    await fireEvent.click(approve);
+    expect(onResolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a pointer click with no press recorded by the displayed review', async () => {
+    const onResolve = vi.fn();
+    render(GateReviewPanel, { props: makeProps({ onResolve }) });
+    await advance();
+    const approve = screen.getByRole('button', { name: 'Approve' });
+    await fireEvent.click(approve, { detail: 1 });
+    expect(onResolve).not.toHaveBeenCalled();
+    await fireEvent.pointerDown(approve);
+    await fireEvent.click(approve, { detail: 1 });
+    expect(onResolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('restarts for a changed gate, accepted events, or refresh signal and resets drafts', async () => {
+    const onResolve = vi.fn();
+    const props = makeProps({ onResolve });
+    const view = render(GateReviewPanel, { props });
+    await advance();
+    await fireEvent.click(screen.getByRole('button', { name: 'Request Revision' }));
+    await fireEvent.input(screen.getByLabelText('Revision feedback'), { target: { value: 'Review notes' } });
+    await view.rerender({ ...props, gate: makeGate({ acceptedEvents: ['APPROVE', 'ABORT'] }) });
+    expect(screen.queryByLabelText('Revision feedback')).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    expect(onResolve).not.toHaveBeenCalled();
+    await advance();
+    await view.rerender({ ...props, gate: makeGate({ gateId: 'gate-2' }), refreshSignal: 'refreshed' });
+    await fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    expect(onResolve).not.toHaveBeenCalled();
+    await advance();
+    await fireEvent.pointerDown(screen.getByRole('button', { name: 'Approve' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    expect(onResolve).toHaveBeenCalledExactlyOnceWith('gate-2', 'APPROVE');
+  });
+
+  it('restarts after focus and visibility interruptions', async () => {
+    const onResolve = vi.fn();
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+    render(GateReviewPanel, { props: makeProps({ onResolve }) });
+    await advance();
+    await fireEvent.pointerDown(screen.getByRole('button', { name: 'Approve' }));
+    window.dispatchEvent(new Event('blur'));
+    await advance();
+    await fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    expect(onResolve).not.toHaveBeenCalled();
+    window.dispatchEvent(new Event('focus'));
+    await advance(749);
+    await fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    expect(onResolve).not.toHaveBeenCalled();
+    visibility.mockReturnValue('hidden');
+    document.dispatchEvent(new Event('visibilitychange'));
+    await advance();
+    await fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    expect(onResolve).not.toHaveBeenCalled();
+    visibility.mockReturnValue('visible');
+    document.dispatchEvent(new Event('visibilitychange'));
+    await advance();
+    await fireEvent.pointerDown(screen.getByRole('button', { name: 'Approve' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    expect(onResolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('restarts when the approval row moves and ignores repeated keyboard activation', async () => {
+    let top = 10;
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(() => new DOMRect(0, top, 100, 30));
+    const onResolve = vi.fn();
+    render(GateReviewPanel, { props: makeProps({ onResolve }) });
+    await advance();
+    await fireEvent.pointerDown(screen.getByRole('button', { name: 'Approve' }));
+    top = 20;
+    await advance(16);
+    await fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    expect(onResolve).not.toHaveBeenCalled();
+    await advance();
+    const approve = screen.getByRole('button', { name: 'Approve' });
+    await fireEvent.click(approve);
+    expect(onResolve).not.toHaveBeenCalled();
+    await fireEvent.keyDown(approve, { key: 'Enter', repeat: true });
+    await fireEvent.click(approve);
+    expect(onResolve).not.toHaveBeenCalled();
+    await fireEvent.keyDown(approve, { key: 'Enter' });
+    await fireEvent.click(approve);
+    expect(onResolve).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['refreshSignal', 'layoutSignal'])('restarts for a %s change on the same gate', async (key) => {
+    const onResolve = vi.fn();
+    const props = makeProps({ onResolve });
+    const view = render(GateReviewPanel, { props });
+    await advance();
+    await view.rerender({ ...props, [key]: 'next' });
+    await fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    expect(onResolve).not.toHaveBeenCalled();
+    await advance();
+    await fireEvent.pointerDown(screen.getByRole('button', { name: 'Approve' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    expect(onResolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('requires a fresh delay when an initially unfocused review returns to the foreground', async () => {
+    vi.mocked(document.hasFocus).mockReturnValue(false);
+    const onResolve = vi.fn();
+    render(GateReviewPanel, { props: makeProps({ onResolve }) });
+    await advance();
+    await fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    expect(onResolve).not.toHaveBeenCalled();
+    window.dispatchEvent(new Event('focus'));
+    await advance(749);
+    await fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    expect(onResolve).not.toHaveBeenCalled();
+    await advance(1);
+    await fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    expect(onResolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('allows only one submission while resolution is pending', async () => {
+    let finish!: () => void;
+    const onResolve = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    render(GateReviewPanel, { props: makeProps({ onResolve }) });
+    await advance();
+    const approve = screen.getByRole('button', { name: 'Approve' });
+    await fireEvent.click(approve);
+    await fireEvent.click(approve);
+    expect(onResolve).toHaveBeenCalledTimes(1);
+    finish();
+    await tick();
   });
 });

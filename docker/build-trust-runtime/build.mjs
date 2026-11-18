@@ -1,5 +1,21 @@
 #!/usr/bin/env node
 
+// Cross-compiles the build-trust runc wrapper for linux/amd64 and linux/arm64.
+//
+//   --write  replaces the committed binaries under bin/, regenerates
+//            src/docker/build-trust-runtime-contract.ts and records the
+//            toolchain in manifest.json.
+//   --check  rebuilds both with the toolchain manifest.json records and
+//            requires the committed binaries to be byte-identical to the fresh
+//            build (BLD-12). The build is reproducible (-trimpath, no cgo, no VCS
+//            stamp, cross-compiled in a pinned Go environment), so a difference
+//            means a committed ELF is stale or was replaced. It also checks the
+//            generated protocol metadata. Another Go release may compile the
+//            same source to other bytes, so with any other `go` --check fails
+//            with a toolchain mismatch instead of comparing bytes it cannot
+//            reproduce. CI and release install the recorded release
+//            (scripts/check-go-toolchain.ts keeps those pins in step).
+
 import { execFileSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -9,6 +25,25 @@ import { parseGoFailureDiagnosticCodes } from './diagnostic-codes.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const architectures = ['amd64', 'arm64'];
+// The toolchain decides the bytes: never let go.mod, GOFLAGS, a go.env or
+// go.work file, another GOROOT, or a microarchitecture level, experiment or
+// FIPS module inherited from the caller switch to another release or change the
+// build while `go version` still reports the recorded release. The pinned
+// values are Go's defaults, which CI and release use. Without GOROOT, `go`
+// uses the installation it belongs to.
+const callerEnvironment = { ...process.env };
+delete callerEnvironment.GOROOT;
+const goEnvironment = {
+  ...callerEnvironment,
+  GOENV: 'off',
+  GOFLAGS: '',
+  GOTOOLCHAIN: 'local',
+  GOWORK: 'off',
+  GOAMD64: 'v1',
+  GOARM64: 'v8.0',
+  GOEXPERIMENT: '',
+  GOFIPS140: 'off',
+};
 const runtimeContractPath = join(root, '../../src/docker/build-trust-runtime-contract.ts');
 const fixture = JSON.parse(readFileSync(join(root, 'testdata/synthetic-build-trust-contract.json'), 'utf8'));
 const mode = process.argv[2];
@@ -51,26 +86,33 @@ const metadata = {
   },
 };
 const rendered = `/** Generated protocol/layout metadata. No executable byte pins. */\n// prettier-ignore\nexport const BUILD_TRUST_RUNTIME_CONTRACT = ${JSON.stringify(metadata, null, 2)} as const;\n`;
+const targets = architectures.map((architecture) => ({
+  architecture,
+  path: `bin/linux-${architecture}/ironcurtain-build-trust-runc`,
+}));
+const goVersion = execFileSync('go', ['version'], { cwd: root, encoding: 'utf8', env: goEnvironment }).trim();
+const release = goRelease(goVersion);
+if (mode === '--check') {
+  const recorded = goRelease(readManifest().goVersion);
+  if (release !== recorded) {
+    throw new Error(
+      `toolchain mismatch: manifest.json records ${recorded}, which built the committed binaries, but go is ${release}. ` +
+        `--check compares the committed binaries byte for byte with a fresh build, which only ${recorded} reproduces: ` +
+        `install ${recorded}, or rebuild with node build.mjs --write and move the CI and release Go pins to ${release} in the same change.`,
+    );
+  }
+}
 const temporary = mkdtempSync(join(tmpdir(), 'ironcurtain-build-trust-runtime-'));
 try {
-  const goVersion = execFileSync('go', ['version'], { encoding: 'utf8' }).trim();
-  const outputs = [];
-  for (const architecture of architectures) {
+  const problems = [];
+  for (const { architecture, path } of targets) {
     const binary = join(temporary, `runc-${architecture}`);
     execFileSync(
       'go',
       ['build', '-buildvcs=false', '-mod=readonly', '-trimpath', '-ldflags=-s -w', '-o', binary, '.'],
       {
         cwd: root,
-        env: {
-          ...process.env,
-          GOOS: 'linux',
-          GOARCH: architecture,
-          CGO_ENABLED: '0',
-          GOENV: 'off',
-          GOFLAGS: '',
-          GOTOOLCHAIN: 'local',
-        },
+        env: { ...goEnvironment, GOOS: 'linux', GOARCH: architecture, CGO_ENABLED: '0' },
         stdio: 'inherit',
       },
     );
@@ -84,31 +126,71 @@ try {
     ) {
       throw new Error(`compiler did not produce a Linux ${architecture} ELF executable`);
     }
-    const relative = `bin/linux-${architecture}/ironcurtain-build-trust-runc`;
-    outputs.push({ architecture, path: relative });
-    if (mode === '--write') atomicWrite(join(root, relative), bytes, 0o755);
+    if (mode === '--write') {
+      atomicWrite(join(root, path), bytes, 0o755);
+    } else if (!sameBytes(join(root, path), bytes)) {
+      problems.push(`${path} is not the ${release} build of this source`);
+    }
   }
   if (mode === '--write') {
     atomicWrite(runtimeContractPath, Buffer.from(rendered), 0o644);
     atomicWrite(
       join(root, 'manifest.json'),
-      Buffer.from(`${JSON.stringify({ schemaVersion: 2, goVersion, targets: outputs }, null, 2)}\n`),
+      Buffer.from(`${JSON.stringify({ schemaVersion: 2, goVersion, targets }, null, 2)}\n`),
       0o644,
     );
   } else {
-    // Compare protocol values, not compiler output. Different supported compiler
-    // versions may produce different bytes without changing the runtime contract.
     const source = readFileSync(runtimeContractPath, 'utf8');
     const match = /export const BUILD_TRUST_RUNTIME_CONTRACT = ([\s\S]*?) as const;/u.exec(source);
     if (match === null || JSON.stringify(JSON.parse(match[1])) !== JSON.stringify(metadata)) {
-      throw new Error('build-trust protocol metadata differs; run node build.mjs --write');
+      problems.push('the generated build-trust protocol metadata differs from this source');
+    }
+    if (problems.length > 0) {
+      throw new Error(
+        `build-trust runtime check failed: ${problems.join('; ')}. Run node build.mjs --write and commit the result.`,
+      );
     }
   }
   process.stdout.write(
-    `build-trust runtime ${mode === '--write' ? 'packaged' : 'compiled and checked'} for ${architectures.join(', ')}\n`,
+    mode === '--write'
+      ? `build-trust runtime packaged for ${architectures.join(', ')} with ${release}\n`
+      : `build-trust runtime compiled with ${release}; committed binaries for ${architectures.join(', ')} are byte-identical\n`,
   );
 } finally {
   rmSync(temporary, { recursive: true, force: true });
+}
+
+/** The release in `go version` output: "go version go1.26.1 linux/amd64" is "go1.26.1". */
+function goRelease(output) {
+  const match = /^go version (go\d+\.\d+(?:\.\d+)?(?:(?:rc|beta)\d+)?)(?:\s|$)/u.exec(String(output));
+  if (match === null) throw new Error(`cannot read a Go release from ${JSON.stringify(output)}`);
+  return match[1];
+}
+
+/** manifest.json as --write produced it, for these targets. */
+function readManifest() {
+  const manifest = JSON.parse(readFileSync(join(root, 'manifest.json'), 'utf8'));
+  if (
+    manifest === null ||
+    typeof manifest !== 'object' ||
+    manifest.schemaVersion !== 2 ||
+    typeof manifest.goVersion !== 'string' ||
+    JSON.stringify(manifest.targets) !== JSON.stringify(targets)
+  ) {
+    throw new Error(
+      'manifest.json is not the schema 2 manifest for the amd64 and arm64 targets; run node build.mjs --write',
+    );
+  }
+  return manifest;
+}
+
+function sameBytes(path, expected) {
+  try {
+    return readFileSync(path).equals(expected);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
 }
 
 function atomicWrite(path, bytes, modeBits) {

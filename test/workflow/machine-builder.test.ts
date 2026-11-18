@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { createActor, fromPromise, type AnyActor } from 'xstate';
 import {
+  buildDeterministicInvokeInput,
   buildWorkflowMachine,
   createInitialContext,
   truncateAgentOutput,
@@ -11,7 +12,20 @@ import {
   type FanOutInvokeResult,
 } from '../../src/workflow/machine-builder.js';
 import type { WorkflowDefinition } from '../../src/workflow/types.js';
-import { makeAgentResult, makeRejectedResult, makeVerdictResult, settle } from './machine-test-helpers.js';
+import {
+  AgentInvocationError,
+  WorkflowQuotaExhaustedError,
+  WorkflowTransientFailureError,
+} from '../../src/workflow/errors.js';
+import { createAgentConversationId } from '../../src/session/types.js';
+import {
+  agentStateOf,
+  deterministicStateOf,
+  makeAgentResult,
+  makeRejectedResult,
+  makeVerdictResult,
+  settle,
+} from './machine-test-helpers.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -703,9 +717,36 @@ describe('buildWorkflowMachine', () => {
       expect(capturedInput!.commands).toEqual([['npm', 'test']]);
       expect(capturedInput!.context.taskDescription).toBe('my task');
       expect(capturedInput!.container).toBe(false);
+      expect(capturedInput!.host).toBeUndefined();
       expect(capturedInput!.containerScope).toBeUndefined();
       expect(capturedInput!.timeoutMs).toBeUndefined();
       expect(capturedInput!.resultFile).toBeUndefined();
+    });
+
+    it('passes the host: true acknowledgement and timeoutMs to deterministic service', async () => {
+      const definition = structuredClone(deterministicLoopDefinition);
+      const testState = definition.states.test;
+      if (testState.type !== 'deterministic') throw new Error('fixture drift');
+      definition.states.test = { ...testState, host: true, timeoutMs: 4321 };
+      const result = buildWorkflowMachine(definition, 'my task');
+      let capturedInput: DeterministicInvokeInput | undefined;
+
+      const testMachine = result.machine.provide({
+        actors: {
+          agentService: fromPromise(async () => makeAgentResult()),
+          deterministicService: fromPromise(async ({ input }: { input: DeterministicInvokeInput }) => {
+            capturedInput = input;
+            return makeDeterministicResult({ passed: true });
+          }),
+        },
+      });
+
+      const actor = createActor(testMachine);
+      actor.start();
+
+      await settle();
+
+      expect(capturedInput).toMatchObject({ stateId: 'test', container: false, host: true, timeoutMs: 4321 });
     });
 
     it('passes container execution options to deterministic service', async () => {
@@ -743,6 +784,82 @@ describe('buildWorkflowMachine', () => {
         containerScope: 'eval',
         timeoutMs: 1234,
         resultFile: '.workflow/result.json',
+      });
+    });
+
+    it('passes exactly what buildDeterministicInvokeInput builds, lane placeholders resolved', async () => {
+      // The orchestrator's resume replay uses the same builder, so this is
+      // what a replayed deterministic state receives as well.
+      const definition = structuredClone(deterministicLoopDefinition);
+      const testState = definition.states.test;
+      if (testState.type !== 'deterministic') throw new Error('fixture drift');
+      const placeholderState = {
+        ...testState,
+        container: true,
+        run: [['/workflow-scripts/check.py', '--dir', '{laneDir}', '--lane-id', '{laneId}']],
+        resultFile: '{laneRelDir}/check.json',
+      };
+      definition.states.test = placeholderState;
+      const result = buildWorkflowMachine(definition, 'my task');
+      let capturedInput: DeterministicInvokeInput | undefined;
+
+      const testMachine = result.machine.provide({
+        actors: {
+          agentService: fromPromise(async () => makeAgentResult()),
+          deterministicService: fromPromise(async ({ input }: { input: DeterministicInvokeInput }) => {
+            capturedInput = input;
+            return makeDeterministicResult({ passed: true });
+          }),
+        },
+      });
+
+      const actor = createActor(testMachine);
+      actor.start();
+      await settle();
+
+      if (!capturedInput) throw new Error('deterministic service was not invoked');
+      expect(capturedInput).toEqual(buildDeterministicInvokeInput('test', placeholderState, capturedInput.context));
+      expect(capturedInput.commands).toEqual([
+        ['/workflow-scripts/check.py', '--dir', '/workspace/.evolve_runs/main/current', '--lane-id', '0'],
+      ]);
+      expect(capturedInput.resultFile).toBe('.evolve_runs/main/current/check.json');
+    });
+
+    it('buildDeterministicInvokeInput scopes argv and result path to the active lane', () => {
+      const state = deterministicLoopDefinition.states.test;
+      if (state.type !== 'deterministic') throw new Error('fixture drift');
+      const laneState = {
+        ...state,
+        container: true,
+        containerScope: 'eval',
+        timeoutMs: 99,
+        run: [['/opt/check', '{laneDir}/x.json', '/workspace/.evolve_runs/main/current/y.json']],
+        resultFile: '.evolve_runs/main/current/result.json',
+      };
+      const context = {
+        ...createInitialContext(deterministicLoopDefinition),
+        taskDescription: 'task',
+        lane: {
+          id: 2,
+          dir: '/workspace/.evolve_runs/main/current/lane_2',
+          relativeDir: '.evolve_runs/main/current/lane_2',
+        },
+      };
+
+      expect(buildDeterministicInvokeInput('test', laneState, context)).toEqual({
+        stateId: 'test',
+        commands: [
+          [
+            '/opt/check',
+            '/workspace/.evolve_runs/main/current/lane_2/x.json',
+            '/workspace/.evolve_runs/main/current/lane_2/y.json',
+          ],
+        ],
+        context,
+        container: true,
+        containerScope: 'eval',
+        timeoutMs: 99,
+        resultFile: '.evolve_runs/main/current/lane_2/result.json',
       });
     });
 
@@ -987,7 +1104,7 @@ describe('buildWorkflowMachine', () => {
         states: {
           ...fanOutRoundDefinition.states,
           workers: {
-            ...fanOutRoundDefinition.states.workers,
+            ...deterministicStateOf(fanOutRoundDefinition, 'workers'),
             transitions: [{ to: 'done', when: { verdict: 'recorded' } }, { to: 'failed' }],
           },
         },
@@ -1858,6 +1975,413 @@ describe('buildWorkflowMachine', () => {
       // Guard must fail closed on empty when, falling through to safe_done
       expect(actor.getSnapshot().matches('safe_done')).toBe(true);
       expect(actor.getSnapshot().matches('should_not_reach')).toBe(false);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Engine guards: self-transitions, unmatched outputs, upstream failures
+// ---------------------------------------------------------------------------
+
+interface InvokeConfigShape {
+  invoke: {
+    onDone: Array<{ target: string; reenter?: boolean; actions?: unknown[] }>;
+    onError: unknown;
+  };
+}
+
+/** Reads a state's compiled invoke config off the built machine (shape assertions). */
+function invokeConfigOf(machine: { config: { states?: unknown } }, stateId: string): InvokeConfigShape {
+  const states = machine.config.states as Record<string, InvokeConfigShape> | undefined;
+  const state = states?.[stateId];
+  if (!state) throw new Error(`state "${stateId}" missing from machine config`);
+  return state;
+}
+
+describe('engine guards: self-transitions, unmatched outputs, upstream failures', () => {
+  const selfLoopDefinition: WorkflowDefinition = {
+    name: 'self-loop',
+    description: 'Agent state that loops onto itself until it approves',
+    initial: 'work',
+    states: {
+      work: {
+        type: 'agent',
+        description: 'Works',
+        persona: 'global',
+        prompt: 'Work.',
+        inputs: [],
+        outputs: [],
+        transitions: [
+          { to: 'done', when: { verdict: 'approved' } },
+          { to: 'work', when: { verdict: 'again' } },
+        ],
+      },
+      done: { type: 'terminal', description: 'Done' },
+    },
+  };
+
+  describe('self-transitions', () => {
+    it('re-runs the invoke and increments the visit count on each loop', async () => {
+      const { machine } = buildWorkflowMachine(selfLoopDefinition, 'task');
+      let calls = 0;
+      const testMachine = machine.provide({
+        actors: {
+          agentService: fromPromise(async () => {
+            calls += 1;
+            return calls === 1 ? makeVerdictResult('again') : makeAgentResult();
+          }),
+        },
+      });
+
+      const actor = createActor(testMachine);
+      actor.start();
+      await settle();
+
+      // Without `reenter: true` the self-target is an internal transition:
+      // the settled invoke is never restarted (one call), the visit count
+      // stays at 1, and the actor sits at `work` forever.
+      expect(calls).toBe(2);
+      expect(actor.getSnapshot().value).toBe('done');
+      expect(actor.getSnapshot().status).toBe('done');
+      expect(actor.getSnapshot().context.visitCounts.work).toBe(2);
+    });
+
+    it('marks only the self-target transition with reenter: true', () => {
+      const { machine } = buildWorkflowMachine(selfLoopDefinition, 'task');
+      const onDone = invokeConfigOf(machine, 'work').invoke.onDone;
+      expect(onDone.find((t) => t.target === 'work')?.reenter).toBe(true);
+      expect(onDone.find((t) => t.target === 'done')?.reenter).toBeUndefined();
+    });
+
+    it('marks an in-segment self-loop of a child round machine with reenter: true', () => {
+      const result = buildWorkflowMachine(fanOutRoundDefinition, 'task');
+      const roundMachine = result.roundMachinesByState.get('workers');
+      expect(roundMachine).toBeDefined();
+      // researcher -> researcher (retry) is an in-segment passthrough edge.
+      const definitionWithLoop: WorkflowDefinition = {
+        ...fanOutRoundDefinition,
+        states: {
+          ...fanOutRoundDefinition.states,
+          researcher: {
+            ...agentStateOf(fanOutRoundDefinition, 'researcher'),
+            transitions: [{ to: 'researcher', when: { verdict: 'retry' } }, { to: 'evaluate' }],
+          },
+        },
+      };
+      const loopRound = buildWorkflowMachine(definitionWithLoop, 'task').roundMachinesByState.get('workers');
+      expect(loopRound).toBeDefined();
+      const onDone = invokeConfigOf(loopRound as { config: { states?: unknown } }, 'researcher').invoke.onDone;
+      expect(onDone.find((t) => t.target === 'researcher')?.reenter).toBe(true);
+      expect(onDone.find((t) => t.target === 'evaluate')?.reenter).toBeUndefined();
+    });
+  });
+
+  describe('implicit fallback when no transition matches', () => {
+    const guardOnlyDeterministic: WorkflowDefinition = {
+      name: 'guard-only',
+      description: 'Deterministic state whose only transition is guarded',
+      initial: 'check',
+      states: {
+        check: {
+          type: 'deterministic',
+          description: 'Checks',
+          run: [['false']],
+          transitions: [{ to: 'done', guard: 'isPassed' }],
+        },
+        done: { type: 'terminal', description: 'Done' },
+        failed: { type: 'terminal', description: 'Failed' },
+      },
+    };
+
+    it('routes a deterministic result matching no transition to the error target with lastError', async () => {
+      const { machine } = buildWorkflowMachine(guardOnlyDeterministic, 'task');
+      const testMachine = machine.provide({
+        actors: {
+          deterministicService: fromPromise(async () => makeDeterministicResult({ passed: false, errors: 'exit 1' })),
+        },
+      });
+
+      const actor = createActor(testMachine);
+      actor.start();
+      await settle();
+
+      // XState drops a done event that matches no transition; without the
+      // implicit fallback the actor would stay `active` at `check` forever.
+      expect(actor.getSnapshot().value).toBe('failed');
+      expect(actor.getSnapshot().status).toBe('done');
+      expect(actor.getSnapshot().context.lastError).toBe('no transition matched (verdict none, passed=false)');
+    });
+
+    it('routes an agent verdict matching no transition to the error target with lastError', async () => {
+      const definition: WorkflowDefinition = {
+        name: 'verdict-only',
+        description: 'Agent state with a single verdict edge',
+        initial: 'work',
+        states: {
+          work: {
+            type: 'agent',
+            description: 'Works',
+            persona: 'global',
+            prompt: 'Work.',
+            inputs: [],
+            outputs: [],
+            transitions: [{ to: 'done', when: { verdict: 'approved' } }],
+          },
+          done: { type: 'terminal', description: 'Done' },
+          failed: { type: 'terminal', description: 'Failed' },
+        },
+      };
+      const { machine } = buildWorkflowMachine(definition, 'task');
+      const testMachine = machine.provide({
+        actors: { agentService: fromPromise(async () => makeVerdictResult('weird')) },
+      });
+
+      const actor = createActor(testMachine);
+      actor.start();
+      await settle();
+
+      expect(actor.getSnapshot().value).toBe('failed');
+      expect(actor.getSnapshot().status).toBe('done');
+      expect(actor.getSnapshot().context.lastError).toBe('no transition matched (verdict "weird")');
+    });
+
+    it('routes a fan-out verdict matching no transition to the error target with lastError', async () => {
+      const definition: WorkflowDefinition = {
+        name: 'fanout-verdict-only',
+        description: 'Fan-out parent with a single verdict edge',
+        initial: 'workers',
+        settings: { workers: 1 },
+        states: {
+          workers: {
+            type: 'deterministic',
+            description: 'Fan out',
+            run: [],
+            fanOut: { count: 'workers', join: 'barrier' },
+            segment: ['sample'],
+            transitions: [{ to: 'done', when: { verdict: 'recorded' } }],
+          },
+          sample: {
+            type: 'deterministic',
+            description: 'Samples',
+            run: [['sample']],
+            fanOutMember: true,
+            transitions: [{ to: 'done' }],
+          },
+          done: { type: 'terminal', description: 'Done' },
+          failed: { type: 'terminal', description: 'Failed' },
+        },
+      };
+      const { machine } = buildWorkflowMachine(definition, 'task');
+      const testMachine = machine.provide({
+        actors: {
+          fanOutService: fromPromise(async ({ input }: { input: FanOutInvokeInput }): Promise<FanOutInvokeResult> => ({
+            passed: false,
+            verdict: 'unexpected',
+            context: input.context,
+          })),
+        },
+      });
+
+      const actor = createActor(testMachine);
+      actor.start();
+      await settle();
+
+      expect(actor.getSnapshot().value).toBe('failed');
+      expect(actor.getSnapshot().status).toBe('done');
+      expect(actor.getSnapshot().context.lastError).toBe('no transition matched (verdict "unexpected")');
+    });
+
+    it('renders an unmatched untrusted verdict with control and bidi characters escaped and its length bounded', async () => {
+      // A container-written result file controls the deterministic verdict
+      // (up to 1 MiB). It reaches lastError, stderr, the tab and the gate
+      // summary, so it must not carry raw terminal controls (C1 CSI U+009B,
+      // which JSON.stringify leaves alone), bidi overrides, or its full size.
+      const definition: WorkflowDefinition = {
+        name: 'hostile-verdict',
+        description: 'Verdict-routed deterministic state with an unexpected verdict',
+        initial: 'check',
+        states: {
+          check: {
+            type: 'deterministic',
+            description: 'Classifies',
+            run: [['classify']],
+            container: true,
+            resultFile: '.workflow/result.json',
+            transitions: [{ to: 'done', when: { verdict: 'pass' } }],
+          },
+          done: { type: 'terminal', description: 'Done' },
+          failed: { type: 'terminal', description: 'Failed' },
+        },
+      };
+      const hostile = `\u009b2J\u001b]52;c;Zm9v\u0007\u202eevil${'x'.repeat(5000)}`;
+      const { machine } = buildWorkflowMachine(definition, 'task');
+      const testMachine = machine.provide({
+        actors: {
+          deterministicService: fromPromise(async () => makeDeterministicResult({ passed: true, verdict: hostile })),
+        },
+      });
+
+      const actor = createActor(testMachine);
+      actor.start();
+      await settle();
+
+      expect(actor.getSnapshot().value).toBe('failed');
+      const lastError = String(actor.getSnapshot().context.lastError ?? '');
+      expect(lastError.startsWith('no transition matched (verdict "\\u009b2J\\u001b]52;c;Zm9v\\u0007\\u202eevil')).toBe(
+        true,
+      );
+      expect(lastError).toMatch(/\.\.\.\[\+\d+ chars\]\)$/);
+      // eslint-disable-next-line no-control-regex -- asserting that no raw controls survive
+      expect(lastError).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e]/);
+      expect(lastError.length).toBeLessThan(300);
+    });
+
+    it('appends the fallback only when no author transition is unconditional', () => {
+      const { machine } = buildWorkflowMachine(selfLoopDefinition, 'task');
+      // Two author edges (both conditional) + the implicit fallback, which
+      // targets the error target (`done` is the only terminal here).
+      const loopOnDone = invokeConfigOf(machine, 'work').invoke.onDone;
+      expect(loopOnDone).toHaveLength(3);
+      expect(loopOnDone[2].target).toBe('done');
+      expect(loopOnDone[2].actions).toEqual(['storeNoTransitionMatched']);
+
+      const unconditional: WorkflowDefinition = {
+        ...selfLoopDefinition,
+        states: {
+          ...selfLoopDefinition.states,
+          work: { ...agentStateOf(selfLoopDefinition, 'work'), transitions: [{ to: 'done' }] },
+        },
+      };
+      const plainOnDone = invokeConfigOf(buildWorkflowMachine(unconditional, 'task').machine, 'work').invoke.onDone;
+      expect(plainOnDone).toHaveLength(1);
+    });
+  });
+
+  describe('upstream failure routing', () => {
+    /**
+     * `review`'s only gate-bound edge makes `findErrorTarget` pick
+     * `escalate_gate`, which is where an ordinary rejection must still go.
+     * A quota/transient failure must instead land on a terminal.
+     */
+    function gateErrorTargetDefinition(terminals: readonly string[] = ['done', 'aborted']): WorkflowDefinition {
+      const states: WorkflowDefinition['states'] = {
+        review: {
+          type: 'agent',
+          description: 'Reviews',
+          persona: 'global',
+          prompt: 'Review.',
+          inputs: [],
+          outputs: [],
+          transitions: [
+            { to: 'done', when: { verdict: 'approved' } },
+            { to: 'escalate_gate', when: { verdict: 'rejected' } },
+          ],
+        },
+        escalate_gate: {
+          type: 'human_gate',
+          description: 'Escalation',
+          acceptedEvents: ['APPROVE', 'FORCE_REVISION', 'ABORT'],
+          transitions: [
+            { to: 'done', event: 'APPROVE' },
+            { to: 'review', event: 'FORCE_REVISION' },
+            { to: terminals[1], event: 'ABORT' },
+          ],
+        },
+      };
+      for (const terminal of terminals) {
+        states[terminal] = { type: 'terminal', description: terminal };
+      }
+      return { name: 'gate-error-target', description: 'Error target resolves to a gate', initial: 'review', states };
+    }
+
+    async function rejectWith(definition: WorkflowDefinition, error: unknown) {
+      const { machine } = buildWorkflowMachine(definition, 'task');
+      const testMachine = machine.provide({
+        actors: {
+          agentService: fromPromise(async () => {
+            throw error;
+          }),
+        },
+      });
+      const actor = createActor(testMachine);
+      actor.start();
+      await settle();
+      return actor.getSnapshot();
+    }
+
+    it('sends quota exhaustion to the abort-preserving terminal instead of the gate', async () => {
+      const conversationId = createAgentConversationId();
+      const snapshot = await rejectWith(
+        gateErrorTargetDefinition(),
+        new AgentInvocationError({
+          stateId: 'review',
+          agentConversationId: conversationId,
+          cause: new WorkflowQuotaExhaustedError({ stateId: 'review', rawMessage: '429 usage limit' }),
+        }),
+      );
+      expect(snapshot.value).toBe('aborted');
+      expect(snapshot.status).toBe('done');
+      expect(snapshot.context.lastError).toContain('quota exhausted');
+      // Both onError branches run the same actions: the conversation id is still recorded.
+      expect(snapshot.context.agentConversationsByState.review).toBe(conversationId);
+    });
+
+    it('sends a transient upstream failure to the abort-preserving terminal instead of the gate', async () => {
+      const snapshot = await rejectWith(
+        gateErrorTargetDefinition(),
+        new AgentInvocationError({
+          stateId: 'review',
+          agentConversationId: createAgentConversationId(),
+          cause: new WorkflowTransientFailureError({
+            stateId: 'review',
+            kind: 'degenerate_response',
+            rawMessage: '{"usage":{"output_tokens":0}}',
+          }),
+        }),
+      );
+      expect(snapshot.value).toBe('aborted');
+      expect(snapshot.status).toBe('done');
+      expect(snapshot.context.lastError).toContain('transient upstream failure');
+    });
+
+    it('recognises a bare (unwrapped) upstream failure error too', async () => {
+      const snapshot = await rejectWith(
+        gateErrorTargetDefinition(),
+        new WorkflowQuotaExhaustedError({ stateId: 'review', rawMessage: '429' }),
+      );
+      expect(snapshot.value).toBe('aborted');
+      expect(snapshot.status).toBe('done');
+    });
+
+    it('prefers a failed terminal when the workflow has no aborted terminal, never the gate', async () => {
+      const snapshot = await rejectWith(
+        gateErrorTargetDefinition(['done', 'failed']),
+        new WorkflowQuotaExhaustedError({ stateId: 'review', rawMessage: '429' }),
+      );
+      expect(snapshot.value).toBe('failed');
+      expect(snapshot.status).toBe('done');
+    });
+
+    it('keeps routing ordinary rejections to the gate error target', async () => {
+      const snapshot = await rejectWith(gateErrorTargetDefinition(), new Error('boom'));
+      expect(snapshot.value).toBe('escalate_gate');
+      expect(snapshot.status).toBe('active');
+      expect(snapshot.context.lastError).toBe('boom');
+    });
+
+    it('collapses to a single onError transition when both targets coincide (child round machines)', () => {
+      const roundMachine = buildWorkflowMachine(fanOutRoundDefinition, 'task').roundMachinesByState.get('workers');
+      expect(roundMachine).toBeDefined();
+      const onError = invokeConfigOf(roundMachine as { config: { states?: unknown } }, 'researcher').invoke.onError;
+      expect(Array.isArray(onError)).toBe(false);
+      expect((onError as { target: string }).target).toBe('errored');
+
+      const parentOnError = invokeConfigOf(buildWorkflowMachine(gateErrorTargetDefinition(), 'task').machine, 'review')
+        .invoke.onError as Array<{ target: string; guard?: string }>;
+      expect(parentOnError).toHaveLength(2);
+      expect(parentOnError[0]).toMatchObject({ guard: '__isResumableStop', target: 'aborted' });
+      expect(parentOnError[1]).toMatchObject({ target: 'escalate_gate' });
+      expect(parentOnError[1].guard).toBeUndefined();
     });
   });
 });

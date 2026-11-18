@@ -1,5 +1,7 @@
 # Workflow Semantic Linter — Revised Design (v2)
 
+**Status (2026-11-14):** Implemented (`src/workflow/lint.ts`, `ironcurtain workflow lint`). The catalog has grown: this doc covers WF001 to WF007 (WF005 since retired) and WF016 to WF020; WF008 and WF010 to WF015 are described in `lint.ts`, and WF009 is retired.
+
 ## Why a revision
 
 The v1 design was correct in shape (pure `lint.ts` module, `LintContext`
@@ -131,6 +133,11 @@ it as "missing but worth adding," and I agree it clears the bar.
 
 ### WF005 — `parallelKey` + `worktree: true` without `settings.gitRepoPath`
 
+> **Retired.** The `parallelKey` field was removed and git worktrees were
+> never wired into the runtime, so this precondition can no longer fire and
+> the code must not be reused. `worktree` and `settings.gitRepoPath` are now
+> reported as ignored fields by WF017 (below).
+
 **What:** If any agent state has `parallelKey` set AND `worktree: true`,
 the workflow requires `settings.gitRepoPath`. Without it, worktree creation
 fails at runtime. (The reviewer correctly pointed out that the v1 check
@@ -186,6 +193,88 @@ tests don't touch the real filesystem, and the web UI could in principle
 ask the daemon's persona manager instead of stat-ing directly.
 
 **External context needed:** yes (via `LintContext`).
+
+## Later additions: fields that validate but do nothing (WF016–WF018)
+
+`validateSemantics` rejects silent no-ops where it can, but some fields
+must keep loading for backward compatibility or describe a feature that is
+only partly built. These warnings make sure an author does not rely on
+them. Messages name the field only and never echo the author's values
+(paths, commands, resource strings). The WF014 suppression for a
+self-loopable fan-out child now requires the same effective cap that WF016
+checks, so a bare `maxVisits` no longer silences it. (WF015, the warning on
+`host: true` deterministic states, is a different concern; see
+`deterministic-in-container-execution.md`.)
+
+### WF016 — visit cap that is never checked
+
+**What:** `maxVisits` is read only by the `isStateVisitLimitReached` guard
+on the same state's transitions, and only for a plain agent state. Warn on
+`maxVisits` without such a transition, on `maxVisits` on a fan-out parent
+(fan-out states count no visits), and on an `isStateVisitLimitReached`
+transition on a state without `maxVisits` (the guard is always false).
+Ordering of a wired cap stays WF008's job.
+
+**Severity:** warning. **False-positive risk:** none; each case is dead
+configuration.
+
+### WF017 — legacy fields that are accepted but ignored
+
+**What:** `settings.gitRepoPath`, agent `worktree` and terminal `cleanup`
+validate (existing manifests must still load) but nothing reads them: no
+git worktree is created, and terminal cleanup commands never run.
+
+**Severity:** warning. **False-positive risk:** none.
+
+### WF018 — lane scheduling metadata without a scheduler
+
+**What:** `schedule` (pool) and `schedule.resources` are metadata for the
+evaluation-slot pool (fan-out Phase 8), which does not exist yet. Warn on
+each separately: the pool is ignored, and resource requests are not
+enforced (all lanes share the workflow container's CPU and memory). Retire
+or narrow this code when the pool lands.
+
+**Severity:** warning. **False-positive risk:** none until the pool exists.
+
+## Later addition: fan-out width (WF019)
+
+### WF019 — fan-out wider than the default resource envelope
+
+**What:** validation caps a fan-out at `MAX_FAN_OUT_LANES` (16) lanes
+(`settings.workers` and a numeric `fanOut.count`); below that cap the
+width is legal but costly. Warn on a fan-out state whose resolved lane
+count exceeds `FAN_OUT_LANES_WARNING_THRESHOLD` (4, `lane-template.ts`).
+In shared-container mode every lane is an agent process under the one
+container's CPU and memory ceiling (`dockerResources`, default 4 CPUs /
+8 GB), so extra lanes contend instead of overlapping; otherwise each lane
+is its own agent session and takes one of the `maxConcurrentAgentSessions`
+slots (default 4), so extra lanes wait. The hint says to cap `workers` to
+the container's CPU and RAM budget or raise both settings.
+
+**Severity:** warning. **False-positive risk:** low; a host configured
+with larger `dockerResources` and `maxConcurrentAgentSessions` can run
+more lanes, and the warning is advisory there.
+
+## Later addition: model provider vs. agent harness (WF020)
+
+### WF020 — explicit model provider the state's harness does not call
+
+**What:** a Docker-mode agent state runs on its own `dockerAgent`, else
+`settings.dockerAgent`, else `claude-code` (`agent-harness.ts`). Warn when
+the state's effective model (`model`, else `settings.model`) carries an
+explicit `provider:` prefix that the harness's own client does not call:
+Claude Code calls Anthropic, Codex calls OpenAI. The typical case is a
+state moved to another harness (`dockerAgent: codex`) that still inherits
+the workflow's Anthropic model, which otherwise fails only when the state's
+first turn runs. Bare model names carry no provider and are not checked.
+Goose is never flagged (it calls whichever provider `gooseProvider` selects
+in the user's config, which the linter cannot see), and neither is builtin
+mode, which runs no harness. An unknown harness name is a validation error
+(`DOCKER_AGENTS`), so it has no lint code.
+
+**Severity:** warning. **False-positive risk:** low; a gateway provider
+profile (OpenRouter, say) can serve another provider's models to any
+harness, and the hint says to ignore the warning there.
 
 ## What's deliberately NOT in v1
 

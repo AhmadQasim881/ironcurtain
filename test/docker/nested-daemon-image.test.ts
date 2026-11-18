@@ -34,10 +34,18 @@ describe('purpose-built rootless nested daemon image', () => {
     expect(dockerfile.indexOf('/run/ironcurtain-docker/')).toBeLessThan(dockerfile.indexOf('USER 0:0'));
   });
 
-  it('keeps the image role without unused provenance arguments or static builder digests', () => {
+  it('keeps the image role without unused provenance arguments; only the Go builder may be pinned by digest', () => {
     expect(dockerfile).toContain('LABEL com.ironcurtain.docker-workload.image-role="nested-daemon"');
     expect(dockerfile).not.toContain('IRONCURTAIN_PROVENANCE_DIGEST');
-    expect(dockerfile).not.toMatch(/^FROM .*@sha256:/mu);
     expect(dockerfile).not.toContain('IRONCURTAIN_TOOLCHAIN_DIGEST');
+    // The Go toolchain that compiles the runc shim is an exact release, pinned by
+    // the digest of its index before a release (BLD-13,
+    // scripts/check-go-toolchain.ts --strict). The Docker source stays a
+    // versioned tag that the coordinator resolves once per build.
+    const lines = dockerfile.split('\n');
+    expect(lines.filter((line) => /^FROM golang:/u.test(line))).toEqual([
+      expect.stringMatching(/^FROM golang:\d+\.\d+\.\d+-[a-z]+(?:@sha256:[0-9a-f]{64})? AS shim-build$/u),
+    ]);
+    expect(lines.filter((line) => /^FROM (?!golang:).*@sha256:/u.test(line))).toEqual([]);
   });
 });

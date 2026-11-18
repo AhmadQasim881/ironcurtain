@@ -134,6 +134,22 @@
   line-height: 1.65;
   word-wrap: break-word;
   overflow-wrap: break-word;
+  /* Agent-written markdown stays inside its own box: `contain: paint` makes
+     this the containing block for fixed/absolute descendants and clips their
+     painting, `isolation` keeps stacking local. overflow-x keeps wide tables
+     scrollable instead of clipped. (The renderer in lib/markdown.ts already
+     strips style/class; this is defense in depth.) */
+  contain: paint;
+  isolation: isolate;
+  overflow-x: auto;
+}
+
+/* Untrusted text: left-to-right base direction isolated from the page, so a
+   natural RTL run reorders only within itself. Bidi control characters never
+   reach the DOM (lib/unicode-display.ts shows them as visible escapes). */
+.bidi-safe {
+  unicode-bidi: isolate;
+  direction: ltr;
 }
 .prose-markdown p {
   margin: 0.25em 0;

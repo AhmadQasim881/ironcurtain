@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type {
   LlmExchangeFilters,
   LlmStatisticsDimension,
+  LlmStatisticsMeasure,
   StatisticsExchangeDto,
   StatisticsDimensionValueDto,
   StatisticsDistributionQuery,
@@ -11,6 +12,7 @@ import type {
   StatisticsIdentitySource,
 } from '../packages/web-ui/src/lib/types.js';
 import type { IdentitySource } from '../src/llm-metrics/types.js';
+import { STATISTICS_MEASURES, type StatisticsMeasure } from '../src/llm-metrics/query-contract.js';
 
 describe('statistics frontend DTO types', () => {
   it('keeps identity-source values synchronized with the backend contract', () => {
@@ -20,6 +22,16 @@ describe('statistics frontend DTO types', () => {
     ] = [true, true];
 
     expect(parity).toEqual([true, true]);
+  });
+
+  it('mirrors the backend measure vocabulary, without the withdrawn observable stream-span rate', () => {
+    const parity: [
+      LlmStatisticsMeasure extends StatisticsMeasure ? true : false,
+      StatisticsMeasure extends LlmStatisticsMeasure ? true : false,
+    ] = [true, true];
+
+    expect(parity).toEqual([true, true]);
+    expect(STATISTICS_MEASURES).not.toContain('observableOutputTokensPerSecond');
   });
 
   it('mirror service-tier and measurement-provenance query fields', () => {
@@ -114,17 +126,18 @@ describe('statistics frontend DTO types', () => {
   });
 
   it('requires exactly one time-series bucket form at compile time', () => {
+    // Checked by `npm run typecheck:tests`. Each rejected value is one
+    // expression on the line its directive covers, built from parts the
+    // accepted cases below show to be valid on their own.
+    const range = { fromMs: 0, toMs: 1, measures: ['requestCount' as const] };
+    const buckets = { bucketMs: 60_000, calendarBucket: { unit: 'day', timeZone: 'UTC' } } as const;
     // @ts-expect-error Statistics series require a fixed or calendar bucket.
-    const missing: StatisticsSeriesQuery = { fromMs: 0, toMs: 1, measures: ['requestCount'] };
+    const missing: StatisticsSeriesQuery = { ...range };
     // @ts-expect-error Statistics series cannot use both bucket forms.
-    const duplicate: StatisticsSeriesQuery = {
-      fromMs: 0,
-      toMs: 1,
-      measures: ['requestCount'],
-      bucketMs: 60_000,
-      calendarBucket: { unit: 'day', timeZone: 'UTC' },
-    };
+    const duplicate: StatisticsSeriesQuery = { ...range, ...buckets };
+    const fixed: StatisticsSeriesQuery = { ...range, bucketMs: buckets.bucketMs };
+    const calendar: StatisticsSeriesQuery = { ...range, calendarBucket: buckets.calendarBucket };
 
-    expect([missing, duplicate]).toHaveLength(2);
+    expect([missing, duplicate, fixed, calendar]).toHaveLength(4);
   });
 });

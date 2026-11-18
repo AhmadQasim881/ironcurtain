@@ -19,7 +19,13 @@ import {
   type DaemonClient,
   type DaemonCloseInfo,
 } from '../daemon-client/daemon-client.js';
-import { renderEventBatch, renderConnected, renderSessionEnded, type RenderOptions } from './observe-renderer.js';
+import {
+  renderEventBatch,
+  renderConnected,
+  renderConnectionLost,
+  renderSessionEnded,
+  type RenderOptions,
+} from './observe-renderer.js';
 import type { TokenStreamEvent } from '../docker/token-stream-types.js';
 import type { ObserveEventSink } from './observe-tui-types.js';
 import { createObserveTui, type ObserveTui } from './observe-tui.js';
@@ -71,7 +77,7 @@ function createPlainSink(renderOptions: RenderOptions): ObserveEventSink {
       process.stderr.write(renderSessionEnded(label, reason));
     },
     connectionLost(reason: string): void {
-      process.stderr.write(`\nConnection lost: ${reason}\n`);
+      process.stderr.write(renderConnectionLost(reason));
     },
   };
 }

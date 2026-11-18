@@ -1,5 +1,7 @@
 # IronCurtain: Secure Agent Runtime -- PoC Handoff Document
 
+**Status (2026-11-14):** Historical: the proof-of-concept handoff of February 2026, kept as a record. Much has changed since (Docker Agent Mode, a central `ToolCallCoordinator` (one per session, or per shared-container workflow bundle) with the MCP proxy subprocesses reduced to relays, escalations through many front ends instead of the removed `EscalationHandler`, opt-in taint escalation, task scopes and outbound content assessment). The direct-tool-call fallback it lists beside `TrustedProcess` no longer exists: `TrustedProcess` (`src/trusted-process/index.ts`) serves only integration tests, and the builtin agent runs as `AgentSession` (`src/session/agent-session.ts`). `docs/MISSING_FEATURES.md` is the source of truth for what is implemented.
+
 **Project Name: IronCurtain**
 **Date: February 2026**
 **Author: Niels Provos**

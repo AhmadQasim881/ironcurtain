@@ -10,6 +10,7 @@
 - [ ] Modifies the sandbox boundary or V8 isolate setup
 - [ ] Adds or changes MCP server spawning, IPC, or credential handling
 - [ ] Introduces new tool argument roles or path resolution logic
+- [ ] Changes files under `src/docker/` or `src/trusted-process/`: I checked `docs/SECURITY_CONCERNS.md` and `SANDBOXING.md` against the change and corrected every statement it makes stale (a document's "Last verified against code" line moves only when the whole document is re-checked)
 - [ ] None of the above
 
 ## Test plan

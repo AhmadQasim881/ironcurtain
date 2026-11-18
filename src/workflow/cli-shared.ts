@@ -10,11 +10,12 @@
  */
 
 import { parseArgs } from 'node:util';
+import { validateWorkflowModelId } from '../config/user-config.js';
 import { runPreflight, type LintMode } from './lint-integration.js';
 import { loadDefinition } from './definition-loader.js';
 import type { Diagnostic } from './lint.js';
 import type { WorkflowDefinition } from './types.js';
-import { writeStderr, RED, CYAN, DIM, RESET } from './cli-support.js';
+import { writeStderr, displayLine, RED, CYAN, DIM, RESET } from './cli-support.js';
 
 // ---------------------------------------------------------------------------
 // Lint helpers
@@ -22,9 +23,11 @@ import { writeStderr, RED, CYAN, DIM, RESET } from './cli-support.js';
 
 export function formatDiagnostic(d: Diagnostic): string[] {
   const sevColor = d.severity === 'error' ? RED : CYAN;
-  const location = d.stateId ? ` (state: ${d.stateId})` : '';
-  const lines = [`${DIM}[${d.code}]${RESET} ${sevColor}${d.severity}${RESET} ${d.message}${location}`];
-  if (d.hint) lines.push(`  ${DIM}hint: ${d.hint}${RESET}`);
+  // Messages quote definition values (state ids, names), and `workflow
+  // inspect` lints a run directory's copy of the definition: escape them.
+  const location = d.stateId ? ` (state: ${displayLine(d.stateId)})` : '';
+  const lines = [`${DIM}[${d.code}]${RESET} ${sevColor}${d.severity}${RESET} ${displayLine(d.message)}${location}`];
+  if (d.hint) lines.push(`  ${DIM}hint: ${displayLine(d.hint)}${RESET}`);
   return lines;
 }
 
@@ -109,6 +112,25 @@ export function parseArgsStrict(opts: Omit<ParseArgsConfig, 'strict'>): ReturnTy
     writeStderr(`${DIM}Run with --help to see available options.${RESET}`);
     process.exit(1);
   }
+}
+
+/**
+ * Returns a `--model` override after checking it like the `model` field of a
+ * workflow definition (`looseModelId`: a misspelled provider such as
+ * "opnai:gpt-5" is refused rather than sent to the default provider as an
+ * opaque model name). On an invalid value it prints the reason and exits
+ * with `exitCode`, before the run has spent anything.
+ */
+export function checkedModelOverride(value: unknown, exitCode: number): string | undefined {
+  if (value === undefined) return undefined;
+  // parseArgs gives a string for `model: { type: 'string' }`; anything else fails validation.
+  const model = typeof value === 'string' ? value : '';
+  const problem = validateWorkflowModelId(model);
+  if (problem !== undefined) {
+    writeStderr(`${RED}Invalid --model ${displayLine(JSON.stringify(model))}: ${problem}${RESET}`);
+    process.exit(exitCode);
+  }
+  return model;
 }
 
 /**

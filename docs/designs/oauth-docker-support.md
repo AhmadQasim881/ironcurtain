@@ -1,6 +1,7 @@
 # Design: OAuth Support for Docker Agent Sessions
 
-**Status:** Proposed
+**Status (2026-11-14):** Implemented: OAuth credentials are detected from `~/.claude/.credentials.json` and preferred over API keys, and the real token stays on the host (`src/docker/oauth-credentials.ts`, `src/docker/oauth-token-manager.ts`).
+
 **Date:** 2026-02-28
 
 ## 1. Problem Statement
@@ -33,11 +34,12 @@ claude setup-token
 The only additional requirement is `{"hasCompletedOnboarding": true}` in `~/.claude.json`, which our entrypoint already provides.
 
 **Related env vars:**
-| Variable | Purpose |
-|---|---|
-| `CLAUDE_CODE_OAUTH_TOKEN` | Pre-configured OAuth access token |
-| `CLAUDE_CODE_OAUTH_REFRESH_TOKEN` | Refresh token for auto-renewal |
-| `CLAUDE_CODE_OAUTH_SCOPES` | Required when using refresh token |
+
+| Variable                          | Purpose                           |
+| --------------------------------- | --------------------------------- |
+| `CLAUDE_CODE_OAUTH_TOKEN`         | Pre-configured OAuth access token |
+| `CLAUDE_CODE_OAUTH_REFRESH_TOKEN` | Refresh token for auto-renewal    |
+| `CLAUDE_CODE_OAUTH_SCOPES`        | Required when using refresh token |
 
 ## 3. Current State: API Key Flow
 
@@ -98,6 +100,8 @@ function detectAuthMethod(config: IronCurtainConfig): AuthMethod;
 Each credential file is considered independently: an expired file whose refresh fails does **not** shadow a valid (or refreshable) lower-priority file — detection falls through to the next candidate.
 
 Token refresh writes back to the file the credentials were detected in, preserving that file's native format — the `AuthMethod` file variant carries a `filePath` for this. If the origin file vanished between detection and write-back, the format is decided by the target path (CLI store path → flat snake_case) so the wrong shape is never written into the Anthropic CLI's store.
+
+These files are shared with the host Claude Code, Anthropic CLI and Codex, which may read or refresh them at any time. The write-back (`saveOAuthCredentials`, `saveCodexOAuthCredentials`) is therefore atomic: a 0600 temporary file in the same directory is fsynced and renamed over the file, so the host never reads an empty or half-written file (a dotfile-managed symlink is resolved first and stays a symlink). It also re-reads the file after the refresh grant returned and keeps what the host stored meanwhile when that token no longer holds the refresh token our grant used (the host rotated it, or the user logged in again) and is still usable, or when it expires later than ours without holding the refresh token our grant just rotated away (`src/auth/refresh-write-back.ts`); the caller then uses that stored token. A file that exists but cannot be read (for example after the host CLI ran as root) is left alone and the write-back fails, since a rename needs only the directory to be writable and would otherwise replace the host's other fields with ours; a session keeps using the refreshed token from memory, and `doctor --check-refresh` reports the failed persistence. The re-read and the rename are not one atomic step, so a host write in the microseconds between them is not detected; there is no lock shared with the host CLIs.
 
 **Refresh client kind.** Claude Code and the Anthropic CLI (`ant`) are separate OAuth applications: Claude Code's client (`9d1c250a-…`) takes a form-encoded refresh grant at `platform.claude.com/v1/oauth/token`, while the Anthropic CLI's client (`41077d10-…`) takes a JSON grant at `api.anthropic.com/v1/oauth/token`. A refresh grant presented with the wrong client is rejected as `400 invalid_grant` (and the CLI's `user:developer` scope is not registered on Claude Code's client). Parsed credentials therefore carry a `clientKind` (`'anthropic-cli'` for the CLI store shape, undefined = Claude Code), and `refreshOAuthToken()` selects client ID, endpoint, and body encoding from it. The kind propagates through refreshed credentials so subsequent refreshes keep using the issuing client. Neither grant carries `workspace_id` or organization identifiers — that binding lives in the token itself.
 
@@ -192,8 +196,11 @@ export const anthropicOAuthProvider: ProviderConfig = {
   allowedEndpoints: anthropicProvider.allowedEndpoints,
   keyInjection: { type: 'bearer' },
   fakeKeyPrefix: 'sk-ant-oat01-ironcurtain-',
-  requestRewriter: stripServerSideTools,
+  requestRewriter: anthropicRequestRewriter,
   rewriteEndpoints: ['/v1/messages'],
+  // Same anthropic-messages request sanitizer as the API-key provider
+  // (see mitm-request-filtering.md).
+  sanitizedEndpoints: anthropicProvider.sanitizedEndpoints,
 };
 
 export const claudePlatformOAuthProvider: ProviderConfig = {
@@ -237,6 +244,10 @@ function extractFromKeychain(): OAuthCredentials | null {
 - Prompts the user for Keychain password if locked (acceptable UX for a one-time session start)
 - SSH sessions may need `security unlock-keychain` first
 - If Keychain access fails, fall back to API key with a helpful message
+
+**Write-back.** Credentials refreshed from a Keychain entry are written back to that entry (`writeToKeychain()`), keeping its other fields. The token JSON never appears on a command line, where any local user could read it from the process list: the update is a single `add-generic-password -U -s "<service>" -a "<account>" -X <hex>` command written to the standard input of `security -i`, with the password given as hex so the line needs no escaping, and the entry is read back afterwards, so a write `security` did not apply is an error rather than a silently lost rotated token.
+
+**Doctor.** `ironcurtain doctor` never writes the Keychain or runs a refresh grant on its own: `--check-api` sends the current access token to `GET https://api.anthropic.com/api/oauth/usage` (authenticated, runs no model) and reports whether it is accepted and when it expires; an expired access token is not validated. Only an explicit `--check-refresh` exchanges the refresh token, and only for file-stored credentials, whose rotated token it writes back like a session; Keychain-stored credentials are skipped.
 
 ### 4.6 Token refresh at session start
 

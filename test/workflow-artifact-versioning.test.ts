@@ -3,17 +3,62 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, cpSync } from 'node:fs';
-import { resolve } from 'node:path';
+import {
+  chmodSync,
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  existsSync,
+  lstatSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  truncateSync,
+  constants as fsConstants,
+} from 'node:fs';
+import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 
-// Passthrough mock so individual tests can override cpSync via mockImplementationOnce.
+// Pass-through `node:fs` with two seams, so a test can act as a live agent in
+// the shared workspace at the exact moment the host looks at or opens a path:
+// `afterLstat` runs after every lstatSync (with whether it threw), and
+// `beforeOpen` runs before every openSync.
+const fsHooks = vi.hoisted(() => ({
+  afterLstat: undefined as ((path: string, threw: boolean) => void) | undefined,
+  beforeOpen: undefined as ((path: string, flags: number) => void) | undefined,
+}));
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
-  return { ...actual, cpSync: vi.fn(actual.cpSync) };
+  const lstatSync = (path: unknown, ...rest: unknown[]): unknown => {
+    let threw = false;
+    try {
+      return (actual.lstatSync as (...args: unknown[]) => unknown)(path, ...rest);
+    } catch (error) {
+      threw = true;
+      throw error;
+    } finally {
+      fsHooks.afterLstat?.(String(path), threw);
+    }
+  };
+  const openSync = (path: unknown, flags: unknown, ...rest: unknown[]): number => {
+    fsHooks.beforeOpen?.(String(path), typeof flags === 'number' ? flags : 0);
+    return (actual.openSync as (...args: unknown[]) => number)(path, flags, ...rest);
+  };
+  return { ...actual, lstatSync, openSync };
 });
 
-import { snapshotArtifacts } from '../src/workflow/artifacts.js';
+// Pass-through so a test can fail one file copy via mockImplementationOnce.
+vi.mock('../src/hardened-fs.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/hardened-fs.js')>();
+  return { ...actual, copyRegularFileBelow: vi.fn(actual.copyRegularFileBelow) };
+});
+
+import { copyRegularFileBelow } from '../src/hardened-fs.js';
+import { SNAPSHOT_MAX_BYTES, SNAPSHOT_WALK_LIMITS, snapshotArtifacts } from '../src/workflow/artifacts.js';
+import { fifoSupported, makeFifo, startFifoUnblocker } from './helpers/fifo.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -44,6 +89,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  fsHooks.afterLstat = undefined;
+  fsHooks.beforeOpen = undefined;
   rmSync(artifactDir, { recursive: true, force: true });
 });
 
@@ -143,9 +190,8 @@ describe('snapshotArtifacts', () => {
     writeArtifactFile('broken', 'broken.md', 'triggers copy error');
     writeArtifactFile('analysis', 'analysis.md', 'analysis content');
 
-    // Fail the first cpSync call only; the second call proceeds normally.
-    const mockedCpSync = vi.mocked(cpSync);
-    mockedCpSync.mockImplementationOnce(() => {
+    // Fail the first file copy only; the second output proceeds normally.
+    vi.mocked(copyRegularFileBelow).mockImplementationOnce(() => {
       throw new Error('simulated copy failure');
     });
 
@@ -172,5 +218,165 @@ describe('snapshotArtifacts', () => {
     expect(combined).toContain(resolve(artifactDir, 'broken'));
     expect(combined).toContain(resolve(artifactDir, 'broken.v1'));
     expect(combined).toContain('simulated copy failure');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A live agent in the shared workspace
+// ---------------------------------------------------------------------------
+
+describe('snapshotArtifacts with a live agent in the workspace', () => {
+  // In shared-container mode the agent's container (a peer fan-out lane, or a
+  // background process an earlier turn left behind) keeps running while the
+  // host snapshots its outputs, so it can create entries in the half-built
+  // snapshot and swap entries in the source. The hooks above play that agent
+  // at the exact moment the host looks at or opens a path.
+  let base: string;
+  let workspace: string;
+  let workflowDir: string;
+  let hostSsh: string;
+  let stderrWrites: string[];
+  let stderrSpy: { mockRestore(): void };
+
+  const hostKey = 'ssh-ed25519 HOST key\n';
+
+  beforeEach(() => {
+    base = mkdtempSync(join(tmpdir(), 'ironcurtain-snapshot-live-'));
+    workspace = join(base, 'workspace');
+    workflowDir = join(workspace, '.workflow');
+    hostSsh = join(base, 'host-home', '.ssh');
+    mkdirSync(join(workflowDir, 'plan'), { recursive: true });
+    mkdirSync(hostSsh, { recursive: true });
+    writeFileSync(join(hostSsh, 'authorized_keys'), hostKey);
+    stderrWrites = [];
+    stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      stderrWrites.push(String(chunk));
+      return true;
+    });
+  });
+
+  afterEach(() => {
+    stderrSpy.mockRestore();
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  it('never writes through a symlink planted inside the half-built snapshot', () => {
+    writeFileSync(join(workflowDir, 'plan', 'authorized_keys'), 'ssh-ed25519 ATTACKER key\n');
+    const dest = join(workflowDir, 'plan.v1');
+    // Right after the host saw nothing at the versioned name, the agent creates
+    // it with a link to a host file at a name the copy is about to write.
+    fsHooks.afterLstat = (path, threw) => {
+      if (path !== dest || !threw) return;
+      fsHooks.afterLstat = undefined;
+      mkdirSync(dest);
+      symlinkSync(join(hostSsh, 'authorized_keys'), join(dest, 'authorized_keys'));
+    };
+
+    snapshotArtifacts(workflowDir, ['plan'], 2, new Set(), workspace);
+
+    expect(fsHooks.afterLstat).toBeUndefined(); // the agent really acted
+    expect(readFileSync(join(hostSsh, 'authorized_keys'), 'utf-8')).toBe(hostKey);
+    expect(lstatSync(join(dest, 'authorized_keys')).isSymbolicLink()).toBe(true);
+    expect(stderrWrites.join('')).toContain('snapshotArtifacts: failed to copy');
+  });
+
+  it('creates nothing with content in a host directory the snapshot directory is swapped for', () => {
+    writeFileSync(join(workflowDir, 'plan', 'notes.md'), 'attacker content');
+    const dest = join(workflowDir, 'plan.v1');
+    fsHooks.beforeOpen = (path, flags) => {
+      if ((flags & fsConstants.O_CREAT) === 0 || !path.endsWith(join('plan.v1', 'notes.md'))) return;
+      fsHooks.beforeOpen = undefined;
+      renameSync(dest, join(workflowDir, 'plan.v1-moved'));
+      symlinkSync(hostSsh, dest);
+    };
+
+    snapshotArtifacts(workflowDir, ['plan'], 2, new Set(), workspace);
+
+    expect(fsHooks.beforeOpen).toBeUndefined();
+    const strays = readdirSync(hostSsh).filter((name) => name !== 'authorized_keys');
+    if (process.platform === 'linux') {
+      // Located through /proc/self/fd before anything was written, and removed.
+      expect(strays).toEqual([]);
+    } else {
+      for (const name of strays) expect(statSync(join(hostSsh, name)).size).toBe(0);
+    }
+    expect(readFileSync(join(hostSsh, 'authorized_keys'), 'utf-8')).toBe(hostKey);
+    expect(stderrWrites.join('')).toContain('snapshotArtifacts: failed to copy');
+  });
+
+  it('never copies a host file when a source file is swapped for a link to it', () => {
+    writeFileSync(join(hostSsh, 'id_ed25519'), 'PRIVATE KEY');
+    writeFileSync(join(workflowDir, 'plan', 'notes.md'), 'notes');
+    writeFileSync(join(workflowDir, 'plan', 'plan.md'), 'the plan');
+    fsHooks.beforeOpen = (path, flags) => {
+      if ((flags & fsConstants.O_CREAT) !== 0 || !path.endsWith(join('.workflow', 'plan', 'notes.md'))) return;
+      fsHooks.beforeOpen = undefined;
+      rmSync(join(workflowDir, 'plan', 'notes.md'));
+      symlinkSync(join(hostSsh, 'id_ed25519'), join(workflowDir, 'plan', 'notes.md'));
+    };
+
+    snapshotArtifacts(workflowDir, ['plan'], 2, new Set(), workspace);
+
+    expect(fsHooks.beforeOpen).toBeUndefined();
+    expect(existsSync(join(workflowDir, 'plan.v1', 'notes.md'))).toBe(false);
+    expect(readFileSync(join(workflowDir, 'plan.v1', 'plan.md'), 'utf-8')).toBe('the plan');
+  });
+
+  it.skipIf(!fifoSupported)('copies only regular files: FIFOs and symlinks are skipped without blocking', () => {
+    writeFileSync(join(workflowDir, 'plan', 'plan.md'), 'the plan');
+    makeFifo(join(workflowDir, 'plan', 'pipe'));
+    symlinkSync(join(hostSsh, 'authorized_keys'), join(workflowDir, 'plan', 'keys'));
+    const unblocker = startFifoUnblocker(join(workflowDir, 'plan', 'pipe'));
+    const started = Date.now();
+    try {
+      snapshotArtifacts(workflowDir, ['plan'], 2, new Set(), workspace);
+    } finally {
+      unblocker.stop();
+    }
+
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(readdirSync(join(workflowDir, 'plan.v1'))).toEqual(['plan.md']);
+  });
+
+  it('refuses to copy more than SNAPSHOT_MAX_BYTES', () => {
+    writeFileSync(join(workflowDir, 'plan', 'plan.md'), 'the plan');
+    // Sparse, so it costs no disk here, but a plain copy would write a GiB.
+    writeFileSync(join(workflowDir, 'plan', 'huge.bin'), '');
+    truncateSync(join(workflowDir, 'plan', 'huge.bin'), SNAPSHOT_MAX_BYTES + 1);
+    const started = Date.now();
+
+    snapshotArtifacts(workflowDir, ['plan'], 2, new Set(), workspace);
+
+    expect(Date.now() - started).toBeLessThan(5000);
+    expect(existsSync(join(workflowDir, 'plan.v1', 'huge.bin'))).toBe(false);
+    expect(stderrWrites.join('')).toContain(`more than ${SNAPSHOT_MAX_BYTES} bytes to copy`);
+  });
+
+  it('reports a snapshot cut short by the walk limits as partial', () => {
+    let deepest = join(workflowDir, 'plan');
+    for (let level = 0; level <= SNAPSHOT_WALK_LIMITS.maxDepth + 1; level++) deepest = join(deepest, 'd');
+    mkdirSync(deepest, { recursive: true });
+    writeFileSync(join(deepest, 'too-deep.md'), 'unreachable');
+    writeFileSync(join(workflowDir, 'plan', 'plan.md'), 'the plan');
+
+    snapshotArtifacts(workflowDir, ['plan'], 2, new Set(), workspace);
+
+    expect(readFileSync(join(workflowDir, 'plan.v1', 'plan.md'), 'utf-8')).toBe('the plan');
+    expect(stderrWrites.join('')).toContain('the snapshot is partial');
+  });
+
+  it('keeps permission bits, nested output names and empty outputs', () => {
+    writeFileSync(join(workflowDir, 'plan', 'run.sh'), '#!/bin/sh\n');
+    chmodSync(join(workflowDir, 'plan', 'run.sh'), 0o755);
+    mkdirSync(join(workflowDir, 'empty'));
+    mkdirSync(join(workflowDir, 'reviews', 'round1'), { recursive: true });
+    writeFileSync(join(workflowDir, 'reviews', 'round1', 'review.md'), 'lgtm');
+
+    snapshotArtifacts(workflowDir, ['plan', 'empty', 'reviews/round1'], 2, new Set(), workspace);
+
+    expect(statSync(join(workflowDir, 'plan.v1', 'run.sh')).mode & 0o777).toBe(0o755);
+    expect(readdirSync(join(workflowDir, 'empty.v1'))).toEqual([]);
+    expect(readFileSync(join(workflowDir, 'reviews', 'round1.v1', 'review.md'), 'utf-8')).toBe('lgtm');
+    expect(stderrWrites.join('')).toBe('');
   });
 });

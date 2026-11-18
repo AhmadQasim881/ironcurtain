@@ -30,9 +30,13 @@
     expanded: boolean;
     children: TreeNode[] | null;
     loading: boolean;
+    // The daemon lists at most 2,000 entries per directory; true when this
+    // directory's listing stopped early.
+    truncated: boolean;
   }
 
   let roots = $state<TreeNode[]>([]);
+  let rootTruncated = $state(false);
   let rootLoading = $state(true);
   let error = $state('');
   // Bumped by every load/reconcile; an in-flight async pass that finds its
@@ -70,6 +74,7 @@
       const res = await fetchFileTree(id);
       if (version !== loadVersion) return;
       roots = res.entries.map((e) => entryToNode(e, ''));
+      rootTruncated = res.truncated === true;
     } catch (err) {
       if (version !== loadVersion) return;
       error = err instanceof Error ? err.message : String(err);
@@ -88,6 +93,7 @@
       // A newer pass may have started while we were merging; don't clobber it.
       if (version !== loadVersion) return;
       roots = merged;
+      rootTruncated = res.truncated === true;
     } catch {
       // Keep the existing tree on a transient refresh failure.
     } finally {
@@ -136,6 +142,7 @@
                 // unguarded, unlike the top-level `roots = merged`).
                 if (version !== loadVersion) return;
                 node.children = childResult;
+                node.truncated = sub.truncated === true;
               } catch {
                 // Keep previously loaded children if this sub-fetch fails.
               }
@@ -161,6 +168,7 @@
       expanded: false,
       children: null,
       loading: false,
+      truncated: false,
     };
   }
 
@@ -177,6 +185,7 @@
       try {
         const res = await fetchFileTree(workflowId, node.path);
         node.children = res.entries.map((e) => entryToNode(e, node.path));
+        node.truncated = res.truncated === true;
       } catch {
         node.children = [];
       }
@@ -219,6 +228,11 @@
         {@render treeItem(node, 0)}
       {/each}
     </ul>
+    {#if rootTruncated}
+      <p class="text-muted-foreground text-[10px] px-2 py-1" data-testid="file-tree-truncated">
+        Listing truncated: showing the first {roots.length} entries.
+      </p>
+    {/if}
   {/if}
 </div>
 
@@ -252,6 +266,15 @@
         {#each node.children as child (child.path)}
           {@render treeItem(child, depth + 1)}
         {/each}
+        {#if node.truncated}
+          <li
+            class="text-muted-foreground text-[10px] py-0.5"
+            style="padding-left: {(depth + 1) * 16 + 8}px"
+            data-testid="file-tree-truncated"
+          >
+            Listing truncated: showing the first {node.children.length} entries.
+          </li>
+        {/if}
       </ul>
     {/if}
   </li>

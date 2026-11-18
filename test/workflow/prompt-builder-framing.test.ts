@@ -9,7 +9,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { buildAgentCommand } from '../../src/workflow/prompt-builder.js';
+import { RESUME_NOTICE, buildAgentCommand, buildAgentReplacementCommand } from '../../src/workflow/prompt-builder.js';
 import type { AgentStateDefinition, WorkflowContext, WorkflowDefinition } from '../../src/workflow/types.js';
 
 // ---------------------------------------------------------------------------
@@ -310,5 +310,66 @@ describe('buildAgentCommand — scoping section (body + notes)', () => {
     // Directive/Notes split is only used for cross-state handoffs
     expect(command).not.toContain('### Directive');
     expect(command).not.toContain('### Notes');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Resume notice (state replayed from its start after `workflow resume`)
+// ---------------------------------------------------------------------------
+
+describe('buildAgentCommand — resume notice', () => {
+  const SECTION_SEPARATOR = '\n\n---\n\n';
+
+  it('opens a first-visit prompt with the notice when the state is replayed after resume', () => {
+    const state = makeAgentState();
+    const context = makeContext({ humanPrompt: 'Please revise.' });
+
+    const command = buildAgentCommand('work', state, context, definition, { resumeReplay: true });
+
+    expect(command.startsWith(`${RESUME_NOTICE}${SECTION_SEPARATOR}`)).toBe(true);
+    // The rest of the prompt is unchanged, human feedback still before the role.
+    expect(command.slice(RESUME_NOTICE.length + SECTION_SEPARATOR.length)).toBe(
+      buildAgentCommand('work', state, context, definition),
+    );
+    expect(RESUME_NOTICE).toContain('Inspect the workspace');
+    expect(RESUME_NOTICE).toContain('Do not repeat actions outside the workspace');
+  });
+
+  it('opens a re-visit prompt (freshSession: false) with the notice too', () => {
+    const state = makeAgentState({ freshSession: false });
+    const context = makeContext({ visitCounts: { work: 3 }, previousStateName: 'review', previousAgentOutput: 'x' });
+
+    const command = buildAgentCommand('work', state, context, definition, { resumeReplay: true });
+
+    expect(command).toContain('## Round');
+    expect(command.startsWith(`${RESUME_NOTICE}${SECTION_SEPARATOR}`)).toBe(true);
+  });
+
+  it('adds the notice to a fresh replacement prompt for a replayed state', () => {
+    const state = makeAgentState();
+    const command = buildAgentReplacementCommand(
+      'work',
+      state,
+      makeContext(),
+      definition,
+      { incompleteOutputExcerpts: ['partial'] },
+      { resumeReplay: true },
+    );
+
+    expect(command.startsWith(RESUME_NOTICE)).toBe(true);
+    expect(command).toContain('## Recovery handoff');
+  });
+
+  it('leaves ordinary invocations without the notice', () => {
+    const state = makeAgentState();
+    const revisit = makeAgentState({ freshSession: false });
+    for (const command of [
+      buildAgentCommand('work', state, makeContext(), definition),
+      buildAgentCommand('work', state, makeContext(), definition, { resumeReplay: false }),
+      buildAgentCommand('work', revisit, makeContext({ visitCounts: { work: 2 } }), definition),
+      buildAgentReplacementCommand('work', state, makeContext(), definition, { incompleteOutputExcerpts: [] }),
+    ]) {
+      expect(command).not.toContain('Resumed after an interruption');
+    }
   });
 });

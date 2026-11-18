@@ -1,5 +1,7 @@
 /** Exact per-session accounting for the strict package-egress proxy. */
 
+import { MAX_REGISTRY_METADATA_BYTES } from './registry-metadata.js';
+
 export interface PackageEgressClock {
   now(): number;
 }
@@ -16,6 +18,12 @@ export interface PackageEgressLimits {
   readonly maxConcurrentUpstreams: number;
   readonly maxBytesPerRequest: number;
   readonly maxSessionBytes: number;
+  /**
+   * Largest source-owned metadata document read for one artifact decision.
+   * It is scanned as it streams, never buffered; its bytes also count against
+   * the per-request and per-session ceilings.
+   */
+  readonly maxDerivedMetadataBytes: number;
   readonly absoluteTimeoutMs: number;
   readonly idleTimeoutMs: number;
   readonly tlsHandshakeMaxBytes: number;
@@ -36,6 +44,7 @@ export const DEFAULT_PACKAGE_EGRESS_LIMITS: PackageEgressLimits = Object.freeze(
   maxConcurrentUpstreams: 24,
   maxBytesPerRequest: 2 * 1024 * 1024 * 1024,
   maxSessionBytes: 16 * 1024 * 1024 * 1024,
+  maxDerivedMetadataBytes: MAX_REGISTRY_METADATA_BYTES,
   absoluteTimeoutMs: 10 * 60_000,
   idleTimeoutMs: 60_000,
   tlsHandshakeMaxBytes: 64 * 1024,
@@ -251,6 +260,7 @@ function validateLimits(limits: PackageEgressLimits): void {
     'maxConcurrentUpstreams',
     'maxBytesPerRequest',
     'maxSessionBytes',
+    'maxDerivedMetadataBytes',
     'absoluteTimeoutMs',
     'idleTimeoutMs',
     'tlsHandshakeMaxBytes',

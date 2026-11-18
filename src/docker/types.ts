@@ -23,6 +23,13 @@ export interface DockerContainerConfig {
   /** Environment variables passed to the container. */
   readonly env: Readonly<Record<string, string>>;
 
+  /**
+   * Values delivered to `docker create` through bare --env names, outside argv.
+   * They remain Docker metadata; flattened snapshots omit known runtime
+   * admission/proxy variables, rather than sanitizing arbitrary image ENV.
+   */
+  readonly privateEnv?: Readonly<Record<string, string>>;
+
   /** Command to execute (CMD). */
   readonly command: readonly string[];
 
@@ -95,7 +102,9 @@ export interface DockerContainerConfig {
    *
    * Agent containers add capabilities needed for `sudo apt-get install`
    * to work inside the container (SETUID, SETGID, CHOWN, FOWNER,
-   * DAC_OVERRIDE, AUDIT_WRITE). Service containers may need additional
+   * DAC_OVERRIDE, AUDIT_WRITE), unless the user disabled agent sudo
+   * (`agentSudo: false`), in which case they add none. The decision lives in
+   * `agent-privileges.ts`. Service containers may need additional
    * capabilities for their entrypoints.
    */
   readonly capAdd?: readonly string[];
@@ -158,9 +167,11 @@ export interface DockerContainerConfig {
    * Used on Linux to start the agent container as `0:0` so the
    * entrypoint can renumber the baked codespace user to match the
    * host UID/GID before dropping privileges (see issue #232 and
-   * `docker/entrypoint-claude-code.sh`). Must be omitted on macOS,
+   * `docker/entrypoint-claude-code.sh`). Must not be `0:0` on macOS,
    * where Docker Desktop's VirtioFS translates UIDs transparently and
-   * passing `--user 0:0` would defeat that translation.
+   * passing `--user 0:0` would defeat that translation. A sudo-off agent
+   * (`agentSudo: false`) runs as the numeric image UID (`1000`) on every
+   * Docker host instead, never as root (see `agent-privileges.ts`).
    *
    * When this is set to anything other than `codespace`, every
    * `docker exec` against the container must pass `--user codespace`
@@ -198,9 +209,27 @@ export interface DockerTrustedDeviceMapping {
 }
 
 /**
- * Docker-only create controls for trusted infrastructure containers.
- * Callers must supply frozen, coordinator-owned values rather than forwarding
- * configuration or agent input.
+ * A per-process resource limit emitted as `--ulimit <name>=<soft>:<hard>`.
+ *
+ * Only `nofile` is supported. `nproc` is deliberately not offered: Docker
+ * documents that RLIMIT_NPROC is per user, not per container. It counts every
+ * process of the real UID in the user namespace, and without user-namespace
+ * remapping the agent runs as the host user's UID, so the limit would include
+ * the host user's own processes and could stop the agent from forking at all
+ * (while root-owned sidecars are exempt from it). The cgroup `pidsLimit` is
+ * the container-scoped process bound instead.
+ */
+export interface DockerUlimit {
+  readonly name: 'nofile';
+  readonly soft: number;
+  readonly hard: number;
+}
+
+/**
+ * Docker-only create controls for infrastructure and agent containers.
+ * Callers supply values selected by the host coordinator (fixed profiles, or
+ * validated operator configuration such as `dockerResources.pidsLimit`);
+ * nothing here may be derived from agent input.
  */
 export interface DockerTrustedCreateOptions {
   readonly namedVolumeMounts?: readonly DockerNamedVolumeMount[];
@@ -212,20 +241,50 @@ export interface DockerTrustedCreateOptions {
   readonly securityOptions?: readonly string[];
   /** Host path or Docker literal used as `--security-opt seccomp=<value>`. */
   readonly seccompProfile?: string;
+  /** cgroup pids controller ceiling (`--pids-limit`); bounds fork bombs per container. */
   readonly pidsLimit?: number;
+  /** Per-process limits (`--ulimit`). See {@link DockerUlimit} for why only `nofile` is offered. */
+  readonly ulimits?: readonly DockerUlimit[];
 }
 
 /** Result of a docker exec command. */
 export interface DockerExecResult {
+  /**
+   * Process exit code as reported by the runtime CLI. When the host-side
+   * deadline fired (`timedOut`), this is {@link EXEC_TIMED_OUT_EXIT_CODE}
+   * (124, coreutils' `timeout` convention) regardless of what the CLI
+   * reported: the Docker CLI exits 0 on SIGTERM, which must never read as
+   * a completed command.
+   */
   readonly exitCode: number;
   readonly stdout: string;
   readonly stderr: string;
+  /**
+   * True when the host-side `timeoutMs` deadline ended the exec: Node
+   * signalled the runtime CLI (or, for an exec implementation that cannot
+   * report that, the monotonic deadline passed; see `exec-deadline.ts`).
+   * Only the host `docker exec` / `container exec` client was signalled:
+   * the process inside the container may still be running.
+   * Callers that need the in-container process stopped wrap the command with
+   * `turn-timeout.ts`, which runs it under coreutils `timeout` and sweeps
+   * survivors by marker after any detected timeout. Absent (never `false`)
+   * on results that completed before the deadline.
+   */
+  readonly timedOut?: boolean;
 }
+
+/** Exit code reported for a host-deadline hit; mirrors coreutils `timeout`. */
+export const EXEC_TIMED_OUT_EXIT_CODE = 124;
 
 export interface DockerCommitOptions {
   readonly tag?: string;
   readonly changes?: readonly string[];
   readonly pause?: boolean;
+  /**
+   * Upper bound, in milliseconds, on the whole commit: a flattened commit's
+   * config inspect, export and import share it, so a caller with a deadline
+   * can rely on it. Zero disables it.
+   */
   readonly timeoutMs?: number;
   /**
    * When true, snapshot through docker export/import instead of docker commit
@@ -237,6 +296,16 @@ export interface DockerCommitOptions {
    * source container, so a flattened image still behaves like its source.
    */
   readonly flatten?: boolean;
+}
+
+/** How an image build may use the builder's layer cache. */
+export interface ImageBuildOptions {
+  /**
+   * Run every step again instead of reusing cached layers (`--no-cache`), so
+   * an unpinned install step (an agent CLI override of `latest`) fetches the
+   * current release. Used by `ironcurtain images rebuild`.
+   */
+  readonly noCache?: boolean;
 }
 
 export interface DockerImageInfo {
@@ -278,6 +347,18 @@ export interface DockerVolumeInfo {
   readonly labels: Readonly<Record<string, string>>;
   readonly driver: string;
   readonly mountpoint: string;
+}
+
+/**
+ * A runtime-owned host file holding one container's writable storage (Apple:
+ * the VM's rootfs image). The identity is pinned when the container is
+ * created, so a later measurement can refuse a substituted file.
+ */
+export interface ContainerStorageDescriptor {
+  readonly kind: 'host-file';
+  readonly path: string;
+  readonly device: number;
+  readonly inode: number;
 }
 
 export interface DockerVolumeCreateOptions {
@@ -329,11 +410,33 @@ export interface ContainerRuntime {
   readContainerLogTail?(nameOrId: string): Promise<string>;
 
   /**
+   * Stream a container's complete stdout/stderr log (`docker logs` /
+   * `container logs`, no follow) into `sink`, which is left open for the
+   * caller to end. Unlike `readContainerLogTail` there is no cap and the
+   * runtime keeps no copy: diagnostic capture wants the whole log, and
+   * crash-looping containers, the ones worth diagnosing, are the ones whose
+   * logs overflow a buffer. Resolves once the runtime CLI has exited and all
+   * its output was handed to `sink`; rejects when the CLI cannot be spawned,
+   * exits non-zero (the message then quotes the tail of its stderr, which
+   * carries the container's own stderr output) or stays silent past an idle
+   * timeout. Optional across runtimes.
+   */
+  streamContainerLogs?(nameOrId: string, sink: NodeJS.WritableStream): Promise<void>;
+
+  /**
    * Execute a command inside a running container via `docker exec`.
    * Returns when the command exits. Both stdout and stderr are captured.
    *
-   * @param timeoutMs - kill the exec process after this many ms. Zero disables
-   *   the timeout; undefined uses the runtime's default timeout.
+   * @param timeoutMs - host-side deadline in ms. Zero disables it; undefined
+   *   uses the runtime's default timeout. When it passes, the host CLI client
+   *   is terminated and the result carries `timedOut: true` with exit code
+   *   124 (see `DockerExecResult`). The deadline is detected from the killed
+   *   child, never from the CLI's exit code (the Docker CLI exits 0 on
+   *   SIGTERM); monotonic elapsed time decides only when the exec
+   *   implementation cannot report `killed` (see `exec-deadline.ts`). This
+   *   layer does not stop the process inside the container;
+   *   `turn-timeout.ts` does, for agent turns and for workflow
+   *   deterministic commands (`runBoundedContainerCommand`).
    * @param execUser - override the exec user via `docker exec --user <value>`.
    *   - `undefined` (default): pins `--user codespace`, the correct behavior
    *     for agent containers (which on Linux are created with `--user 0:0`
@@ -399,6 +502,24 @@ export interface ContainerRuntime {
   inspectImage(ref: string): Promise<DockerImageInfo | undefined>;
 
   /**
+   * Size in bytes of a container's whole filesystem (`SizeRootFs` of
+   * `container inspect --size`: image layers plus the writable layer, without
+   * mounts), which is what a flattened snapshot exports and imports. Bounded
+   * by `timeoutMs`; undefined when it cannot be determined. Optional: only the
+   * snapshot pre-check uses it.
+   */
+  containerSize?(nameOrId: string, timeoutMs?: number): Promise<number | undefined>;
+
+  /**
+   * The engine's data root (`DockerRootDir`) when the engine runs on this
+   * host and the path exists here, so its free space can be checked before a
+   * snapshot import. Bounded by `timeoutMs` (at most 10 seconds). Undefined
+   * for a remote or VM-backed engine, or when it cannot be determined.
+   * Optional: only the snapshot pre-check uses it.
+   */
+  localDataRoot?(timeoutMs?: number): Promise<string | undefined>;
+
+  /**
    * Create a second local reference for an image. Optional because the Apple
    * selected-agent capture path is the only caller that needs to pin a
    * mutable logical tag before exporting it.
@@ -421,6 +542,7 @@ export interface ContainerRuntime {
     contextDir: string,
     labels?: Record<string, string>,
     buildArgs?: Readonly<Record<string, string>>,
+    options?: ImageBuildOptions,
   ): Promise<void>;
 
   /** Read a label value from a Docker image. Returns undefined if image or label doesn't exist. */
@@ -440,11 +562,26 @@ export interface ContainerRuntime {
   /** Create a Docker network. No-op if it already exists. */
   createNetwork(name: string, options?: DockerNetworkCreateOptions): Promise<void>;
 
-  /** Enumerate Docker networks. Optional for non-Docker runtimes. */
-  listNetworks?(): Promise<readonly DockerNetworkInfo[]>;
+  /**
+   * Enumerate Docker networks. `labelFilter` (`key` or `key=value`) is applied
+   * by the daemon, so a filtered inventory never inspects foreign networks.
+   * Optional for non-Docker runtimes.
+   */
+  listNetworks?(options?: { readonly labelFilter?: string }): Promise<readonly DockerNetworkInfo[]>;
 
   /** Enumerate Docker containers, including stopped containers. Optional for non-Docker runtimes. */
   listContainers?(options?: { readonly labelFilter?: string }): Promise<readonly DockerContainerInfo[]>;
+
+  /**
+   * Inspect exactly one container by immutable ID or name. Resolves `undefined`
+   * only when the runtime reports the object absent; every other failure
+   * rejects, so absence is never inferred from an error. Docker may resolve a
+   * name term as an ID prefix, so callers compare the returned name or ID.
+   */
+  inspectContainer?(nameOrId: string): Promise<DockerContainerInfo | undefined>;
+
+  /** Inspect exactly one network by immutable ID or name, with {@link inspectContainer}'s absence contract. */
+  inspectNetwork?(nameOrId: string): Promise<DockerNetworkInfo | undefined>;
 
   /**
    * Return Docker's unmodified container-inspect object. Optional because its
@@ -470,6 +607,21 @@ export interface ContainerRuntime {
 
   /** Remove a named Docker volume. Already-absent volumes are ignored. Optional for non-Docker runtimes. */
   removeVolume?(name: string): Promise<void>;
+
+  /**
+   * Sizes of the local named volumes as the Engine's own disk-usage report
+   * gives them: the outer daemon walks each volume, so the number does not come
+   * from anything inside a container. The CLI rounds to four significant
+   * digits; `null` marks a volume the Engine could not size. Docker only.
+   */
+  measureVolumeUsage?(timeoutMs: number): Promise<ReadonlyMap<string, number | null>>;
+
+  /**
+   * Resolve the runtime-owned host file holding one container's writable root
+   * filesystem. Apple only: each container is a VM whose rootfs image lives
+   * under the runtime's application data root.
+   */
+  describeContainerStorage?(nameOrId: string): Promise<ContainerStorageDescriptor>;
 
   /** Pull a Docker image from a registry. */
   pullImage(image: string): Promise<void>;

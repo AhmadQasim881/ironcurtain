@@ -1,5 +1,7 @@
 # Sequence-Aware Policy Evaluation
 
+**Status (2026-11-14):** Partial: slice 1 implemented, opt-in (`taintEscalation.enabled`, default off): a monotonic per-session taint flag and human-only escalation of sink tools in a tainted session. See [Slice 1: what is implemented](#slice-1-what-is-implemented) for the exact behaviour, the default source and sink lists, and how it differs from the proposal below. Session predicates in compiled rules and Docker-mode fact sources are later slices.
+
 ## Problem Statement
 
 IronCurtain's PolicyEngine evaluates each tool call independently — it sees `{tool, arguments}` and produces `allow | deny | escalate` with no memory of prior actions in the session. This is sufficient for a coding agent with a narrow tool set, but for general-purpose agents the actual risk surface depends on how actions **compose**.
@@ -217,3 +219,99 @@ This provides the strongest guarantees but requires a custom execution model inc
 5. **Extend the auto-approver** to handle `taint-escalation` by evaluating action consistency against user intent
 6. **Extend the audit log** to record taint events and taint-escalation decisions with provenance
 7. **Persist taint status** across session suspend/resume
+
+Slice 1 implements steps 2, 4, 6 and 7, and a deterministic stand-in for steps 1 and 3; step 5 is deliberately not implemented. Details and the reasons follow.
+
+## Slice 1: what is implemented
+
+Code: `src/trusted-process/taint-policy.ts` (classification, session state, the decision override, audit replay), wired through `ToolCallCoordinator` (owns the state), `tool-call-pipeline.ts` (applies it) and `egress-policy.ts` (MITM egress decisions mark it); the workflow orchestrator hands a resumed run's earlier bundle audit logs to the bundles it mints (`src/workflow/orchestrator.ts`). Shared types: `src/types/taint.ts`; audit field: `AuditEntry.taint` in `src/types/audit.ts`. Tests: `test/taint-policy.test.ts`, `test/workflow/orchestrator-taint-resume.test.ts`.
+
+### Opt-in configuration
+
+Off by default. Enable it in `~/.ironcurtain/config.json` or with `ironcurtain config` (Security, "Taint escalation"):
+
+```json
+{
+  "taintEscalation": {
+    "enabled": true,
+    "tools": {
+      "slack/read_channel": "source",
+      "slack/post_message": "sink",
+      "google-workspace/gsheets_format_cells": "none"
+    }
+  }
+}
+```
+
+`tools` is optional. Keys are `server/tool`, or `server/*` for every tool of a server; values are `source`, `sink`, `both` or `none`. A tool key beats its server's key, which beats the default profile. The block is validated strictly: a misspelled field or key is a configuration error rather than a protection silently left off. Nothing is backfilled into existing config files. When disabled, the coordinator builds no taint state at all: the pipeline behaves exactly as before and no audit record carries taint facts.
+
+The setting applies to every session built from the user config: interactive and one-shot sessions in Code Mode and Docker Agent Mode, daemon and cron sessions, and workflow bundles.
+
+### Default classification
+
+A **source** is a tool whose result can carry content other people wrote. A **sink** is a tool that can deliver data to other people or act where they see it: send, post, push, share. The classification is a static table in `DEFAULT_TAINT_PROFILES` (no LLM is involved). Every tool the shipped annotations describe for the built-in servers is named in exactly one list; `test/taint-policy.test.ts` fails when a re-annotation adds, removes or renames a tool until it is classified.
+
+| Server | Sources | Sinks | Neither |
+| --- | --- | --- | --- |
+| `fetch` | `http_fetch`, `web_search` | none | none |
+| `git` | `git_clone`, `git_fetch`, `git_pull` (remote content enters the workspace) | `git_push` | every local operation (`git_add`, `git_commit`, `git_log`, `git_show`, `git_remote`, ...) |
+| `github` | every read: issues, pull requests, comments, files, commits, releases, tags, branches, labels, searches, teams | every write: comments, issues and sub-issues, pull requests and reviews, file pushes and deletes, branches, merges, repositories, forks, Copilot assignment and review requests | `get_me` |
+| `google-workspace` | Gmail reads (search, message, thread, batches); calendar events, instances, calendar lists and calendar metadata; Drive search, listings, file reads, exports, metadata, permissions and revisions; Docs and Sheets reads, exports, listings and metadata | `gmail_send_message`; calendar event create, update, quick-add, move and delete (they notify attendees), `calendar_calendars_update`, `calendar_acl_insert`; every Drive change (upload, create, copy, move, rename, update, delete, empty trash, folders, sharing and permission changes); every Docs and Sheets change | labels (`gmail_list_labels`, `gmail_modify_labels`, `gmail_batch_modify_labels`, `gmail_manage_label`), `gmail_draft_message` (a draft is not sent), `calendar_freebusy_query`, `calendar_colors_get`, `calendar_settings_list`, `calendar_acl_list`, `calendar_calendars_insert` |
+| `filesystem` | none | none | every tool (the workspace is not a source in this slice) |
+| `proxy` (Docker Agent Mode) | `add_proxy_domain` (an approved passthrough tunnel lets content reach the agent without another MCP call) | none | `remove_proxy_domain`, `list_proxy_domains` |
+| `network` (Docker Agent Mode, policy-evaluated MITM egress) | `request`: a destination the egress gate admits, by rule or by a human (the container then reaches it without another MCP call, like an approved `add_proxy_domain`) | none (like `http_fetch`: the destinations stay gated by the egress rules) | none |
+
+Why Drive, Docs and Sheets writes are sinks: a file or folder may be shared, so a write there can deliver data to its collaborators (an attacker who shares an editable document with the user is a known exfiltration route). Narrow it per tool with `"none"` when that does not apply.
+
+A tool of `fetch`, `git`, `github` or `google-workspace` that the table does not name (a newer server release that the user re-annotated) counts as both a source and a sink. A tool of `filesystem` that it does not name, and every tool of a server without a profile (user-added servers), counts as neither unless configured. Trusted servers (the built-in memory server) skip annotations and compiled rules, and their own per-tool policy (`trusted-server-policy.ts`) alone decides their calls, so they are never sinks; they can be configured as sources.
+
+### Decision rule
+
+When a sink call is evaluated in a tainted session (`evaluateWithTaint`):
+
+1. `deny` stays `deny`.
+2. `allow` becomes `escalate` with rule `taint-escalation`, a reason naming what tainted the session and the rule that would have allowed it, and `humanOnly` set.
+3. `escalate` stays `escalate` under its own rule and escalated roles, with `humanOnly` set and the taint noted in its reason.
+
+With the opt-in outbound content assessment on (see [outbound-content-assessment.md](./outbound-content-assessment.md) section 5), the rule applies to the assessed decision: content that did not pass is already an `escalate`, and the session's taint is read after the assessment, which can wait on its model, so a source dispatched during that wait still gates the call.
+
+`humanOnly` is the existing flag that the hardcoded `add_proxy_domain` rule and the structural `structural-nested-argument-escalate` (an argument holding a nested object or array) use: the pipeline never consults the auto-approver, matches no approval-whitelist pattern and offers no `/approve+` candidate, and the escalation request carries `humanOnly: true` so `/approve all` in the mux and the escalation listener leaves it for an explicit decision. The human also sees an `Untrusted content` context entry: which tool tainted the session and when. A session with no human to ask (no in-process handler and no escalation directory, as in unattended runs without Signal or the web UI) denies the call.
+
+Representing a taint escalation as `escalate` plus `humanOnly`, rather than adding a fourth `PolicyDecisionStatus`, means every existing consumer of decisions, escalation requests and audit records keeps working, and no front-end can fall back to a weaker path for an unknown status.
+
+A sink that policy escalated while the session was still untainted can be waiting for the auto-approver when the session becomes tainted: the call mutex is released during an approval wait, so another call (a parallel tool call, a subagent, a fan-out lane) can dispatch a source meanwhile. The pipeline checks the taint again when the approver answers (`sinkTaint`): if the taint now gates the call, the approval is not acted on. The call is withdrawn without being dispatched, audited as `cancelled` with the sink facts, and the agent is told that calling it again asks a human (which it then does, as a human-only escalation). A human's approval given during such a wait stands: a human decided that call.
+
+### When the session becomes tainted
+
+At dispatch: when the write-ahead `dispatching` audit record of a source call is written (`logWriteAhead` in the pipeline), before the backend is called or the virtual proxy tool runs, so the flag is set before anything the backend returns can reach the agent. A MITM egress decision (`network/request`, opt-in `egressPolicy`; see [mitm-egress-policy.md](./mitm-egress-policy.md)) is not a pipeline call: `decideEgress` writes its single audit record and, when it admits the destination, taints the session before the decision is returned to the proxy, so before the proxy opens the tunnel or forwards the request. A refused destination taints nothing. A call that policy or the circuit breaker denies, an escalation the human refuses, and a call its caller cancels before dispatch (`call-cancelled`, e.g. an `execute_code` script that ended) are never dispatched and taint nothing; a source call cancelled while its backend runs has already tainted the session. The first taint event (`via` = `server/tool`, request id, timestamp) is kept; taint is never cleared.
+
+Scope: one coordinator. That is one session, or one workflow bundle (shared-container mode, one per `containerScope`): taint survives `loadPolicy` hot-swaps between personas, and fan-out lanes that share a coordinator share its taint. Both are over-approximations on purpose: the next persona and the other lanes work in the same workspace that the tainted content may have reached. The approval whitelist, in contrast, is still emptied on every hot-swap. Two bundles of one run (different scopes) do not share taint while the run is live; see "Resume" for what a resumed run restores.
+
+### Audit records
+
+With taint escalation enabled, `AuditEntry.taint` records:
+
+- `source: true` on the write-ahead record and the outcome record of a dispatched source call, and on the record of a MITM egress decision that admitted its destination (it has no write-ahead record);
+- `sink: true` and `taintedBy` (the first taint event) on every record of a sink call evaluated in a tainted session, and on the `cancelled` record of a sink whose auto-approval the taint overtook (see "Decision rule").
+
+Calls that are neither carry no `taint` field.
+
+### Resume
+
+A coordinator built on an existing audit file (`ironcurtain start --resume`, which appends to the session's `audit.jsonl`) replays it before appending (`restoreTaintFromAuditLog`). A record proves taint when it carries `taint.source`, or when it is a dispatched call (`dispatching`, `success` or `error`) to a tool the current classification calls a source. The second rule makes enabling the feature on resume see what the session read while it was disabled. The file is streamed in chunks and opened non-blocking; a torn last line is ignored. A missing file is a new session. A file that exists but cannot be read to the end (permissions, not a regular file, an I/O error) fails closed: the session starts tainted. Replay can only add taint, so a forged record can at most cost the user extra prompts.
+
+A resumed shared-container workflow run does not reuse its bundles: every scope mints a new bundle with a new audit file (`workflow-runs/<id>/containers/<bundleId>/audit.jsonl`). So `resume` lists the audit logs of the bundles the run's earlier legs minted, before the resumed leg mints any, and hands them to every bundle it mints (`CreateWorkflowInfrastructureInput.taintReplayAuditLogPaths`, set as `IronCurtainConfig.taintReplayAuditLogPaths`); the bundle's coordinator replays them after its own file (`ToolCallCoordinatorOptions.taintReplayAuditLogPaths`). The checkpoint does not record which scope a bundle served, so every scope replays every earlier bundle: on resume, a taint any scope recorded reaches all of them (it can only add prompts). A containers directory that cannot be listed fails closed the same way an unreadable audit file does.
+
+### Differences from the proposal above
+
+- **Classification is static, not produced by `annotate-tools`.** Annotation output comes from an LLM, and a user overlay entry replaces the package entry for its server, so flags shipped in `tool-annotations.json` would silently disappear when a user re-annotates. A reviewed table in the trusted process, checked against the shipped annotations by a test, keeps the classification in one place. `StoredToolAnnotation` is unchanged.
+- **No new decision status** (see "Decision rule").
+- **No LLM approver for taint escalations.** The proposal lets the auto-approver judge a taint escalation against all user messages. Slice 1 sends every taint escalation to a human instead, so the auto-approver never decides one, and it still receives only the most recent user message for ordinary escalations (`auto-approver.md`, principle 3: an older message must not authorize a later action). Giving an LLM approver the full user-message history belongs with the slice that adds such an approver, and needs the user-context IPC (`user-context.json`, written by the session and by the PTY front-ends) to carry the session's human messages.
+
+### Not covered yet
+
+- **The workspace and memory.** Reading files in the agent's own workspace, and content recalled from persistent memory, does not taint. A workspace can contain untrusted content the user placed there, and a memory may have been written in an earlier tainted session.
+- **Workflows without a shared container.** Builtin workflows and Docker workflows without `sharedContainer: true` run every agent state as its own session with its own coordinator and audit log, so taint does not carry from one state to the next, although the states share the workflow's workspace (and the next state's prompt can carry the previous agent's output). Each state's session starts untainted. Carrying taint across them needs a workflow-level taint record; later slice.
+- **Docker-mode traffic outside MCP.** Package registry downloads and hosts reachable through the MITM proxy by configuration (providers, and every unknown host under the deprecated `IRONCURTAIN_MITM_ALLOW_ALL_HOSTS`) never become MCP calls, so they do not taint (only `add_proxy_domain` does). The exception is policy-evaluated egress (`egressPolicy.enabled`, which ignores that variable): every destination it admits is a `network/request` decision and taints (see the table). Later slice: the remaining MITM egress observations as fact sources.
+- **Fetch as an exfiltration channel.** `http_fetch` is a source, not a sink: its URL (and headers) can carry data to the destination, but making it a sink would put a human in front of every page a research task reads. The same holds for a `web_search` query and for the remote URL of `git_clone`, `git_fetch` and `git_pull`. Destinations stay gated by the fetch and git domain policy.
+- **Session predicates in compiled rules** (`CompiledRuleCondition` conditions on session facts, with multi-step verifier scenarios). Later slice.

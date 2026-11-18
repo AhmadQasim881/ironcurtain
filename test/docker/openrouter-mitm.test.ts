@@ -23,6 +23,7 @@
 
 import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import type * as http from 'node:http';
+import * as zlib from 'node:zlib';
 import { readFileSync } from 'node:fs';
 import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -35,6 +36,9 @@ import type { ProviderConfig, RequestBodyRewriter } from '../../src/docker/provi
 import { makeOpenRouterProvider, makeOpenRouterRewriter } from '../../src/docker/openrouter.js';
 import { makeGatewayRequestRewriter } from '../../src/docker/gateway-runtime.js';
 import { getTokenStreamBus, resetTokenStreamBus } from '../../src/docker/token-stream-bus.js';
+import { getLlmMetricsEventBus, resetLlmMetricsEventBus } from '../../src/llm-metrics/event-bus.js';
+import type { LlmExchangeCompleted } from '../../src/llm-metrics/types.js';
+import { usageTokenBounds } from '../../src/llm-metrics/usage-bounds.js';
 import type { TokenStreamEvent } from '../../src/docker/token-stream-types.js';
 import { providerForHost, createReassembler, AnthropicReassembler } from '../../src/docker/trajectory-reassembler.js';
 import type { SessionId } from '../../src/session/types.js';
@@ -317,6 +321,30 @@ describe('OpenRouter through the real MITM (G3 / §12.2)', () => {
     expect(messageEnd?.cachedTokens).toBe(900);
   });
 
+  // 6a. The same stream through LLM statistics: the cache read that only
+  // message_delta reports is kept, and the exchange is never counted as zero.
+  it('records the Anthropic-skin cache read from message_delta in LLM metrics', async () => {
+    resetLlmMetricsEventBus();
+    const exchanges: LlmExchangeCompleted[] = [];
+    const unsubscribe = getLlmMetricsEventBus().subscribe((exchange) => exchanges.push(exchange));
+    try {
+      const sse = readFixture('openrouter-messages-stream.sse');
+      await startProxy({
+        statisticsEnabled: true,
+        upstreamResponder: () => ({ status: 200, contentType: 'text/event-stream', body: sse }),
+      });
+      await post('/api/v1/messages', { model: 'claude-sonnet-4-6', stream: true, messages: [] });
+      await expect.poll(() => exchanges.length).toBe(1);
+      const usage = exchanges[0].usage;
+      expect(usage).toMatchObject({ inputTokensUncached: 1024, cacheReadInputTokens: 900, outputTokensTotal: 128 });
+      // The exact total is unknown here (this test route declares no usage
+      // contract), but the known components bound it from below.
+      expect(usageTokenBounds(usage).totalTokens).toBe(2052);
+    } finally {
+      unsubscribe();
+    }
+  });
+
   // 6b. usage cost / cached_tokens on the Chat Completions wire (Goose).
   it('surfaces usage.cost and cached_tokens on the token-stream bus (Chat Completions skin)', async () => {
     const sid = 'cost-conv-chat' as SessionId;
@@ -360,6 +388,127 @@ describe('OpenRouter through the real MITM (G3 / §12.2)', () => {
     expect(messageEnd, 'responses wire must surface a message_end carrying authoritative cost').toBeDefined();
     expect(messageEnd?.costUsd).toBe(0.0123);
     expect(messageEnd?.cachedTokens).toBe(900);
+  });
+
+  // 6d-6f. Compressed responses: the token stream decodes before parsing, so
+  // OpenRouter's authoritative cost is not lost to gzip/br (MITM-9).
+  function messageEnds(events: TokenStreamEvent[]): Array<Extract<TokenStreamEvent, { kind: 'message_end' }>> {
+    return events.filter((e): e is Extract<TokenStreamEvent, { kind: 'message_end' }> => e.kind === 'message_end');
+  }
+
+  it('surfaces usage.cost from a gzip-compressed Anthropic-skin stream', async () => {
+    const sid = 'cost-conv-gzip' as SessionId;
+    const events: TokenStreamEvent[] = [];
+    getTokenStreamBus().subscribe(sid, (_s, e) => events.push(e));
+
+    const sse = readFixture('openrouter-messages-stream.sse');
+    await startProxy({
+      initialTokenSessionId: sid,
+      upstreamResponder: () => ({
+        status: 200,
+        contentType: 'text/event-stream',
+        contentEncoding: 'gzip',
+        body: zlib.gzipSync(sse),
+      }),
+    });
+    await post('/api/v1/messages', { model: 'claude-sonnet-4-6', messages: [] });
+
+    await expect.poll(() => messageEnds(events).length).toBe(1);
+    expect(messageEnds(events)[0]).toMatchObject({ costUsd: 0.0123, cachedTokens: 900 });
+  });
+
+  it('feeds LLM metrics and the token stream from one decode of a gzip stream', async () => {
+    resetLlmMetricsEventBus();
+    const exchanges: LlmExchangeCompleted[] = [];
+    const unsubscribe = getLlmMetricsEventBus().subscribe((exchange) => exchanges.push(exchange));
+    const sid = 'cost-conv-gzip-metrics' as SessionId;
+    const events: TokenStreamEvent[] = [];
+    getTokenStreamBus().subscribe(sid, (_s, e) => events.push(e));
+    try {
+      const sse = readFixture('openrouter-messages-stream.sse');
+      await startProxy({
+        statisticsEnabled: true,
+        initialTokenSessionId: sid,
+        upstreamResponder: () => ({
+          status: 200,
+          contentType: 'text/event-stream',
+          contentEncoding: 'gzip',
+          body: zlib.gzipSync(sse),
+        }),
+      });
+      await post('/api/v1/messages', { model: 'claude-sonnet-4-6', stream: true, messages: [] });
+
+      await expect.poll(() => exchanges.length).toBe(1);
+      await expect.poll(() => messageEnds(events).length).toBe(1);
+      expect(exchanges[0].usage).toMatchObject({ inputTokensUncached: 1024, cacheReadInputTokens: 900 });
+      // This test route overrides the upstream (upstreamTarget), which makes
+      // the metrics gateway opaque: its cost is never priced as fact.
+      expect(exchanges[0].route.gatewayKind).toBe('opaque');
+      expect(exchanges[0].usage).toMatchObject({ costUsd: null, estimatedCostUsd: null, costSource: null });
+      expect(messageEnds(events)[0]).toMatchObject({ costUsd: 0.0123, cachedTokens: 900 });
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it('surfaces usage.cost from a br-compressed Chat Completions stream', async () => {
+    const sid = 'cost-conv-chat-br' as SessionId;
+    const events: TokenStreamEvent[] = [];
+    getTokenStreamBus().subscribe(sid, (_s, e) => events.push(e));
+
+    const sse = readFixture('openrouter-chat-stream.sse');
+    await startProxy({
+      kind: 'chat',
+      initialTokenSessionId: sid,
+      upstreamResponder: () => ({
+        status: 200,
+        contentType: 'text/event-stream',
+        contentEncoding: 'br',
+        body: zlib.brotliCompressSync(sse),
+      }),
+    });
+    await post('/api/v1/chat/completions', { model: 'claude-sonnet-4-6', messages: [] });
+
+    await expect.poll(() => messageEnds(events).some((e) => e.costUsd !== undefined)).toBe(true);
+    expect(messageEnds(events).find((e) => e.costUsd !== undefined)).toMatchObject({
+      costUsd: 0.0123,
+      cachedTokens: 900,
+    });
+  });
+
+  it('surfaces usage.cost from a br-compressed non-streaming JSON response', async () => {
+    const sid = 'cost-conv-json-br' as SessionId;
+    const events: TokenStreamEvent[] = [];
+    getTokenStreamBus().subscribe(sid, (_s, e) => events.push(e));
+
+    const json = JSON.stringify({
+      id: 'gen-json',
+      type: 'message',
+      role: 'assistant',
+      model: 'z-ai/glm-5.2',
+      content: [{ type: 'text', text: 'Hello from GLM' }],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 10, output_tokens: 3, cache_read_input_tokens: 7, cost: 0.0042 },
+    });
+    await startProxy({
+      initialTokenSessionId: sid,
+      upstreamResponder: () => ({
+        status: 200,
+        contentType: 'application/json',
+        contentEncoding: 'br',
+        body: zlib.brotliCompressSync(json),
+      }),
+    });
+    await post('/api/v1/messages', { model: 'claude-sonnet-4-6', stream: false, messages: [] });
+
+    await expect.poll(() => messageEnds(events).length).toBe(1);
+    expect(messageEnds(events)[0]).toMatchObject({
+      inputTokens: 10,
+      outputTokens: 3,
+      costUsd: 0.0042,
+      cachedTokens: 7,
+    });
+    expect(events.find((e) => e.kind === 'text_delta')).toMatchObject({ text: 'Hello from GLM' });
   });
 
   // 7. keep-alive comment tolerance.

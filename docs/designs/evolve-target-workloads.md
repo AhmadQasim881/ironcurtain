@@ -1,6 +1,8 @@
 # Evolve Target Workloads — Validation Fixture & First Dogfood (vetted)
 
-Status: **Vetted research record** (2026-06-19). Produced by a supervised research → adversarial-vetting loop (two research agents, two adversarial vetters). Every load-bearing claim below survived an independent verification pass; the claims that did **not** survive are listed in §4 so the corrections are traceable.
+**Status (2026-11-14):** Historical: a vetted research record (2026-06-19) used to choose the evolve validation fixture and first dogfood target.
+
+Record: **Vetted research record** (2026-06-19). Produced by a supervised research → adversarial-vetting loop (two research agents, two adversarial vetters). Every load-bearing claim below survived an independent verification pass; the claims that did **not** survive are listed in §4 so the corrections are traceable.
 
 ## Purpose
 

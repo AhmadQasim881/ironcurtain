@@ -1,5 +1,7 @@
 # Persona System
 
+**Status (2026-11-14):** Implemented (`src/persona/`, `ironcurtain persona`).
+
 > **Note (2026-03):** References to `memory.md` and `workspace/memory.md` in this document are historical. Persistent agent memory is now handled by the memory MCP server (see `memory-mcp-server-v2.md`). The persona workspace directory still exists but no longer contains a `memory.md` file.
 
 ## Overview
@@ -32,6 +34,8 @@ Today IronCurtain has one global policy for interactive sessions and per-job pol
         compiled-policy.json
       workspace/
         memory.md
+  .persona-trash/              # soft-deleted personas (persona trash list|restore|purge)
+    old-helper-2026-11-12T10-04-05-123Z/
 ```
 
 Personas live under `~/.ironcurtain/personas/`, which is already covered by the IronCurtain home directory's protected-path rule. The agent cannot modify persona configuration files (`constitution.md`, `persona.json`, `generated/`). However, `workspace/` (including `workspace/memory.md`) is writable by the agent — it is the persona's persistent state.
@@ -48,9 +52,26 @@ Tool annotations (`tool-annotations.json`) remain global -- they describe MCP to
   "description": "Email triage, calendar management, and document review",
   "createdAt": "2026-03-06T12:00:00.000Z",
   // Optional: only these MCP servers are available (allowlist)
-  "servers": ["filesystem", "fetch", "gmail", "google-calendar"]
+  "servers": ["filesystem", "fetch", "gmail", "google-calendar"],
+  // Optional: agent model and resource limits for this persona's sessions
+  // (see "Per-Persona Agent Model and Resource Limits" below)
+  "agentModelId": "anthropic:claude-haiku-4-5",
+  "resourceBudget": { "maxEstimatedCostUsd": 1, "maxSteps": 60 }
 }
 ```
+
+Other optional fields: `memory` (`{"enabled": false}` opts the persona out of memory), `allowBroadPolicy` (`true` is the broad-policy opt-in, set only through the gated opt-in flows) and `memoryNamespace` (written by `persona rename`, see below).
+
+#### Validation
+
+`loadPersona` (`src/persona/resolve.ts`) reads persona.json only through `readPersonaDefinition` (`src/persona/persona-definition.ts`), so sessions, cron jobs, workflows, compiles, the CLI, the web UI and `ironcurtain doctor` judge a definition the same way. The file is validated with a strict zod schema and refused, never coerced, with error code `PERSONA_INVALID` and one line per problem:
+
+- `name` must equal the persona's directory name. A persona directory copied by hand keeps the original's name; trusting it would send the copy's edits (and its sessions' policy and workspace lookups) to the original, and a name such as `"../x"` would point outside `personas/`. Every path operation uses the directory name. The error names the fix: set the name and recompile, or remove the copy and run `ironcurtain persona clone <original> <copy>`.
+- `description` is a string, `createdAt` an ISO 8601 timestamp, `servers` an array of server names (a bare string such as `"github"` used to match server names character by character), `memory` is `{"enabled": <boolean>}`, `allowBroadPolicy` a boolean (the string `"false"` is truthy) and `memoryNamespace` a slug.
+- An unknown field is refused (a misspelled `"server"` would otherwise silently mean "all servers").
+- `agentModelId` and `resourceBudget` are known fields whose values are left to `readPersonaOverrides()`, which checks them wherever they take effect (see "Per-Persona Agent Model and Resource Limits" below): a malformed value refuses the persona's sessions with `PERSONA_OVERRIDES_INVALID`, while the persona itself still loads, so `persona set` can repair it and `persona show` and `ironcurtain doctor` can report it. Neither value is ever coerced.
+
+Whether the listed servers are configured is checked when a persona is created (below), not on load: a server removed from the configuration later must not make its personas unloadable. `persona list` reports directories under `personas/` whose persona.json is missing or invalid; pickers and `personas.list` leave them out.
 
 ### PersonaDefinition type
 
@@ -77,9 +98,11 @@ export function createPersonaName(raw: string): PersonaName {
 
 /**
  * Persisted persona definition. Stored as JSON at
- * ~/.ironcurtain/personas/{name}/persona.json.
+ * ~/.ironcurtain/personas/{name}/persona.json and read only through
+ * loadPersona, which validates it (see Validation above).
  */
 export interface PersonaDefinition {
+  /** Always the persona's directory name. */
   readonly name: PersonaName;
   readonly description: string;
   readonly createdAt: string;
@@ -90,6 +113,10 @@ export interface PersonaDefinition {
    * The "filesystem" server is always included regardless.
    */
   readonly servers?: readonly string[];
+  readonly memory?: { readonly enabled: boolean };
+  /** The namespace in the persona's own memory.db; absent = the persona name. */
+  readonly memoryNamespace?: string;
+  readonly allowBroadPolicy?: boolean;
 }
 ```
 
@@ -205,7 +232,7 @@ New subcommand group: `ironcurtain persona <action>`.
 
 ### `ironcurtain persona create <name>`
 
-Creates a new persona with an interactive flow mirroring `ironcurtain cron create`:
+Creates a new persona with an interactive flow mirroring the cron job wizard (named `cron create` in this design; as built, `ironcurtain daemon add-job`):
 
 1. Prompt for description (or accept via `--description`)
 2. Prompt for server allowlist (multi-select from available servers in `mcp-servers.json`)
@@ -238,7 +265,7 @@ $ ironcurtain persona create exec-assistant
 
 Options:
 - `--description <text>` -- set the description (skip prompt)
-- `--servers <s1,s2>` -- set the server allowlist (skip multi-select)
+- `--servers <s1,s2>` -- set the server allowlist (skip multi-select). Every name must be a configured server (the package's `mcp-servers.json` plus the user's `~/.ironcurtain/mcp-servers.json`, as `ironcurtain mcp list` shows them); an unknown one is refused before any prompt (`validatePersonaServers`, which `createPersona` also applies for the web UI's `personas.create`, there as `INVALID_PARAMS`)
 - `--no-generate` -- skip auto-generation, open `$EDITOR` directly
 
 ### `ironcurtain persona list`
@@ -251,9 +278,11 @@ $ ironcurtain persona list
   coder            Software development            not compiled
 ```
 
-### `ironcurtain persona compile <name>`
+Directories under `personas/` that have a persona name but a missing or invalid persona.json (typically a persona directory copied by hand) are listed after the personas, under "Persona directories that cannot be used", with the loader's reasons.
 
-Compiles the persona's `constitution.md` into policy rules, writing output to the persona's `generated/` directory. Reuses `compileTaskPolicy()` (or a thin wrapper) since the compilation pipeline is identical -- the only difference is the input directory.
+### `ironcurtain persona compile <name> [--allow-broad]`
+
+Compiles the persona's `constitution.md` into policy rules, writing output to the persona's `generated/` directory. The compile runs through `runPersonaCompile` (`src/persona/persona-compile-service.ts`), the same path as a web-UI compile: it holds the persona's compile lock (a compile of the same persona running in the daemon refuses this one, and vice versa), runs the broad-policy validator before anything is written, is aborted at the 20-minute wall-clock cap, and records the compile in the policy-mutation audit log. See §4.3a of [web-ui-policy-persona-management.md](web-ui-policy-persona-management.md).
 
 ```
 $ ironcurtain persona compile exec-assistant
@@ -261,17 +290,41 @@ Compiling policy for persona "exec-assistant"...
 Done.
 ```
 
+A result that grants broad access (a broad wildcard domain or list, a `paths.within` outside the persona's workspace, or an `allow` rule that leaves a resource argument unconstrained) is not written unless the persona has opted in to broad policies. The command prints what is broad and exits 1; `--allow-broad` sets the persona's opt-in (`allowBroadPolicy: true`, audited) and compiles; refused because another compile of the persona is running, it changes nothing. Exit status 2 means the policy was written but some servers failed and have no rules. `persona create` and `persona edit` ask before setting the opt-in, and `persona edit` can clear it again.
+
 ### `ironcurtain persona edit <name>`
 
-Opens the persona's `constitution.md` in `$EDITOR`. After the editor exits, prompts to recompile if the file changed.
+Opens the persona's `constitution.md` in `$EDITOR`. After the editor exits, prompts to recompile if the file changed. Every edit (customizer, editor, generation, memory, broad-policy toggle) writes to the persona's directory name; a persona whose persona.json is invalid is refused before anything is written.
+
+### `ironcurtain persona clone <source> <name> [--description <text>]`
+
+Creates `<name>` as an independent copy of `<source>`'s configuration: its constitution (verbatim), description (unless `--description` is given), server allowlist, memory setting, agent model and resource limits, and `skills/` (links inside it are copied as they are, so a relative link resolves inside the clone, never into the source). The copy is built atomically like `persona create`. The agent model and limits are copied as sessions validate them: a malformed one refuses the clone (`PERSONA_OVERRIDES_INVALID`; fix the source with `persona set`) instead of being copied, and none is dropped, since a clone without the source's cost cap would run on looser limits. The `clonePersona` audit record carries the copied `agentModelId` and `resourceBudget` as a `setPersonaOverrides` record does. Not copied: the compiled policy (it was compiled for the source's workspace path; compile the clone), the workspace, `memory.db` and the broad-policy opt-in (set only through the gated opt-in flows, never inherited). This is the supported way to copy a persona; a copied directory is refused (see Validation).
+
+### `ironcurtain persona rename <name> <new-name>`
+
+Moves the whole persona directory (constitution, workspace, `memory.db`, skills) to `personas/<new-name>/` and rewrites persona.json for the new name. The compiled policy is moved aside to `generated/compiled-policy.revoked.json`: it names the old workspace path, so it would either grant access to a directory that is no longer this persona's (and could become another persona's) or be refused, and sessions refuse the persona until it is recompiled. persona.json records the old name as `memoryNamespace`, so the persona's sessions keep seeing the memories stored under its old name (in its own `memory.db`, never another persona's). The rename holds the persona's compile lock (refused while a compile runs). Cron jobs, workflow definitions and running sessions that name the old persona do not follow it.
 
 ### `ironcurtain persona delete <name>`
 
-Removes the persona directory after confirmation.
+Removes the persona directory permanently after confirmation (refused while the persona is being compiled). The web UI's `personas.delete` soft-deletes by default instead, into the trash below.
+
+### `ironcurtain persona trash list|restore|purge`
+
+A soft delete (the web UI's default, or the persona a forced restore replaced) moves the persona directory, workspace and `memory.db` included, to `~/.ironcurtain/.persona-trash/<name>-<timestamp>/`, outside `personas/`, so nothing lists, resolves or loads it.
+
+- `trash list` shows each entry with the persona's name, deletion time, description and expiry; an entry whose persona.json cannot be used says why.
+- `trash restore <entry|name> [--as <name>] [--force]` restores an entry (a persona name selects its newest entry). The entry's persona.json is validated again and must name the persona it was deleted as. A persona with the target name is never overwritten: the restore is refused unless `--force`, which first moves that persona to the trash (recoverable; it is put back if the restore then fails). `--as` restores under another name, which re-labels the persona as a rename does (compiled policy moved aside, memory namespace kept). A restore under the same name keeps the compiled policy; while the persona is in the trash, `ironcurtain mcp add|remove` strip a server name from its policy as from an active persona's, so a restore never brings back rules an earlier server of a name left for a new server of that name.
+- `trash purge <entry|name>... | --expired | --all [--yes]` permanently removes entries after showing them and asking (`--yes` skips the question). A purge first renames every entry it removes to a `.purging-<id>-<uuid>` remnant in the trash directory, which is never listed or restored, and only then deletes the files; a restore running meanwhile finds the whole entry or nothing, never a half-deleted persona. Files that cannot be deleted (or a purge cut short) stay in the remnant, the purge reports them, and the next purge deletes them. `--expired` selects the entries older than `personas.trashRetentionDays` in `config.json` (default 30 days; `null` keeps entries until purged by hand).
+
+The retention sweep (purging expired entries) runs after every move into the trash, so the trash only grows within the retention window. Restore, purge and the sweep take effect at the service layer (`persona-service.ts`), so the CLI and the web UI's `personas.listTrash` / `restoreTrash` / `purgeTrash` behave the same; each restore and each purged entry is recorded in the policy-mutation audit log.
 
 ### `ironcurtain persona show <name>`
 
-Prints the persona's metadata and constitution to stdout.
+Prints the persona's metadata, its agent model and resource limits (or that it inherits them, or why they are invalid) and its constitution to stderr.
+
+### `ironcurtain persona set <name> [options]`
+
+Sets or removes the persona's `agentModelId` and `resourceBudget` without prompting: `--model <id>` / `--clear-model`, and per limit `--max-tokens`, `--max-steps`, `--max-session-seconds`, `--max-cost`, `--warn-threshold`, each taking a number, `none` (disable the limit for the persona's sessions; not for the warn threshold) or `inherit` (remove the persona's value). `--clear-limits` removes every limit. The write goes through `setPersonaOverrides()` in the persona service, which validates the result exactly as sessions do and records a `setPersonaOverrides` entry in the hash-chained policy-mutation audit log: the model (`agentModelId`, `null` when removed) and the limits (`resourceBudget`, as JSON with sorted keys, `null` when removed), so the entry's details stay flat and `ironcurtain audit verify` checks it like any other.
 
 ### CLI Registration
 
@@ -280,7 +333,7 @@ In `src/cli.ts`, add a `persona` case:
 ```typescript
 case 'persona': {
   const { main } = await import('./persona/persona-command.js');
-  await main(process.argv.slice(3));
+  await main(args); // the arguments after the command name
   break;
 }
 ```
@@ -312,8 +365,10 @@ export function getPersonaConstitutionPath(name: PersonaName): string {
 }
 
 /**
- * Loads a persona definition from disk.
- * Throws if the persona directory or persona.json does not exist.
+ * Loads a persona definition from disk, validated against the persona.json
+ * schema (src/persona/persona-definition.ts); its `name` is always the
+ * directory name. Throws PERSONA_NOT_FOUND when persona.json does not exist,
+ * PERSONA_INVALID when it cannot be used.
  */
 export function loadPersona(name: PersonaName): PersonaDefinition { ... }
 
@@ -321,28 +376,36 @@ export function loadPersona(name: PersonaName): PersonaDefinition { ... }
  * Resolves a persona name to a validated policyDir, workspace path,
  * and persona definition.
  *
- * @throws if persona does not exist or has no compiled policy
+ * @throws if persona does not exist, or ScopedPolicyError when its
+ *   compiled policy is missing (POLICY_MISSING) or no longer matches
+ *   constitution.md (POLICY_STALE) and allowStalePolicy was not given
  */
-export function resolvePersona(nameRaw: string): {
-  policyDir: string;
-  persona: PersonaDefinition;
-  workspacePath: string;
-} {
+export function resolvePersona(
+  nameRaw: string,
+  options: { allowStalePolicy?: boolean } = {},
+): ResolvedPersona {
   const name = createPersonaName(nameRaw);
-  const personaDir = getPersonaDir(name);
-  const generatedDir = getPersonaGeneratedDir(name);
+  const persona = loadPersona(name);
 
-  if (!existsSync(resolve(generatedDir, 'compiled-policy.json'))) {
-    throw new Error(
-      `Persona "${name}" has no compiled policy. ` +
-        `Run: ironcurtain persona compile ${name}`,
+  // Recomputes sha256(constitution.md) and compares it with the
+  // compiled policy's constitutionHash on every call.
+  const state = getPersonaPolicyState(name);
+  if (state.kind === 'missing') {
+    throw new ScopedPolicyError(
+      `Persona "${name}" has no compiled policy. Run: ironcurtain persona compile ${name}`,
+      'POLICY_MISSING',
     );
+  }
+  if (state.kind === 'stale' && options.allowStalePolicy !== true) {
+    throw new ScopedPolicyError(`Persona "${name}" has a stale compiled policy: ...`, 'POLICY_STALE');
   }
 
   return {
-    policyDir: generatedDir,
-    persona: loadPersona(name),
-    workspacePath: resolve(personaDir, 'workspace'),
+    policyDir: getPersonaGeneratedDir(name),
+    persona,
+    workspacePath: getPersonaWorkspaceDir(name),
+    // set only for an allowed stale policy; the caller warns
+    ...(state.kind === 'stale' ? { stalePolicy: { reason: state.reason, detail: state.detail } } : {}),
   };
 }
 ```
@@ -468,6 +531,8 @@ Update the `/help` output to show: `/new [persona] - start a new session (option
 
 Mux persona support is deferred to a follow-up PR. The mux uses a picker-mode state machine for session creation, requiring changes to `MuxInputHandler`, `MuxAction`, `PtyBridgeOptions`, and `createPtyBridge()`. Once `--persona` works on the CLI, the mux integration is straightforward but not blocking for the initial release.
 
+(The picker has since shipped. Each mux tab is an `ironcurtain start --pty --persona <name>` child, so it resolves the persona's agent model and limits like any `start` session; the picker shows a persona's `agentModelId` next to its description and, like an uncompiled or stale persona, does not offer one whose overrides are malformed. See "Per-Persona Agent Model and Resource Limits".)
+
 ### Cron: `persona` field in JobDefinition
 
 Add an optional `persona` field to `JobDefinition`:
@@ -490,6 +555,37 @@ export interface JobDefinition {
 When the daemon creates a cron session and `job.persona` is set, it resolves the persona and passes `persona` in `SessionOptions` instead of `policyDir: jobGeneratedDir`. This lets cron jobs share a persona's policy without maintaining a separate constitution.
 
 The `taskConstitution` field remains the primary path for cron jobs. The `persona` field is a convenience for jobs that want to reuse an existing persona rather than defining their own policy inline.
+
+## Per-Persona Agent Model and Resource Limits
+
+A persona may set the agent model and the resource limits of its sessions:
+
+```typescript
+export interface PersonaDefinition {
+  // ... existing fields ...
+  /** "provider:model-name", a bare ID, or a gateway "name:tag" ID. */
+  readonly agentModelId?: string;
+  /** Same fields as config.json's resourceBudget (no model prices); null disables a limit. */
+  readonly resourceBudget?: Partial<ResolvedResourceBudgetConfig>;
+}
+```
+
+### Precedence
+
+Both sit below everything a caller sets explicitly and above the global defaults (`src/session/model-budget-precedence.ts`):
+
+- **Agent model**, highest first: `--model` on the command line (`ironcurtain start`, and so the `start --pty` children of the mux and the web UI; `ironcurtain workflow start|resume-standalone|run-state`) > the workflow state's `model` > the workflow's `settings.model` > the persona's `agentModelId` > the global `agentModelId`. Callers collapse the first three into `SessionOptions.agentModelOverride` (the workflow session factory puts `--model` over the orchestrator's `state.model ?? settings.model`); `buildSessionConfig` applies the persona's model only when that override is absent.
+- **Resource limits**, field by field, highest first: the limits the caller sets explicitly (`SessionOptions.resourceBudgetOverrides`: a workflow's `settings.resourceBudget`, a cron job's `budgetOverrides`) > the persona's `resourceBudget` > the caller's own defaults (`SessionOptions.resourceBudgetBaseline`: the global/default limits a workflow run saved at start, the cron defaults) > the config's `resourceBudget`.
+
+The workflow orchestrator splits a run's saved limits by their recorded source (`workflowSessionBudgetOptions` in `src/workflow/resource-budget.ts`): a limit the workflow sets stays an override, one the run inherited becomes the baseline, so a state's persona can tighten or loosen only what the workflow left to the defaults. The run's budget panel still shows the run-level limits; a state's session may run with its persona's value for an inherited field.
+
+### Where it applies
+
+`buildSessionConfig` resolves both once for every entry point (`ironcurtain start`, `start --pty` and therefore the mux and web UI terminals, Signal `/new <persona>`, web `sessions.create` in code mode, cron jobs with `persona`, workflow states). The chosen model goes into both `config.agentModelId` and `config.userConfig.agentModelId`, and into `SessionDirConfig.agentModelOverride`, which the builtin and container sessions pass to every agent turn; it is also the agent model the host-model roles fall back to (auto-compaction's summary model without credentials, `src/session/host-model-roles.ts`). The layered limits go into `config.userConfig.resourceBudget`, which the budget trackers read, and which a standalone container session's MITM budget gate (`src/docker/budget-gate.ts`) takes its token and cost limits from. A workflow's shared-container bundle keeps the run's limits as its container-wide gate, so there a state persona's tighter token or cost limit is enforced between turns (the session's own budget check) while the gate bounds a turn in flight at the run's limit. The agent adapter registry is process-wide (one adapter per agent, registered by whichever session needs it first, in a daemon possibly a persona session), so adapters capture no configuration: the Claude Code adapter derives `IRONCURTAIN_MODEL` for an interactive PTY from the session config it is given, and `DockerAgentSession` passes the session config's own `agentModelId` to `buildCommand` on every batch turn, so a global-model session started after a persona session does not inherit the persona's model. `ironcurtain start` additionally applies the persona's model to its config before the mode preflight, so the builtin agent's API-key check and the host-model role checks see the model the session will run.
+
+### Validation
+
+The persona.json schema (`src/persona/persona-definition.ts`, see "Validation" above) knows both fields but carries their values unchecked, so a malformed value never makes the persona unloadable. `readPersonaOverrides()` (`src/persona/persona-overrides.ts`) validates both whenever they are about to take effect: `agentModelId` with the workflow model-ID grammar, in printable ASCII without spaces, and never an agent name (`claude-code`, `goose`, `codex`); `resourceBudget` with config.json's limit schema, strict (an unknown field is an error). A malformed value fails closed: the session is refused before anything is created for it (`PersonaOverridesError`, code `PERSONA_OVERRIDES_INVALID`), rather than silently running on the global model or limits. `ironcurtain start` exits with the message before its preflight, a cron job with `persona` is refused before its git sync with the usual "Not run" notice (`findPersonaOverridesProblem`), and a workflow is refused at start, before its first state runs, when any agent state's persona has one (the orchestrator's persona pre-check names each such persona and the states that use it, next to any persona that does not exist). `persona show`, the mux picker and `ironcurtain doctor` (its persona check, `lintPersonaDefinition`) report the problem; `persona set` and `setPersonaOverrides()` never write a value that would be refused, and `persona clone` refuses to copy one. The other operations that rewrite persona.json (the memory and broad-policy toggles, `persona rename`, a trash restore under another name) keep both fields as they are.
 
 ## Constitution Authoring
 
@@ -631,7 +727,7 @@ export async function compilePersonaPolicy(name: PersonaName): Promise<CompiledP
     allowedDirectory: config.allowedDirectory,
     protectedPaths: config.protectedPaths,
     mcpServers: config.mcpServers,
-    includeHandwrittenScenarios: false,
+    includeHandwrittenScenarios: true, // the universal invariants hold for every persona
   });
 }
 ```
@@ -665,9 +761,12 @@ This ensures the compiled policy only references tools from servers the persona 
 src/persona/
   types.ts                    # PersonaName, PersonaDefinition, PERSONA_NAME_PATTERN
   resolve.ts                  # getPersonaDir, resolvePersona, loadPersona, applyServerAllowlist
-  compile-persona-policy.ts   # compilePersonaPolicy wrapper
+  compile-persona-policy.ts   # compilePersonaPolicy wrapper (reached only from persona-compile-service.ts)
+  persona-compile-service.ts  # runPersonaCompile: the one compile path (lock, validator, cap, audit)
+  policy-breadth-check.ts     # breadth of a compiled policy on disk (load-time check, opt-out)
   persona-customizer.ts       # LLM-assisted constitution customizer (adapts job-customizer)
   persona-prompt.ts           # buildPersonaSystemPromptAugmentation (memory injection)
+  persona-overrides.ts        # agentModelId / resourceBudget validation (readPersonaOverrides)
   persona-command.ts          # CLI entry point for `ironcurtain persona` subcommands
 ```
 
@@ -675,7 +774,8 @@ src/persona/
 
 ```
 CLI (src/cli.ts)
-  └─ persona-command.ts ──> resolve.ts, compile-persona-policy.ts, persona-customizer.ts
+  └─ persona-command.ts ──> resolve.ts, persona-service.ts, persona-customizer.ts,
+                             persona-compile-service.ts ──(await import)──> compile-persona-policy.ts
 
 Constitution authoring (reused from cron)
   ├─ constitution-generator.ts  (src/cron/) ──> generateConstitution()
@@ -712,17 +812,21 @@ Persona names use the same validation pattern as job IDs (`PERSONA_NAME_PATTERN`
 
 ### Directory containment
 
-`resolvePersona()` validates that the resolved persona directory is under `~/.ironcurtain/personas/`. The existing `validatePolicyDir()` in `buildSessionConfig()` provides a second layer of defense: it verifies the `policyDir` is under the IronCurtain home directory.
+`resolvePersona()` validates that the resolved persona directory is under `~/.ironcurtain/personas/`. The existing `validatePolicyDir()` in `buildSessionConfig()` provides a second layer of defense: the realpath of `policyDir` must be exactly one of the directories IronCurtain compiles policies into (`<home>/generated`, `<home>/personas/<name>/generated`, `<home>/jobs/<id>/generated`, a published task scope `<home>/task-policies/<key>`, or the package's bundled `generated/` and `generated-readonly/`), never another place in the home such as an agent-writable session sandbox or workspace, and it and the directories above it must not be writable by another user. A `policyDir` that does not exist yet is left to the caller's "no compiled policy" check, but the directory it would be created in must pass the same ownership rules, and a path that leads through a dangling symlink is refused (its target could appear later, in a sandbox say). The policy artifacts in it are read without following a symlink at their names, with the same owner and mode checks.
 
-### Compiled policy required
+### Compiled policy required, and it must be current
 
 `resolvePersona()` refuses to return a `policyDir` for a persona that has no `compiled-policy.json`. This prevents sessions from falling through to the global policy when the user intended a persona-specific policy. The error message tells the user exactly what command to run.
+
+It also refuses a stale policy: `compiled-policy.json` records the sha256 of the `constitution.md` text it was compiled from (`constitutionHash`), and `getPersonaPolicyState()` recomputes that hash from disk on every call (`src/config/constitution-hash.ts`, no pipeline import). A policy whose hash does not match the current constitution, records none, or cannot be read is stale (`ScopedPolicyError` with code `POLICY_STALE`), so a narrowed constitution can never keep enforcing the older, broader rules without the user noticing. Unattended callers (cron jobs, workflow states) always refuse. An interactive session may run a stale persona only on an explicit override, `ironcurtain start --persona <name> --allow-stale-policy` (also honored on `--resume`), which prints a warning and records it in the session log; the mux picker and the web UI session launcher show such personas as stale and do not offer them. `persona list`, `persona show`, `personas.list` and `personas.get` report the stale state (`stale: 'constitution'`; `'engine'` is reserved: compiled policies now record their provenance, but it is checked when the policy is loaded, governed by `policy.onStale`, see the "Policy Provenance" section of [per-server-policy-compilation.md](per-server-policy-compilation.md)), and `persona edit` warns that sessions refuse the persona until it is recompiled.
+
+Finally, it refuses a policy that grants broad access when the persona has not opted in (`ScopedPolicyError` with code `POLICY_TOO_BROAD`): `resolvePersona` runs the broad-policy validator's LLM-free check on the artifacts on disk (`policy-breadth-check.ts`: the compiled policy and its resolved dynamic lists, judged with the tool annotations in effect), so a policy compiled before CLI compiles ran the validator, a hand-edited `persona.json` or policy file, or an annotation or list change that broadens an existing policy cannot run without the opt-in. No override applies, `--allow-stale-policy` included. Clearing the opt-in (`personas.setBroadPolicyOptIn`, `persona edit`) moves a broad compiled policy aside to `generated/compiled-policy.revoked.json`, so the persona has no compiled policy until it is recompiled.
 
 ### Server filter safety
 
 The `filesystem` server is never filtered out (hardcoded exception in `applyServerAllowlist`). If a persona's allowlist omits `filesystem`, it is silently added back. This preserves the sandbox invariant.
 
-Server names in the allowlist are validated against the keys in `mcp-servers.json` at session creation time. Unknown server names produce a warning (not an error) to avoid breaking personas when servers are added or removed from the global config.
+Server names in the allowlist are validated against the configured servers (the package's `mcp-servers.json` plus the user's `~/.ironcurtain/mcp-servers.json`, as loaded by `loadConfig()`; `listPersonaServerNames` in `persona-service.ts`) when the persona is created: `createPersona` refuses an unknown name (`PERSONA_UNKNOWN_SERVERS`, `INVALID_PARAMS` over the web UI). The web UI's create form offers exactly these names (`personas.listServers`). At session creation time an unknown name (a server removed from the configuration since) produces a warning, not an error, to avoid breaking personas when servers are added or removed from the global config. Matching is by whole name only (persona.json validation guarantees `servers` is an array, and `applyServerAllowlist` matches with a `Set`).
 
 Only allowlists are supported. This ensures new servers added to the global config are never silently available to existing personas — each persona must explicitly opt in.
 
@@ -782,8 +886,6 @@ All tests use the existing `SandboxFactory` mock pattern from `SessionOptions` -
 
 - **Mux persona support**: Thread `--persona` through the mux picker-mode state machine (`MuxInputHandler`, `MuxAction`, `PtyBridgeOptions`, `createPtyBridge()`). Once CLI `--persona` works, this is a UI plumbing task.
 - **Persona inheritance**: A persona could extend another persona's constitution, adding or overriding specific rules. Not needed now -- constitutions are small enough to copy.
-- **Per-persona model override**: A persona could specify a different `agentModelId` (e.g., a cheaper model for routine tasks). This would be a field in `persona.json` that patches the session config.
 - **Persona sharing**: Export/import personas as tarballs or from a central registry. The directory structure is self-contained, making this straightforward.
 - **Auto-compile on constitution change**: Watch `constitution.md` for changes and trigger recompilation. The content-hash caching in the pipeline makes this cheap when nothing changed.
 - **Default persona**: A `defaultPersona` field in `config.json` that applies when no persona is specified, replacing the global policy as the baseline.
-- **Per-persona resource budgets**: Override `resourceBudget` fields per persona for cost control across different use cases.

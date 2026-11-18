@@ -5,6 +5,12 @@
  * On validation failure, feeds the error back to the LLM in a multi-turn
  * conversation so it can fix its output. Up to maxRepairAttempts retries.
  *
+ * A response that stopped at its output-token cap (finish reason "length")
+ * is not a schema error and is never sent back for repair: asking again
+ * under the same cap would truncate it again. It is requested once more with
+ * a larger cap ({@link generateWithinOutputCap}); when that is truncated too,
+ * the call fails with {@link OutputTruncatedError}.
+ *
  * Does NOT use Output.object / structured output because Anthropic's API
  * rejects several JSON Schema constructs that Zod legitimately produces
  * (propertyNames from z.record, oneOf from z.discriminatedUnion).  Instead
@@ -16,6 +22,65 @@ import { generateText } from 'ai';
 import type { z } from 'zod';
 
 export const DEFAULT_MAX_TOKENS = 8192;
+
+/**
+ * Output-token cap of the one retry after a response stopped at its cap.
+ * Every pipeline call starts below it (256 to 16384 tokens).
+ */
+export const TRUNCATION_RETRY_MAX_TOKENS = 32768;
+
+/** Discriminant `code` of {@link OutputTruncatedError}. */
+export const OUTPUT_TRUNCATED = 'OUTPUT_TRUNCATED';
+
+/**
+ * The model's response did not fit its output-token cap, also after one
+ * retry with {@link TRUNCATION_RETRY_MAX_TOKENS}. Reported as itself rather
+ * than as the JSON or schema error the cut-off text would cause. Callers in
+ * other modules match it by `code`, not `instanceof`.
+ */
+export class OutputTruncatedError extends Error {
+  readonly code = OUTPUT_TRUNCATED;
+
+  constructor(readonly maxOutputTokens: number) {
+    super(
+      `LLM output truncated at ${maxOutputTokens} tokens: the response did not fit the output-token limit, ` +
+        'also after one retry with a larger limit',
+    );
+    this.name = 'OutputTruncatedError';
+  }
+}
+
+/** A response and the output-token cap it was produced under. */
+export interface CappedResponse<R> {
+  readonly result: R;
+  readonly maxOutputTokens: number;
+}
+
+/**
+ * Sends one LLM request, `request(cap)`, under `maxOutputTokens`. When the
+ * response stops at the cap (finish reason "length"), the request is sent
+ * once more under {@link TRUNCATION_RETRY_MAX_TOKENS}; a second truncation,
+ * or a truncation under a cap that is already at least that large, throws
+ * {@link OutputTruncatedError}.
+ *
+ * Returns the cap the response was produced under: a caller that sends a
+ * follow-up turn for the same output (a schema repair) starts it there, so
+ * an output that needed the larger cap is not cut off again by the smaller.
+ */
+export async function generateWithinOutputCap<R extends { readonly finishReason: string }>(
+  request: (maxOutputTokens: number) => PromiseLike<R>,
+  maxOutputTokens: number,
+  onProgress?: (message: string) => void,
+): Promise<CappedResponse<R>> {
+  const result = await request(maxOutputTokens);
+  if (result.finishReason !== 'length') return { result, maxOutputTokens };
+  if (maxOutputTokens >= TRUNCATION_RETRY_MAX_TOKENS) throw new OutputTruncatedError(maxOutputTokens);
+
+  onProgress?.(`Output truncated at ${maxOutputTokens} tokens; retrying with ${TRUNCATION_RETRY_MAX_TOKENS}...`);
+  const retry = await request(TRUNCATION_RETRY_MAX_TOKENS);
+  if (retry.finishReason === 'length') throw new OutputTruncatedError(TRUNCATION_RETRY_MAX_TOKENS);
+  return { result: retry, maxOutputTokens: TRUNCATION_RETRY_MAX_TOKENS };
+}
 
 /** Converts a Zod schema to a JSON Schema string for inclusion in prompts. */
 export function schemaToPromptHint(schema: z.ZodType): string {
@@ -70,6 +135,8 @@ interface GenerateObjectWithRepairOptions<T extends z.ZodType> {
   prompt: string;
   maxRepairAttempts?: number;
   maxOutputTokens?: number;
+  /** Sampling temperature; the provider's default when absent. */
+  temperature?: number;
   onProgress?: (message: string) => void;
 }
 
@@ -80,21 +147,30 @@ export async function generateObjectWithRepair<T extends z.ZodType>({
   prompt,
   maxRepairAttempts = 2,
   maxOutputTokens = DEFAULT_MAX_TOKENS,
+  temperature,
   onProgress,
 }: GenerateObjectWithRepairOptions<T>): Promise<{ output: z.infer<T>; repairAttempts: number }> {
   const promptWithSchema = prompt + schemaToPromptHint(schema);
   const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [
     { role: 'user', content: promptWithSchema },
   ];
+  // Raised for the rest of the exchange once a response needed the larger cap.
+  let outputCap = maxOutputTokens;
 
   for (let attempt = 0; attempt <= maxRepairAttempts; attempt++) {
     if (attempt > 0) {
       onProgress?.(`Schema repair ${attempt}/${maxRepairAttempts}...`);
     }
 
-    const result = system
-      ? await generateText({ model, system, messages, maxOutputTokens })
-      : await generateText({ model, messages, maxOutputTokens });
+    const { result, maxOutputTokens: usedCap } = await generateWithinOutputCap(
+      (cap) =>
+        system
+          ? generateText({ model, system, messages, maxOutputTokens: cap, temperature })
+          : generateText({ model, messages, maxOutputTokens: cap, temperature }),
+      outputCap,
+      onProgress,
+    );
+    outputCap = usedCap;
 
     const text = result.text;
 

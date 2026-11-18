@@ -7,6 +7,10 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
+// The persona CLI reaches the compiler only through runPersonaCompile's dynamic
+// import (persona-compile-service.ts); these tests never compile.
+vi.mock('../src/persona/compile-persona-policy.js', () => ({ compilePersonaPolicy: vi.fn() }));
+
 // Mock the memory prompt module before importing persona-prompt
 vi.mock('../src/memory/memory-prompt.js', () => ({
   buildMemorySystemPrompt: vi.fn(
@@ -21,6 +25,7 @@ import {
   getPersonaDir,
   getPersonaGeneratedDir,
   getPersonaConstitutionPath,
+  getPersonaPolicyState,
   getPersonaWorkspaceDir,
   loadPersona,
   personaExists,
@@ -28,10 +33,19 @@ import {
   applyServerAllowlist,
   filterMcpServersByPolicy,
 } from '../src/persona/resolve.js';
+import {
+  createPersona,
+  getPersonaDetail,
+  listPersonas,
+  setPersonaConstitution,
+} from '../src/persona/persona-service.js';
+import { main as personaMain } from '../src/persona/persona-command.js';
+import { isScopedPolicyError } from '../src/config/constitution-hash.js';
 import { buildPersonaSystemPromptAugmentation } from '../src/persona/persona-prompt.js';
 import { buildConstitutionGeneratorSystemPrompt } from '../src/cron/constitution-generator.js';
 import { buildPersonaCustomizerSystemPrompt } from '../src/persona/persona-customizer.js';
 import type { MCPServerConfig } from '../src/config/types.js';
+import { writePersonaPolicy } from './fixtures/scoped-policy.js';
 
 const TEST_HOME = resolve(`/tmp/ironcurtain-persona-test-${process.pid}`);
 
@@ -67,7 +81,7 @@ function createTestPersona(
   writeFileSync(resolve(personaDir, 'persona.json'), JSON.stringify(definition));
 
   if (opts.compiled !== false) {
-    writeFileSync(resolve(generatedDir, 'compiled-policy.json'), JSON.stringify({ rules: [] }));
+    writePersonaPolicy(personaDir);
   }
 }
 
@@ -192,6 +206,122 @@ describe('resolvePersona', () => {
 
     const result = resolvePersona('wp-test');
     expect(result.workspacePath).toContain('personas/wp-test/workspace');
+  });
+
+  it('refuses a policy compiled from an older constitution (POLICY_STALE)', () => {
+    createTestPersona('narrowed');
+    // The user narrows the constitution but never recompiles.
+    writeFileSync(getPersonaConstitutionPath(createPersonaName('narrowed')), 'Only READ files under ~/projects.\n');
+
+    let thrown: unknown;
+    try {
+      resolvePersona('narrowed');
+    } catch (err) {
+      thrown = err;
+    }
+    expect(isScopedPolicyError(thrown, 'POLICY_STALE')).toBe(true);
+    expect((thrown as Error).message).toBe(
+      'Persona "narrowed" has a stale compiled policy: the constitution changed after the policy was compiled. ' +
+        'Recompile it with: ironcurtain persona compile narrowed',
+    );
+  });
+
+  it('refuses a policy that records no constitution hash', () => {
+    createTestPersona('legacy');
+    writeFileSync(
+      resolve(getPersonaGeneratedDir(createPersonaName('legacy')), 'compiled-policy.json'),
+      JSON.stringify({ rules: [] }),
+    );
+
+    expect(() => resolvePersona('legacy')).toThrow(/stale compiled policy: the compiled policy does not record/);
+  });
+
+  it('returns a stale policy only on the explicit override, flagged for the caller to warn', () => {
+    createTestPersona('edited');
+    writeFileSync(getPersonaConstitutionPath(createPersonaName('edited')), 'Edited.\n');
+
+    const result = resolvePersona('edited', { allowStalePolicy: true });
+    expect(result.policyDir).toBe(getPersonaGeneratedDir(createPersonaName('edited')));
+    expect(result.stalePolicy).toEqual({
+      reason: 'constitution',
+      detail: 'the constitution changed after the policy was compiled',
+    });
+    // A fresh persona never carries the flag.
+    createTestPersona('fresh');
+    expect(resolvePersona('fresh', { allowStalePolicy: true })).not.toHaveProperty('stalePolicy');
+  });
+});
+
+describe('persona policy staleness on read', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** Creates a persona through the service and compiles it (writes the matching policy). */
+  function createCompiledPersona(name: string, constitution: string): void {
+    createPersona({ name, description: `Persona ${name}`, constitution }, 'cli');
+    writePersonaPolicy(getPersonaDir(createPersonaName(name)), {}, `${constitution}\n`);
+  }
+
+  it('getPersonaPolicyState recomputes the state from disk on every call', () => {
+    createCompiledPersona('coder', 'Read and write the workspace.');
+    const name = createPersonaName('coder');
+    expect(getPersonaPolicyState(name)).toEqual({ kind: 'fresh' });
+
+    setPersonaConstitution(name, 'Read the workspace only.', 'cli');
+    expect(getPersonaPolicyState(name)).toMatchObject({ kind: 'stale', reason: 'constitution' });
+
+    // Reverting the edit makes the existing policy match again.
+    setPersonaConstitution(name, 'Read and write the workspace.', 'cli');
+    expect(getPersonaPolicyState(name)).toEqual({ kind: 'fresh' });
+  });
+
+  it('persona list and detail report stale after a constitution edit', () => {
+    createCompiledPersona('coder', 'Read and write the workspace.');
+    createCompiledPersona('writer', 'Write docs.');
+    createPersona({ name: 'draft', description: 'Persona draft', constitution: 'Draft.' }, 'cli');
+    expect(listPersonas().find((p) => p.name === 'coder')).toEqual({
+      name: 'coder',
+      description: 'Persona coder',
+      compiled: true,
+    });
+
+    expect(setPersonaConstitution(createPersonaName('coder'), 'Read the workspace only.', 'cli')).toEqual({
+      stale: true,
+    });
+
+    expect(listPersonas()).toEqual([
+      { name: 'coder', description: 'Persona coder', compiled: true, stale: 'constitution' },
+      { name: 'draft', description: 'Persona draft', compiled: false },
+      { name: 'writer', description: 'Persona writer', compiled: true },
+    ]);
+    const detail = getPersonaDetail(createPersonaName('coder'));
+    expect(detail.hasPolicy).toBe(true);
+    expect(detail.stale).toBe('constitution');
+    expect(getPersonaDetail(createPersonaName('writer'))).not.toHaveProperty('stale');
+  });
+
+  it('`persona list` and `persona show` print the stale status', async () => {
+    createCompiledPersona('coder', 'Read and write the workspace.');
+    createCompiledPersona('writer', 'Write docs.');
+    setPersonaConstitution(createPersonaName('coder'), 'Read the workspace only.', 'cli');
+    const lines: string[] = [];
+    vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      lines.push(args.map(String).join(' '));
+    });
+
+    await personaMain(['list']);
+    const coderRow = lines.find((l) => l.includes('coder'));
+    const writerRow = lines.find((l) => l.includes('writer'));
+    expect(coderRow).toMatch(/stale \(recompile\)/);
+    expect(writerRow).toMatch(/compiled/);
+    expect(writerRow).not.toMatch(/stale/);
+
+    lines.length = 0;
+    await personaMain(['show', 'coder']);
+    expect(lines.find((l) => l.startsWith('Policy:'))).toMatch(
+      /stale: the constitution changed after the policy was compiled\. Recompile with: ironcurtain persona compile coder/,
+    );
   });
 });
 

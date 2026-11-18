@@ -1066,3 +1066,220 @@ describe('Trajectory poison: failure modes', () => {
     expect(warnSpy).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * Capture resource limits (MITM-11). The reassemblers frame with the
+ * trajectory limits (trajectory-limits.ts), not the metrics observer's 32 MiB
+ * / 100,000-event defaults, and an exceeded limit costs only the exchange that
+ * exceeded it: it is counted in `session-end.abortedExchanges` and the session
+ * keeps capturing. Poisoning stays reserved for parser and decoder faults.
+ */
+describe('Trajectory capture limits: exchange-scoped drops', () => {
+  let dir: string;
+  let writer: TrajectoryCaptureWriter;
+
+  beforeEach(() => {
+    dir = mkdtempSync(resolve(tmpdir(), 'tj-limits-'));
+    writer = createTrajectoryCaptureWriter({ capturesDir: dir });
+  });
+
+  afterEach(async () => {
+    try {
+      await writer.close();
+    } catch {
+      /* swallow */
+    }
+    rmSync(dir, { recursive: true, force: true });
+    vi.restoreAllMocks();
+  });
+
+  const MESSAGE_START =
+    'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_long","type":"message","role":"assistant","model":"c","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":3}}}\n\n' +
+    'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n';
+  const MESSAGE_END =
+    'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n' +
+    'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":7}}\n\n' +
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+
+  /** A complete Anthropic stream of `deltas` text deltas, in network-sized chunks. */
+  function longAnthropicStream(deltas: number, text = 'x'): Buffer[] {
+    const delta = Buffer.from(
+      `event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":${JSON.stringify(text)}}}\n\n`,
+    );
+    const perChunk = Math.max(1, Math.floor((64 * 1024) / delta.length));
+    const chunks: Buffer[] = [Buffer.from(MESSAGE_START)];
+    for (let written = 0; written < deltas; written += perChunk) {
+      chunks.push(Buffer.concat(Array<Buffer>(Math.min(perChunk, deltas - written)).fill(delta)));
+    }
+    chunks.push(Buffer.from(MESSAGE_END));
+    return chunks;
+  }
+
+  function beginAnthropicExchange(
+    sid: SessionId,
+    overrides: Partial<Parameters<typeof beginCaptureExchange>[0]> = {},
+  ): PassThrough {
+    const handle = beginCaptureExchange({
+      writer,
+      sessionId: sid,
+      host: 'api.anthropic.com',
+      path: '/v1/messages',
+      method: 'POST',
+      requestHeaders: { 'content-type': 'application/json' },
+      requestStartedAt: Date.now(),
+      ...overrides,
+    });
+    handle.setRequestBody(Buffer.from('{}', 'utf-8'));
+    return handle.attachResponse({ statusCode: 200, headers: { 'content-type': 'text/event-stream' } });
+  }
+
+  async function feed(tap: PassThrough, chunks: readonly Buffer[]): Promise<void> {
+    const settled = new Promise<void>((resolveSettled) => tap.once('close', () => resolveSettled()));
+    for (const chunk of chunks) tap.write(chunk);
+    tap.end();
+    await settled;
+  }
+
+  function sessionEnd(sid: SessionId): Extract<ManifestEntry, { event: 'session-end' }> {
+    const end = readManifest(dir).find((m) => m.event === 'session-end' && m.sessionId === sid);
+    if (end?.event !== 'session-end') throw new Error('no session-end entry');
+    return end;
+  }
+
+  it('captures a 150k-event stream in full: the metrics framer cap (100k events) no longer applies', async () => {
+    const sid = makeSessionId('sess-150k-captured');
+    writer.beginSession({ sessionId: sid });
+
+    await feed(beginAnthropicExchange(sid), longAnthropicStream(150_000));
+    await writer.endSession(sid);
+
+    const records = readJsonl(resolve(dir, `${sid}.jsonl`)) as ExchangeRecord[];
+    expect(records).toHaveLength(1);
+    expect(records[0].capture.reassemblyOk).toBe(true);
+    expect(records[0].response.streamRaw?.events.length).toBe(150_000 + 5);
+    expect(sessionEnd(sid)).toMatchObject({ poisoned: false, exchanges: 1, abortedExchanges: 0 });
+  }, 60_000);
+
+  it('drops only the exchange whose 150k-event stream exceeds the event cap; the session keeps capturing', async () => {
+    const logger = await import('../../src/logger.js');
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const sid = makeSessionId('sess-150k-over-cap');
+    writer.beginSession({ sessionId: sid });
+
+    // The cap the stream used to hit (the metrics framer's 100,000 events),
+    // applied explicitly so the overflow path runs.
+    await feed(beginAnthropicExchange(sid, { sseFramerLimits: { maxEvents: 100_000 } }), longAnthropicStream(150_000));
+    // The next exchange of the same session is captured normally.
+    await feed(beginAnthropicExchange(sid), longAnthropicStream(3));
+    await writer.endSession(sid);
+
+    const records = readJsonl(resolve(dir, `${sid}.jsonl`)) as ExchangeRecord[];
+    expect(records).toHaveLength(1);
+    expect(records[0].response.bodyUtf8).toContain('"text":"xxx"');
+    expect(readManifest(dir).some((m) => m.event === 'session-poisoned')).toBe(false);
+    expect(sessionEnd(sid)).toMatchObject({ poisoned: false, exchanges: 1, abortedExchanges: 1 });
+    expect(warnSpy.mock.calls.some(([message]) => message.includes('exchange dropped (capture-limit)'))).toBe(true);
+  }, 60_000);
+
+  it('drops only the exchange whose stream exceeds the byte cap', async () => {
+    const sid = makeSessionId('sess-stream-bytes');
+    writer.beginSession({ sessionId: sid });
+
+    await feed(beginAnthropicExchange(sid, { sseFramerLimits: { maxStreamBytes: 64 * 1024 } }), [
+      ...longAnthropicStream(2_000),
+    ]);
+    await writer.endSession(sid);
+
+    expect(sessionEnd(sid)).toMatchObject({ poisoned: false, exchanges: 0, abortedExchanges: 1 });
+  });
+
+  it('drops only the exchange whose single line exceeds the line cap', async () => {
+    const sid = makeSessionId('sess-line-bytes');
+    writer.beginSession({ sessionId: sid });
+
+    await feed(
+      beginAnthropicExchange(sid, { sseFramerLimits: { maxLineBytes: 4 * 1024, maxEventBytes: 4 * 1024 } }),
+      longAnthropicStream(1, 'y'.repeat(8 * 1024)),
+    );
+    await writer.endSession(sid);
+
+    expect(sessionEnd(sid)).toMatchObject({ poisoned: false, exchanges: 0, abortedExchanges: 1 });
+  });
+
+  it('drops only the exchange whose verbatim (non-streaming) body exceeds the raw cap', async () => {
+    const sid = makeSessionId('sess-raw-bytes');
+    writer.beginSession({ sessionId: sid });
+    const handle = beginCaptureExchange({
+      writer,
+      sessionId: sid,
+      host: 'api.anthropic.com',
+      path: '/v1/messages',
+      method: 'POST',
+      requestHeaders: { 'content-type': 'application/json' },
+      requestStartedAt: Date.now(),
+      maxRawResponseBytes: 1024,
+    });
+    handle.setRequestBody(Buffer.from('{"stream":false}', 'utf-8'));
+    const tap = handle.attachResponse({ statusCode: 200, headers: { 'content-type': 'application/json' } });
+
+    await feed(tap, [Buffer.from(`{"content":[{"type":"text","text":"${'z'.repeat(2048)}"}]}`)]);
+    writer.write(buildRecord(sid, 1));
+    await writer.endSession(sid);
+
+    expect(readJsonl(resolve(dir, `${sid}.jsonl`))).toHaveLength(1);
+    expect(sessionEnd(sid)).toMatchObject({ poisoned: false, exchanges: 1, abortedExchanges: 1 });
+  });
+
+  it('drops only the exchange when a compressed response exceeds a decoder limit', async () => {
+    const { createResponseCaptureInlet } = await import('../../src/docker/trajectory-tap.js');
+    const zlib = await import('node:zlib');
+    const sid = makeSessionId('sess-decoder-limit');
+    writer.beginSession({ sessionId: sid });
+    const handle = beginCaptureExchange({
+      writer,
+      sessionId: sid,
+      host: 'api.anthropic.com',
+      path: '/v1/messages',
+      method: 'POST',
+      requestHeaders: { 'content-type': 'application/json' },
+      requestStartedAt: Date.now(),
+    });
+    handle.setRequestBody(Buffer.from('{}', 'utf-8'));
+    const captureTap = handle.attachResponse({
+      statusCode: 200,
+      headers: { 'content-type': 'text/event-stream', 'content-encoding': 'gzip' },
+    });
+    const settled = new Promise<void>((resolveSettled) => captureTap.once('close', () => resolveSettled()));
+    const onPoison = vi.fn();
+    const inlet = createResponseCaptureInlet({ captureTap, contentEncoding: 'gzip', captureHandle: handle, onPoison });
+
+    // Writing 9 MiB of stored (level 0) gzip without yielding outruns zlib:
+    // the decoder's 8 MiB pending-input cap (a resource limit) trips.
+    const wire = zlib.gzipSync(Buffer.alloc(9 * 1024 * 1024, 0x61), { level: 0 });
+    for (let offset = 0; offset < wire.length; offset += 64 * 1024)
+      inlet.write(wire.subarray(offset, offset + 64 * 1024));
+    inlet.end();
+    await settled;
+    writer.write(buildRecord(sid, 1));
+    await writer.endSession(sid);
+
+    expect(onPoison).not.toHaveBeenCalled();
+    expect(sessionEnd(sid)).toMatchObject({ poisoned: false, exchanges: 1, abortedExchanges: 1 });
+  });
+
+  it('keeps poisoning the session for a genuine reassembly fault', async () => {
+    const sid = makeSessionId('sess-parser-fault');
+    writer.beginSession({ sessionId: sid });
+
+    // A delta for a block that was never opened: a parser fault, not a limit.
+    await feed(beginAnthropicExchange(sid), [
+      Buffer.from(
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"c","content":[]}}\n\n' +
+          'event: content_block_delta\ndata: {"type":"content_block_delta","index":3,"delta":{"type":"text_delta","text":"x"}}\n\n',
+      ),
+    ]);
+    await writer.endSession(sid);
+
+    expect(sessionEnd(sid)).toMatchObject({ poisoned: true, poisonReason: 'reassembly-failure' });
+  });
+});

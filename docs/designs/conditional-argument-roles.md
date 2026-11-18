@@ -1,7 +1,10 @@
 # Design: Conditional Argument Role Assignment
 
-**Status:** Proposed (revised)
+**Status (2026-11-14):** Implemented: annotations may carry `when` clauses that choose an argument's roles from the call's other arguments, resolved by `resolveStoredAnnotation` (`src/types/argument-roles.ts`). The git examples use git-mcp-server 2.8 argument names; see the note below.
+
 **Date:** 2026-03-04
+
+> **Argument names.** The examples use the argument names of git-mcp-server 2.8.4, which this design was written against. Since 2.15, `git_branch`'s discriminator is `mode` (with `branchName`/`newBranchName`) and `git_clone`'s destination is `path`; the shipped annotations use the live names. A condition keyed on an argument the live server no longer has, or on a value outside its live enum, never matches, so the argument always gets its default roles: the live-schema drift check (`src/trusted-process/schema-drift.ts`, see [tool-annotation-overlay.md](tool-annotation-overlay.md) section 8) reports such conditions as broken discriminators, and scenario validation in `compile-policy` uses the live schemas of the servers it reaches.
 
 ## 1. Problem
 
@@ -686,7 +689,7 @@ for (const [argName, spec] of Object.entries(a.args)) {
   if (!Array.isArray(spec) && 'when' in spec) {
     for (const entry of spec.when) {
       const condArg = entry.condition.arg;
-      if (!(condArg in a.args)) {
+      if (!Object.hasOwn(a.args, condArg)) {
         ctx.addIssue({
           code: 'custom',
           path: [i, 'args', argName],
@@ -698,6 +701,8 @@ for (const [argName, spec] of Object.entries(a.args)) {
   }
 }
 ```
+
+The test is on own keys, so an inherited name such as `constructor` is not taken for an argument. The runtime loaders apply the same check to every `tool-annotations.json` they read (`src/types/policy-schema.ts`), and they also refuse a server entry that annotates a tool twice. The same `superRefine` therefore rejects a batch that returns one tool twice (the repair loop asks for one annotation per tool), and `annotateServerTools` fails, before any LLM call, when the server lists a tool more than once, so `annotate-tools` never writes a file the runtime refuses.
 
 ### 7.5 Cache invalidation
 

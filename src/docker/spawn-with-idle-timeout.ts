@@ -13,6 +13,7 @@
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import type { ChildProcess, SpawnOptions } from 'node:child_process';
+import { StringDecoder } from 'node:string_decoder';
 
 export type SpawnFn = (cmd: string, args: readonly string[], options?: SpawnOptions) => ChildProcess;
 
@@ -156,21 +157,29 @@ export function spawnWithIdleTimeout(
       idleTimer.unref();
     };
 
-    const forward = (chunk: Buffer | string, sink: NodeJS.WritableStream, captureTail: boolean): void => {
-      const text = typeof chunk === 'string' ? chunk : chunk.toString('utf-8');
-      // Best-effort write; ignore backpressure since stdio piping is informational.
-      sink.write(text);
+    // One decoder per stream: a multi-byte UTF-8 character split across two
+    // chunks reaches the sink whole, not as two U+FFFD (the sink may be a
+    // log file, see `ContainerRuntime.streamContainerLogs`).
+    const stdoutDecoder = new StringDecoder('utf8');
+    const stderrDecoder = new StringDecoder('utf8');
+
+    const forward = (text: string, sink: NodeJS.WritableStream, captureTail: boolean): void => {
+      // Best-effort write that ignores backpressure: the sinks are the
+      // terminal, a progress renderer or a local log file.
+      if (text !== '') sink.write(text);
       if (captureTail) {
         stderrTail = (stderrTail + text).slice(-STDERR_TAIL_CHARS);
       }
       resetIdleTimer();
     };
+    const decode = (decoder: StringDecoder, chunk: Buffer | string): string =>
+      typeof chunk === 'string' ? chunk : decoder.write(chunk);
 
     child.stdout?.on('data', (chunk: Buffer | string) => {
-      forward(chunk, stdoutSink, false);
+      forward(decode(stdoutDecoder, chunk), stdoutSink, false);
     });
     child.stderr?.on('data', (chunk: Buffer | string) => {
-      forward(chunk, stderrSink, true);
+      forward(decode(stderrDecoder, chunk), stderrSink, true);
     });
 
     child.on('error', (err: Error) => {
@@ -182,6 +191,9 @@ export function spawnWithIdleTimeout(
     child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
       exited = true;
       if (settled) return;
+      // The bytes of a character the child never finished (as U+FFFD).
+      forward(stdoutDecoder.end(), stdoutSink, false);
+      forward(stderrDecoder.end(), stderrSink, true);
       if (code === 0 && !signal) {
         settle(() => resolvePromise());
         return;

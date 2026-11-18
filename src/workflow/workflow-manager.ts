@@ -15,8 +15,13 @@
  * `WebEventMap` is a type-only import and adds no runtime coupling.
  */
 
-import { mkdirSync, copyFileSync, existsSync } from 'node:fs';
+import { mkdirSync, existsSync, lstatSync } from 'node:fs';
 import { resolve } from 'node:path';
+import {
+  copyWorkflowStagedDirectory,
+  isOwnWorkflowRunsDirectory,
+  validatedWorkflowStagedDirectory,
+} from './staged-directories.js';
 
 import {
   WorkflowOrchestrator,
@@ -24,11 +29,28 @@ import {
   type WorkflowTabHandle,
   type WorkflowLifecycleEvent,
   type WorkflowController,
+  type WorkflowStopOptions,
 } from './orchestrator.js';
-import { FileCheckpointStore } from './checkpoint.js';
+import { FileCheckpointStore, isWorkflowRunFileTooNewError, rebaseRunLocalPaths } from './checkpoint.js';
+import {
+  claimWorkflowRunLock,
+  isWorkflowLockBusyError,
+  isWorkflowRunLockHeld,
+  releaseWorkflowLock,
+} from './run-lock.js';
+import type { ProcessLockHandle } from '../docker-workload/process-lock.js';
 import { createWorkflowSessionFactory } from './cli-support.js';
-import { findLatestResumableCheckpoint } from './checkpoint-selection.js';
+import { assertWorkflowRunsBaseDir, findLatestResumableCheckpoint, isSameDirectory } from './checkpoint-selection.js';
 import { loadDefinition } from './definition-loader.js';
+import {
+  hostCommandStates,
+  loadRunDefinition,
+  RECORDED_DEFINITION_ALLOWANCES,
+  runDefinitionPath,
+  writeRunDefinition,
+  type RunDefinitionLoadResult,
+} from './run-definition.js';
+import { isWorkspaceValidationError, validateWorkspacePath } from '../session/workspace-validation.js';
 import type { TypedEventBus } from '../event-bus/typed-event-bus.js';
 import type { WebEventMap } from '../web-ui/web-event-bus.js';
 import type { Session, SessionOptions } from '../session/types.js';
@@ -36,10 +58,13 @@ import { getIronCurtainHome } from '../config/paths.js';
 import { loadConfig } from '../config/index.js';
 import {
   type HumanGateRequestDto,
+  isSafeWorkflowId,
   toHumanGateRequestDto,
   type WorkflowId,
   type WorkflowCheckpoint,
   type WorkflowDefinition,
+  type WorkflowToolCallEscalation,
+  type WorkflowToolCallEscalationDecision,
 } from './types.js';
 import { sweepContainerSnapshots } from './container-snapshots.js';
 import * as logger from '../logger.js';
@@ -70,18 +95,37 @@ export interface PastRunLoadSuccess {
   readonly messageLogPath: string;
   /** True iff `workflowId` is present in `controller.listActive()` at call time. */
   readonly isLive: boolean;
+  /**
+   * True when the run is not live here but its run lock is held by a live
+   * process: it is running in another IronCurtain process (a CLI
+   * `workflow start`, another daemon), so it is neither interrupted nor
+   * resumable from here. Always false when `isLive`.
+   */
+  readonly runningElsewhere: boolean;
 }
 
 /**
  * Failed past-run load.
  * - `not_found`: directory doesn't exist OR has no loadable definition (so
- *   there's nothing to render).
+ *   there's nothing to render), or the id is not a safe path segment.
  * - `corrupted`: a present file (checkpoint or definition) failed to parse
  *   or validate.
+ * - `too_new`: a present file was written by a newer IronCurtain in a format
+ *   this one does not read (`WORKFLOW_CHECKPOINT_TOO_NEW`).
  */
 export interface PastRunLoadError {
-  readonly error: 'not_found' | 'corrupted';
+  readonly error: 'not_found' | 'corrupted' | 'too_new';
   readonly message?: string;
+}
+
+/** Options for {@link WorkflowManager.importExternalCheckpoint}. */
+export interface ImportExternalCheckpointOptions {
+  /**
+   * The caller (a human, via `--trust` / RPC `trust: true`) has reviewed the
+   * imported definition and accepts that its deterministic states run
+   * commands on this host. Without it such a definition is refused.
+   */
+  readonly trust?: boolean;
 }
 
 export type PastRunLoadResult = PastRunLoadSuccess | PastRunLoadError;
@@ -124,6 +168,20 @@ export interface WorkflowManagerOptions {
    * real session factory. The type matches `WorkflowOrchestratorDeps.createSession`.
    */
   readonly sessionFactoryOverride?: (options: SessionOptions) => Promise<Session>;
+  /**
+   * Optional overrides for the orchestrator's infrastructure / control-plane
+   * seams (`createWorkflowInfrastructure`, `destroyWorkflowInfrastructure`,
+   * `startWorkflowControlServer`, `loadPolicyRpc`). Like
+   * `sessionFactoryOverride`, a test-only DI seam: it lets an integration
+   * test run a shared-container workflow through the daemon with a real
+   * coordinator but no Docker. Production callers leave it unset.
+   */
+  readonly orchestratorDepsOverride?: Partial<
+    Pick<
+      WorkflowOrchestratorDeps,
+      'createWorkflowInfrastructure' | 'destroyWorkflowInfrastructure' | 'startWorkflowControlServer' | 'loadPolicyRpc'
+    >
+  >;
   /** Enable daemon-mode startup and periodic workflow container snapshot GC. */
   readonly enableSnapshotGc?: boolean;
 }
@@ -132,25 +190,52 @@ export interface WorkflowManagerOptions {
 // WorkflowManager
 // ---------------------------------------------------------------------------
 
+/**
+ * Thrown by {@link WorkflowManager.getOrchestrator} once the manager has been
+ * shut down. `code` is the discriminant for callers in other modules.
+ */
+export class WorkflowManagerClosedError extends Error {
+  readonly code = 'WORKFLOW_MANAGER_CLOSED' as const;
+
+  constructor() {
+    super('The workflow manager is shut down (the daemon is stopping); no workflow requests are accepted');
+    this.name = 'WorkflowManagerClosedError';
+  }
+}
+
 export class WorkflowManager {
   private orchestrator: WorkflowOrchestrator | null = null;
   private readonly eventBus: TypedEventBus<WebEventMap>;
   private readonly baseDirOverride: string | undefined;
   private readonly captureTraces: boolean | undefined;
   private readonly sessionFactoryOverride: ((options: SessionOptions) => Promise<Session>) | undefined;
+  private readonly orchestratorDepsOverride: WorkflowManagerOptions['orchestratorDepsOverride'];
   private readonly enableSnapshotGc: boolean;
   private snapshotGcTimer: ReturnType<typeof setInterval> | undefined;
+  /**
+   * Set when {@link shutdown} begins. Afterwards {@link getOrchestrator}
+   * throws instead of lazily creating a fresh orchestrator (which would
+   * accept new runs and restart snapshot GC behind a stopping daemon).
+   */
+  private closed = false;
+  /** The one {@link shutdown} drain; later calls join it. */
+  private shutdownPromise: Promise<void> | undefined;
 
   constructor(options: WorkflowManagerOptions) {
     this.eventBus = options.eventBus;
     this.baseDirOverride = options.baseDirOverride;
     this.captureTraces = options.captureTraces;
     this.sessionFactoryOverride = options.sessionFactoryOverride;
+    this.orchestratorDepsOverride = options.orchestratorDepsOverride;
     this.enableSnapshotGc = options.enableSnapshotGc ?? false;
   }
 
-  /** Lazily creates the orchestrator on first use. */
+  /**
+   * Lazily creates the orchestrator on first use. Throws
+   * {@link WorkflowManagerClosedError} once {@link shutdown} has begun.
+   */
   getOrchestrator(): WorkflowController {
+    if (this.closed) throw new WorkflowManagerClosedError();
     if (!this.orchestrator) {
       this.orchestrator = this.createOrchestrator();
     }
@@ -171,14 +256,29 @@ export class WorkflowManager {
     }
   }
 
-  /** Clean shutdown of all workflows. */
-  async shutdown(): Promise<void> {
+  /**
+   * Clean shutdown of all workflows: every run is aborted (with
+   * `options.reason`, a snapshot when its workflow asks for one, a terminal
+   * checkpoint and `run_terminal` marker) and every infrastructure teardown is
+   * drained. Final: the manager refuses all further requests (see
+   * {@link getOrchestrator}), and a start or resume racing the shutdown is
+   * refused by the orchestrator. Idempotent: a later call joins the first
+   * one's drain.
+   */
+  shutdown(options: WorkflowStopOptions = {}): Promise<void> {
+    this.shutdownPromise ??= this.runShutdown(options);
+    return this.shutdownPromise;
+  }
+
+  private async runShutdown(options: WorkflowStopOptions): Promise<void> {
+    this.closed = true;
     if (this.snapshotGcTimer !== undefined) {
       clearInterval(this.snapshotGcTimer);
       this.snapshotGcTimer = undefined;
     }
-    if (this.orchestrator) {
-      await this.orchestrator.shutdownAll();
+    const orchestrator = this.orchestrator;
+    if (orchestrator) {
+      await orchestrator.shutdownAll(options);
       this.orchestrator = null;
     }
   }
@@ -187,29 +287,60 @@ export class WorkflowManager {
    * Imports a checkpoint from an external directory into the daemon's own store.
    *
    * When `workflowId` is omitted, picks the most recent checkpoint in the external dir.
-   * Copies both the checkpoint and `definition.json` so that `resume()` can find them.
+   * Writes the run's checkpoint and definition copy into this base directory
+   * so that `resume()` can find them.
+   *
+   * Nothing in the external directory is trusted without a check, since an
+   * agent may have written it:
+   * - the directory must be a base directory of runs, not one run's
+   *   directory (whose workspace an agent can write; see
+   *   `assertWorkflowRunsBaseDir`), and an explicit id must be a safe path
+   *   segment;
+   * - the definition must load, and one that runs commands on the host needs
+   *   `options.trust`; the checked definition is what gets imported, and the
+   *   imported checkpoint names that local copy, so resume uses exactly it;
+   * - the recorded workspace (rebased onto the external run directory when the
+   *   run directory was moved) must pass `validateWorkspacePath`;
+   * - staged skills and scripts are kept only when they are real directories
+   *   canonically inside the external run directory (never a symlink out of
+   *   it), and container snapshot references are dropped (resume starts the
+   *   containers fresh), since resume would otherwise mount, restore from and
+   *   later delete whatever images or directories they name.
    *
    * @returns The workflow ID that was imported.
    */
-  importExternalCheckpoint(externalBaseDir: string, workflowId?: string): WorkflowId {
-    const externalStore = new FileCheckpointStore(externalBaseDir);
+  importExternalCheckpoint(
+    externalBaseDir: string,
+    workflowId?: string,
+    options: ImportExternalCheckpointOptions = {},
+  ): WorkflowId {
+    const externalDir = resolve(externalBaseDir);
+    assertWorkflowRunsBaseDir(externalDir);
+    const externalStore = new FileCheckpointStore(externalDir);
     let targetId: WorkflowId;
     let checkpoint: WorkflowCheckpoint | undefined;
 
-    if (workflowId) {
-      targetId = workflowId as WorkflowId;
+    if (workflowId !== undefined) {
+      if (!isSafeWorkflowId(workflowId)) {
+        throw new WorkflowResumeError(
+          'WORKFLOW_INVALID_ID',
+          `Invalid workflow ID ${JSON.stringify(workflowId)}: use 1-128 letters, digits, "_" or "-"`,
+        );
+      }
+      targetId = workflowId;
     } else {
       // `findLatestResumableCheckpoint` returns the most recent resumable
-      // run by `checkpoint.timestamp`. The two error paths preserve the
+      // run by `checkpoint.timestamp`, skipping (and reporting) runs whose
+      // checkpoint fails to load. The two error paths preserve the
       // pre-refactor wording so external callers (web UI, scripts) keep
       // their existing diagnostics.
       let latest;
       try {
-        latest = findLatestResumableCheckpoint(externalBaseDir, externalStore);
+        latest = findLatestResumableCheckpoint(externalDir, externalStore);
       } catch (err) {
         throw new WorkflowResumeError(
           'WORKFLOW_CHECKPOINT_CORRUPTED',
-          `Failed to load checkpoint from ${externalBaseDir}: ${describeError(err)}`,
+          `Failed to load checkpoint from ${externalDir}: ${describeError(err)}`,
         );
       }
       if (!latest) {
@@ -223,13 +354,16 @@ export class WorkflowManager {
         } catch (err) {
           throw new WorkflowResumeError(
             'WORKFLOW_CHECKPOINT_CORRUPTED',
-            `Failed to inspect checkpoints in ${externalBaseDir}: ${describeError(err)}`,
+            `Failed to inspect checkpoints in ${externalDir}: ${describeError(err)}`,
           );
         }
         if (externalIds.length === 0) {
-          throw new WorkflowResumeError('WORKFLOW_CHECKPOINT_NOT_FOUND', `No checkpoints found in ${externalBaseDir}`);
+          throw new WorkflowResumeError('WORKFLOW_CHECKPOINT_NOT_FOUND', `No checkpoints found in ${externalDir}`);
         }
-        throw new WorkflowResumeError('WORKFLOW_NOT_RESUMABLE', `No valid checkpoints found in ${externalBaseDir}`);
+        throw new WorkflowResumeError(
+          'WORKFLOW_NOT_RESUMABLE',
+          `No valid checkpoints found in ${externalDir} (runs still running in another process are skipped)`,
+        );
       }
       targetId = latest.workflowId;
       checkpoint = latest.checkpoint;
@@ -240,7 +374,7 @@ export class WorkflowManager {
         checkpoint = externalStore.load(targetId);
       } catch (err) {
         throw new WorkflowResumeError(
-          'WORKFLOW_CHECKPOINT_CORRUPTED',
+          isWorkflowRunFileTooNewError(err) ? 'WORKFLOW_CHECKPOINT_TOO_NEW' : 'WORKFLOW_CHECKPOINT_CORRUPTED',
           `Failed to load checkpoint for workflow ${targetId}: ${describeError(err)}`,
         );
       }
@@ -248,30 +382,199 @@ export class WorkflowManager {
     if (!checkpoint) {
       throw new WorkflowResumeError(
         'WORKFLOW_CHECKPOINT_NOT_FOUND',
-        `No checkpoint found for workflow ${targetId} in ${externalBaseDir}`,
+        `No checkpoint found for workflow ${targetId} in ${externalDir}`,
       );
     }
     if (this.orchestrator?.listActive().includes(targetId)) {
       throw new WorkflowResumeError('WORKFLOW_ALREADY_ACTIVE', `Workflow ${targetId} is already active`);
     }
-    // The daemon already owns checkpoints under its own base directory.
-    if (resolve(externalBaseDir) === resolve(this.getBaseDir())) {
+    // The source run may still be executing in another process (a CLI
+    // `workflow start` or `resume-standalone` on that directory). Importing it
+    // would let this daemon resume a second copy; its run lock lives in the
+    // external directory, so it is checked here (the workspace lock catches
+    // the shared workspace as well when both processes share a home).
+    if (isWorkflowRunLockHeld(externalDir, targetId)) {
+      throw new WorkflowResumeError(
+        'WORKFLOW_ALREADY_ACTIVE',
+        `Workflow ${targetId} in ${externalDir} is running in another IronCurtain process`,
+      );
+    }
+    // The daemon already owns checkpoints under its own base directory, under
+    // whatever spelling (a symlink, `..`) it was named: re-importing a run
+    // over itself would drop its snapshot references and rewrite its files.
+    if (isSameDirectory(externalDir, this.getBaseDir())) {
       return targetId;
     }
 
-    // Save into daemon's own store
-    const localStore = this.getCheckpointStore();
-    localStore.save(targetId, checkpoint);
+    const imported = this.prepareImport(externalDir, targetId, checkpoint, options.trust === true);
 
-    // Copy definition.json if it exists in the external dir
-    const externalDefPath = resolve(externalBaseDir, targetId, 'definition.json');
-    const localMetaDir = resolve(this.getBaseDir(), targetId);
-    mkdirSync(localMetaDir, { recursive: true });
-    if (existsSync(externalDefPath)) {
-      copyFileSync(externalDefPath, resolve(localMetaDir, 'definition.json'));
+    // Reserve a fresh destination atomically. An inactive run is still its
+    // owner's existing data: importing over it could replace definition.json
+    // before a later staged-file copy fails. Never merge into that directory.
+    const localRunDir = resolve(this.getBaseDir(), targetId);
+    mkdirSync(this.getBaseDir(), { recursive: true, mode: 0o700 });
+    try {
+      mkdirSync(localRunDir, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      let active = false;
+      try {
+        // A final symlink is never followed to inspect an existing run.
+        active = lstatSync(localRunDir).isDirectory() && isWorkflowRunLockHeld(this.getBaseDir(), targetId);
+      } catch {
+        // The destination changed meanwhile; it is still not ours to replace.
+      }
+      throw new WorkflowResumeError(
+        active ? 'WORKFLOW_ALREADY_ACTIVE' : 'WORKFLOW_NOT_RESUMABLE',
+        `Cannot import workflow ${targetId}: destination run already exists; existing files were left unchanged`,
+      );
+    }
+
+    // The copy lands in this base directory, which other processes share (a
+    // CLI `workflow start` runs under the same workflow-runs directory): hold
+    // the local run lock while copying, so the checkpoint and definition of a
+    // run that is live in another process under the same id are never
+    // overwritten.
+    let localLock: ProcessLockHandle;
+    try {
+      localLock = claimWorkflowRunLock(this.getBaseDir(), targetId);
+    } catch (err) {
+      if (isWorkflowLockBusyError(err)) {
+        throw new WorkflowResumeError('WORKFLOW_ALREADY_ACTIVE', `Cannot import: ${err.message}`);
+      }
+      throw err;
+    }
+    try {
+      // Definition first: a checkpoint is what makes the run resumable, and
+      // it must never name a definition copy that is not there yet.
+      writeRunDefinition(localRunDir, imported.definition);
+      const { workflowSkillsDir, workflowScriptsDir, ...checkpoint } = imported.checkpoint;
+      this.getCheckpointStore().save(targetId, {
+        ...checkpoint,
+        ...(workflowSkillsDir === undefined
+          ? {}
+          : { workflowSkillsDir: copyWorkflowStagedDirectory(workflowSkillsDir, localRunDir, 'skills') }),
+        ...(workflowScriptsDir === undefined
+          ? {}
+          : { workflowScriptsDir: copyWorkflowStagedDirectory(workflowScriptsDir, localRunDir, 'scripts') }),
+      });
+    } finally {
+      releaseWorkflowLock(localLock, (message) => logger.warn(`[workflow] ${message}`));
     }
 
     return targetId;
+  }
+
+  /**
+   * Checks an external run before import and builds the checkpoint and
+   * definition to write locally (see {@link importExternalCheckpoint}).
+   * Writes nothing.
+   */
+  private prepareImport(
+    externalDir: string,
+    workflowId: WorkflowId,
+    external: WorkflowCheckpoint,
+    trust: boolean,
+  ): { checkpoint: WorkflowCheckpoint; definition: WorkflowDefinition } {
+    const externalRunDir = resolve(externalDir, workflowId);
+    // Run-local paths follow the external run directory (it may itself have
+    // been moved or copied from another home).
+    const rebased = rebaseRunLocalPaths(external, workflowId, externalRunDir);
+
+    // The definition a resume would run: the run's own copy, else the file
+    // the checkpoint names. Display-grade validation, so a definition that
+    // predates `host: true` (or the one-persona rule for a shared scope) is
+    // still imported and recognised as running host commands; resume
+    // validates it fully.
+    const copyPath = runDefinitionPath(externalRunDir);
+    let loaded: RunDefinitionLoadResult;
+    let sourcePath: string;
+    if (existsSync(copyPath)) {
+      sourcePath = copyPath;
+      loaded = loadRunDefinition(copyPath, RECORDED_DEFINITION_ALLOWANCES);
+    } else {
+      throw new WorkflowResumeError(
+        'WORKFLOW_CHECKPOINT_CORRUPTED',
+        `Cannot import workflow ${workflowId}: a run-local ${copyPath} is required`,
+      );
+    }
+    if (!loaded.ok) {
+      throw new WorkflowResumeError(
+        loaded.kind === 'too_new' ? 'WORKFLOW_CHECKPOINT_TOO_NEW' : 'WORKFLOW_CHECKPOINT_CORRUPTED',
+        `Cannot import workflow ${workflowId}: ${loaded.message}`,
+      );
+    }
+    const definition = loaded.definition;
+    const hostStates = hostCommandStates(definition);
+    if (hostStates.length > 0 && !trust) {
+      throw new WorkflowResumeError(
+        'WORKFLOW_IMPORT_UNTRUSTED',
+        `Workflow ${workflowId} in ${externalDir} runs commands on this host (state(s): ${hostStates.join(', ')}), ` +
+          `and nothing vouches for its definition ${sourcePath}. Review it, then import again with --trust ` +
+          '(RPC: trust: true) to run it.',
+      );
+    }
+
+    let workspacePath: string | undefined;
+    if (rebased.workspacePath !== undefined) {
+      try {
+        workspacePath = validateWorkspacePath(rebased.workspacePath, loadConfig().protectedPaths);
+      } catch (err) {
+        if (isWorkspaceValidationError(err) && err.code === 'WORKSPACE_NOT_FOUND') {
+          throw new WorkflowResumeError(
+            'WORKFLOW_WORKSPACE_MISSING',
+            `Cannot import workflow ${workflowId}: its workspace ${rebased.workspacePath} does not exist`,
+          );
+        }
+        throw new WorkflowResumeError(
+          'WORKFLOW_NOT_RESUMABLE',
+          `Cannot import workflow ${workflowId}: workspace failed validation: ${describeError(err)}`,
+        );
+      }
+    }
+
+    // Staged skills are copied into the agent's sessions and staged scripts
+    // are bind-mounted into its container, so only a real directory that
+    // canonically lies inside the external run directory is kept. A symlink
+    // there (the bind mount would follow it) or a missing entry (which could
+    // be created as one later) is dropped, and the canonical path is kept.
+    const stagedDirInsideExternalRun = (path: string | undefined, kind: 'skills' | 'scripts'): string | undefined => {
+      if (path === undefined) return undefined;
+      const canonical = validatedWorkflowStagedDirectory(externalRunDir, path, kind);
+      if (canonical === undefined) {
+        logger.warn(
+          `[workflow] Import ${workflowId}: ignoring staged directory ${path}, which is not a directory inside ${externalRunDir}`,
+        );
+      }
+      return canonical;
+    };
+    const workflowSkillsDir = stagedDirInsideExternalRun(rebased.workflowSkillsDir, 'skills');
+    const workflowScriptsDir = stagedDirInsideExternalRun(rebased.workflowScriptsDir, 'scripts');
+
+    const checkpoint: WorkflowCheckpoint = {
+      machineState: rebased.machineState,
+      context: rebased.context,
+      timestamp: rebased.timestamp,
+      transitionHistory: rebased.transitionHistory,
+      // Resume reads the definition from the local copy written by this
+      // import, never from a path the external checkpoint chose.
+      definitionPath: runDefinitionPath(resolve(this.getBaseDir(), workflowId)),
+      runDir: resolve(this.getBaseDir(), workflowId),
+      ...(rebased.resourceBudget !== undefined ? { resourceBudget: rebased.resourceBudget } : {}),
+      // The run-wide usage so far: resume continues the run's totals and its
+      // `settings.workflowBudget` ceiling from it instead of starting over.
+      ...(rebased.usage !== undefined ? { usage: rebased.usage } : {}),
+      // A task-scoped run stays task-scoped: a task scope can only narrow the
+      // policy, and resume re-validates it (refusing the run when it no longer
+      // validates) instead of ever running the run unscoped.
+      ...(rebased.taskPolicyDir !== undefined ? { taskPolicyDir: rebased.taskPolicyDir } : {}),
+      ...(workspacePath !== undefined ? { workspacePath } : {}),
+      ...(workflowSkillsDir !== undefined ? { workflowSkillsDir } : {}),
+      ...(workflowScriptsDir !== undefined ? { workflowScriptsDir } : {}),
+      ...(rebased.finalStatus !== undefined ? { finalStatus: rebased.finalStatus } : {}),
+      ...(rebased.activeGateId !== undefined ? { activeGateId: rebased.activeGateId } : {}),
+    };
+    return { checkpoint, definition };
   }
 
   /**
@@ -285,18 +588,27 @@ export class WorkflowManager {
    * the per-call `controller.listActive()` allocation.
    */
   loadPastRun(workflowId: WorkflowId, activeIds?: ReadonlySet<WorkflowId>): PastRunLoadResult {
+    // Never join an id that is not one plain path segment into a path.
+    if (!isSafeWorkflowId(workflowId)) {
+      return { error: 'not_found', message: `Invalid workflow ID ${JSON.stringify(workflowId)}` };
+    }
     const store = this.getCheckpointStore();
-    const messageLogPath = resolve(this.getBaseDir(), workflowId, 'messages.jsonl');
+    const runDir = resolve(this.getBaseDir(), workflowId);
+    const messageLogPath = resolve(runDir, 'messages.jsonl');
 
     let checkpoint: WorkflowCheckpoint | undefined;
     try {
       checkpoint = store.load(workflowId);
     } catch (err: unknown) {
+      if (isWorkflowRunFileTooNewError(err)) return { error: 'too_new', message: describeError(err) };
       return {
         error: 'corrupted',
         message: `Failed to parse checkpoint for ${workflowId}: ${describeError(err)}`,
       };
     }
+    // Show (and browse) the workspace where the run directory is now, not
+    // where it was when the checkpoint was written.
+    if (checkpoint) checkpoint = rebaseRunLocalPaths(checkpoint, workflowId, runDir);
 
     const definitionResult = this.loadDefinitionForCheckpoint(workflowId, checkpoint);
     if ('error' in definitionResult) {
@@ -304,7 +616,40 @@ export class WorkflowManager {
     }
 
     const isLive = activeIds ? activeIds.has(workflowId) : this.getOrchestrator().listActive().includes(workflowId);
-    return { checkpoint, definition: definitionResult.definition, messageLogPath, isLive };
+    const runningElsewhere = !isLive && isWorkflowRunLockHeld(this.getBaseDir(), workflowId);
+    return { checkpoint, definition: definitionResult.definition, messageLogPath, isLive, runningElsewhere };
+  }
+
+  /**
+   * Finds the live workflow that owns a pending tool-call escalation.
+   * Escalation ids are coordinator UUIDs, unique across workflows, so a
+   * plain scan of the active runs is unambiguous.
+   */
+  findToolCallEscalation(
+    escalationId: string,
+  ): { readonly workflowId: WorkflowId; readonly escalation: WorkflowToolCallEscalation } | undefined {
+    // No orchestrator yet means no live workflow; do not create one (and
+    // start its background work) just to answer a session escalation lookup.
+    const controller = this.orchestrator;
+    if (!controller) return undefined;
+    for (const workflowId of controller.listActive()) {
+      const escalation = controller
+        .listToolCallEscalations(workflowId)
+        .find((candidate) => candidate.escalationId === escalationId);
+      if (escalation) return { workflowId, escalation };
+    }
+    return undefined;
+  }
+
+  /**
+   * Settles a pending tool-call escalation by id alone (the web UI's
+   * `escalations.resolve` route). Returns false when no live workflow has
+   * that escalation pending.
+   */
+  resolveToolCallEscalation(escalationId: string, decision: WorkflowToolCallEscalationDecision): boolean {
+    const found = this.findToolCallEscalation(escalationId);
+    if (!found || !this.orchestrator) return false;
+    return this.orchestrator.resolveToolCallEscalation(found.workflowId, escalationId, decision);
   }
 
   /** Returns the stable base directory for workflow data. */
@@ -351,13 +696,13 @@ export class WorkflowManager {
     workflowId: WorkflowId,
     checkpoint: WorkflowCheckpoint | undefined,
   ): { definition: WorkflowDefinition } | PastRunLoadError {
-    const definitionCopyPath = resolve(this.getBaseDir(), workflowId, 'definition.json');
+    const definitionCopyPath = runDefinitionPath(resolve(this.getBaseDir(), workflowId));
     const hasCopy = existsSync(definitionCopyPath);
 
     let definitionPath: string | undefined;
     if (hasCopy) {
       definitionPath = definitionCopyPath;
-    } else if (checkpoint && existsSync(checkpoint.definitionPath)) {
+    } else if (checkpoint && isOwnWorkflowRunsDirectory(this.getBaseDir()) && existsSync(checkpoint.definitionPath)) {
       definitionPath = checkpoint.definitionPath;
     }
 
@@ -376,9 +721,21 @@ export class WorkflowManager {
     // Both `parse` and `validate` failures map to `corrupted`: the file is
     // present on disk but unusable. Preserve the pre-refactor message
     // wording so existing UI consumers keep their diagnostic strings.
-    const result = loadDefinition(definitionPath);
+    //
+    // This load only displays the run, so a run recorded before host
+    // deterministic states needed `host: true`, or before a shared-container
+    // scope needed one persona (or `allowMixedPersonas: true`), stays
+    // visible. Resuming it goes through the orchestrator, which validates
+    // without these allowances (and refuses an unacknowledged host state at
+    // runtime anyway).
+    const result = hasCopy
+      ? loadRunDefinition(definitionPath, RECORDED_DEFINITION_ALLOWANCES)
+      : loadDefinition(definitionPath, RECORDED_DEFINITION_ALLOWANCES);
     if (result.ok) return { definition: result.definition };
 
+    if (result.kind === 'too_new') {
+      return { error: 'too_new', message: result.message };
+    }
     if (result.kind === 'parse') {
       return {
         error: 'corrupted',
@@ -422,9 +779,13 @@ export class WorkflowManager {
       baseDir,
       checkpointStore,
       userConfig: config.userConfig,
+      // Caller-supplied workspaces (workflows.start) and non-default
+      // checkpoint workspaces (resume, import) are validated against these.
+      protectedPaths: config.protectedPaths,
       // Forward the raw `--capture-traces` daemon flag; the infrastructure
       // factory resolves it against userConfig (single resolution point).
       captureTracesOverride: this.captureTraces,
+      ...this.orchestratorDepsOverride,
     };
 
     const orchestrator = new WorkflowOrchestrator(deps);
@@ -499,6 +860,19 @@ export class WorkflowManager {
         break;
       case 'gate_dismissed':
         // Already emitted via dismissGate callback
+        break;
+      case 'tool_call_escalation_raised':
+        this.eventBus.emit('workflow.escalation_raised', {
+          workflowId: event.workflowId,
+          escalation: event.escalation,
+        });
+        break;
+      case 'tool_call_escalation_resolved':
+        this.eventBus.emit('workflow.escalation_resolved', {
+          workflowId: event.workflowId,
+          escalationId: event.escalationId,
+          outcome: event.outcome,
+        });
         break;
       case 'agent_started':
         this.eventBus.emit('workflow.agent_started', {

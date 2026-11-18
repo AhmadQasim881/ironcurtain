@@ -4,9 +4,11 @@ import { resolve } from 'node:path';
 
 // Mock realpathSync so tests don't depend on real filesystem symlinks.
 // This isolates path normalization logic from host-specific symlink layout.
+// resolveRealPath calls realpathSync.native on macOS, so mock both.
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
-  return { ...actual, realpathSync: (p: string) => p };
+  const identity = (p: string): string => p;
+  return { ...actual, realpathSync: Object.assign(identity, { native: identity }) };
 });
 import {
   ARGUMENT_ROLE_REGISTRY,
@@ -26,12 +28,12 @@ import {
   extractDomain,
   extractDomainForRole,
   extractGitDomain,
-  resolveGitRemote,
+  resolveUrlForDomainCheck,
 } from '../src/trusted-process/domain-utils.js';
 
 describe('ARGUMENT_ROLE_REGISTRY', () => {
-  it('contains all sixteen roles', () => {
-    expect(ARGUMENT_ROLE_REGISTRY.size).toBe(16);
+  it('contains all nineteen roles', () => {
+    expect(ARGUMENT_ROLE_REGISTRY.size).toBe(19);
   });
 
   it('has entries for all known roles', () => {
@@ -43,13 +45,16 @@ describe('ARGUMENT_ROLE_REGISTRY', () => {
       'delete-history',
       'fetch-url',
       'git-remote-url',
+      'egress-host',
       'github-owner',
       'github-repo',
+      'github-resource-id',
       'branch-name',
       'commit-message',
       'email-address',
       'email-body',
       'share-permission',
+      'outbound-text',
       'proxy-domain',
       'none',
     ];
@@ -110,8 +115,33 @@ describe('getResourceRoles', () => {
     expect(roles).not.toContain('commit-message');
   });
 
-  it('returns exactly ten roles', () => {
-    expect(getResourceRoles()).toHaveLength(10);
+  it('returns exactly twelve roles', () => {
+    expect(getResourceRoles()).toHaveLength(12);
+  });
+
+  // WP-118: the destination host of policy-evaluated MITM egress is a URL
+  // role scoped to the virtual network server, so compiled `domains`
+  // conditions and the structural domain gate judge it, and a rule written
+  // for another server's URL roles never applies to it.
+  it('treats egress-host as a URL resource role for the network server only', () => {
+    const def = getRoleDefinition('egress-host');
+    expect(def.isResourceIdentifier).toBe(true);
+    expect(def.category).toBe('url');
+    expect(def.serverNames).toEqual(['network']);
+    expect(def.canonicalize('Registry.Example.COM')).toBe('registry.example.com');
+  });
+
+  // WP-27: a global GitHub ID (review-thread node ID, sub-issue ID) names a
+  // resource outside the call's owner/repo. It is a resource identifier, so
+  // the engine evaluates (and escalates) it, but opaque, so the approval
+  // whitelist cannot generalize it and an owner/repo pattern never covers it.
+  it('treats github-resource-id as an opaque resource identifier for github only', () => {
+    expect(getResourceRoles()).toContain('github-resource-id');
+    const def = getRoleDefinition('github-resource-id');
+    expect(def.isResourceIdentifier).toBe(true);
+    expect(def.category).toBe('opaque');
+    expect(def.serverNames).toEqual(['github']);
+    expect(def.canonicalize('PRRT_kwDOAbc123')).toBe('PRRT_kwDOAbc123');
   });
 });
 
@@ -347,26 +377,47 @@ describe('extractGitDomain', () => {
   });
 });
 
-describe('resolveGitRemote', () => {
-  it('returns URLs with :// as-is', () => {
-    expect(resolveGitRemote('https://github.com/user/repo.git', {})).toBe('https://github.com/user/repo.git');
+describe('resolveUrlForDomainCheck (git-remote-url)', () => {
+  const context = { allowedDirectory: '/nonexistent-sandbox', loadTrustedGitConfig: () => ({ entries: [] }) };
+
+  it('takes URLs with :// at face value', () => {
+    expect(resolveUrlForDomainCheck('https://github.com/user/repo.git', 'git-remote-url', {}, context)).toEqual({
+      status: 'resolved',
+      domains: ['github.com/user/repo'],
+    });
   });
 
-  it('returns SSH URLs as-is', () => {
-    expect(resolveGitRemote('git@github.com:user/repo.git', {})).toBe('git@github.com:user/repo.git');
+  it('takes SSH URLs at face value', () => {
+    expect(resolveUrlForDomainCheck('git@github.com:user/repo.git', 'git-remote-url', {}, context)).toEqual({
+      status: 'resolved',
+      domains: ['github.com/user/repo'],
+    });
   });
 
-  it('returns original value when git command fails (no repo)', () => {
-    // Resolution will fail because /nonexistent is not a git repo
-    expect(resolveGitRemote('origin', { path: '/nonexistent' })).toBe('origin');
+  it('marks a named remote it cannot resolve as unverifiable', () => {
+    expect(resolveUrlForDomainCheck('origin', 'git-remote-url', { path: '/nonexistent' }, context).status).toBe(
+      'unverifiable',
+    );
+    expect(resolveUrlForDomainCheck('nonexistent-remote', 'git-remote-url', { path: '/tmp' }, context).status).toBe(
+      'unverifiable',
+    );
+  });
+});
+
+describe('resolveUrlForDomainCheck (egress-host)', () => {
+  it('resolves a canonical host name to itself, lowercased', () => {
+    expect(resolveUrlForDomainCheck('Registry.Example.com', 'egress-host', {})).toEqual({
+      status: 'resolved',
+      domains: ['registry.example.com'],
+    });
   });
 
-  it('uses path argument as cwd for git command', () => {
-    // This test verifies the function signature accepts allArgs with path
-    const result = resolveGitRemote('nonexistent-remote', { path: '/tmp' });
-    // Should fail gracefully and return original value
-    expect(result).toBe('nonexistent-remote');
-  });
+  it.each(['93.184.216.34', '2001:db8::1', '127.1', 'example.com.', 'exa mple.com', 'https://example.com', ''])(
+    'treats %j as unverifiable, so no wildcard or allowlist entry can match it',
+    (value) => {
+      expect(resolveUrlForDomainCheck(value, 'egress-host', {}).status).toBe('unverifiable');
+    },
+  );
 });
 
 describe('getRolesByCategory', () => {
@@ -384,7 +435,8 @@ describe('getRolesByCategory', () => {
     const urls = getRolesByCategory('url');
     expect(urls).toContain('fetch-url');
     expect(urls).toContain('git-remote-url');
-    expect(urls).toHaveLength(2);
+    expect(urls).toContain('egress-host');
+    expect(urls).toHaveLength(3);
   });
 
   it('returns opaque-category roles', () => {
@@ -395,7 +447,9 @@ describe('getRolesByCategory', () => {
     expect(opaques).toContain('email-body');
     expect(opaques).toContain('share-permission');
     expect(opaques).toContain('none');
-    expect(opaques).toHaveLength(6);
+    expect(opaques).toContain('github-resource-id');
+    expect(opaques).toContain('outbound-text');
+    expect(opaques).toHaveLength(8);
   });
 });
 
@@ -407,9 +461,9 @@ describe('getPathRoles', () => {
 });
 
 describe('getUrlRoles', () => {
-  it('returns exactly the two URL roles', () => {
+  it('returns exactly the three URL roles', () => {
     const roles = getUrlRoles();
-    expect(roles).toEqual(['fetch-url', 'git-remote-url']);
+    expect(roles).toEqual(['fetch-url', 'git-remote-url', 'egress-host']);
   });
 });
 

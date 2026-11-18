@@ -1,6 +1,10 @@
 # TLS-Terminating API Proxy Design
 
+**Status (2026-11-14):** Implemented (`src/docker/mitm-proxy.ts`). The open questions on request-body inspection are answered by the request sanitizers (`mitm-request-filtering.md`), and the proxy enforces token and cost limits per bundle (`src/docker/budget-gate.ts`).
+
 ## 1. Overview
+
+**Response containment (2026-11-16):** `upstream-response.ts` validates integer HTTP statuses in the range 100–599 and contains synchronous failures inside each asynchronous provider, passthrough and read-only registry response callback. Invalid response metadata or header/relay setup returns 502 with connection close; an already-started response is destroyed. Raw WebSocket handshake responses use the same status contract. The outer request listener's synchronous guard does not cover these later callbacks.
 
 The current Docker agent architecture passes real API keys into the untrusted container environment and uses a passthrough CONNECT proxy that tunnels raw TCP bytes without inspecting them. This design replaces that proxy with a **TLS-terminating MITM proxy** that:
 
@@ -111,7 +115,7 @@ export interface CertificateAuthority {
 export function loadOrCreateCA(caDir: string): CertificateAuthority;
 ```
 
-**Why 2048-bit RSA:** We use `node-forge` (pure JS) for cert generation. 2048-bit keys generate in ~200-500ms, which is acceptable for a one-time operation. Per-host leaf certs also use 2048-bit but are pre-warmed at startup (see Section 5).
+**Why 2048-bit RSA:** We use `node-forge` (pure JS) for cert generation. 2048-bit keys generate in ~200-500ms, which is acceptable for a one-time operation. Per-host leaf certs also use 2048-bit RSA, but every leaf under one CA generation shares a single key pair per process, generated off the event loop when a proxy starts (see Section 5).
 
 ### Docker Image Integration
 
@@ -332,7 +336,7 @@ The MITM proxy replaces `connect-proxy.ts`. It uses the same UDS-based listening
 // src/docker/mitm-proxy.ts
 
 export interface MitmProxy {
-  /** Start listening on the UDS. Pre-warms cert cache for all providers. */
+  /** Start listening on the UDS. Generates the shared leaf key pair off the event loop first. */
   start(): Promise<{ socketPath: string }>;
   /** Stop the proxy and close all connections. */
   stop(): Promise<void>;
@@ -375,7 +379,7 @@ The proxy is built from Node.js builtins (`http`, `tls`, `https`, `net`) plus `n
 │    2. Reply "200 Connection Established"             │
 │    3. Unshift head buffer back into socket           │
 │    4. Wrap clientSocket in tls.TLSSocket             │
-│       (SNICallback → cached SecureContext per host)  │
+│       (leaf for the CONNECT host; other SNI refused) │
 │    5. Store socket metadata, track in activeConns    │
 │    6. Emit TLS socket into shared innerServer        │
 │                                                     │
@@ -438,6 +442,8 @@ async stop() {
 
 ### CONNECT Handler
 
+`parseConnectTarget` in this sketch is `parseConnectAuthority` (`src/docker/proxy-authority.ts`) in the implementation: it accepts only a canonical host (lowercase, no trailing dot, IDNA ASCII), a decimal port 1-65535 and bracketed IPv6, and anything else is answered `400 Bad Request` before any `200` or certificate is produced. Every per-connection listener also runs inside a guard that drops only the offending connection if its body throws. The passthrough rules that grew around this handler (host:port approvals, SNI-pinned tunnels) are described in `proxy-mcp-server.md`.
+
 ```typescript
 outerServer.on('connect', (req: IncomingMessage, clientSocket: Socket, head: Buffer) => {
   const { host, port } = parseConnectTarget(req.url);
@@ -465,12 +471,18 @@ outerServer.on('connect', (req: IncomingMessage, clientSocket: Socket, head: Buf
     clientSocket.unshift(head);
   }
 
-  // 4. Upgrade to TLS (MITM)
+  // 4. Upgrade to TLS (MITM). The leaf is the one for the admitted CONNECT
+  //    host (minted before the 200 above, so an unissuable host is a 403);
+  //    it is also served to a ClientHello without SNI. A ClientHello naming
+  //    any other host is refused: a peer-chosen name is never minted.
+  const hostContext = getOrCreateSecureContext(host);
   const tlsSocket = new tls.TLSSocket(clientSocket, {
     isServer: true,
+    secureContext: hostContext,
     SNICallback: (servername, cb) => {
-      const ctx = getOrCreateSecureContext(servername);
-      cb(null, ctx);
+      // Compared in canonical form (case, trailing dot, IDNA), like the CONNECT host.
+      if (canonicalizeHostname(servername) !== host) return cb(new Error('SNI must match the CONNECT host'));
+      cb(null, hostContext);
     },
   });
 
@@ -591,82 +603,33 @@ const innerServer = http.createServer((clientReq, clientRes) => {
 
 ### Per-Host Certificate Generation
 
-Leaf certificates are generated on-demand and cached for the session lifetime. The cert cache is **pre-warmed** during `start()` for all configured provider hosts to avoid ~200-500ms latency on the first real request.
+Leaf certificates are minted lazily, the first time a host is dialed, and only for the **admitted CONNECT host**: the name already checked against the provider/registry allowlist (or the registry-egress manifest), never a name the peer puts in its TLS SNI. A ClientHello naming any other host is refused in every listener mode (the SNI is compared in the canonical form `parseConnectAuthority` gives the CONNECT host, so case and a trailing dot do not matter, and an SNI that is not a valid hostname is refused); one without SNI gets the CONNECT host's leaf. (Minting by SNI let a compromised agent loop `CONNECT api.anthropic.com:443` with a fresh random SNI: each name cost a 2048-bit key generation plus a JavaScript RSA signature, about 50 ms of blocked event loop shared by every session in the daemon, and an unbounded cache entry.)
+
+Issuance lives in `src/docker/ca.ts`:
+
+- `prepareLeafIssuance(ca)` verifies the authority and generates **one RSA-2048 leaf key pair per CA generation per process** with the asynchronous `crypto.generateKeyPair` (libuv thread pool). `start()` awaits it before listening, so no handshake waits on a key generation. Without it, the first mint generates the key pair synchronously once.
+- `createLeafSecureContextCache(ca)` returns the per-host lookup. A miss builds the TBSCertificate with node-forge and signs its DER with `crypto.sign` (native, about 1 ms); no RSA private-key operation runs in JavaScript. A name is certified as a dNSName and must be lowercase DNS syntax (`isLeafHostname`). An IP literal is certified as an iPAddress, which is what a client connecting by address verifies, and only in the canonical spelling `parseConnectAuthority` reports (a dotted quad, or RFC 5952 IPv6 without brackets): a provider configured by address is admitted by that address. Anything else is refused, and the CONNECT gets a 403 (a malformed authority never gets this far: `parseConnectAuthority` answers it with a 400).
+- Contexts live in **one process-wide least-recently-used cache** keyed by CA generation and hostname and bounded at `LEAF_SECURE_CONTEXT_CACHE_MAX_ENTRIES` (256), shared by every proxy (bundle) in the process. The bound matters for a nested transport under the deprecated `IRONCURTAIN_MITM_ALLOW_ALL_HOSTS`, which TLS-terminates every unknown host (under policy-evaluated egress, every host the policy admits; see `mitm-egress-policy.md`). A leaf is valid for 24 hours and renewed within an hour of expiry.
 
 ```typescript
-// Certificate cache: hostname → tls.SecureContext
-const certCache = new Map<string, tls.SecureContext>();
-
-/**
- * Returns a cached SecureContext for the hostname, generating one if needed.
- *
- * CONCURRENCY NOTE: This function is synchronous because node-forge's
- * RSA key generation is synchronous (pure JS). This means concurrent
- * SNICallback invocations for the same uncached hostname block the event
- * loop sequentially — the first call generates and caches, the second
- * finds the cache populated. If key generation is ever made async,
- * a Map<string, Promise<SecureContext>> deduplication pattern should
- * be used to prevent redundant generation.
- */
-function getOrCreateSecureContext(hostname: string): tls.SecureContext {
-  const cached = certCache.get(hostname);
-  if (cached) return cached;
-
-  // Generate leaf cert signed by IronCurtain CA
-  const leafKeys = forge.pki.rsa.generateKeyPair(2048);
-  const leafCert = forge.pki.createCertificate();
-
-  leafCert.publicKey = leafKeys.publicKey;
-  leafCert.serialNumber = randomSerialNumber();
-  leafCert.validity.notBefore = new Date();
-  leafCert.validity.notAfter = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
-
-  leafCert.setSubject([{ name: 'commonName', value: hostname }]);
-  leafCert.setIssuer(caCert.subject.attributes);
-  leafCert.setExtensions([
-    { name: 'subjectAltName', altNames: [{ type: 2, value: hostname }] },
-    { name: 'keyUsage', digitalSignature: true, keyEncipherment: true },
-    { name: 'extKeyUsage', serverAuth: true },
-  ]);
-
-  leafCert.sign(caKey, forge.md.sha256.create());
-
-  const ctx = tls.createSecureContext({
-    key: forge.pki.privateKeyToPem(leafKeys.privateKey),
-    cert: forge.pki.certificateToPem(leafCert),
-  });
-
-  certCache.set(hostname, ctx);
-  return ctx;
-}
+// mitm-proxy.ts, CONNECT handler (after the allowlist check)
+const hostContext = getOrCreateSecureContext(host); // throws → 403 Forbidden
+clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+const tlsSocket = new tls.TLSSocket(clientSocket, {
+  isServer: true,
+  secureContext: hostContext, // served when the ClientHello has no SNI
+  SNICallback: (servername, cb) =>
+    canonicalizeHostname(servername) === host
+      ? cb(null, hostContext)
+      : cb(new Error('SNI must match the CONNECT host')),
+});
 ```
 
-**Pre-warming in `start()`:**
-
-```typescript
-async start() {
-  // Clean up stale socket file from a previous run
-  if (existsSync(options.socketPath)) {
-    unlinkSync(options.socketPath);
-  }
-
-  // Pre-warm cert cache for all configured providers.
-  // This moves the ~200-500ms per-host RSA generation out of the
-  // request hot path and into session initialization.
-  for (const mapping of options.providers) {
-    getOrCreateSecureContext(mapping.config.host);
-  }
-
-  return new Promise((resolve, reject) => {
-    outerServer.listen(options.socketPath, () => {
-      resolve({ socketPath: options.socketPath });
-    });
-    outerServer.once('error', reject);
-  });
-}
-```
+Nothing is pre-minted at `start()` or on `hosts.addHost()`: a direct proxy tunnels passthrough hosts raw, and a mint costs one signature. (The former pre-warm of every provider and registry host blocked the event loop for about 0.6 s per bundle start.)
 
 ### API Key Validation and Swapping
+
+> **Current implementation** (`src/docker/provider-credentials.ts`): the check below grew into a credential gate. It strips every credential carrier (`authorization`, `x-api-key`, `x-goog-api-key`, `api-key`, `anthropic-api-key`, cookies, and the `key`/`api_key`/`access_token`-style query parameters), accepts the sentinel in any of them and injects the real key only in the provider's configured location, and answers any other credential with a local **401** (JSON error body). A request with no credential is forwarded, without one, only to an endpoint the provider lists in `unauthenticatedEndpoints` (connectivity checks, public catalogs and key sets); anywhere else it is a 401. The code below is the original design.
 
 The proxy validates that the incoming API key matches the expected fake sentinel before swapping. This prevents:
 - A compromised agent from sending requests without credentials and having them auto-authenticated
@@ -741,6 +704,8 @@ function isEndpointAllowed(
 }
 ```
 
+> **Current implementation** (`matchesEndpointPattern` in `src/docker/llm-observation/completion-endpoint.ts`): a `*` matches one or more RFC 3986 unreserved characters (`[A-Za-z0-9._~-]`) that are not all dots, instead of `[^/]+`. The request path is forwarded verbatim, so a wildcard must not match a dot segment (`/api/eval/..`), a percent-encoded separator or dot (`%2F`, `%5C`, `%2E`), a backslash, a `;` path parameter or a `#`, any of which an upstream could normalize or decode into a different route. Model ids such as `gemini-2.5-pro` still match.
+
 ### Logging
 
 Every request is logged with decision and timing:
@@ -813,7 +778,7 @@ Session teardown:
 4. Start MITM proxy (UDS) with:
    - CA cert/key
    - Provider configs with fake→real key mappings
-   - Pre-warms cert cache for all provider hosts
+   - Generates the process's shared leaf key pair off the event loop (leaves are minted on first CONNECT)
 5. Query MCP proxy for tools — unchanged
 6. Generate orientation — unchanged
 7. Build Docker image (with CA cert baked in, using temp build context)
@@ -871,7 +836,20 @@ With TLS terminated, we can see the full HTTP request. The proxy applies a defau
 
 3. **Data exfiltration via API key reuse**: Even if the agent extracts the fake API key from its environment, the key is useless — it's a random sentinel that no provider will accept.
 
-4. **Unauthenticated request injection**: The proxy validates that the incoming request carries the expected fake key before swapping. Requests without the correct sentinel are rejected with 403, preventing the proxy from blindly authenticating arbitrary requests.
+4. **Unauthenticated request injection**: The proxy validates that the incoming request carries the expected fake key before swapping. Requests with any other credential, or with none outside the provider's declared unauthenticated endpoints, are rejected with a local 401, preventing the proxy from blindly authenticating arbitrary requests or forwarding an agent-chosen key.
+
+### Completion Budget Gate
+
+Each bundle's proxy enforces the session's (or workflow's) `resourceBudget.maxTotalTokens` and `maxEstimatedCostUsd` on the completion requests it forwards (`src/docker/budget-gate.ts`, created by `prepareDockerInfrastructure`). The gate is per bundle and counts every completion exchange, whatever metrics lease (proxy credential) the CONNECT carried: the lease is agent-readable, so it never decides anything. A shared workflow bundle has one budget for all of its lanes; per-state usage is still reported in the gate's snapshot and in the log line when it trips.
+
+- **Turn rule.** Batch and workflow bundles forward a completion request only while the host runs an agent turn on the bundle (`DockerAgentSession` opens one around each agent exec). A process left running between turns, or a deterministic workflow step, gets a refusal. PTY bundles have one session-long allowance.
+- **Admission.** Before forwarding (after the body has been sanitized), the gate pre-charges the request's output cap (`max_tokens`, `max_output_tokens`, `max_completion_tokens`, `generationConfig.maxOutputTokens`, or 32,000 tokens when the request names none) once for every choice it asks for (`n`, `generationConfig.candidateCount`), priced at the requested model's output list price. Field names are matched as a lenient decoder may match them (Google also accepts the proto names such as `generation_config.max_output_tokens`; case and `_`/`-` are folded), and the largest value counts. The request is refused when the charged totals plus the reservations of the requests in flight plus its own reservation would exceed a limit. The first such refusal latches the gate; the session then sweeps the running turn's processes and ends the turn with `BudgetExhaustedError` (so cron records `budget_exhausted`), and no later turn starts. A cheap check before the body is read refuses a request while the gate is latched or no turn is open, so such a request is never buffered, and a request whose client has already gone (for example while its body was decoded) is neither admitted nor forwarded.
+- **Refusal.** HTTP 400 with `x-should-retry: false`, `x-ironcurtain-refusal: budget-exhausted` (or `no-active-turn`) and an Anthropic-shaped JSON error whose `type` and `code` are `ironcurtain_budget_exhausted` (or `ironcurtain_no_active_turn`). Never 429: agent CLIs retry a 429 and report it as a provider quota.
+- **Speed.** A fast-mode request (Anthropic `speed: "fast"`, under any spelling a lenient decoder accepts) is reserved and charged at the model's fast-mode list price (`pricingForSpeed`), which bills every token at a multiple of the standard rate; any `speed` other than `standard` counts as fast, so an unrecognized value prices fail-closed. When the proxy did not inspect the body, the observed exchange record's request speed decides at settlement. A model the price table gives no fast-mode price (a `resourceBudget.modelPricing` override, a fallback default) is charged its listed rates.
+- **Settlement.** When the exchange ends, the reservation becomes a charge: the measured tokens once the protocol's final usage report has been observed, priced with the gateway's reported cost (OpenRouter) or at list prices per billing attempt (`src/llm-metrics/pricing.ts`; an attempt whose prompt is past its model's `unmodeledPremiumAbovePromptTokens`, a long-context tier the table does not list, is charged twice every listed rate through `estimateCapRequestCostUsd`, with a warning once per model, since the tiers it stands for bill at most that); nothing for a provider error status or a request whose upstream connection never came up; and otherwise (a protocol the proxy does not parse, a response without usage such as a Chat Completions stream without `include_usage`, a stream ended or abandoned before its final usage report) a conservative estimate with a warning in the log: output is the larger of what was measured and the reserved output cap; input is the measured total when one was reported, and otherwise the larger of the measured parts and the forwarded request body's size at 3 bytes per token, priced at the plain input rate. The agent decides whether usage is reported, so unmeasured input is never free.
+- **Statistics.** The proxy observes completion usage for the gate whether or not statistics are enabled; exchange records reach the statistics bus (and SQLite) only when they are.
+
+The reservation covers output only, so the inputs of the exchanges in flight can still take the totals past a limit; every later request is then refused. The input estimate for unmeasured exchanges is a typical-text ratio, not a bound: text built to tokenize densely can carry up to about three times as many tokens as estimated (and base64 image data far fewer).
 
 ## 9. SSE Streaming
 
@@ -887,9 +865,28 @@ The proxy uses `upstreamRes.pipe(clientRes)` for response streaming, with explic
 
 No SSE parsing is needed — the proxy is a transparent pipe at the HTTP level.
 
-### Timeout Handling
+### Timeout Handling and Resource Bounds
 
-SSE connections are long-lived. The proxy does not impose idle timeouts on individual HTTP connections. The session-level timeout (via `docker exec` timeout) handles runaway sessions. The only timeout is the 10-second TLS handshake timeout, which only applies before the connection is established.
+The proxy runs in the daemon (or session) process and shares its event loop, memory and file descriptors with every other session, so each proxy (one per bundle) bounds what its agent can pin. The ceilings and deadlines live in `src/docker/mitm-resource-limits.ts` (`DEFAULT_MITM_RESOURCE_LIMITS`; `MitmProxyOptions.resourceLimits` overrides them for tests):
+
+| Bound                                                                  | Default        | Over the bound                                                  |
+| ---------------------------------------------------------------------- | -------------- | --------------------------------------------------------------- |
+| Requests in flight (decrypted, plain HTTP, or inside a port-80 tunnel) | 128            | 503 `overloaded_error`, `Retry-After: 1`, `Connection: close`   |
+| Passthrough tunnels (raw, SNI-pinned, port-80) and WebSocket bridges   | 64             | `503 Service Unavailable` on the raw socket                     |
+| TLS-terminated connections (handshakes too)                            | 256            | `503 Service Unavailable` on the raw socket                     |
+| Client sockets on the outer listener                                   | 512            | `net.Server#maxConnections` backstop: the connection is dropped |
+| Buffered request-body bytes (raw + decoded)                            | 128 MiB        | 503 `overloaded_error`, `Retry-After: 1`, `Connection: close`   |
+| One buffered request body                                              | provider limit | 413 `request_too_large` (32 MiB default, 50 MiB OpenAI)         |
+| Request head on a decrypted connection or port-80 tunnel               | 60 s           | connection closed                                               |
+| Decrypted connection or port-80 tunnel with no bytes either way        | 15 min         | connection closed                                               |
+| Buffered body: no bytes / not complete                                 | 60 s / 5 min   | 408 `timeout_error`, `Connection: close`                        |
+| Upstream response headers                                              | 10 min         | 504 (the connection is dropped if the response already started) |
+| Upstream exchange with no bytes either way                             | 10 min         | 504, or the connection is dropped                               |
+| Raw or SNI-pinned tunnel, or WebSocket bridge, with no bytes           | 10 min         | tunnel closed                                                   |
+
+The inner HTTP server never listens (it receives connections through `emit('connection')`), and neither does the server that handles an approved port-80 passthrough tunnel as HTTP (`proxy-mcp-server.md`, decision 2), so Node enforces neither its `headersTimeout` nor its `requestTimeout` there, and it rewrites a socket's own timeout around every keep-alive request. `DecryptedConnectionMonitor` therefore tracks the request-head and idle deadlines of both kinds of connection itself, sweeping the connections' byte counters; a request admitted on such a connection suspends its head deadline until the response ends. A port-80 tunnel whose request is upgraded to a WebSocket stops being tracked: the bridge's own handshake timeout and tunnel idle timeout bound it, and the tunnel's slot under the tunnel ceiling covers it. The request-head deadline stops a client that drips a request head; the idle deadline sits above the upstream deadlines, which match the 10-minute request ceiling of the Anthropic and OpenAI SDKs, so a non-streaming completion the client still waits for is not cut short. SSE streams keep every idle timer alive with their events and pings.
+
+A buffered body is charged to the bundle's budget as it arrives and stays charged until its exchange ends, because the forwarded body is kept for the OAuth 401 retry while the response streams. A compressed body's decoded bytes are charged chunk by chunk as the decoder produces them, not once decoding has finished, and compressed bodies are decoded one at a time per bundle: otherwise concurrent decompression bombs, each under the per-request limit, would together hold many times the budget while they decode, and interleaved decodes would race each other for it. A refused request gets its JSON error at once, and the rest of its upload is read and discarded (up to 64 MiB or 30 s) before the connection closes, so a fetch-style client that only reads after it finishes writing still sees the error instead of a reset. The 10-second TLS handshake timeout is unchanged.
 
 ## 10. Security Analysis
 
@@ -918,7 +915,7 @@ SSE connections are long-lived. The proxy does not impose idle timeouts on indiv
 - Agent sees: `Blocked: GET /v1/some-endpoint is not an allowed endpoint`
 
 **3. Agent sends requests without the expected fake key**
-- The proxy validates the key before swapping — requests with a missing or non-matching key are rejected with 403
+- The proxy validates the key before swapping — requests with a non-matching key, or a missing key outside the declared unauthenticated endpoints, are rejected with 401
 - This prevents the proxy from blindly authenticating arbitrary requests
 
 **4. Agent tries to exfiltrate data in the request body**
@@ -928,16 +925,20 @@ SSE connections are long-lived. The proxy does not impose idle timeouts on indiv
 **5. Agent tries to reach other hosts**
 - CONNECT to non-allowlisted host → 403 at the CONNECT level (before TLS even starts)
 
-**6. Agent bypasses HTTPS_PROXY and connects directly**
+**6. Agent runs up LLM spend through the proxy**
+- The bundle's completion budget gate (§8) refuses completion requests once the token or cost limit is reached, and outside agent turns in batch and workflow mode
+- Dropping or replaying the metrics lease credential changes nothing: the gate counts every completion exchange of the bundle
+
+**7. Agent bypasses HTTPS_PROXY and connects directly**
 - Container is `--network=none` — no direct connections possible
 - The only path out is through the mounted UDS → socat → MITM proxy
 
-**7. Agent detects the MITM and refuses to operate**
+**8. Agent detects the MITM and refuses to operate**
 - The IronCurtain CA is trusted via both the system CA store (`update-ca-certificates`) and `NODE_EXTRA_CA_CERTS`
 - Standard TLS clients trust it. Claude Code uses Node.js which respects `NODE_EXTRA_CA_CERTS`.
 - The agent has no reason to pin certificates
 
-**8. CA key is compromised**
+**9. CA key is compromised**
 - If `~/.ironcurtain/ca/ca-key.pem` is stolen, an attacker could forge certs for any domain
 - Mitigation: file permissions (0600, verified on load), and the CA is only trusted inside IronCurtain containers (not system-wide on the host)
 - The CA cert is a self-signed root that is only installed in the Docker image, not in the host's trust store
@@ -962,7 +963,7 @@ SSE connections are long-lived. The proxy does not impose idle timeouts on indiv
   - TLS `head` buffer handling via `unshift()`
   - TLS handshake timeout (10s)
   - Stale UDS cleanup on start
-  - Cert cache pre-warming for all configured provider hosts
+  - Lazy leaf issuance for the CONNECT host (shared key pair, native signing, bounded LRU cache)
   - `flushHeaders()` + `setNoDelay(true)` for SSE
   - Client disconnect → abort upstream request
   - Upstream error after headers sent → destroy client socket
@@ -1068,12 +1069,12 @@ No other new dependencies. Everything else uses Node.js builtins: `http`, `https
 
 ## 13. Open Questions
 
-1. **Request body inspection.** The proxy currently only inspects method/path/headers. Should we also inspect request bodies? For example, we could block requests with specific model names, or requests that appear to be data exfiltration. This adds complexity (must buffer the body before forwarding) and is deferred.
+1. **Request body inspection.** The proxy currently only inspects method/path/headers. Should we also inspect request bodies? For example, we could block requests with specific model names, or requests that appear to be data exfiltration. This adds complexity (must buffer the body before forwarding) and is deferred. **Resolved (2026-11):** the proxy now buffers and parses completion request bodies on every provider route and runs the request sanitizers over them, refusing what it cannot parse (`src/docker/request-sanitizers/`, `mitm-request-filtering.md`).
 
 2. **Response logging for audit.** The proxy could log all requests to a MITM-specific audit log (separate from the MCP audit log). This would provide a complete record of all LLM API calls. Deferred for now; the MCP audit log already captures tool calls.
 
 3. **HTTP/2.** The current design handles HTTP/1.1 only. LLM API providers currently support HTTP/1.1. If they switch to HTTP/2-only, the proxy would need updating. Node.js `http2` module could handle this, but it's a different wire format.
 
-4. **Anthropic web search/fetch tools.** Claude Code has built-in tools that route through Anthropic's API (e.g., web search). These go through `/v1/messages` as normal completion requests with tool use. The MITM proxy allows them because the endpoint is `/v1/messages`. If we want to block these specifically, we'd need to inspect the request body for tool use patterns — this is a future enhancement.
+4. **Anthropic web search/fetch tools.** Claude Code has built-in tools that route through Anthropic's API (e.g., web search). These go through `/v1/messages` as normal completion requests with tool use. The MITM proxy allows them because the endpoint is `/v1/messages`. If we want to block these specifically, we'd need to inspect the request body for tool use patterns — this is a future enhancement. **Resolved (2026-11):** provider-hosted tools (web search, web fetch, code execution, MCP connectors) are stripped from every completion request unconditionally, and each removal is logged (`mitm-request-filtering.md`).
 
 5. **Query-parameter key injection.** Some providers (e.g., Google) support API keys in query parameters (`?key=`). The current implementation only supports header-based injection. Query-parameter support can be added by extending `KeyInjection` with a `query` variant and rewriting `clientReq.url` in the request handler. Deferred until a provider requires it.

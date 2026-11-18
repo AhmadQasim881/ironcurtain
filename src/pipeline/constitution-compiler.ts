@@ -13,6 +13,7 @@ import { z } from 'zod';
 import {
   DEFAULT_MAX_TOKENS,
   generateObjectWithRepair,
+  generateWithinOutputCap,
   parseJsonWithSchema,
   schemaToPromptHint,
 } from './generate-with-repair.js';
@@ -27,12 +28,19 @@ import type {
   RulePatchOp,
   RulePatch,
 } from './types.js';
-import { isArgumentRole, getArgumentRoleValues } from '../types/argument-roles.js';
+import { isArgumentRole, getArgumentRoleValues, getRoleDefinition } from '../types/argument-roles.js';
+import { isCatchAllCondition } from '../types/policy-schema.js';
 import { formatFailedResults } from './policy-verifier.js';
+import { getMcpListScopeError } from './dynamic-list-types.js';
 
 export interface CompilerConfig {
   protectedPaths: string[];
   allowedDirectory?: string;
+  /**
+   * The policy opted in to broad domain access (see policy-lint.ts). When
+   * false, prompts for servers with URL roles carry the broad-egress section.
+   */
+  allowBroadDomains?: boolean;
 }
 
 export interface CompilationOutput {
@@ -56,14 +64,23 @@ const listConditionSchema = z.object({
   matchType: z.enum(['domains', 'emails', 'identifiers']),
 });
 
-const listDefinitionSchema = z.object({
-  name: z.string().regex(/^[a-z][a-z0-9-]*$/),
-  type: z.enum(['domains', 'emails', 'identifiers']),
-  principle: z.string(),
-  generationPrompt: z.string(),
-  requiresMcp: z.boolean(),
-  mcpServerHint: z.string().optional(),
-});
+const listDefinitionSchema = z
+  .object({
+    name: z.string().regex(/^[a-z][a-z0-9-]*$/),
+    type: z.enum(['domains', 'emails', 'identifiers']),
+    principle: z.string(),
+    generationPrompt: z.string(),
+    requiresMcp: z.boolean(),
+    mcpServerHint: z.string().optional(),
+  })
+  // A data-backed list must name the one server it reads, and never a
+  // network-fetch server: list resolution has no "all servers" fallback.
+  .superRefine((definition, ctx) => {
+    const scopeError = getMcpListScopeError(definition);
+    if (scopeError) {
+      ctx.addIssue({ code: 'custom', message: scopeError, path: ['mcpServerHint'] });
+    }
+  });
 
 /**
  * Options for building the compiler response schema.
@@ -99,8 +116,13 @@ function buildCompiledRuleSchema(
         domains: domainConditionSchema.optional(),
         lists: z.array(listConditionSchema).optional(),
       })
-      .refine((cond) => Object.values(cond).some((v) => v !== undefined), {
-        message: 'Rule condition must have at least one field — catch-all rules are not allowed',
+      // Same definition as the runtime loader (src/types/policy-schema.ts),
+      // so the compiler never writes a rule the runtime refuses to load. An
+      // empty `lists` array constrains nothing.
+      .refine((cond) => !isCatchAllCondition(cond), {
+        message:
+          'Rule condition must constrain the call (server, tool, roles, paths, domains or a non-empty lists) ' +
+          '— catch-all rules are not allowed',
       }),
     then: z.enum(['allow', 'escalate']),
     reason: z.string(),
@@ -138,9 +160,11 @@ Do NOT emit rules for other servers or tools not listed in the annotations above
 }
 
 /**
- * Formats handwritten scenarios as ground truth constraints for the compiler LLM.
+ * Formats handwritten scenarios as ground truth constraints for the compiler
+ * LLM. Empty when there are none. Used by the constitution and task-policy
+ * compiler prompts and by the repair prompts.
  */
-function formatGroundTruthSection(scenarios?: TestScenario[]): string {
+export function formatGroundTruthSection(scenarios?: readonly TestScenario[]): string {
   if (!scenarios || scenarios.length === 0) return '';
 
   const lines = scenarios.map((s, i) => {
@@ -189,6 +213,38 @@ function formatCondition(cond: RoleCondition): string {
   if (cond.in !== undefined) return `${cond.arg}∈${JSON.stringify(cond.in)}`;
   if (cond.is !== undefined) return `${cond.arg} is ${cond.is}`;
   return `${cond.arg}=?`;
+}
+
+/** Whether any argument of the tools can carry a URL-category role (in any mode). */
+function hasUrlRole(annotations: readonly StoredToolAnnotation[]): boolean {
+  return annotations.some((annotation) =>
+    Object.values(annotation.args).some((spec) => {
+      const roles = Array.isArray(spec) ? spec : [...spec.default, ...spec.when.flatMap((clause) => clause.roles)];
+      return roles.some((role) => getRoleDefinition(role).category === 'url');
+    }),
+  );
+}
+
+/**
+ * Prompt section stating what the policy lint (policy-lint.ts) rejects for
+ * network access, so the compiler does not have to learn it from a rejected
+ * answer. Only for servers whose tools take URLs, and only when the policy has
+ * not opted in to broad domains; otherwise empty, leaving the prompt (and the
+ * compile cache key) unchanged.
+ */
+export function buildBroadEgressSection(
+  annotations: readonly StoredToolAnnotation[],
+  allowBroadDomains: boolean,
+): string {
+  if (allowBroadDomains || !hasUrlRole(annotations)) return '';
+  return `
+
+## Broad Egress (not permitted for this policy)
+
+A deterministic check rejects these ALLOW rules:
+- "*", or a wildcard over a public suffix or a multi-tenant cloud domain (e.g. "*.com", "*.co.uk", "*.github.io", "*.pages.dev", "*.amazonaws.com"), in domains.allowed;
+- an allow covering a URL role (fetch-url, git-remote-url) with no "domains" condition.
+Allow only the domains (or dynamic lists) the constitution names. Where it permits other destinations, ESCALATE them instead; an escalate rule may use "domains": {"roles": [...], "allowed": ["*"]}.`;
 }
 
 /**
@@ -376,20 +432,22 @@ When the constitution references a CATEGORY of things (e.g., "major news sites",
    - requiresMcp: true ONLY if the list requires querying live data from an
      MCP server (e.g., "my contacts" needs a contacts database).
      false for knowledge-based lists (e.g., "major news sites").
-   - mcpServerHint: the MCP server name if requiresMcp is true
+   - mcpServerHint: REQUIRED when requiresMcp is true -- the name of the one
+     MCP server that holds the data. Resolution reads only that server, under
+     a read-only policy. A web-fetch server ("fetch") cannot back a list.
 
 When the constitution says something like "any domain" or "all", do NOT create a
 list. Use the wildcard pattern "*" directly.
 
 Examples:
 - "major news sites" -> @major-news-sites (type: domains, requiresMcp: false)
-- "people in my contacts" -> @my-contacts (type: emails, requiresMcp: true)
-- "major tech stocks" -> @tech-stock-tickers (type: identifiers, requiresMcp: false)`;
+- "people in my contacts" -> @my-contacts (type: emails, requiresMcp: true, mcpServerHint: "google-workspace")
+- "major tech stocks" -> @tech-stock-tickers (type: identifiers, requiresMcp: false)${buildBroadEgressSection(annotations, config.allowBroadDomains === true)}`;
 }
 
 /** Builds the repair instructions sent as the user prompt during repair rounds. */
 export function buildRepairInstructions(repairContext: RepairContext): string {
-  const failuresText = formatFailedResults(repairContext.failedScenarios);
+  const failuresText = formatFailedResults(repairContext.failedScenarios, repairContext.failureNotes);
 
   let existingListsText = '';
   if (repairContext.existingListDefinitions && repairContext.existingListDefinitions.length > 0) {
@@ -426,6 +484,41 @@ ${existingListsText}
 5. If the judge identified a **region coverage gap** (a tool with rules for some inputs but not their complement), re-read the constitution clause that authorized the existing rule. If the constitution speaks to the complementary region — explicitly allowing it OR explicitly requiring approval for it — emit a rule covering it. Default-deny is acceptable only when the constitution is silent on that region.
 6. If the judge identified a **name/decision mismatch**, decide which is correct per the constitution and fix the other. Do not leave the rule with a misleading name or an unintended decision.
 ${formatGroundTruthSection(repairContext.handwrittenScenarios)}`;
+}
+
+/**
+ * The user turn that sends deterministic rule-check errors (validateCompiledRules
+ * and the policy lint) back to the compiler. These fire before any scenario is
+ * run, so there are no failed scenarios or judge analysis to show. The rejected
+ * rule set is included: after a point-fix repair the compiler's last answer is
+ * a patch, not the rules the checks saw.
+ */
+export function buildValidationRepairInstructions(
+  errors: readonly string[],
+  attemptNumber: number,
+  rejected: CompilationOutput,
+): string {
+  const rejectedJson = JSON.stringify({ rules: rejected.rules, listDefinitions: rejected.listDefinitions }, null, 2);
+  return `## RULE VALIDATION REPAIR (attempt ${attemptNumber})
+
+The rule set below (your last answer, with any patch applied) was rejected by deterministic policy checks before any testing. Fix every error listed.
+
+### Rejected rule set
+
+\`\`\`json
+${rejectedJson}
+\`\`\`
+
+### Errors
+
+${errors.map((error) => `- ${error}`).join('\n')}
+
+### Requirements
+
+1. Fix each error without granting more than the constitution allows: narrow the rule (name the tools, directories, domains or identifiers the constitution permits) or change it to "escalate".
+2. Do not drop rules that are not named in an error.
+3. Keep every rule name unique.
+4. Return the complete corrected rule set as a JSON object with "rules" and "listDefinitions", the format of the initial compilation (not a patch): all rules, not only the changed ones, and every list definition the rules reference.`;
 }
 
 export async function compileConstitution(
@@ -466,6 +559,17 @@ export async function compileConstitution(
 
 const INITIAL_COMPILE_MESSAGE = 'Compile the constitution into policy rules following the instructions above.';
 
+/** What a point-fix request produced: an applied patch, or why it falls back to a full recompile. */
+type PointFixOutcome =
+  | {
+      readonly kind: 'applied';
+      /** The response text the patch came from (kept in the conversation history). */
+      readonly text: string;
+      readonly rules: CompiledRule[];
+      readonly listDefinitions: ListDefinition[] | undefined;
+    }
+  | { readonly kind: 'fallback'; readonly message: string };
+
 /**
  * A stateful multi-turn wrapper around the constitution compiler.
  *
@@ -490,6 +594,14 @@ export class ConstitutionCompilerSession {
   private readonly schemaHint: string;
   private readonly schemaOptions?: CompilerSchemaOptions;
   private turns = 0;
+  /**
+   * Output-token cap the next request starts at. Once a response needed the
+   * larger truncation-retry cap it stays raised for the session: a recompile
+   * returns the whole rule set again, about as long as the last one, and
+   * starting each turn below it would cut off (and pay for) one response per
+   * repair round before the retry.
+   */
+  private outputCap = DEFAULT_MAX_TOKENS;
 
   constructor(options: {
     system: string | SystemModelMessage;
@@ -524,6 +636,20 @@ export class ConstitutionCompilerSession {
     return this.callAndParse(buildRepairInstructions(repairContext), onProgress);
   }
 
+  /**
+   * Validation repair: feeds the errors of the deterministic rule checks back,
+   * with the rule set they rejected, and requests a complete corrected rule
+   * set.
+   */
+  async repairValidation(
+    errors: readonly string[],
+    attemptNumber: number,
+    rejected: CompilationOutput,
+    onProgress?: (message: string) => void,
+  ): Promise<CompilationOutput> {
+    return this.callAndParse(buildValidationRepairInstructions(errors, attemptNumber, rejected), onProgress);
+  }
+
   /** Returns the number of turns completed so far. */
   get turnCount(): number {
     return this.turns;
@@ -537,51 +663,64 @@ export class ConstitutionCompilerSession {
 
     onProgress?.('Compiling...');
 
-    const result = await generateText({
-      model: this.model,
-      system: this.systemPrompt,
-      messages: this.history,
-      maxOutputTokens: DEFAULT_MAX_TOKENS,
-    });
+    try {
+      // A response cut off at its output cap is requested again with a
+      // larger one (or fails as truncated), never "repaired" as a schema error.
+      const result = await this.request(this.history, onProgress);
 
-    // Try to parse; on schema failure, do one internal retry
-    const firstAttempt = this.tryParse(result.text);
-    if (firstAttempt.ok) {
-      this.history.push({ role: 'assistant', content: result.text });
-      this.turns++;
-      return firstAttempt.value;
-    }
+      // Try to parse; on schema failure, do one internal retry
+      const firstAttempt = this.tryParse(result.text);
+      if (firstAttempt.ok) {
+        this.history.push({ role: 'assistant', content: result.text });
+        this.turns++;
+        return firstAttempt.value;
+      }
 
-    // First parse failed -- attempt one schema repair round.
-    // Build the retry messages without mutating history so that only
-    // the successful response is persisted in the conversation.
-    onProgress?.('Schema repair 1/1...');
+      // First parse failed -- attempt one schema repair round.
+      // Build the retry messages without mutating history so that only
+      // the successful response is persisted in the conversation.
+      onProgress?.('Schema repair 1/1...');
 
-    const retryResult = await generateText({
-      model: this.model,
-      system: this.systemPrompt,
-      messages: [
+      const retryMessages = [
         ...this.history,
         { role: 'assistant' as const, content: result.text },
         {
           role: 'user' as const,
           content: `Your response failed schema validation:\n${firstAttempt.error}\n\nPlease fix the errors and return valid JSON matching the schema.`,
         },
-      ],
-      maxOutputTokens: DEFAULT_MAX_TOKENS,
-    });
+      ];
+      const retryResult = await this.request(retryMessages, onProgress);
 
-    // If retry also fails, remove the dangling user message from
-    // history before re-throwing so the session remains usable.
-    try {
       const retryOutput = this.parseOutput(retryResult.text);
       this.history.push({ role: 'assistant', content: retryResult.text });
       this.turns++;
       return retryOutput;
-    } catch (retryError) {
-      this.history.pop(); // remove the user message added at the start
-      throw retryError;
+    } catch (error) {
+      // Remove the dangling user message before re-throwing so the session
+      // remains usable (a schema failure, a truncation or an LLM error).
+      this.history.pop();
+      throw error;
     }
+  }
+
+  /**
+   * One compiler request with the fixed system prompt, under the session's
+   * output cap ({@link outputCap}) and retried once with the larger cap when
+   * cut off ({@link generateWithinOutputCap}). Throws `OutputTruncatedError`
+   * when the larger cap is cut off too.
+   */
+  private async request(
+    messages: ReadonlyArray<{ role: 'user' | 'assistant'; content: string }>,
+    onProgress?: (message: string) => void,
+  ) {
+    const { result, maxOutputTokens } = await generateWithinOutputCap(
+      (cap) =>
+        generateText({ model: this.model, system: this.systemPrompt, messages: [...messages], maxOutputTokens: cap }),
+      this.outputCap,
+      onProgress,
+    );
+    this.outputCap = maxOutputTokens;
+    return result;
   }
 
   /** Attempts to parse LLM output, returning a discriminated result. */
@@ -598,7 +737,9 @@ export class ConstitutionCompilerSession {
    * recompilation. The LLM returns a small set of update/add/delete operations
    * that are mechanically applied to the existing rules, avoiding oscillation.
    *
-   * Falls back to full recompile if the patch cannot be applied.
+   * Falls back to full recompile if the patch cannot be parsed or applied.
+   * A patch response truncated even under the larger output cap throws
+   * `OutputTruncatedError` instead: the full rule set would be longer still.
    */
   async repairPointFix(
     existingRules: CompiledRule[],
@@ -626,64 +767,86 @@ export class ConstitutionCompilerSession {
 
     onProgress?.('Point-fix repair...');
 
-    const result = await generateText({
-      model: this.model,
-      system: this.systemPrompt,
-      messages: this.history,
-      maxOutputTokens: DEFAULT_MAX_TOKENS,
-    });
+    let patched: PointFixOutcome;
+    try {
+      patched = await this.requestPatch(existingRules, patchSchema, onProgress);
+    } catch (error) {
+      // A truncated patch or an LLM error: a full recompile would be at least
+      // as long, so fail instead of falling back to one.
+      this.history.pop(); // remove the point-fix user message
+      throw error;
+    }
+
+    if (patched.kind === 'applied') {
+      this.history.push({ role: 'assistant', content: patched.text });
+      this.turns++;
+      return {
+        rules: patched.rules,
+        listDefinitions: mergeListDefinitions(existingListDefinitions, patched.listDefinitions),
+      };
+    }
+
+    onProgress?.(patched.message);
+    this.history.pop(); // remove the point-fix user message
+    return this.recompile(repairContext, onProgress);
+  }
+
+  /**
+   * Requests a patch for the point-fix user message at the end of the
+   * history, with one schema repair retry, and applies it. Returns
+   * 'fallback' when no patch could be parsed and applied; throws when a
+   * response is truncated even under the larger cap, or the LLM call fails.
+   */
+  private async requestPatch(
+    existingRules: CompiledRule[],
+    patchSchema: ReturnType<typeof buildPatchResponseSchema>,
+    onProgress?: (message: string) => void,
+  ): Promise<PointFixOutcome> {
+    const result = await this.request(this.history, onProgress);
 
     const firstAttempt = tryParsePatch(result.text, patchSchema);
     if (firstAttempt.ok) {
       const applyResult = applyRulePatch(existingRules, firstAttempt.value.operations);
       if (applyResult.ok) {
-        this.history.push({ role: 'assistant', content: result.text });
-        this.turns++;
         return {
+          kind: 'applied',
+          text: result.text,
           rules: applyResult.rules,
-          listDefinitions: mergeListDefinitions(existingListDefinitions, firstAttempt.value.listDefinitions),
+          listDefinitions: firstAttempt.value.listDefinitions,
         };
       }
       // Patch apply failed -- fall back to full recompile
-      onProgress?.('Patch apply failed, falling back to full recompile...');
-      this.history.pop(); // remove the point-fix user message
-      return this.recompile(repairContext, onProgress);
+      return { kind: 'fallback', message: 'Patch apply failed, falling back to full recompile...' };
     }
 
     // First parse failed -- attempt one schema repair retry
     onProgress?.('Patch schema repair 1/1...');
 
-    const retryResult = await generateText({
-      model: this.model,
-      system: this.systemPrompt,
-      messages: [
-        ...this.history,
-        { role: 'assistant' as const, content: result.text },
-        {
-          role: 'user' as const,
-          content: `Your response failed schema validation:\n${firstAttempt.error}\n\nPlease fix the errors and return valid JSON matching the patch schema.`,
-        },
-      ],
-      maxOutputTokens: DEFAULT_MAX_TOKENS,
-    });
+    const retryMessages = [
+      ...this.history,
+      { role: 'assistant' as const, content: result.text },
+      {
+        role: 'user' as const,
+        content: `Your response failed schema validation:\n${firstAttempt.error}\n\nPlease fix the errors and return valid JSON matching the patch schema.`,
+      },
+    ];
+    const retryResult = await this.request(retryMessages, onProgress);
 
     const retryParsed = tryParsePatch(retryResult.text, patchSchema);
     if (retryParsed.ok) {
       const applyResult = applyRulePatch(existingRules, retryParsed.value.operations);
       if (applyResult.ok) {
-        this.history.push({ role: 'assistant', content: retryResult.text });
-        this.turns++;
         return {
+          kind: 'applied',
+          text: retryResult.text,
           rules: applyResult.rules,
-          listDefinitions: mergeListDefinitions(existingListDefinitions, retryParsed.value.listDefinitions),
+          listDefinitions: retryParsed.value.listDefinitions,
         };
       }
     }
 
     // All patch attempts failed -- fall back to full recompile
-    onProgress?.('Patch failed, falling back to full recompile...');
-    this.history.pop(); // remove the point-fix user message
-    return this.recompile(repairContext, onProgress);
+    return { kind: 'fallback', message: 'Patch failed, falling back to full recompile...' };
   }
 
   private parseOutput(text: string): CompilationOutput {
@@ -757,7 +920,7 @@ export function buildPointFixRepairInstructions(existingRules: CompiledRule[], r
     })
     .join('\n');
 
-  const failuresText = formatFailedResults(repairContext.failedScenarios);
+  const failuresText = formatFailedResults(repairContext.failedScenarios, repairContext.failureNotes);
 
   let existingListsText = '';
   if (repairContext.existingListDefinitions && repairContext.existingListDefinitions.length > 0) {
@@ -1000,7 +1163,11 @@ export function validateCompiledRules(
       }
     }
 
-    // Check for structural invariant concepts that should not be compiled
+    // Wording that suggests a structural invariant is only a hint: real tools
+    // use these words ("protected ranges" in Sheets, "protected branches" on
+    // GitHub), and a misnamed rule cannot weaken the invariants, which the
+    // engine evaluates before compiled rules (and `then` is allow/escalate
+    // only). Rules that target protected paths are found by the policy lint.
     const lowerName = rule.name.toLowerCase();
     const lowerDesc = rule.description.toLowerCase();
     if (
@@ -1010,8 +1177,9 @@ export function validateCompiledRules(
       lowerDesc.includes('protected path') ||
       lowerDesc.includes('unknown tool')
     ) {
-      errors.push(
-        `Rule "${rule.name}": appears to implement a structural invariant -- these must not be in compiled rules`,
+      warnings.push(
+        `Rule "${rule.name}": its name or description mentions a structural invariant (protected paths, ` +
+          'unknown tools); the engine enforces those before compiled rules, so it should implement a constitution principle',
       );
     }
   }

@@ -250,15 +250,11 @@ function createCallTrackingMockModel(responses: unknown[]) {
     doGenerate: async (opts) => {
       // Capture system and messages at call time (messages mutate)
       const system = opts.prompt.filter((p) => p.role === 'system');
-      const messages = opts.prompt
-        .filter((p) => p.role === 'user' || p.role === 'assistant')
-        .map((p) => ({
-          role: p.role,
-          content: p.content
-            .filter((c): c is { type: 'text'; text: string } => 'type' in c && c.type === 'text')
-            .map((c) => c.text)
-            .join(''),
-        }));
+      const messages = opts.prompt.flatMap((p) =>
+        p.role === 'user' || p.role === 'assistant'
+          ? [{ role: p.role, content: p.content.map((c) => (c.type === 'text' ? c.text : '')).join('') }]
+          : [],
+      );
       calls.push({ system, messages });
 
       const response = responses[callIndex] ?? responses[responses.length - 1];
@@ -713,6 +709,72 @@ describe('Batched generateScenarios', () => {
     expect(result).toHaveLength(2);
   });
 
+  // WP-88 / PIP-15(d), DOA-15: the batches are independent, so they run
+  // concurrently (the pipeline's model is already throttled by its shared
+  // semaphore) and are concatenated in batch order whatever order they finish in.
+  it('runs 6 batches concurrently and concatenates them in batch order', async () => {
+    const annotations = generateAnnotations(6 * SCENARIO_BATCH_SIZE);
+    const BATCHES = 6;
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const waiting: Array<() => void> = [];
+    let allArrived: () => void = () => {};
+    const arrived = new Promise<void>((resolveArrived) => {
+      allArrived = resolveArrived;
+    });
+
+    const model = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        // The batch is known by the first tool of its slice in the system prompt.
+        const system = JSON.stringify(options.prompt.filter((p) => p.role === 'system'));
+        const batch = [...Array(BATCHES).keys()].find((b) =>
+          new RegExp(`/tool_${b * SCENARIO_BATCH_SIZE}:`).test(system),
+        );
+        if (batch === undefined) throw new Error('unknown batch');
+        // Hold every call until all batches are in flight (sequential batches
+        // would never get there), then answer them last-batch-first.
+        await new Promise<void>((release) => {
+          waiting.push(release);
+          if (waiting.length === BATCHES) allArrived();
+        });
+        inFlight--;
+        const toolName = `tool_${batch * SCENARIO_BATCH_SIZE}`;
+        const serverName = (batch * SCENARIO_BATCH_SIZE) % 2 === 0 ? 'serverA' : 'serverB';
+        return createMockModel({
+          scenarios: [
+            {
+              description: `batch ${batch + 1}`,
+              request: { serverName, toolName, arguments: { path: `/tmp/sandbox/${batch}` } },
+              expectedDecision: 'allow',
+              reasoning: 'ok',
+            },
+          ],
+        }).doGenerate(options);
+      },
+    });
+
+    const generating = generateScenarios(sampleConstitution, annotations, [], SANDBOX_DIR, model);
+    const timeout = new Promise<'timeout'>((resolveTimeout) => setTimeout(() => resolveTimeout('timeout'), 5_000));
+    expect(await Promise.race([arrived.then(() => 'arrived' as const), timeout])).toBe('arrived');
+    for (const release of [...waiting].reverse()) {
+      release();
+      await new Promise((tick) => setImmediate(tick));
+    }
+    const result = await generating;
+
+    expect(maxInFlight).toBe(BATCHES);
+    expect(result.map((s) => s.description)).toEqual([
+      'batch 1',
+      'batch 2',
+      'batch 3',
+      'batch 4',
+      'batch 5',
+      'batch 6',
+    ]);
+  });
+
   it('0 annotations returns only handwritten scenarios without LLM call', async () => {
     // Empty annotations should early-return without calling the LLM,
     // since chunk([]) returns [[]] and z.enum([]) would throw.
@@ -1130,6 +1192,43 @@ describe('buildGeneratorSystemPrompt annotation rendering', () => {
     const prompt = buildGeneratorSystemPrompt('Test constitution', staticAnnotations, '/tmp/sandbox');
     expect(prompt).toContain('path: [read-path, write-history, delete-history]');
     expect(prompt).not.toContain('default=');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The rules' directories in the generator prompt (PIP-12)
+// ---------------------------------------------------------------------------
+
+describe('buildGeneratorSystemPrompt rule directories', () => {
+  const constitution = 'The agent may read files in my Documents folder.';
+
+  it('labels them as referenced by the policy under test and never as permitted', () => {
+    const prompt = buildGeneratorSystemPrompt(constitution, sampleAnnotations, '/tmp/sandbox', [
+      '/home/user',
+      '/home/user/Documents',
+    ]);
+    expect(prompt).toContain('## Directories Referenced by the Policy Under Test');
+    expect(prompt).toContain('- /home/user\n- /home/user/Documents\n');
+    expect(prompt).toContain(
+      'do NOT assume a directory is permitted because it is listed here: the rules may be wrong',
+    );
+    expect(prompt).toContain('test paths inside each directory as well as just outside it');
+    expect(prompt).not.toMatch(/permitted director/i);
+    expect(prompt).not.toContain('Use these EXACT paths');
+  });
+
+  it('derives expectations from the constitution, never from the compiled rules', () => {
+    const prompt = buildGeneratorSystemPrompt(constitution, sampleAnnotations, '/tmp/sandbox', ['/home/user']);
+    expect(prompt).toContain('Base every expectedDecision on the constitution, never on the compiled rules');
+    expect(prompt).toContain(
+      'operations that SHOULD be allowed (inside the sandbox, or where the constitution grants access)',
+    );
+  });
+
+  it('has no directory section when the rules name no directory', () => {
+    const withNone = buildGeneratorSystemPrompt(constitution, sampleAnnotations, '/tmp/sandbox', []);
+    expect(withNone).not.toContain('## Directories Referenced');
+    expect(withNone).toBe(buildGeneratorSystemPrompt(constitution, sampleAnnotations, '/tmp/sandbox'));
   });
 });
 

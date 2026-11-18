@@ -10,9 +10,10 @@
  */
 
 import type { MemoryConfig } from '../config.js';
+import type { CallControls } from '../engine.js';
 import { llmComplete } from '../llm/client.js';
 import { estimateTokens } from '../retrieval/scoring.js';
-import { MAX_CONTENT_LENGTH } from '../tools/validation.js';
+import { MAX_CONTENT_LENGTH, capImportance } from '../tools/validation.js';
 
 export interface ExtractedFact {
   fact: string;
@@ -27,10 +28,18 @@ export type IngestMode = 'conversation' | 'document';
 /** Per-chunk token budget; comfortably inside Haiku's window with room for prompt + output. */
 export const MAX_INGEST_CHUNK_TOKENS = 6000;
 
-/** Cap total extracted facts per ingest to bound a runaway response. */
+/**
+ * Cap on the facts one ingest keeps, across all of its chunks (extractAllFacts), and on
+ * the facts one model response may carry (parseExtractedFacts). Once an ingest holds
+ * this many, its remaining chunks are not sent to the LLM.
+ */
 export const MAX_FACTS_PER_INGEST = 200;
 
-/** Cap total chunks so a hostile/enormous blob can't fan out unboundedly. */
+/**
+ * Cap total chunks so a hostile/enormous blob can't fan out unboundedly. The content
+ * cap (MAX_INGEST_CONTENT_BYTES in tools/validation.ts) keeps a real ingest well below
+ * it; content past it is reported as `truncated`.
+ */
 export const MAX_INGEST_CHUNKS = 50;
 
 /**
@@ -214,8 +223,16 @@ function capPieces(pieces: string[]): string[] {
  * hard-split on whitespace. Total chunk count is bounded by MAX_INGEST_CHUNKS.
  */
 export function chunkBlob(blob: string): string[] {
+  return chunkBlobReport(blob).chunks;
+}
+
+/**
+ * chunkBlob, and whether content past the MAX_INGEST_CHUNKS-th chunk was left out
+ * (`truncated`), so an ingest can say that it did not read all of its input.
+ */
+export function chunkBlobReport(blob: string): { chunks: string[]; truncated: boolean } {
   if (estimateTokens(blob) <= MAX_INGEST_CHUNK_TOKENS) {
-    return [blob];
+    return { chunks: [blob], truncated: false };
   }
 
   // Normalize lines, hard-splitting any single line that exceeds the threshold.
@@ -232,6 +249,7 @@ export function chunkBlob(blob: string): string[] {
   const chunks: string[] = [];
   let window: string[] = [];
   let windowTokens = 0;
+  let truncated = false;
 
   const flush = (): void => {
     if (window.length === 0) return;
@@ -247,17 +265,21 @@ export function chunkBlob(blob: string): string[] {
     const lineTokens = estimateTokens(line) + 1; // +1 for the newline
     if (windowTokens + lineTokens > MAX_INGEST_CHUNK_TOKENS && window.length > 0) {
       flush();
-      if (chunks.length >= MAX_INGEST_CHUNKS) break;
+      if (chunks.length >= MAX_INGEST_CHUNKS) {
+        // This line (and any after it) would start another chunk.
+        truncated = true;
+        break;
+      }
     }
     window.push(line);
     windowTokens += lineTokens;
   }
 
-  if (chunks.length < MAX_INGEST_CHUNKS && window.length > 0) {
+  if (!truncated && window.length > 0) {
     chunks.push(window.join('\n'));
   }
 
-  return chunks.slice(0, MAX_INGEST_CHUNKS);
+  return { chunks, truncated };
 }
 
 // ---------- Passage splitting (recall-time return shaping) ----------
@@ -363,9 +385,14 @@ export async function extractFacts(
   config: MemoryConfig,
   blob: string,
   mode: IngestMode,
+  signal?: AbortSignal,
 ): Promise<ExtractedFact[] | null> {
   const maxTokens = Math.min(1500, Math.max(300, estimateTokens(blob)));
-  const raw = await llmComplete(config, systemPromptFor(mode), `<input>\n${blob}\n</input>`, { maxTokens });
+  const raw = await llmComplete(config, systemPromptFor(mode), `<input>\n${blob}\n</input>`, {
+    maxTokens,
+    timeoutMs: config.llmTimeoutMs,
+    signal,
+  });
   if (raw === null) return null;
 
   const facts = parseExtractedFacts(raw);
@@ -375,4 +402,103 @@ export async function extractFacts(
     return null;
   }
   return facts;
+}
+
+// ---------- Whole-ingest extraction ----------
+
+/** One source chunk and the facts extracted from it (the chunk→fact mapping). */
+export interface ChunkGroup {
+  chunkText: string;
+  facts: ExtractedFact[];
+}
+
+export interface ExtractionOutcome {
+  /** One group per chunk that was extracted without failing, in chunk order. */
+  groups: ChunkGroup[];
+  /** Chunks the content was split into, extracted or not. */
+  totalChunks: number;
+  /** Chunks whose extraction failed (no LLM, an error, a timeout, an unparseable response). */
+  failedChunks: number;
+  /** Chunks never sent to the LLM because the ingest already held MAX_FACTS_PER_INGEST facts. */
+  droppedChunks: number;
+  /**
+   * True when part of the content did not make it into the facts: chunks were dropped,
+   * the last extracted chunk had more facts than fit under the cap, or the content ran
+   * past MAX_INGEST_CHUNKS chunks.
+   */
+  truncated: boolean;
+}
+
+/** Thrown when the MCP request an ingest serves is cancelled; nothing after that point runs. */
+export function cancelledError(what: string): Error {
+  const error = new Error(`${what} was cancelled`);
+  error.name = 'AbortError';
+  return error;
+}
+
+/**
+ * Extract the facts of a whole ingest, chunk by chunk, KEEPING the chunk→fact mapping so
+ * each fact can be linked to its source segment (§6.1). Exact-`fact`-string duplicates
+ * across windows are dropped, keeping the FIRST occurrence — so a fact deduped away in a
+ * later chunk stays attached to its first chunk's group (no second parent link).
+ *
+ * Spend is bounded per ingest, dry runs included: the union of facts is capped at
+ * MAX_FACTS_PER_INGEST, and once it is full the remaining chunks are not sent to the LLM
+ * (`droppedChunks`). Importance from the model is capped like the agent's: the model read
+ * agent-supplied text. `controls.signal` stops the loop before the next chunk (throwing
+ * cancelledError), and `controls.onProgress` hears about every chunk.
+ */
+export async function extractAllFacts(
+  config: MemoryConfig,
+  content: string,
+  mode: IngestMode,
+  controls: CallControls = {},
+): Promise<ExtractionOutcome> {
+  const { chunks, truncated: chunkCapReached } = chunkBlobReport(content);
+  const { signal, onProgress } = controls;
+  const seen = new Set<string>();
+  const groups: ChunkGroup[] = [];
+  let failedChunks = 0;
+  let extracted = 0;
+  let factsCut = false;
+
+  for (const chunk of chunks) {
+    if (seen.size >= MAX_FACTS_PER_INGEST) break;
+    if (signal?.aborted) throw cancelledError('memory_ingest');
+    const chunkFacts = await extractFacts(config, chunk, mode, signal);
+    // A call cut short by the cancellation returns null: that is not a failed chunk.
+    if (signal?.aborted) throw cancelledError('memory_ingest');
+    extracted += 1;
+    onProgress?.({
+      progress: extracted,
+      total: chunks.length,
+      message: `Extracted ${extracted} of ${chunks.length} chunk(s)`,
+    });
+    // Only `null` is a real failure (no LLM / hard-fail / unparseable). An empty
+    // array means the model validly found nothing durable — not a failed chunk.
+    if (chunkFacts === null) {
+      failedChunks += 1;
+      continue;
+    }
+    const ownedFacts: ExtractedFact[] = [];
+    for (const fact of chunkFacts) {
+      if (seen.has(fact.fact)) continue; // already owned by an earlier chunk's group
+      if (seen.size >= MAX_FACTS_PER_INGEST) {
+        factsCut = true;
+        break;
+      }
+      seen.add(fact.fact);
+      ownedFacts.push(fact.importance === undefined ? fact : { ...fact, importance: capImportance(fact.importance) });
+    }
+    groups.push({ chunkText: chunk, facts: ownedFacts });
+  }
+
+  const droppedChunks = chunks.length - extracted;
+  return {
+    groups,
+    totalChunks: chunks.length,
+    failedChunks,
+    droppedChunks,
+    truncated: chunkCapReached || factsCut || droppedChunks > 0,
+  };
 }

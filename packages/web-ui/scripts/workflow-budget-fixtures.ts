@@ -1,4 +1,29 @@
-import type { ResourceBudgetConfigDto, WorkflowBudgetDto } from '../src/lib/types.js';
+import type { ResourceBudgetConfigDto, WorkflowBudgetDto, WorkflowUsageDto } from '../src/lib/types.js';
+
+/** Canned run-wide usage: a lower bound (one exchange not measured in full). */
+export function buildRunUsage(totalTokens: number): WorkflowUsageDto {
+  const outputTokens = Math.round(totalTokens * 0.08);
+  return {
+    inputTokens: totalTokens - outputTokens,
+    cacheReadTokens: Math.round(totalTokens * 0.6),
+    cacheWriteTokens: Math.round(totalTokens * 0.05),
+    outputTokens,
+    totalTokens,
+    estimatedCostUsd: 17,
+    gateOnlyTokens: 0,
+    gateOnlyCostUsd: 0,
+    activeSeconds: 2_400,
+    observedExchanges: 48,
+    incompleteExchanges: 1,
+    unmeasuredExchanges: 0,
+    meteredSessions: 6,
+    reportedSessions: 0,
+    untrackedSessions: 0,
+    uncountedSessions: 0,
+    lowerBound: true,
+    tokenTrackingStatus: 'partial',
+  };
+}
 
 export type ResourceBudgetFixture = ResourceBudgetConfigDto;
 export type WorkflowBudgetFixture = WorkflowBudgetDto;
@@ -68,6 +93,12 @@ export function buildRunBudget(
       elapsedSeconds: 1200,
       estimatedCostUsd: 17,
       tokenTrackingAvailable: true,
+      tokenTrackingStatus: 'complete',
+      observedExchanges: 12,
+      incompleteExchanges: 0,
     },
+    // A run ceiling (settings.workflowBudget) and the whole-run totals it is checked against.
+    workflowLimits: { maxEstimatedCostUsd: 20, maxWallClockSeconds: 14_400 },
+    workflowUsage: buildRunUsage(2_150_000),
   };
 }

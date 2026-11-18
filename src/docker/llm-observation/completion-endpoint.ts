@@ -16,7 +16,11 @@ export interface CompletionEndpointCapabilities {
 
 export interface EndpointPatternLike {
   readonly method: 'GET' | 'POST' | 'PUT' | 'DELETE';
-  /** Exact path or a path with `*` matching one non-empty segment. */
+  /**
+   * Exact path, or a path in which each `*` matches one or more RFC 3986
+   * unreserved characters (`[A-Za-z0-9._~-]`, so model ids such as
+   * `gemini-2.5-pro` match) that are not all dots.
+   */
   readonly path: string;
 }
 
@@ -38,6 +42,32 @@ function cleanRequestPath(path: string): string {
   return path.split('?', 1)[0] ?? path;
 }
 
+/**
+ * What one `*` may match: RFC 3986 unreserved characters only. The request
+ * path is forwarded verbatim, so a wildcard must not match anything an
+ * upstream could decode or normalize into a different route: a `%2F`, `%2E`
+ * or `%5C` escape, a backslash, a `;` path parameter or a `#`.
+ */
+const WILDCARD_VALUE = '([A-Za-z0-9._~-]+)';
+
+/** `.`, `..` and longer all-dot values, which a normalizing upstream may resolve as a parent directory. */
+const ALL_DOTS = /^\.+$/u;
+
+function globMatches(pattern: string, path: string): boolean {
+  const expression = pattern
+    .split('*')
+    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join(WILDCARD_VALUE);
+  const match = new RegExp(`^${expression}$`, 'u').exec(path);
+  return match !== null && match.slice(1).every((value) => !ALL_DOTS.test(value));
+}
+
+/**
+ * Exact patterns compare literally (query string stripped). Each `*` of a glob
+ * matches one or more unreserved characters that are not all dots, so
+ * `POST /api/eval/..` or `/v1beta/models/..%2F..%2Fx:generateContent` never
+ * match while `gemini-2.5-pro` still does.
+ */
 export function matchesEndpointPattern(
   endpoint: EndpointPatternLike,
   method: string | undefined,
@@ -46,20 +76,12 @@ export function matchesEndpointPattern(
   if (!method || !path || endpoint.method !== method.toUpperCase()) return false;
   const cleanPath = cleanRequestPath(path);
   if (!endpoint.path.includes('*')) return endpoint.path === cleanPath;
-  const expression = endpoint.path
-    .split('*')
-    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-    .join('[^/]+');
-  return new RegExp(`^${expression}$`).test(cleanPath);
+  return globMatches(endpoint.path, cleanPath);
 }
 
 function patternMatchesPath(pattern: string, path: string): boolean {
   if (!pattern.includes('*')) return pattern === path;
-  const expression = pattern
-    .split('*')
-    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-    .join('[^/]+');
-  return new RegExp(`^${expression}$`).test(path);
+  return globMatches(pattern, path);
 }
 
 function segmentPatternsMayOverlap(left: string, right: string): boolean {

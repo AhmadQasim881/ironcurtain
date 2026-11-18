@@ -160,6 +160,35 @@ describe('isMemoryEnabledFor', () => {
       }),
     ).toBe(false);
   });
+
+  it('returns false on a borrowed workflow bundle even when the persona and job would enable it', () => {
+    // A shared-container bundle runs no memory server, so no session that
+    // borrows one may advertise the memory tool.
+    expect(
+      isMemoryEnabledFor({
+        persona: makePersona({ enabled: true }),
+        job: makeJob(),
+        userConfig: makeUserConfig(true),
+        borrowedBundle: true,
+      }),
+    ).toBe(false);
+    expect(isMemoryEnabledFor({ persona: makePersona(), userConfig: makeUserConfig(true), borrowedBundle: true })).toBe(
+      false,
+    );
+  });
+
+  it('is unaffected by borrowedBundle: false (standalone sessions spawn their own memory server)', () => {
+    expect(
+      isMemoryEnabledFor({ persona: makePersona(), userConfig: makeUserConfig(true), borrowedBundle: false }),
+    ).toBe(true);
+    expect(
+      isMemoryEnabledFor({
+        persona: makePersona({ enabled: false }),
+        userConfig: makeUserConfig(true),
+        borrowedBundle: false,
+      }),
+    ).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------

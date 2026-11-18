@@ -120,6 +120,7 @@ This directory persists across runs. Use it for cross-run state:
   - Actions taken (with counts: "Labeled 12 issues, commented on 3, closed 1")
   - Any issues encountered or items skipped
   - Recommendations for next run (if any)
+- **previous-run.md** -- The last-run.md an earlier run wrote, moved here before this run started (absent if no run has written one yet). Read it for its recommendations; write this run's summary to last-run.md.
 
 ### Headless Behavior
 

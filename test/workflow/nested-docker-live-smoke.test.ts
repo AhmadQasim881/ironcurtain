@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DockerInfrastructure } from '../../src/docker/docker-infrastructure.js';
+import { TIMEOUT_BINARY, TURN_MARKER_ENV } from '../../src/docker/turn-timeout.js';
 import {
   APPLE_VM_DAEMON_DOCKER_HOST,
   APPLE_VM_PACKAGE_EGRESS_SOCKET,
@@ -99,7 +100,10 @@ describe('nested-docker-live-smoke workflow', () => {
   });
 
   it('mints a deterministic package-mode bundle without creating an LLM session', async () => {
+    // A caller-supplied workspace must already exist: start() validates it
+    // with validateWorkspacePath() before creating anything.
     const workspace = resolve(tempDir, 'workspace');
+    mkdirSync(workspace, { recursive: true });
     const manifestPath = resolve(WORKFLOW_ROOT, 'workflow.yaml');
     const createSession = vi.fn(async () => {
       throw new Error('the deterministic smoke must not create an LLM session');
@@ -143,12 +147,15 @@ describe('nested-docker-live-smoke workflow', () => {
     expect(createSession).not.toHaveBeenCalled();
     expect(createWorkflowInfrastructure).toHaveBeenCalledTimes(1);
     expect(startWorkflowControlServer).toHaveBeenCalledTimes(1);
+    // The probe runs under the in-container wall clock (its 93-minute
+    // timeoutMs) with its own marker; the host deadline is only a backstop.
     expect(exec).toHaveBeenCalledWith(
       'container-deterministic-smoke',
-      ['python3', '/workflow-scripts/nested_docker_probe.py'],
-      5_580_000,
+      [TIMEOUT_BINARY, '--kill-after=10', '5580', 'python3', '/workflow-scripts/nested_docker_probe.py'],
+      5_580_000 + 25_000,
       'codespace',
       '/workspace',
+      { [TURN_MARKER_ENV]: expect.any(String) as unknown },
     );
     expect(destroyWorkflowInfrastructure).toHaveBeenCalledTimes(1);
     expect(existsSync(resolve(workspace, '.workflow', 'nested-docker-result.json'))).toBe(true);

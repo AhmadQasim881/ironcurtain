@@ -1,5 +1,7 @@
 # ASI-Evolve Native Workflow Design
 
+**Status (2026-11-14):** Implemented as the `evolve` workflow (`src/workflow/workflows/evolve/`), shipped in slices: PRs #300, #302, #303, #309, #313 and #315, plus the N-way fan-out lanes of #323. The slice documents record what each one shipped.
+
 > **Review status (2026-06-15):** A ground-truth review against the IronCurtain
 > workflow runtime and the standalone ASI-Evolve repo is recorded in
 > [`asi-evolve-native-workflow-review.md`](./asi-evolve-native-workflow-review.md).

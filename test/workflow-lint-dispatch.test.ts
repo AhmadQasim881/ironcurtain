@@ -129,12 +129,8 @@ function createContext(overrides?: {
   startMock: ReturnType<typeof vi.fn>;
   resumeMock: ReturnType<typeof vi.fn>;
 } {
-  const startMock = vi
-    .fn<Parameters<WorkflowController['start']>, ReturnType<WorkflowController['start']>>()
-    .mockResolvedValue('mock-workflow-id' as WorkflowId);
-  const resumeMock = vi
-    .fn<Parameters<WorkflowController['resume']>, ReturnType<WorkflowController['resume']>>()
-    .mockResolvedValue(undefined);
+  const startMock = vi.fn<WorkflowController['start']>().mockResolvedValue('mock-workflow-id' as WorkflowId);
+  const resumeMock = vi.fn<WorkflowController['resume']>().mockResolvedValue(undefined);
 
   const controller: WorkflowController = {
     start: startMock,
@@ -145,6 +141,8 @@ function createContext(overrides?: {
     getBudget: vi.fn().mockReturnValue(undefined),
     listActive: vi.fn().mockReturnValue([]),
     resolveGate: vi.fn(),
+    listToolCallEscalations: vi.fn().mockReturnValue([]),
+    resolveToolCallEscalation: vi.fn().mockReturnValue(false),
     abort: vi.fn().mockResolvedValue(undefined),
     onEvent: vi.fn(),
     shutdownAll: vi.fn().mockResolvedValue(undefined),

@@ -16,7 +16,9 @@
   "main": "dist/index.js",
   "exports": {
     ".": "./dist/index.js",
-    "./prompts": "./dist/prompts.js"
+    "./prompts": "./dist/prompts.js",
+    "./models": "./dist/models/cli.js",
+    "./admin": "./dist/admin.js"
   },
   "files": [
     "dist/"
@@ -31,19 +33,21 @@
     "test:e2e": "vitest run test/e2e/",
     "benchmark": "npx tsx benchmark/run.ts --verbose",
     "benchmark:json": "npx tsx benchmark/run.ts --json",
+    "pin-models": "tsx scripts/pin-models.ts",
     "prepublishOnly": "npm run build",
     "start": "node dist/index.js",
-    "lint": "eslint src/ test/",
-    "lint:fix": "eslint --fix src/ test/",
-    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
-    "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\""
+    "lint": "eslint src/ test/ scripts/",
+    "lint:fix": "eslint --fix src/ test/ scripts/",
+    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\" \"scripts/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\" \"scripts/**/*.ts\""
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "better-sqlite3": "^13.0.3",
     "sqlite-vec": "^0.1.9",
     "@huggingface/transformers": "^4.3.0",
-    "openai": "^6.44.0"
+    "openai": "^6.44.0",
+    "zod": "^3.25 || ^4.0"
   },
   "devDependencies": {
     "tsx": "^4.22.4",

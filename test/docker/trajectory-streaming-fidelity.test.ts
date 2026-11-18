@@ -25,6 +25,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { AnthropicReassembler } from '../../src/docker/trajectory-reassembler.js';
 import {
   beginCaptureExchange,
+  CaptureLimitError,
   createResponseCaptureInlet,
   type CaptureExchangeHandle,
 } from '../../src/docker/trajectory-tap.js';
@@ -512,10 +513,13 @@ describe('Trajectory capture decompression (createResponseCaptureInlet)', () => 
     expect(onPoison).not.toHaveBeenCalled();
   });
 
-  it('poisons only capture when a non-draining decoder exceeds its bounded input backlog', async () => {
+  it('drops only the exchange (no poison) when a non-draining decoder exceeds its bounded input backlog', async () => {
+    // The backlog cap is a resource limit of this one response, like the
+    // decoded-size cap: the capture tap is torn down with a CaptureLimitError
+    // (the tap counts the exchange as aborted) and the session is untouched.
     const captureTap = new PassThrough();
     captureTap.on('data', () => {});
-    const captureFailed = new Promise<void>((resolve) => captureTap.once('error', () => resolve()));
+    const captureFailed = new Promise<Error>((resolve) => captureTap.once('error', (err) => resolve(err)));
     const abort = vi.fn();
     const onPoison = vi.fn();
     const inlet = createResponseCaptureInlet({
@@ -533,11 +537,31 @@ describe('Trajectory capture decompression (createResponseCaptureInlet)', () => 
       inlet.write(chunk);
     }
     inlet.end();
-    await captureFailed;
+    const error = await captureFailed;
 
     expect(Buffer.concat(forwarded).equals(wire)).toBe(true);
+    expect(error).toBeInstanceOf(CaptureLimitError);
+    expect(abort).not.toHaveBeenCalled();
+    expect(onPoison).not.toHaveBeenCalled();
+  });
+
+  it('still poisons the session when the compressed bytes are corrupt', async () => {
+    const captureTap = new PassThrough();
+    captureTap.on('data', () => {});
+    const captureFailed = new Promise<void>((resolve) => captureTap.once('error', () => resolve()));
+    const abort = vi.fn();
+    const onPoison = vi.fn();
+    const inlet = createResponseCaptureInlet({
+      captureTap,
+      contentEncoding: 'gzip',
+      captureHandle: { abort } as unknown as CaptureExchangeHandle,
+      onPoison,
+    });
+
+    inlet.end(Buffer.from('this is not a gzip stream at all'));
+    await captureFailed;
+
     expect(abort).toHaveBeenCalledOnce();
-    expect(onPoison).toHaveBeenCalledOnce();
     expect(onPoison).toHaveBeenCalledWith('reassembly-failure');
   });
 

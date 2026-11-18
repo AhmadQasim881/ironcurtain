@@ -56,12 +56,29 @@ stty -F "$PTS" size 2>/dev/null || echo "0 0"
 
 // ─── Shared Docker Environment Prompt Sections ──────────────
 
-/** Workspace and external-access orientation shared by every agent adapter. */
+/**
+ * Workspace and external-access orientation shared by every agent adapter. A
+ * read-only workspace (`context.workspaceReadOnly`) gets its own wording: the
+ * agent's tools only read it, and outputs go through the filesystem MCP tool.
+ */
 export function buildWorkspaceAccessSection(
   context: OrientationContext,
   localTools: string,
   externalTools: string,
 ): string {
+  if (context.workspaceReadOnly === true) {
+    return `### Workspace (read-only)
+Your workspace is \`${context.workspaceDir}\`. It is backed by the host workspace and is
+mounted read-only in this session: use ${localTools} to read and search it, but they
+cannot create, change or delete anything there. Write the files your task asks for
+with \`filesystem.write_file\` through ${externalTools}, at their
+\`${context.workspaceDir}/...\` paths. Policy allows such writes only inside the output
+directories your task names and denies every other change.
+
+### External operations
+The container has no direct internet access. Use ${externalTools} for network
+requests, git remote operations, and writing your outputs.`;
+  }
   return `### Workspace
 Your workspace is \`${context.workspaceDir}\`. It is backed by the host workspace.
 Always refer to workspace files as \`${context.workspaceDir}/...\`.

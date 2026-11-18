@@ -34,6 +34,8 @@ export const watchdogSampleSummarySchema = z
   .object({
     sampledAtMs: z.number().int().nonnegative(),
     availableBytes: z.number().int().nonnegative(),
+    /** Free bytes on the container runtime's own disk (the Docker Desktop VM) when measured. */
+    runtimeAvailableBytes: z.number().int().nonnegative().optional(),
     allocatedBytes: z.number().int().nonnegative(),
   })
   .strict();

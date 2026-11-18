@@ -1,6 +1,7 @@
 # Containerized Deterministic Execution + Workflow Script Packaging
 
-Status: Implemented (branch `feat/deterministic-container-execution`, PR #292)
+**Status (2026-11-14):** Implemented (PR #292). Since WP-47 a deterministic state that runs its commands on the host must say so with `host: true`.
+
 Audience: IronCurtain runtime engineers
 Consumer context: `docs/designs/asi-evolve-native-workflow.md` depends on this capability, but the work here is general-purpose workflow-runtime work, not ASI-Evolve-specific.
 
@@ -13,6 +14,22 @@ Consumer context: `docs/designs/asi-evolve-native-workflow.md` depends on this c
 > inlined in `orchestrator.ts` and share a `reduceDeterministicCommands` reducer
 > instead. See §4.6, §10, and §12 for the full deviation list.
 
+> **Dependency model superseded.** The per-workflow image bake described in the
+> original §6 (`ensureWorkflowImage`, `ironcurtain-wf-<hash>` images) was removed in
+> #308 in favour of runtime installs through the MITM registry proxy. §6 now describes
+> the current model: a host-provisioned, content-keyed shared base that no agent
+> container mounts, plus a per-run writable layer. §2, §10 and §11 keep the PR #292
+> record and still mention the old bake.
+
+> **Host execution is no longer the silent default.** The host path is no longer
+> byte-identical to the pre-#292 loop. A deterministic state that runs commands without
+> `container: true` must now declare `host: true`, or validation fails (§3.3 rule 7).
+> The runtime refuses an unacknowledged host state too. Host commands run under a
+> bounded runner (`src/workflow/host-command-runner.ts`): the workspace is their cwd,
+> stdin is closed, they get their own process group, `timeoutMs` applies, the group is
+> killed on timeout or when the run stops, and output capture is capped. The new lint
+> **WF015** warns on every host state. See §3.3, §4.4 and §9.
+
 ---
 
 ## 1. Summary & goals
@@ -21,17 +38,17 @@ Consumer context: `docs/designs/asi-evolve-native-workflow.md` depends on this c
 
 1. **In-container deterministic execution.** A workflow `deterministic` state can run its `run:` command array _inside the workflow's shared Docker container_ via `docker exec` instead of host-side `execFileAsync`. Opt-in per state via a new boolean field `container: true`. The state binds to a `containerScope` (default `"primary"`), reuses the bundle the orchestrator already minted for that scope (`instance.bundlesByScope`), and returns the **same** `{ passed, testCount, errors }` result shape as before.
 
-2. **Workflow script packaging.** A workflow package can ship a `scripts/` directory (Python and/or Node helpers, plus `requirements.txt` / `package.json`). Code is delivered into the container via a dedicated read-only bind mount at `/workflow-scripts`. Dependencies are installed **at image-build time** (where network exists) into a per-workflow image layer; the resulting venv / `node_modules` are baked into a per-workflow image so they are available at `--network=none` runtime. A no-dependency fast path (stdlib / base-image-only) reuses the shared agent image with zero rebuild.
+2. **Workflow script packaging.** A workflow package can ship a `scripts/` directory (Python and/or Node helpers, plus `requirements.txt` / `package.json`). Code is delivered into the container via a dedicated read-only bind mount at `/workflow-scripts`. Dependencies are installed **at run time** through the bundle's MITM registry proxy into a content-keyed shared base that only a short-lived provisioning container ever mounts; each workflow run then gets its own writable copy at `/opt/workflow-venv` / `/opt/workflow-node_modules` (§6). A no-dependency fast path (stdlib / base-image-only) needs neither.
 
 ### What did NOT ship (explicit seams)
 
 - **The structured deterministic result contract.** Routing on `when: { verdict: ... }` from a helper-written result file is a _separate_ piece (see `docs/designs/asi-evolve-native-workflow.md`). Containerized execution keeps working with today's stdout-mined `{ passed, testCount, errors }`. §4 keeps the host/container fork to a single per-command runner closure (`reduceDeterministicCommands`) so the result-contract piece can later replace only the reduction step. **We did not design the result file here.** (Note: the design originally proposed a standalone `DeterministicRunner`/`HostRunner`/`ContainerRunner` module for this seam; that module was **not** built — see §4.6.)
 - No change to agent-state behavior, policy hot-swap, or the control server.
-- No change to host-side deterministic states: `container: false` (the default) is byte-for-byte the prior path.
+- No change to host-side deterministic states: `container: false` (the default) is byte-for-byte the prior path. _(Superseded: host states now require `host: true` and run under the bounded host runner; see §3.3 rule 7 and §4.4.)_
 
 ### Non-goals / invariants
 
-- `--network=none` (Linux) / internal-bridge (macOS) is preserved at runtime. No runtime network is introduced. All dependency fetching happens at build time.
+- `--network=none` (Linux) / internal-bridge (macOS) is preserved at runtime. No direct network is introduced: dependency fetching goes only through the bundle's MITM registry proxy (package allowlist/denylist and age gate apply), and only while `packageInstall` is enabled.
 - `ToolCallCoordinator` does **not** mediate `docker exec`. Deterministic in-container commands are trusted workflow-author code, not agent-generated tool calls (see §9).
 
 ---
@@ -118,6 +135,7 @@ Add to **deterministic** states:
 | ---------------- | ------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------- |
 | `container`      | `boolean`                             | `false`     | Run `run:` commands via `docker exec` into the shared-container bundle for this state's scope, instead of host `execFileAsync`. |
 | `containerScope` | `string` (charset `^[a-zA-Z0-9_-]+$`) | `"primary"` | Which bundle to exec into. Only meaningful when `container: true`.                                                              |
+| `host`           | `boolean`                             | `false`     | _(Added later, WP-47.)_ Required acknowledgement that the commands run on the host. Mutually exclusive with `container: true`.  |
 
 Add to the workflow **package layout** (not YAML — directory convention, §5): an optional `scripts/` sibling of `workflow.yaml`.
 
@@ -129,13 +147,16 @@ Add to the workflow **package layout** (not YAML — directory convention, §5):
 > deterministic in-container states that do the work — see the
 > `deterministic-eval-smoke` acceptance fixture in §11.
 
-**Before** (host-side, unchanged behavior):
+**Before** (host-side). Since WP-47 a host state must say `host: true`. Without it the
+definition fails validation. Note that `npm test` on the host runs the `test` script
+from the agent-writable workspace, which is why `container: true` is preferred:
 
 ```yaml
 states:
   run_tests:
     type: deterministic
     description: Run the unit suite on the host
+    host: true # required for host execution; see §3.3 rule 7 and §9
     run:
       - ['npm', 'test']
     transitions:
@@ -181,6 +202,16 @@ states:
 4. **`container: true` requires `mode: docker`.** `builtin` mode has no container. Error (`:489`): `State "<id>" has container: true but settings.mode is not "docker".` (`mode` defaults to `'docker'` in the validator.)
 5. **Scope-coherence.** `container: true` states need **no** MCP servers (they don't call the coordinator), so there is no required-server contribution — only the scope charset is enforced (already by the schema). Confirmed: no extra cross-state required-server check was added.
 6. **`containerScope` requires `mode: docker` on agent states (post-review fix).** Builtin mode ignores `sharedContainer` (the orchestrator's `shouldUseSharedContainer` returns `false` for `mode: builtin`), so an agent `containerScope` declared under `mode: builtin` is a silent no-op — a workflow that _looks_ scoped but runs per-state builtin containers. `validateContainerScopes` now rejects it: `State "<id>" declares containerScope "<scope>" but settings.mode is "<mode>", not "docker". Builtin mode ignores sharedContainer, so the scope would be a silent no-op.` Deterministic states reach this transitively (rule 2 → rule 4); agent states are now checked directly. Added in response to PR review feedback.
+7. **Host execution needs `host: true` (added later, WP-47).** `validateHostDeterministicStates` applies in every mode. It rejects a deterministic state that would run commands on the host unless the state sets `host: true`. "Runs commands on the host" (`runsCommandsOnHost`) means the state is not `container: true`, its `run` executes, and it has at least one non-empty command. A fan-out driver's own `run` never executes where it drives a batch, so a driver needs no acknowledgement. A driver that is also a segment member (`fanOutMember: true`) is the exception: lane machines strip a member's fan-out markers and run it as a plain deterministic state, so its `run` executes in every lane and it needs `host: true`. The message says that host commands run as the user with full network access and IronCurtain's environment, outside the container and the policy engine, in the agent-writable workspace. It also says that npm, pytest, make, cargo and git execute code and configuration from that workspace. Then it names the mode's remedy:
+   - builtin: there is no container, so add `host: true`;
+   - non-shared Docker: `container: true` needs `sharedContainer: true`;
+   - shared Docker: set `container: true`.
+
+   `host: true` together with `container: true` is rejected as contradictory. `host` on a non-deterministic state is rejected by the raw-input check, which works like the `resultFile` guard. The runtime re-checks the acknowledgement (§4.4), so a definition that bypasses validation cannot run on the host either. Existing workflows with host deterministic states fail validation until they add `host: true`. That includes resumed runs, whose `definition.json` copy is re-validated; the resume error names that copy, because editing the workflow's source file does not change it. Loading a past run only to display it (`workflow inspect`, the web UI's past runs and message logs) passes `allowUnacknowledgedHostStates`, so runs recorded before the rule stay visible. Displaying a run executes nothing, and starting or resuming never passes the allowance. The shipped workflow packages have no host states. The builtin example `examples/workflow-demo.yaml` (`echo`) declares `host: true`.
+
+   **Why `container: true` still requires `sharedContainer: true`.** A containerized deterministic state execs into its scope's long-lived bundle. That bundle only exists in shared-container mode. Without it, each agent state owns a container that is gone by the time the next state runs, so there is nothing to exec into. Running deterministic commands in a non-shared workflow would need a dedicated bundle (container, proxies, coordinator, teardown). That lifecycle does not exist and is out of scope here. Such a workflow sets `sharedContainer: true` instead.
+
+8. **`timeoutMs` is bounded (WP-47).** The schema caps it at `MAX_DETERMINISTIC_TIMEOUT_MS` (2^31 − 1 ms), the largest delay Node timers honour. Both runners arm a timer with it, and a larger value would fire after 1 ms.
 
 **Backward-compat (held).** No shipped workflow has a `type: deterministic` state (vuln-discovery, design-and-code, test-email-summary contain zero deterministic states — vuln-discovery and test-email-summary set `sharedContainer: true`; design-and-code does not), so there is no existing-YAML regression surface. With `container` defaulting to `false`, `executeDeterministicState` dispatches to `runDeterministicHost` unchanged. This is verified by `test/workflow/orchestrator-deterministic.test.ts` (synthetic host-side state asserting identical `{ passed, testCount, errors }` and that `docker.exec` is never invoked) and a `test/workflow/validate.test.ts` no-regression snapshot over the three shipped workflows.
 
@@ -235,6 +266,8 @@ input: ({ context }: { context: WorkflowContext }) => ({
 
 (`stateDef` is `DeterministicStateDefinition` in this branch; the new fields are added to that type in §10.)
 
+_As built later:_ the machine's invoke mapper and the resume replay no longer build this input separately. Both call `buildDeterministicInvokeInput` in `machine-builder.ts`, which lane-templates `run` and `resultFile` and carries `container`, `host`, `containerScope` and `timeoutMs`, so a replayed state gets exactly what a normal entry gets, including the `host: true` acknowledgement (§4.4).
+
 ### 4.3 Bundle resolution + dispatch in `executeDeterministicState`
 
 > **Resolution note (read first).** The bundle-resolution strategy is **mint-on-demand via `ensureBundleForScope`, not a hard `bundlesByScope.get` fail-fast.** Deterministic-only scopes are intentional and do not emit a runtime warning; WF011 covers only suspicious ordering in mixed agent/deterministic scopes.
@@ -275,6 +308,21 @@ private async executeDeterministicState(
 
 **As built**, the host loop body was not literally duplicated. Both paths share a single reducer, `reduceDeterministicCommands(commands, runCommand)` (`src/workflow/orchestrator.ts:2376`), which owns the empty-array skip, the `N tests pass`/`specs pass` regex, the per-command error accumulation, and the `{ passed, testCount, errors }` assembly. `runDeterministicHost(commands)` (`:2404`) is a thin wrapper passing a `runCommand` closure that calls `execFileAsync`. This keeps the `container: false` path semantically byte-identical to the prior loop (verified by `test/workflow/orchestrator-deterministic.test.ts`), while guaranteeing host and container cannot drift in their pass/fail or test-count logic — the only fork is the per-command runner closure.
 
+**Update (WP-47): the host branch is now bounded.** The reducer is still shared. The host closure no longer calls `execFileAsync(binary, args)`, which had no options at all. It calls `runHostCommand` from `src/workflow/host-command-runner.ts`. `executeDeterministicState(workflowId, input, signal?)` now looks the instance up before the host branch, so it can call `runDeterministicHost(instance, input, signal)`. That function:
+
+- throws when `input.host !== true` and any command is non-empty. The throw routes the state to its error target, because the refusal is a configuration error, not a failed check. `host` is threaded through `DeterministicInvokeInput` from the machine-builder mapper, the resume replay and the evolve barrier inputs;
+- runs each command with `cwd: instance.workspacePath`. This is acceptable only behind the acknowledgement: on its own, the switch would have made every host state run over agent-written files. Before WP-47 the command ran in the CLI's or the daemon's own cwd, so the documented `npm test` tested the wrong directory;
+- passes `timeoutMs: input.timeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS`, the same 10-minute default `DockerManager.exec` uses. Before, the host path silently ignored `timeoutMs`;
+- passes a signal combined from the instance's `stopController` and the XState invoke signal. `abort()` aborts the controller as soon as it claims the terminal, and `destroyWorkflowInfrastructure`, which every stop path runs, aborts it too. The invoke signal aborts when the invoking actor stops, for example when a fan-out batch drains a lane. The resume replay has no invoke signal and relies on the controller.
+
+_(WP-48)_ `stopController` is the run's single stop signal: `abort()` aborts it before its first await. `executeDeterministicState` refuses a state outright (it throws, so nothing runs) once the run is stopping. A host command that the stop kills, and every later command of the state, which the runner then refuses to start, are reported as failures in the state's result; the stopped run's actor ignores that result.
+
+`runHostCommand` spawns the argv (no shell) detached, so the command leads its own process group and session and has no controlling terminal. stdin is `'ignore'`. A timeout or abort SIGKILLs the whole group, which takes grandchildren such as npm → sh → node with it. When the command exits, anything it left in its group is killed as well. A process `exit` hook kills groups that are still running if IronCurtain exits first, for example on a forced exit after a second Ctrl-C. Each stream keeps its first and last 1 MiB, with an omission marker between them. The bytes are copied into one head buffer and one tail ring, so the capture holds at most 2 MiB per stream however finely the output is chunked (a loop printing one byte per write arrives as one chunk per byte). Verbose output therefore never fails a command, and a closing `N tests pass` line survives.
+
+The error text is the runner's own reason (timeout, abort or spawn failure) followed by `stderr || stdout`. With no output it falls back to `command "<argv0>" exited with code N`. The old `stderr ?? stdout ?? String(err)` never fell back, because promisified `execFile` always sets `stderr`, even to `''`. Stdout-only failures, ENOENT and maxBuffer overflows all came back as `errors: ""`.
+
+A process that leaves the group (`setsid`, a daemonizing double fork) escapes the kill. The environment is still inherited. Both are covered by the acknowledgement, not contained (§9).
+
 ### 4.5 In-container branch
 
 **As built**, `runDeterministicInContainer(bundle, input)` delegates to the same `reduceDeterministicCommands` reducer with a `runCommand` closure that calls `bundle.docker.exec`:
@@ -310,6 +358,16 @@ The reducer mines `testCount` from `stdout` on the success path and pushes `erro
 **Exit-code → `passed` mapping.** `passed = allErrors.length === 0`, identical semantics to host (`exitCode !== 0` is the in-container analog of `execFileAsync` rejecting). Test-count mining is unchanged. **Result shape is unchanged** — `{ passed, testCount, errors }`.
 
 **Timeout source.** `input.timeoutMs` flows from the new YAML `timeoutMs` field (**surfaced in the schema — see §12(2)**, a change from the original "deferred" plan) through `DeterministicInvokeInput` to `DockerManager.exec`. When absent it is `undefined` → DockerManager's 10-minute default.
+
+**Update (WP-48): stopping.** `executeDeterministicState` passes the run's stop signal (the instance's `stopController`) to `runDeterministicInContainer`, which hands it to the shared reducer. `docker exec` takes no signal, so a command already running ends when the stop tears the container down. Once the signal has fired, the reducer starts no further command; it throws instead. `executeDeterministicState` also checks the signal after the last command and throws rather than reading the result file of a stopped run. The throw rejects the invoke, which the stopped actor ignores, and the orchestrator does not log the rejection.
+
+**Update (FU-17): the wall clock is enforced inside the container.** The host `docker exec` deadline only killed the host CLI client. `docker exec` forwards no signal, so a hung command (a test runner and its children) kept running in the shared container after its state was routed as failed, next to the states that followed, and each later timeout added another. Each command now goes through `runBoundedContainerCommand` (`src/docker/turn-timeout.ts`), the mechanism agent turns use:
+
+- the argv from `buildWorkflowExecCommand` is wrapped in `/usr/bin/timeout --kill-after=10 <timeoutMs / 1000>`, outside the dependency `PATH` shell (`timeout` is named by absolute path), so coreutils `timeout` signals the command's whole process group at `timeoutMs` (default 10 minutes) and SIGKILLs it 10 s later;
+- every command gets a fresh `IRONCURTAIN_TURN_ID` marker in its exec environment, and the host deadline becomes a backstop of `timeoutMs` + 25 s;
+- after a timeout (exit 124/137 at the deadline, or the backstop) the processes that still carry the marker are swept inside the container, as the command's own exec user, before the state goes on. The failure reads `command "<argv0>" timed out after <timeoutMs> ms; it was stopped inside the container`, followed by the command's output;
+- `executeDeterministicState` hands `runDeterministicInContainer` both the run's stop signal and the invoke signal. When either fires while a command runs (a stopping run, a drained fan-out lane), the command's processes are swept at once instead of running on until teardown or the deadline. Afterwards the run's stop still makes the reducer throw, and a stopped invoke reports every later command as not started. A stop can land between the exec request and the command's process start, when the sweep finds nothing yet; so while the command's exec is still running a second after a stop's sweep, the stop sweeps again, at most five times in all (`STOP_SWEEP_RETRY_MS`, `STOP_SWEEP_MAX_ATTEMPTS`). The in-container deadline still bounds a command no sweep reached.
+- an invalid `timeoutMs` (a definition that bypassed validation) throws before anything runs, where `0` used to disable the host deadline.
 
 ### 4.6 Result-contract seam (built as a shared reducer, not a `DeterministicRunner` module)
 
@@ -364,7 +422,7 @@ docker exec --user codespace --workdir /workspace <containerId> \
   python /workflow-scripts/run_suite.py --json
 ```
 
-For dependency-bearing scripts the venv is on `PATH` / `python` resolves the baked venv (§6), so no `uv run` wrapper is needed; if a workflow prefers explicit isolation it can write `['uv', 'run', '/workflow-scripts/run_suite.py']` and uv resolves the per-workflow venv baked at build time.
+For dependency-bearing scripts the run's venv bin is prepended to `PATH` for these execs, so `python` resolves `/opt/workflow-venv/bin/python` (§6) and no `uv run` wrapper is needed. Workflows normally name the interpreter explicitly, e.g. `['/opt/workflow-venv/bin/python', '/workflow-scripts/run_suite.py']`.
 
 **Node** (`run: [['node', '/workflow-scripts/lint.js']]`):
 
@@ -373,94 +431,62 @@ docker exec --user codespace --workdir /workspace <containerId> \
   node /workflow-scripts/lint.js
 ```
 
-`node_modules` for these scripts live next to the baked install location (§6), discoverable via `NODE_PATH` set in the per-workflow image, so `require('left-pad')` resolves even though `lint.js` runs from `/workflow-scripts`.
+`node_modules` for these scripts live in the run's layer at `/opt/workflow-node_modules` (§6). `buildWorkflowExecCommand` exports `NODE_PATH` for these deterministic execs only, so `require('left-pad')` resolves even though `lint.js` runs from `/workflow-scripts`, while the agent's own Node processes never resolve modules from the run layer. ESM `import` ignores `NODE_PATH`; helpers that need packages use `require()`.
 
 `<containerId>` is `bundle.containerId`. The `--workdir` flag is added to `DockerManager.exec` per §4.5(a).
 
+_As built (FU-17):_ each command also carries `--env IRONCURTAIN_TURN_ID` (its marker, passed through the child environment) and runs under the in-container wall clock, so the Python example execs `docker exec --user codespace --workdir /workspace --env IRONCURTAIN_TURN_ID <containerId> /usr/bin/timeout --kill-after=10 600 python /workflow-scripts/run_suite.py --json` (see §4.5).
+
 ---
 
-## 6. Script packaging — dependencies (offline runtime)
+## 6. Script packaging — dependencies (runtime provisioning)
 
-Runtime is `--network=none`. All fetching happens at **image build**, which has network. We bake a **per-workflow image layer** only when a dependency manifest is present.
+The agent container has no direct network (`--network=none` on Linux, an internal bridge on macOS). Dependencies are installed at run time through the bundle's MITM registry proxy, so the package policy (allowlist/denylist, age gate) applies to them. `prepareDockerInfrastructure` fails fast, before any proxy or container work, when a workflow declares dependencies but `packageInstall` is disabled, or when an admitted nested-Docker bundle would need the provisioning container described below (its lease must ledger every outer resource and has no provisioning role).
+
+The implementation lives in `src/docker/workflow-dependency-cache.ts` (layout, record, verification, seeding, install scripts) and `runWorkflowDependencyProvisioner` in `src/docker/docker-infrastructure.ts` (the provisioning container).
 
 ### 6.1 No-deps fast path (default)
 
-If `scripts/` has **no** `requirements.txt` and **no** `package.json` (or no `scripts/` at all), use the **shared agent image** unchanged. The base image already ships Python 3.12 stdlib, `ruff`, pip, and Node. Zero rebuild, zero per-workflow image. This is the common case and the only case vuln-discovery / design-and-code hit (they ship no scripts).
+If `scripts/` has **no** `requirements.txt` and **no** `package.json` (or no `scripts/` at all), nothing is provisioned or mounted. The base image already ships Python 3.12 stdlib, `ruff`, pip, and Node. This is the common case and the only case vuln-discovery / design-and-code hit (they ship no scripts).
 
-### 6.2 Per-workflow image (when a manifest exists)
+### 6.2 Content key, shared base and provisioned record
 
-When `scripts/requirements.txt` and/or `scripts/package.json` exists, build a thin image **`FROM ironcurtain-<agent>:latest`** (the exact agent image the bundle would otherwise use) that installs deps at build time.
-
-**Generated in-memory with a hardcoded `FROM`.** `DockerManager.buildImage(tag, dockerfilePath, contextDir, labels?)` (`src/docker/docker-manager.ts:325-348`) takes a Dockerfile _path_ and a context _dir_ — **it has no `--build-arg` support** (its only build env is `DOCKER_BUILDKIT=1`, `:342-347`). So `ARG BASE` / `FROM ${BASE}` is not buildable. Instead, generate the Dockerfile text per agent with the base image resolved and **hardcoded** into the `FROM` line, then write it into a dedicated build context (below). The resolved base is exactly the agent image `ensureWorkflowImage` ensured first (§6.3) — i.e. whatever `adapter.getImage()` returns (`src/docker/docker-infrastructure.ts:625`), typically `ironcurtain-<agent>:latest`.
-
-**Dedicated build context (B2).** The agent-image build context is `dockerDir` (`ensureImage`, `:1296`), which does **not** contain the workflow `scripts/` tree — so a `COPY scripts …` against it would fail. Mirror the base-image pattern instead, which assembles a temp context (`mkdtempSync` + copy `docker/*` + CA, `:1341-1348`) and builds from it. For the per-workflow layer, assemble a dedicated **temp** context dir (`mkdtempSync`) containing **only** the dependency manifests and a copy of the `scripts/` tree, write the generated Dockerfile into it, and call `buildImage(tag, <ctx>/Dockerfile, <ctx>, labels)`. Prefer a fresh temp dir over reusing the already-staged `bundleDir/workflow-scripts` from §5.2: that dir is bind-mounted read-only at `/workflow-scripts` at runtime, so writing the generated `Dockerfile` into it would leak the Dockerfile into the running container's `/workflow-scripts`. The `COPY` lines below are written against that context root.
-
-Generated Dockerfile (no `ARG`; `<AGENT_IMAGE>` substituted at generation time). The shipped `ensureWorkflowImage` (`src/docker/docker-infrastructure.ts:1375`) emits this exact text (single-line `RUN` bodies, shown wrapped here for readability):
-
-```dockerfile
-# Generated in-memory per-workflow (written into the dedicated build context).
-FROM <AGENT_IMAGE>            # e.g. ironcurtain-claude-code:latest — resolved & hardcoded
-USER root
-# Context root contains the staged scripts/ tree + manifests at its top level.
-COPY . /opt/workflow-scripts-build
-# Python: uv reaches PyPI over the normal build-host network (see rationale below).
-RUN if [ -f /opt/workflow-scripts-build/requirements.txt ]; then \
-      uv venv /opt/workflow-venv && \
-      VIRTUAL_ENV=/opt/workflow-venv uv pip install \
-        -r /opt/workflow-scripts-build/requirements.txt; \
-    fi
-# Node: npm ci when a lockfile is present, else npm install — both --omit=dev.
-RUN if [ -f /opt/workflow-scripts-build/package.json ]; then \
-      cd /opt/workflow-scripts-build && \
-      if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi && \
-      mv node_modules /opt/workflow-node_modules; \
-    fi
-ENV PATH=/opt/workflow-venv/bin:${PATH}
-ENV NODE_PATH=/opt/workflow-node_modules
-USER codespace
-```
-
-**Deviation from design (Node install).** The design's Dockerfile used an unconditional `npm ci --omit=dev`. **As built** it is `if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi` — `npm ci` requires a lockfile, so the fallback lets a `package.json`-only workflow (no committed `package-lock.json`, like the `deterministic-eval-smoke` fixture) still build. Reproducibility still recommends committing a lockfile.
-
-**Inherited `ENTRYPOINT` / `USER` are fine.** Because the layer is `FROM ironcurtain-<agent>:latest`, it inherits the agent image's `ENTRYPOINT` and `USER codespace`. Neither matters for deterministic execution: the workflow container is launched with `sleep infinity` and commands run via `docker exec`, which **bypasses `ENTRYPOINT` entirely**; the exec user is set explicitly to `codespace` (§4.5), independent of the image's default `USER`. The trailing `USER codespace` above just keeps the image default consistent with the agent image.
-
-- **Python:** `requirements.txt` → `uv pip install` into a baked venv at `/opt/workflow-venv`; the venv `bin` is prepended to `PATH` so `python` resolves the **venv interpreter** with deps. Deterministic states that need the deps should invoke the venv interpreter explicitly — e.g. `['/opt/workflow-venv/bin/python', '/workflow-scripts/run_eval.py']` — or rely on the `PATH` ordering (`python` → `/opt/workflow-venv/bin/python`). (Decision: `uv pip install` over bare `pip` — uv is already the base-image standard.)
-- **Node:** `package.json` (+ `package-lock.json` if present) → `npm ci --omit=dev` (or `npm install --omit=dev` without a lockfile); baked `node_modules` at `/opt/workflow-node_modules`, exposed via `NODE_PATH` so `require()` resolves it even though scripts run from `/workflow-scripts`. (Decision: prefer `npm ci` for lockfile-pinned reproducibility; npm over pnpm because npm ships in the base image and avoids a new toolchain.)
-
-> **Build-time network model (corrected).** There is **no MITM/proxy at `docker build` time.** `buildImage` injects only `DOCKER_BUILDKIT=1` and no proxy env (`src/docker/docker-manager.ts:342-347`); the `HTTPS_PROXY`/`HTTP_PROXY` MITM is only injected into the _running container_ at `docker create` time (`src/docker/docker-infrastructure.ts:969-970,1025-1026`), not the build. So the build reaches PyPI/npm over the **normal build-host network** — implementers should not hunt for a build-time proxy or a CA-trust shim. (`UV_NATIVE_TLS=1` in the base image is incidental here; it governs uv's TLS backend, not any MITM trust, and no MITM is in the build path.)
-
-**Where deps live: baked in the image, NOT mounted.** The `/workflow-scripts` _code_ mount is RO and per-run; the _dependencies_ are baked into the image. This keeps the RO code mount free of a giant `node_modules`/venv, makes the image self-contained for offline runtime, and gives reproducibility (the build hash pins the manifest — §6.3).
-
-The `scripts/` source is also still mounted RO at `/workflow-scripts` at runtime (§5) so edits to the helper code between runs don't require a rebuild _unless_ the dependency manifest changed.
-
-### 6.3 Build-hash extension + the `ensureWorkflowImage` seam
-
-**Child build hash.** `computeBuildHash` is module-private and tied to `dockerDir`'s file set, so it is not reusable for a context whose files are the workflow manifests. **As built**, the per-workflow hash lives in the exported `computeWorkflowImageHash(agentBuildHash, scriptsDir)` (`src/docker/docker-infrastructure.ts:1405`):
+The manifests are read once from the staged scripts directory. The content key is
 
 ```
-wfImageHash = sha256( "agent:<agentBuildHash>\n"
-                      ++ for each of [requirements.txt, package.json, package-lock.json] present:
-                           "file:<name>\n" ++ <bytes> ++ "\n" )
+key = sha256( "agent:<agentBuildHash>\n"
+              ++ for each of [requirements.txt, package.json, package-lock.json] present:
+                   "file:<name>\n" ++ <bytes> ++ "\n" )
 ```
 
-Each manifest is keyed by name before its bytes (so add/remove of a manifest changes the hash), and `agentBuildHash` is the parent agent image's hash — **as built**, `ensureImage` now _returns_ that hash (its signature changed from `Promise<void>` to `Promise<string>`, `:1315`) so `ensureWorkflowImage` can chain it. The per-workflow image is named `ironcurtain-wf-<wfImageHash[0:12]>:latest`, labeled `ironcurtain.build-hash = wfImageHash`, and rebuilt only when stale (`isImageStale`). If no manifest changed and the parent agent image is current, the cached per-workflow image is reused — no rebuild.
+`agentBuildHash` is the ordinary agent image's build identity (snapshot resume keeps it, see `workflow-container-snapshot-resume.md` §4.6). The key covers no run, workspace or persona, so it names a **shared base** at `~/.ironcurtain/workflow-dependency-bases/<key[0:24]>/{python-venv,node_modules}`. Only these three files reach the installer, so a `requirements.txt` that includes another file (`-r`, `-c`) or a `package.json` with local `file:` dependencies is not supported.
 
-**New `ensureWorkflowImage` (the real build seam).** `ensureImage` is module-private, derives `Dockerfile.<agent>` from the image name, and always builds from `dockerDir`. Rather than overload it, the exported **`ensureWorkflowImage(agentImage, scriptsDir, docker, ca)`** (`src/docker/docker-infrastructure.ts:1352`) was added, which:
+- **Only a dedicated provisioning container mounts the base.** It is created from the pristine agent image (never a workflow snapshot), with no workspace, conversation state, skills, scripts mount, nested-Docker wiring or adapter environment (so no fake provider keys). It receives the exact hashed manifest bytes read-only at `/opt/ironcurtain-workflow-manifests`, the public MITM CA read-only at `/etc/ironcurtain`, and only the MITM proxy socket (UDS topologies) or the bundle's internal network and sidecar alias (TCP topologies), so registry traffic still flows only through this bundle's proxy. On TCP topologies the sidecar also forwards the Code Mode proxy port, which carries no per-session credential, so install scripts there could reach the policy-mediated tool-call path; the agent container, where these installs ran before, has the same reach and more. The base is mounted read-write at the same container path the run layer later uses, and `uv venv` + `uv pip install -r` (with `UV_LINK_MODE=copy`) or `npm ci`/`npm install --omit=dev` run as `codespace` with `/tmp` as the working directory.
+- **The container is removed, and its absence confirmed, before the base is trusted.** Package install scripts run in it; a process they left behind must not be able to write the base after it is recorded.
+- **Host-side provisioned record.** The host then walks the base without following symlinks and records every directory (mode), regular file (mode, size, sha256) and symlink (target) in `<base>.provisioned.json`, a sibling of the base outside every mount. FIFOs, sockets, devices and entries that change during the walk fail closed. A base without a valid record for its key, kind and target (for example one left by a crash mid-provisioning) is discarded and rebuilt.
+- **Bounded verification.** The tree walk streams directory entries and refuses more than 100,000 retained entries, 64 directory levels, 16 GiB of file content or 64 MiB of serialized entry metadata. File hashing stops on the first byte beyond the walked size or remaining content budget, so a growing file cannot keep verification reading indefinitely. The sorted manifest digest is computed one entry at a time; its canonical bytes remain compatible with existing provisioned records. Small test-only limit overrides verify each bound without large fixtures.
+- **Legacy caches are never touched.** Earlier versions kept one shared cache per key at `~/.ironcurtain/workflow-deps/<key[0:24]>/{python-venv,node_modules}` and bind-mounted it read-write into every agent container of the workflow, guarded only by an in-tree `.ironcurtain-provisioned-<key>` sentinel. A process of such a version may still be running (for example a daemon started before an upgrade) and mounts whatever directory sits at that path, so the bases live under a different root that no earlier version mounts. The legacy tree is never read, mounted or deleted: removing it on the host would race a still-running agent that can swap its directories for symlinks, and would break that version's run. Operators delete `~/.ironcurtain/workflow-deps/` once no earlier IronCurtain process is running.
+- **Serialization.** Rebuilding and seeding one key are serialized across processes by the host lock `~/.ironcurtain/workflow-dependency-bases/<key[0:24]>.provision-lock` (`provision-lock.ts`, built on the Docker-workload process lock: owner PID + process-start identity + token, takeover by inode capture, release of the own inode only).
 
-1. **ensures the agent image first** via `ensureImage(agentImage, docker, ca)` (capturing its returned `agentBuildHash`) so the `FROM` target exists and is current;
-2. if `scriptsDir` is undefined/absent, or has **neither** `requirements.txt` nor `package.json`, returns `agentImage` unchanged (the §6.1 fast path — no per-workflow image);
-3. otherwise computes `wfImageHash`, and if `ironcurtain-wf-<…>` is stale, `mkdtempSync`'s a temp context, `cpSync`'s `scriptsDir` into it, writes the generated Dockerfile, calls `docker.buildImage(wfImage, <ctx>/Dockerfile, <ctx>, { 'ironcurtain.build-hash': wfImageHash })`, and removes the temp dir in a `finally`;
-4. returns the per-workflow image name.
+### 6.3 Per-run writable layer
 
-**Threading to the real seam (B3) — `imageOverride` was NOT added.** The design proposed adding both `imageOverride?` and `scriptsDir?` to `CreateWorkflowInfrastructureInput` and resolving the image in the orchestrator. **As built, only `scriptsDir`/`workflowScriptsDir` is threaded; there is no `imageOverride` anywhere** (the image is resolved entirely inside the prep path):
+Each workflow run gets its own layer at `~/.ironcurtain/workflow-runs/<workflowId>/deps/<key[0:24]>/{python-venv,node_modules}`, mounted read-write at `/opt/workflow-venv` and `/opt/workflow-node_modules`. The shared base is never mounted into an agent container.
 
-- `CreateWorkflowInfrastructureInput` gained `workflowScriptsDir?: string` (`src/workflow/orchestrator.ts:393`) — no `imageOverride`.
-- `loadDefaultInfrastructureFactory` (`src/workflow/orchestrator.ts:1095`) maps `input.workflowScriptsDir` to the trailing positional `scriptsDir` arg of `createDockerInfrastructure(...)` (`:1134/:1153`). Both `createDockerInfrastructure` (`:757`) and `prepareDockerInfrastructure` (`:352`) gained a matching trailing `scriptsDir?` parameter.
-- Inside `prepareDockerInfrastructure` the unconditional `const image = await adapter.getImage(); await ensureImage(...)` became `const agentImage = await adapter.getImage(); const image = await ensureWorkflowImage(agentImage, scriptsDir, docker, ca);` (`:633`). The returned `image` (per-workflow when a manifest exists, else the agent image) flows into `core.image` exactly as before. No second image field is needed.
+- **Seeding.** When the run layer does not exist yet, the host copies the base into a staging directory next to it (`fs.cp` with `COPYFILE_FICLONE`: a copy-on-write clone where the filesystem supports it, a plain copy otherwise; never a hard link, because an in-place write through a hard link would reach the base). It verifies the copy against the record and only then renames it into place. A mismatch means the base on disk is not the provisioned one, so the base is discarded, rebuilt in a new provisioning container, and the copy redone; a second mismatch fails closed.
+- **Ordering.** All of this happens in `createSessionContainers` before the agent container is created, so the bind-mount sources are final and no agent turn can observe the base or a partially seeded layer.
+- **Agent installs stay in the run.** evolve's `provision` state installs experiment dependencies into `/opt/workflow-venv`; they land in the run layer, survive that run's resume (the layer is keyed by `workflowId` and content key, and an existing layer is re-mounted as-is), and never reach another run. Tampering by a compromised agent or candidate (a patched package, a planted `.pth` file, a replaced `bin/python`) likewise stays in that run's layer. Concurrent runs no longer change each other's scoring environment.
+- **Within a run** all container scopes share the run's layer.
+- **Key changes.** A changed manifest or agent image yields a new key, so resume after such a change seeds a fresh layer from the new base; agent-installed extras in the old layer are not carried over. The evolve `provision` prompt re-checks the packages its marker lists and reinstalls missing ones, but only when the resumed run passes through `provision` again. A run started by an earlier version (shared cache) and resumed after the upgrade is in the same position: its extras lived in the legacy cache, which is never reused.
 
-This keeps the agent-image staleness/build path untouched for the no-manifest fast path and adds the per-workflow layer only when a manifest is present.
+### 6.4 Exec environment
 
-**Reproducibility note.** Builds are not bit-reproducible (uv/npm resolve "latest compatible" absent full pins), but they are **content-addressed**: the same manifests yield the same image hash and the cached image is reused. Workflows wanting strict pinning commit a `package-lock.json` and fully-pinned `requirements.txt`.
+- **Python:** deterministic states invoke the venv interpreter explicitly — e.g. `['/opt/workflow-venv/bin/python', '/workflow-scripts/run_eval.py']`. `buildWorkflowExecCommand` also prepends `/opt/workflow-venv/bin` to the live `$PATH` for these execs.
+- **Node:** `buildWorkflowExecCommand` prepends `/opt/workflow-node_modules/.bin` to `$PATH` and exports `NODE_PATH=/opt/workflow-node_modules` for deterministic execs only, so `require()` resolves the packages from `/workflow-scripts`. The container environment never sets `NODE_PATH`, so the agent's own Node processes do not resolve modules from the run layer.
+- `PATH` is never set with `docker create -e` (that would replace the image's PATH, including the NVM node directory on the x86 base); it is prepended inside a `/bin/sh -lc` wrapper at exec time, with the caller's argv passed verbatim as positional parameters.
+
+**Reproducibility note.** Installs are not bit-reproducible (uv/npm resolve "latest compatible" absent full pins), but a base is fixed once provisioned and verified on every reuse, and every run starts from a copy of it. Workflows wanting strict pinning commit a `package-lock.json` and a fully pinned `requirements.txt`.
+
+**Retention.** Every run that seeds from a base records the time in `<key dir>/last-used.json` (`{ schemaVersion: 1, lastUsedAt }`), written under the provisioning lock. `ironcurtain prune` (and the daemon with `retention.autoPrune`) removes a key directory unused for `retention.dependencyCaches.maxUnusedDays` (14 by default; a base from before the marker is judged by its files' times). It never removes a base that a layer of a kept workflow run (live, or not yet past its own retention) was seeded from, nor one whose provisioning lock is held: removal takes that lock (non-blocking: a busy base is skipped), reads the marker again, deletes the provisioned records first and then the key directory. A run that was waiting for the lock re-creates the key directory once it holds it and rebuilds the base. Per-run layers go with their run directory (`retention.workflowRuns`). The legacy `workflow-deps/` caches are still never removed automatically; the prune report names the directory and its size so the operator can delete it once no earlier version runs. See [retention-and-prune.md](retention-and-prune.md).
 
 ---
 
@@ -468,25 +494,33 @@ This keeps the agent-image staleness/build path untouched for the no-manifest fa
 
 - **Idempotency.** Deterministic states are replayed on resume via `replayInvokeForRestoredState` (`src/workflow/orchestrator.ts:1448`); a `container: true` state re-runs its commands from scratch on resume. Test/lint commands are expected idempotent; no checkpoint of partial command progress (matching host behavior, which also re-runs the whole array).
 - **Bundle resolution is `ensureBundleForScope`, both fresh-run and resume (the §4.3 decision, as built).** The orchestrator mints bundles lazily per scope. A `container: true` deterministic state may intentionally be the first consumer, including in a no-LLM workflow. On resume, `/workspace` carries prior persisted work. WF011 warns only for mixed agent/deterministic scopes where a helper can run before a same-scope agent; deterministic-only scopes are valid.
-- **Scripts on resume.** `workflowScriptsDir` is checkpointed and re-staged on resume by `resolveWorkflowScriptsDirOnResume` (`src/workflow/orchestrator.ts:285`), mirroring `resolveWorkflowSkillsDirOnResume`: trust the checkpointed staged path, else re-stage from the package, else warn (but only when scripts were previously staged — a workflow that never shipped scripts does not warn). The per-workflow image is rebuilt-if-stale by the same `ensureWorkflowImage` path (§6.3), so a resume after a manifest edit transparently rebuilds.
+- **Scripts on resume.** `workflowScriptsDir` is checkpointed and re-staged on resume by `resolveWorkflowScriptsDirOnResume` (`src/workflow/orchestrator.ts:285`), mirroring `resolveWorkflowSkillsDirOnResume`: trust the checkpointed staged path, else re-stage from the package, else warn (but only when scripts were previously staged — a workflow that never shipped scripts does not warn). The content key is recomputed from the re-staged manifests: an unchanged key re-mounts the run's existing dependency layer as-is (§6.3), and a manifest edit yields a new key and a freshly seeded layer.
 
 ---
 
 ## 8. Cross-platform
 
-- **Linux:** container runs `--network=none` (`src/docker/docker-manager.ts:1086`). `docker exec` works identically; no network needed since deps are baked. Exec user is `codespace` (Linux containers start as root for UID-remap then drop; passing `--user codespace` is required so exec lands as the right user — `src/docker/docker-manager.ts:254-261`).
+- **Linux:** container runs `--network=none` (`src/docker/docker-manager.ts:1086`). `docker exec` works identically. Dependencies were installed before the agent container started (§6); the provisioning container reached the registries only through the MITM socket. Exec user is `codespace` (Linux containers start as root for UID-remap then drop; passing `--user codespace` is required so exec lands as the right user — `src/docker/docker-manager.ts:254-261`).
 - **macOS:** container runs on the Docker `--internal` bridge with a socat sidecar; `docker exec` is unaffected (it doesn't use the network). VirtioFS UID translation means `--user codespace` is a harmless no-op (`:258-261`). The `/workflow-scripts` and `/workspace` bind mounts behave like the existing skills/workspace mounts on both platforms.
-- No platform branch is needed in the exec path: `DockerManager.exec` and the new `--workdir` flag are platform-agnostic. Image build (uv/npm) runs on the build host with network on both platforms.
+- No platform branch is needed in the exec path: `DockerManager.exec` and the new `--workdir` flag are platform-agnostic. The dependency provisioning container uses the same transport as the agent: the MITM socket in UDS topologies (Linux Docker, Apple `container`), the bundle's internal network and sidecar alias on macOS Docker Desktop. Run layers are seeded host-side, with copy-on-write clones where the filesystem supports reflinks (for example APFS or Btrfs) and plain copies elsewhere.
 
 ---
 
 ## 9. Security
 
-- **Container isolation is the boundary.** Deterministic in-container commands run inside the same `--network=none` / internal-bridge sandbox as the agent. They cannot reach the network at runtime (deps are baked) and are confined to the container's mounts.
+- **Container isolation is the boundary.** Deterministic in-container commands run inside the same `--network=none` / internal-bridge sandbox as the agent and are confined to the container's mounts. They share the agent's container, so within a run they are not protected from the agent: the agent has sudo there, writes `/workspace`, and owns the run's dependency layer. Helper verdicts are therefore only as trustworthy as that run.
+- **Dependencies do not cross runs.** The shared dependency base is provisioned only in a dedicated short-lived container, recorded and verified host-side, and never mounted into an agent container; each run works on its own copy (§6). A compromised run can corrupt its own layer and its own verdicts, but not the base or any other run's environment.
 - **Explicit non-mediation by `ToolCallCoordinator`.** `docker exec` is NOT a tool call; it does not pass through the policy engine, audit log, or control server. This is intentional and correct: the `run:` command array is **workflow-author** content (committed in `workflow.yaml`), the same trust level as the host-side `execFileAsync` it replaces — not agent-generated input. We add no policy hook. (Contrast: agent `execute_code` is mediated because the agent authors it.) Document this in `src/trusted-process/CLAUDE.md` so future readers don't mistake the gap for an oversight.
 - **No shell string concatenation.** Per root `CLAUDE.md` safe-coding rules, commands are passed as argv arrays to `DockerManager.exec` → `spawn('docker', ['exec', ...])`. The `--workdir` flag value is a constant (`/workspace`), never interpolated user data. We do NOT introduce a `sh -c` wrapper (the §4.5(a) decision avoids it).
 - **Workspace-RW write-scoping gap (called out, not closed).** `/workspace` is bind-mounted RW (`src/docker/docker-infrastructure.ts:950`). A `container: true` command can write anywhere under `/workspace`, which maps to the host run workspace. This is the **same** exposure agent sessions already have (they write `/workspace` freely) and the same as host-side deterministic commands (which run with the orchestrator's host privileges — _strictly broader_ than the container). In-container execution is therefore a **net reduction** in privilege vs. host `execFileAsync`. The residual gap — a buggy/malicious workflow script corrupting `/workspace` — is not closed here; mitigations (RO sub-mounts, a scratch dir) are a future hardening item (§12). Trust model: workflow authors are trusted; this matches today.
-- **No credential exposure.** Deterministic commands get no fake keys, no MITM access (network-none), no MCP proxies. They see only `/workspace` (RW) and `/workflow-scripts` (RO).
+- **The argv is not the whole trust unit for host commands (WP-47).** The bullets above treat the author's `run:` argv as the trust boundary. That is not enough for host execution. A trusted argv such as `npm test`, `pytest`, `make -C <ws>`, `cargo test` or `git diff` executes code and configuration that the agent can write in the workspace: package.json scripts, conftest.py, Makefiles, build scripts, `.git/config` (`core.fsmonitor`, `core.pager`, `diff.external`) and hooks. On the host that code runs as the user, with full network access and the orchestrator's environment (provider keys loaded from `.env` included). It can read `~/.ironcurtain`, `~/.claude` and `~/.ssh`, entirely outside the container and the policy engine. A prompt-injected agent can therefore turn a host deterministic state into host code execution. The controls are:
+  - validation demands an explicit per-state `host: true` (§3.3 rule 7), and the runtime re-checks it;
+  - lint WF015 warns on every host state;
+  - the host runner bounds the process (§4.4).
+
+  None of these contains the code. The containment is `container: true`. Keep `host: true` for commands that read nothing agents can write, and for builtin mode, which has no container. An environment allowlist would be defense in depth only, because `HOME` alone still exposes the credential files. It was not added, because toolchains depend on arbitrary variables.
+
+- **No real credentials.** Deterministic commands run in the agent container, so they see what the agent sees: its environment (fake sentinel keys, `HTTPS_PROXY`), the MITM and Code Mode proxy sockets, `/workspace` (RW), `/workflow-scripts` (RO) and the run's dependency layers (RW). Real credentials never enter the container.
 
 ---
 
@@ -633,6 +667,10 @@ states:
 5. `test/docker-infrastructure.test.ts`: `computeWorkflowImageHash` — same manifests ⇒ same hash, changed `requirements.txt` ⇒ different hash; `ensureWorkflowImage` no-manifest fast path returns the agent image and builds no `ironcurtain-wf-*` tag.
 6. `test/docker-manager.test.ts`: `exec` builds `docker exec ... --workdir <dir> ...` argv.
 7. `test/workflow/lint.test.ts`: **WF011** — flags mixed-scope ordering where a helper can precede its same-scope agent; does not flag host-side helpers or deliberately no-LLM deterministic scopes.
+8. _(WP-47)_ `test/workflow/validate.test.ts` (`host deterministic states`): a host state without `host: true` fails in builtin, non-shared and shared Docker mode with the mode's remedy. `host: true` passes. `host` + `container` is rejected. Empty runs and fan-out drivers need no acknowledgement, but a host fan-out member does, and so does a driver that is itself a segment member. The display-only allowance accepts an unacknowledged state but still rejects `host` + `container`. `host` on an agent state is rejected. `timeoutMs` above the timer limit is rejected. Bundled workflows and the example manifest still validate.
+9. _(WP-47)_ `test/workflow/lint.test.ts`: **WF015** — warns on `host: true` states, with a builtin-specific hint. It does not fire for container states, fan-out drivers or empty runs. The example manifest is flagged and no bundled workflow is.
+10. _(WP-47)_ `test/workflow/host-command-runner.test.ts` and `test/workflow/orchestrator-deterministic.test.ts`: real processes. They cover the workspace cwd, verbatim argv with no shell, closed stdin, stdout-only failures surfacing their stdout, a missing program, and output well over 1 MiB passing. A hung tree's child and grandchild are both dead after `timeoutMs`. `stopController`, the invoke signal and `orchestrator.abort()` each kill the running tree. A background straggler is killed when its command exits. An unacknowledged host state is refused, refuses to start through `orchestrator.start()`, and a run recorded without the acknowledgement refuses to resume with an error naming its `definition.json` copy. `test/workflow/host-output-capture.test.ts` checks the head/tail capture byte for byte across chunkings and that one-byte chunks do not grow the heap. `test/workflow-manager.test.ts` checks that such a recorded run still loads for display.
+11. _(FU-17)_ `test/workflow/orchestrator-deterministic.test.ts` (`container wall clock and stop sweep`): each container command execs `/usr/bin/timeout --kill-after=10 <s>` around its argv (outside the dependency `PATH` shell) with its own marker and the `timeoutMs` + 25 s backstop; a timed-out command (the backstop, or the wrapper's exit 124 at the deadline but not the command's own 124 before it) is swept by its marker as the exec user and reported as a timeout; a run stop or a drained lane during a command sweeps it, and a drained lane starts none of its later commands. Item 4's assertions now include the wrapper. `test/docker/turn-timeout.test.ts` runs the real wrapper and sweep through a local `docker exec` shim: a timed-out command, and one whose stop signal fires, are ended together with a child that left their process group.
 
 **Integration (real docker) — manual verification, NOT committed CI tests.** The following were exercised by hand against a real daemon (see the status note at the top of §11) but did not land as gated automated tests: (8) `deterministic-eval-smoke` end-to-end → `author` mints `"primary"`, `evaluate`/`report` exec into the same container, baked `numpy`/`ajv` resolve at `--network=none`, routing reaches `done`; (9) dependency bake → per-workflow image built, imports succeed offline; (10) resume landing on a deterministic state re-mints the bundle with the persisted `/workspace`.
 
@@ -646,9 +684,9 @@ The items below carried a **decided default**; they are now resolved as built (o
 
 1. **Bundle resolution on a deterministic first/resumed state (§4.3 vs §7).** **Built: `ensureBundleForScope` (mint-on-demand)** — reuses the live bundle when present and mints/re-mints otherwise. This supports both resume and deliberately no-LLM deterministic workflows. WF011 remains only as a mixed-scope workspace-ordering warning when the definition also contains a same-scope agent.
 2. **Per-state `timeoutMs` in YAML.** **Built and surfaced as a YAML field** (a change from the design's "deferred" default). `deterministicStateSchema` now has `timeoutMs: z.number().int().positive().optional()` (`src/workflow/validate.ts:82`), threaded through `DeterministicStateDefinition` → `DeterministicInvokeInput` → `DockerManager.exec`. Absent ⇒ `undefined` ⇒ the 10-minute default.
-3. **Dependency location.** **Settled & built: baked into the per-workflow image, not mounted** — forced by `--network=none` runtime.
+3. **Dependency location.** **Superseded.** Originally baked into a per-workflow image; since #308 installed at run time through the MITM registry proxy, now into a host-provisioned shared base plus a per-run writable layer (§6).
 4. **Per-workflow Dockerfile generation.** **Settled & built: generated in-memory with a hardcoded `FROM ironcurtain-<agent>:latest`, written into a dedicated temp build context** — required because `DockerManager.buildImage` has no `--build-arg` and `dockerDir` lacks the `scripts/` tree (§6.2).
-5. **Per-workflow image storage / GC.** Per-workflow dep images (`ironcurtain-wf-<hash>`) accumulate. No pruning was implemented — cleanup is left to the operator. **Still open.**
+5. **Dependency storage / GC.** Per-workflow images no longer exist. Shared bases under `~/.ironcurtain/workflow-dependency-bases/` are pruned when unused for `retention.dependencyCaches.maxUnusedDays`, and per-run layers under `workflow-runs/<id>/deps/` go with their run (§6, retention). **Built**, except for the legacy `~/.ironcurtain/workflow-deps/` caches of earlier versions, which are reported but left to the operator.
 
 ---
 
@@ -656,7 +694,7 @@ The items below carried a **decided default**; they are now resolved as built (o
 
 - Opt-in `container: true`, not implicit-when-`sharedContainer` → backward-compat is provable.
 - Parallel `/workflow-scripts` RO mount, not skill-stager reuse → no per-transition re-stage, no filter coupling.
-- Deps baked into a per-workflow image, not mounted → offline-runtime-safe, content-addressed, keeps the RO code mount thin.
-- `uv pip install` / `npm ci` → reproducible, uses base-image toolchain. (No MITM at build — the build reaches PyPI/npm over the normal build-host network; see §6.2 build-time network model.)
+- Deps installed at run time through the MITM registry proxy into a host-only shared base (dedicated provisioning container, host-side record) and copied per run → package policy applies, no agent can poison another run, the RO code mount stays thin.
+- `uv pip install` / `npm ci` → uses the base-image toolchain.
 - `--workdir` flag on `DockerManager.exec`, not a `sh -c` wrapper → no shell, clean argv, safe-coding-compliant.
 - Shared `reduceDeterministicCommands` reducer with per-path `runCommand` closures (not the originally-proposed `DeterministicRunner` module) → host/container fork is a single closure; the future verdict-file result contract plugs into the _reducer_, never the exec path. See §4.6.

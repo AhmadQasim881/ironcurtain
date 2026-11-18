@@ -13,12 +13,18 @@
  * 4. Fall back to API key from config
  */
 
-import { existsSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
-import { homedir, platform, userInfo } from 'node:os';
-import { resolve } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { platform, userInfo } from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { keepsStoredToken } from '../auth/refresh-write-back.js';
+import {
+  getAnthropicCliCredentialsPath,
+  getClaudeCodeCredentialsPath,
+  getCodexAuthPath,
+} from '../config/credential-stores.js';
 import type { IronCurtainConfig } from '../config/types.js';
 import * as logger from '../logger.js';
+import { writePrivateFileAtomicSync } from '../util/atomic-write.js';
 
 /**
  * Which OAuth application issued a credential. Claude Code and the Anthropic
@@ -87,25 +93,21 @@ const KEYCHAIN_SERVICE_NAMES = ['Claude Code-credentials', 'Claude Code'] as con
 
 /**
  * Returns the path to Claude Code's credentials file.
- * Exposed for testing.
+ * Shared with the protected-path list (src/config/credential-stores.ts) so
+ * the file read here is always one agents cannot reach.
  */
 export function getCredentialsFilePath(): string {
-  return resolve(homedir(), '.claude', '.credentials.json');
+  return getClaudeCodeCredentialsPath();
 }
 
 /**
  * Returns the path to the Anthropic CLI credential store's default profile.
- * Resolution: ANTHROPIC_CONFIG_DIR > $XDG_CONFIG_HOME/anthropic > ~/.config/anthropic.
+ * Resolution: ANTHROPIC_CONFIG_DIR > $XDG_CONFIG_HOME/anthropic > ~/.config/anthropic;
+ * an empty variable falls through to the next candidate rather than
+ * resolving to a cwd-relative path.
  */
 export function getAnthropicCredentialsFilePath(): string {
-  // Truthy checks (not ??): an empty env var must fall through to the next
-  // candidate rather than resolving to a cwd-relative path.
-  const configDir = process.env.ANTHROPIC_CONFIG_DIR
-    ? process.env.ANTHROPIC_CONFIG_DIR
-    : process.env.XDG_CONFIG_HOME
-      ? resolve(process.env.XDG_CONFIG_HOME, 'anthropic')
-      : resolve(homedir(), '.config', 'anthropic');
-  return resolve(configDir, 'credentials', 'default.json');
+  return getAnthropicCliCredentialsPath();
 }
 
 /** OAuth credentials together with the file they were loaded from. */
@@ -114,9 +116,9 @@ export interface FileCredentialsResult {
   readonly filePath: string;
 }
 
-/** Returns Codex's auth cache path, honoring CODEX_HOME when set. */
+/** Returns Codex's auth cache path, honoring a non-empty CODEX_HOME. */
 export function getCodexAuthFilePath(): string {
-  return resolve(process.env.CODEX_HOME ?? resolve(homedir(), '.codex'), 'auth.json');
+  return getCodexAuthPath();
 }
 
 /**
@@ -337,11 +339,49 @@ export function extractFromKeychain(): OAuthCredentials | null {
   return extractFromKeychainWithService()?.credentials ?? null;
 }
 
+/** Longest `security -i` command line written (its line buffer is larger; the entry is a few hundred bytes). */
+const MAX_KEYCHAIN_COMMAND_LENGTH = 4000;
+
+/**
+ * Quotes a service or account name for a `security -i` command line, which
+ * splits words on whitespace outside double quotes. A name containing a
+ * quote, backslash or line break is refused rather than escaped.
+ */
+function quoteKeychainWord(value: string): string {
+  if (value === '' || /["\\\r\n\0]/.test(value)) {
+    throw new Error(`Cannot address Keychain item ${JSON.stringify(value)} safely`);
+  }
+  return `"${value}"`;
+}
+
+/**
+ * Reads a generic password; the secret arrives on stdout, never on argv.
+ * Throws when the item does not exist or cannot be read.
+ */
+function readKeychainPassword(serviceName: string, account: string): string {
+  return execFileSync('security', ['find-generic-password', '-s', serviceName, '-a', account, '-w'], {
+    encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+    timeout: 10_000,
+  });
+}
+
 /**
  * Writes updated OAuth credentials back to the macOS Keychain.
  * Preserves existing fields in the Keychain entry (e.g., scopes, subscriptionType).
  *
+ * The token JSON never appears in a process's arguments, where any local
+ * user could read it from the process list: the update is one
+ * `add-generic-password -U ... -X <hex>` command written to the standard
+ * input of `security -i` (interactive mode, which reads commands from
+ * stdin), with the password given as hex so the line needs no escaping.
+ * The entry is then read back and compared, so a write `security` did not
+ * apply is an error, not silent data loss.
+ *
  * No-op on non-macOS platforms.
+ *
+ * @throws when the write cannot be made or verified; callers log it and keep
+ *   the refreshed credentials in memory
  */
 export function writeToKeychain(credentials: OAuthCredentials, serviceName: string): void {
   if (platform() !== 'darwin') return;
@@ -351,12 +391,7 @@ export function writeToKeychain(credentials: OAuthCredentials, serviceName: stri
   // Read existing Keychain value to preserve extra fields
   let existing: Record<string, unknown> = {};
   try {
-    const raw = execFileSync('security', ['find-generic-password', '-s', serviceName, '-a', account, '-w'], {
-      encoding: 'utf8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-      timeout: 10_000,
-    });
-    const parsed: unknown = JSON.parse(raw.trim());
+    const parsed: unknown = JSON.parse(readKeychainPassword(serviceName, account).trim());
     if (typeof parsed === 'object' && parsed !== null) {
       existing = parsed as Record<string, unknown>;
     }
@@ -378,11 +413,40 @@ export function writeToKeychain(credentials: OAuthCredentials, serviceName: stri
 
   const json = JSON.stringify(existing);
 
-  // -U flag updates an existing entry or creates a new one
-  execFileSync('security', ['add-generic-password', '-U', '-s', serviceName, '-a', account, '-w', json], {
-    timeout: 10_000,
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
+  // -U updates an existing entry or creates a new one.
+  const command =
+    `add-generic-password -U -s ${quoteKeychainWord(serviceName)} -a ${quoteKeychainWord(account)} ` +
+    `-X ${Buffer.from(json, 'utf8').toString('hex')}\n`;
+  if (command.length > MAX_KEYCHAIN_COMMAND_LENGTH) {
+    throw new Error('Keychain entry is too large to update');
+  }
+  try {
+    execFileSync('security', ['-i'], {
+      input: command,
+      timeout: 10_000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch (err) {
+    // Neither rethrown nor kept as the cause: Node's message carries the
+    // child's output, which could echo the command line and with it the token.
+    const status = (err as { status?: unknown }).status;
+    // eslint-disable-next-line preserve-caught-error -- see above
+    throw new Error(
+      `security could not update Keychain item "${serviceName}"${typeof status === 'number' ? ` (exit ${status})` : ''}`,
+    );
+  }
+
+  let stored: string;
+  try {
+    stored = readKeychainPassword(serviceName, account).trim();
+  } catch (err) {
+    throw new Error(`Keychain write could not be verified: ${err instanceof Error ? err.message : String(err)}`, {
+      cause: err,
+    });
+  }
+  if (stored !== json) {
+    throw new Error(`Keychain write was not applied to "${serviceName}"`);
+  }
 }
 
 /** Claude Code's public OAuth client ID. */
@@ -591,30 +655,99 @@ function shouldWriteAnthropicCliFormat(credPath: string, existing: Record<string
 }
 
 /**
+ * Options of a refresh write-back to a host credential file.
+ */
+export interface CredentialWriteBackOptions {
+  /**
+   * The refresh token the credentials being saved were obtained with. When
+   * the file no longer holds it (the host CLI rotated it, or the user signed
+   * in again) and its token is still usable, the file is left alone. See
+   * `../auth/refresh-write-back.ts`.
+   */
+  readonly refreshedFrom?: string;
+}
+
+/**
+ * The text of a credentials file, or undefined when there is no such file.
+ * Any other read error (EACCES after the host CLI ran as root, EIO, ...) is
+ * thrown: the write-back renames a new file into place, which needs only the
+ * directory to be writable, so starting from `{}` here would drop the fields
+ * the host keeps in that file (Claude Code's `mcpOAuth`, say) and could
+ * clobber a token it never saw. The token manager and detectAuthMethod log
+ * the failure and keep using the refreshed credentials from memory; doctor
+ * reports it.
+ */
+function readCredentialsText(filePath: string): string | undefined {
+  try {
+    return readFileSync(filePath, 'utf-8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+
+/** Parses credentials-file text into an object to merge into; `{}` when there is none. */
+function parseCredentialsObject(raw: string | undefined): Record<string, unknown> {
+  if (raw === undefined) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
  * Writes updated OAuth credentials back to a credentials file (default
  * ~/.claude/.credentials.json), preserving other fields in the file
  * (e.g., scopes, subscriptionType). The write matches the file's existing
  * format: Anthropic CLI files keep their flat snake_case shape (with
  * `expires_at` in epoch seconds); everything else gets the claudeAiOauth
- * shape. For an empty or unreadable file the format falls back to the
- * target path (CLI store path -> CLI shape).
+ * shape. For a missing, empty or unparseable file the format falls back to
+ * the target path (CLI store path -> CLI shape). A file that exists but
+ * cannot be read is left alone and the call throws.
+ *
+ * The file is shared with the host CLI, which may read it at any moment and
+ * may have refreshed it while our refresh grant was in flight. So the file is
+ * re-read right before the write, and a token the host stored meanwhile (one
+ * that replaced `options.refreshedFrom` and is still usable, or one that
+ * expires later than ours; exact rule in `../auth/refresh-write-back.ts`) is
+ * kept instead of overwritten; those stored credentials are then returned.
+ * Otherwise the merged file replaces the old one atomically with mode 0600
+ * (a symlinked file stays a symlink) and `credentials` is returned. The
+ * comparison and the rename are not one atomic step: a host write in the
+ * microseconds between them still wins or loses as before.
+ *
+ * @returns the credentials now in effect for this file
+ * @throws when the existing file cannot be read (anything but ENOENT) or the
+ *   atomic replacement fails; nothing is written then
  */
-export function saveOAuthCredentials(credentials: OAuthCredentials, filePath?: string): void {
+export function saveOAuthCredentials(
+  credentials: OAuthCredentials,
+  filePath?: string,
+  options: CredentialWriteBackOptions = {},
+): OAuthCredentials {
   const credPath = filePath ?? getCredentialsFilePath();
 
-  let existing: Record<string, unknown> = {};
-  try {
-    if (existsSync(credPath)) {
-      const parsed: unknown = JSON.parse(readFileSync(credPath, 'utf-8'));
-      if (typeof parsed === 'object' && parsed !== null) {
-        existing = parsed as Record<string, unknown>;
-      }
+  const raw = readCredentialsText(credPath);
+  const existing = parseCredentialsObject(raw);
+  const cliFormat = shouldWriteAnthropicCliFormat(credPath, existing);
+
+  if (raw !== undefined) {
+    const stored = cliFormat ? parseAnthropicCredentialsJson(raw) : parseCredentialsJson(raw);
+    // The CLI store keeps whole seconds; compare what would actually be written.
+    const incoming = cliFormat
+      ? { ...credentials, expiresAt: Math.round(credentials.expiresAt / 1000) * 1000 }
+      : credentials;
+    if (stored !== null && keepsStoredToken(stored, incoming, options.refreshedFrom)) {
+      logger.info(`Kept the newer OAuth credentials already in ${credPath} instead of overwriting them`);
+      return stored;
     }
-  } catch {
-    // Start fresh if file is unreadable
   }
 
-  if (shouldWriteAnthropicCliFormat(credPath, existing)) {
+  if (cliFormat) {
     existing.access_token = credentials.accessToken;
     existing.refresh_token = credentials.refreshToken;
     existing.expires_at = Math.round(credentials.expiresAt / 1000);
@@ -632,20 +765,45 @@ export function saveOAuthCredentials(credentials: OAuthCredentials, filePath?: s
     };
   }
 
-  writeFileSync(credPath, JSON.stringify(existing, null, 2) + '\n', { mode: 0o600 });
-  // chmod after write — writeFileSync's mode only applies when creating new files;
-  // existing files with broader permissions need an explicit chmod.
-  chmodSync(credPath, 0o600);
+  writePrivateFileAtomicSync(credPath, JSON.stringify(existing, null, 2) + '\n');
+  return credentials;
 }
 
-export function saveCodexOAuthCredentials(credentials: OAuthCredentials, filePath = getCodexAuthFilePath()): void {
-  let existing: Record<string, unknown> = {};
-  try {
-    if (existsSync(filePath)) {
-      existing = JSON.parse(readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+/**
+ * Writes refreshed Codex credentials back to Codex's auth.json, preserving
+ * its other fields, with the same re-read and keep-the-newer rule and the same
+ * atomic, owner-only replacement as {@link saveOAuthCredentials}. Codex keeps
+ * no expiry field, so expiries are compared from the access tokens' JWT `exp`
+ * claims; a stored token whose expiry is unknown never wins, and when only
+ * ours is unknown just the rotation rule can keep the stored one.
+ *
+ * @returns the credentials now in effect for this file
+ * @throws when the existing file cannot be read (anything but ENOENT) or the
+ *   atomic replacement fails; nothing is written then
+ */
+export function saveCodexOAuthCredentials(
+  credentials: OAuthCredentials,
+  filePath = getCodexAuthFilePath(),
+  options: CredentialWriteBackOptions = {},
+): OAuthCredentials {
+  const raw = readCredentialsText(filePath);
+  const existing = parseCredentialsObject(raw);
+
+  const stored = raw === undefined ? null : parseCodexAuthJson(raw);
+  if (stored !== null) {
+    // An unknown expiry never makes the stored token look newer or usable.
+    const storedComparable = {
+      refreshToken: stored.refreshToken,
+      expiresAt: parseJwtExpirationMs(stored.accessToken) ?? Number.NEGATIVE_INFINITY,
+    };
+    const incomingComparable = {
+      refreshToken: credentials.refreshToken,
+      expiresAt: parseJwtExpirationMs(credentials.accessToken) ?? Number.POSITIVE_INFINITY,
+    };
+    if (keepsStoredToken(storedComparable, incomingComparable, options.refreshedFrom)) {
+      logger.info(`Kept the newer Codex credentials already in ${filePath} instead of overwriting them`);
+      return stored;
     }
-  } catch {
-    // Start fresh if the file is unreadable.
   }
 
   const existingTokens =
@@ -660,8 +818,13 @@ export function saveCodexOAuthCredentials(credentials: OAuthCredentials, filePat
     ...(codexCredentials.idToken ? { id_token: codexCredentials.idToken } : {}),
   };
 
-  writeFileSync(filePath, JSON.stringify(existing, null, 2) + '\n', { mode: 0o600 });
-  chmodSync(filePath, 0o600);
+  writePrivateFileAtomicSync(filePath, JSON.stringify(existing, null, 2) + '\n');
+  return credentials;
+}
+
+/** What {@link detectAuthMethod} reads from the configuration: the Anthropic API key, its last resort. */
+export interface AuthDetectionConfig {
+  readonly userConfig: Pick<IronCurtainConfig['userConfig'], 'anthropicApiKey'>;
 }
 
 /**
@@ -676,7 +839,15 @@ export interface CredentialSources {
   loadFromFile: () => OAuthCredentials | null;
   loadFromKeychain: () => OAuthCredentials | null;
   refreshToken?: (refreshToken: string, clientKind?: OAuthClientKind) => Promise<OAuthCredentials | null>;
-  saveToFile?: (credentials: OAuthCredentials, filePath?: string) => void;
+  /**
+   * Refresh write-back. Returns the credentials in effect afterwards, which
+   * are the file's own when it already held newer ones (undefined = ours).
+   */
+  saveToFile?: (
+    credentials: OAuthCredentials,
+    filePath?: string,
+    options?: CredentialWriteBackOptions,
+  ) => OAuthCredentials | undefined;
   /**
    * Path-aware multi-file loader; preferred over loadFromFile when present.
    * Returns every parseable credential file in detection-priority order so
@@ -719,8 +890,9 @@ export const preflightCredentialSources: CredentialSources = {
 /**
  * Pre-built CredentialSources for read-only detection (used by `ironcurtain doctor`).
  * Omits refresh/save so passive diagnostics never mutate credential storage.
- * The user can still validate refresh under `--check-api`, which makes its
- * own write decisions based on the detected auth source.
+ * `doctor --check-api` validates the current access token without a refresh
+ * grant; only an explicit `doctor --check-refresh` runs one, for file-stored
+ * credentials (never the Keychain), and writes the rotated token back.
  */
 export const readOnlyCredentialSources: CredentialSources = {
   loadFromFile: loadOAuthCredentials,
@@ -728,6 +900,15 @@ export const readOnlyCredentialSources: CredentialSources = {
   loadFromFilesWithSource: loadAllOAuthCredentialFiles,
   loadFromKeychainWithService: extractFromKeychainWithService,
 };
+
+/**
+ * Whether `IRONCURTAIN_DOCKER_AUTH=apikey` forces API-key auth for container
+ * sessions: {@link detectAuthMethod} then never uses a Claude login, even a
+ * valid one.
+ */
+export function isApiKeyAuthForced(): boolean {
+  return process.env.IRONCURTAIN_DOCKER_AUTH === 'apikey';
+}
 
 /**
  * Detects the best authentication method available on the host.
@@ -741,12 +922,16 @@ export const readOnlyCredentialSources: CredentialSources = {
  * 3. OAuth credentials from macOS Keychain (valid or refreshable)
  * 4. API key from config
  * 5. None
+ *
+ * Only the API key fallback reads the configuration, so a caller without a
+ * loaded IronCurtainConfig (the first-start wizard, which must not create
+ * config.json) passes just its user config.
  */
-export async function detectAuthMethod(config: IronCurtainConfig, sources?: CredentialSources): Promise<AuthMethod> {
+export async function detectAuthMethod(config: AuthDetectionConfig, sources?: CredentialSources): Promise<AuthMethod> {
   const s = sources ?? defaultSources;
 
   // Allow explicit override to force API key mode
-  if (process.env.IRONCURTAIN_DOCKER_AUTH === 'apikey') {
+  if (isApiKeyAuthForced()) {
     logger.info('Docker auth override: forced API key mode via IRONCURTAIN_DOCKER_AUTH');
     return resolveApiKeyAuth(config);
   }
@@ -817,23 +1002,26 @@ function toFileResults(creds: OAuthCredentials | null): Array<{ credentials: OAu
 /**
  * Attempts to refresh expired file-sourced credentials.
  * On success, saves to the originating file and returns the oauth AuthMethod.
+ * The save re-reads the file after the refresh; if the host CLI stored newer
+ * credentials meanwhile, those are kept and used instead of ours.
  */
 async function tryRefreshFileCreds(
   fileCreds: OAuthCredentials,
   doRefresh: (refreshToken: string, clientKind?: OAuthClientKind) => Promise<OAuthCredentials | null>,
-  saveToFile?: (credentials: OAuthCredentials, filePath?: string) => void,
+  saveToFile?: CredentialSources['saveToFile'],
   filePath?: string,
 ): Promise<AuthMethod | null> {
   const refreshed = await doRefresh(fileCreds.refreshToken, fileCreds.clientKind);
   if (!refreshed) return null;
 
+  let effective = refreshed;
   try {
-    saveToFile?.(refreshed, filePath);
+    effective = saveToFile?.(refreshed, filePath, { refreshedFrom: fileCreds.refreshToken }) ?? refreshed;
   } catch (err) {
     logger.warn(`Failed to save refreshed credentials to file: ${err instanceof Error ? err.message : String(err)}`);
   }
   logger.info('Refreshed expired OAuth token from credentials file');
-  return { kind: 'oauth', credentials: refreshed, source: 'file', filePath };
+  return { kind: 'oauth', credentials: effective, source: 'file', filePath };
 }
 
 /**
@@ -867,7 +1055,7 @@ async function tryRefreshKeychainCreds(
 /**
  * Resolves API key authentication from config.
  */
-function resolveApiKeyAuth(config: IronCurtainConfig): AuthMethod {
+function resolveApiKeyAuth(config: AuthDetectionConfig): AuthMethod {
   const key = config.userConfig.anthropicApiKey;
   if (key) {
     logger.info('Using API key authentication for Docker session');

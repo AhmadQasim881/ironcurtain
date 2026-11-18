@@ -1,151 +1,37 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import http from 'node:http';
-import { WebSocketServer, WebSocket } from 'ws';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { resolve } from 'node:path';
 import {
   SignalBotDaemon,
   parseSignalEnvelope,
   parseHashPrefix,
   isAuthorizedSender,
   normalizePhoneNumber,
+  type SignalBotDaemonOptions,
 } from '../../src/signal/signal-bot-daemon.js';
-import type { SignalContainerManager } from '../../src/signal/signal-container.js';
 import type { ResolvedSignalConfig } from '../../src/signal/signal-config.js';
-
-// --- Mock signal-cli REST API ---
-
-interface SentMessage {
-  message: string;
-  recipients: string[];
-  text_mode?: string;
-}
-
-class MockSignalApi {
-  private server: http.Server;
-  private wss: WebSocketServer;
-  readonly sentMessages: SentMessage[] = [];
-  // Assigned by start() after the OS picks an ephemeral port (bind to 0).
-  port = 0;
-  private identities: Array<{ number: string; fingerprint: string }> = [];
-  private identityEndpointDown = false;
-
-  constructor() {
-    this.server = http.createServer((req, res) => {
-      this.handleRequest(req, res);
-    });
-
-    this.wss = new WebSocketServer({ server: this.server });
-  }
-
-  /** Returns the text of all sent messages (convenience accessor). */
-  get messageTexts(): string[] {
-    return this.sentMessages.map((m) => m.message);
-  }
-
-  setIdentities(identities: Array<{ number: string; fingerprint: string }>): void {
-    this.identities = identities;
-  }
-
-  setIdentityEndpointDown(down: boolean): void {
-    this.identityEndpointDown = down;
-  }
-
-  simulateIncomingMessage(from: string, text: string, timestamp?: number): void {
-    const envelope = JSON.stringify({
-      envelope: {
-        sourceNumber: from,
-        dataMessage: { message: text, timestamp: timestamp ?? Date.now() },
-      },
-    });
-    for (const ws of this.wss.clients) {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(envelope);
-      }
-    }
-  }
-
-  simulateUntrustedIdentity(from: string, text: string): void {
-    const envelope = JSON.stringify({
-      envelope: {
-        sourceNumber: from,
-        untrustedIdentity: true,
-        dataMessage: { message: text, timestamp: Date.now() },
-      },
-    });
-    for (const ws of this.wss.clients) {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(envelope);
-      }
-    }
-  }
-
-  async start(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.server.on('error', reject);
-      // Bind an ephemeral port (0) so parallel/retried runs never collide.
-      this.server.listen(0, '127.0.0.1', () => {
-        const addr = this.server.address();
-        this.port = typeof addr === 'object' && addr ? addr.port : 0;
-        resolve();
-      });
-    });
-  }
-
-  async stop(): Promise<void> {
-    for (const ws of this.wss.clients) {
-      ws.close();
-    }
-    this.wss.close();
-    return new Promise((resolve) => {
-      this.server.close(() => resolve());
-    });
-  }
-
-  private handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
-    const url = new URL(req.url ?? '', `http://127.0.0.1:${this.port}`);
-
-    // Health check
-    if (url.pathname === '/v1/health' && req.method === 'GET') {
-      res.writeHead(204);
-      res.end();
-      return;
-    }
-
-    // Send message
-    if (url.pathname === '/v2/send' && req.method === 'POST') {
-      let body = '';
-      req.on('data', (chunk: Buffer) => (body += String(chunk)));
-      req.on('end', () => {
-        const parsed = JSON.parse(body) as SentMessage;
-        this.sentMessages.push(parsed);
-        res.writeHead(201, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ timestamp: Date.now() }));
-      });
-      return;
-    }
-
-    // Identity check
-    if (url.pathname.startsWith('/v1/identities/') && req.method === 'GET') {
-      if (this.identityEndpointDown) {
-        res.writeHead(500);
-        res.end('Internal Server Error');
-        return;
-      }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(this.identities));
-      return;
-    }
-
-    // Receive (for drain)
-    if (url.pathname.startsWith('/v1/receive/') && req.method === 'GET') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify([]));
-      return;
-    }
-
-    res.writeHead(404);
-    res.end('Not Found');
-  }
-}
+import { SessionManager } from '../../src/session/session-manager.js';
+import type { EscalationRequest, SessionId } from '../../src/session/types.js';
+import type { Transport } from '../../src/session/transport.js';
+import type { JobId } from '../../src/cron/types.js';
+import { EscalationExpiredError } from '../../src/types/errors.js';
+import { ESCALATION_CODE_ALPHABET } from '../../src/signal/escalation-reply.js';
+import { SignalImageError } from '../../src/signal/signal-image.js';
+import { createSignalBridgeClient } from '../../src/signal/signal-bridge-client.js';
+import { escalationDispatch } from '../../src/web-ui/dispatch/escalation-dispatch.js';
+import type { DispatchContext } from '../../src/web-ui/dispatch/types.js';
+import type { EscalationDto } from '../../src/web-ui/web-ui-types.js';
+import * as logger from '../../src/logger.js';
+import {
+  MockSignalApi,
+  createMockSignalContainerManager,
+  createTestSignalConfig,
+  getSignalTestTlsIdentity,
+  waitFor,
+  waitForMessage,
+  waitForMessages,
+} from '../helpers/mock-signal-api.js';
 
 // --- Test helpers ---
 
@@ -154,91 +40,15 @@ function wait(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/**
- * Polls a predicate every 5ms and resolves as soon as it returns true.
- * Falls back to a timeout to avoid hanging forever.
- *
- * The default is 15s — NOT a time budget for expected behavior, but a
- * safety net against a truly wedged bot. Ubuntu/Node CI runners
- * occasionally stall for hundreds of ms on GC or scheduler contention
- * between `simulateIncomingMessage` and the bot's POST response, and
- * the original 5s default flaked on those runs. Individual vitest
- * `it(...)` tests still have their own 30s timeout, so a real
- * correctness bug (bot never sends the awaited message) still fails
- * loudly within the test runner, not within this poll loop.
- */
-async function waitFor(predicate: () => boolean, timeoutMs = 15_000): Promise<void> {
-  const start = Date.now();
-  while (!predicate()) {
-    if (Date.now() - start > timeoutMs) {
-      throw new Error(`waitFor timed out after ${timeoutMs}ms`);
-    }
-    await new Promise((r) => setTimeout(r, 5));
-  }
-}
-
-/** Waits until mockApi.sentMessages has at least `count` entries. */
-function waitForMessages(mockApi: MockSignalApi, count: number, timeoutMs = 15_000): Promise<void> {
-  return waitFor(() => mockApi.sentMessages.length >= count, timeoutMs);
-}
-
-/** Waits until mockApi.messageTexts contains a message matching the predicate. */
-function waitForMessage(
-  mockApi: MockSignalApi,
-  predicate: (text: string) => boolean,
-  timeoutMs = 15_000,
-): Promise<void> {
-  return waitFor(() => mockApi.messageTexts.some(predicate), timeoutMs);
-}
-
 /** Waits until the given mock function has been called at least `count` times. */
 function waitForCalls(fn: ReturnType<typeof vi.fn>, count: number, timeoutMs = 15_000): Promise<void> {
   return waitFor(() => fn.mock.calls.length >= count, timeoutMs);
 }
 
-function createMockContainerManager(port: number): SignalContainerManager {
-  return {
-    async ensureRunning() {
-      return `http://127.0.0.1:${port}`;
-    },
-    async waitForHealthy() {},
-    async teardown() {},
-    async pullImage() {},
-    async exists() {
-      return true;
-    },
-    async isRunning() {
-      return true;
-    },
-  };
-}
-
-function createTestConfig(port: number, overrides?: Partial<ResolvedSignalConfig>): ResolvedSignalConfig {
-  return {
-    botNumber: '+15551234567',
-    recipientNumber: '+15559876543',
-    recipientIdentityKey: 'test-identity-key-abc123',
-    container: {
-      image: 'test:latest',
-      port,
-      dataDir: '/tmp/test-signal',
-      containerName: 'test-signal',
-    },
-    maxConcurrentSessions: 3,
-    ...overrides,
-  };
-}
-
 // Track mock sessions and their onEscalation callbacks for per-session assertions
 interface MockSessionRecord {
   session: ReturnType<typeof createMockSession>;
-  onEscalation?: (request: {
-    escalationId: string;
-    serverName: string;
-    toolName: string;
-    arguments: unknown;
-    reason: string;
-  }) => void;
+  onEscalation?: (request: EscalationRequest) => void;
 }
 const createdMockSessions: MockSessionRecord[] = [];
 
@@ -248,8 +58,8 @@ function createMockSession() {
 
   return {
     getInfo: () => ({
-      id: sessionId,
-      status: 'ready',
+      id: sessionId as SessionId,
+      status: 'ready' as const,
       turnCount: 0,
       createdAt,
     }),
@@ -257,7 +67,7 @@ function createMockSession() {
     getHistory: () => [],
     getDiagnosticLog: () => [],
     resolveEscalation: vi.fn().mockResolvedValue(undefined),
-    getPendingEscalation: () => undefined,
+    getPendingEscalations: () => [],
     getBudgetStatus: () => ({
       totalInputTokens: 100,
       totalOutputTokens: 50,
@@ -273,6 +83,7 @@ function createMockSession() {
         maxEstimatedCostUsd: 5.0,
         warnThresholdPercent: 80,
       },
+      lastTurn: null,
       cumulative: {
         totalInputTokens: 100,
         totalOutputTokens: 50,
@@ -492,11 +303,17 @@ describe('SignalBotDaemon', () => {
     });
   });
 
-  function createDaemon(configOverrides?: Partial<ResolvedSignalConfig>): SignalBotDaemon {
+  function createDaemon(
+    configOverrides?: Partial<ResolvedSignalConfig>,
+    options?: Partial<SignalBotDaemonOptions>,
+  ): SignalBotDaemon {
     return new SignalBotDaemon({
-      config: createTestConfig(port, configOverrides),
-      containerManager: createMockContainerManager(port),
+      config: createTestSignalConfig(port, configOverrides),
+      containerManager: createMockSignalContainerManager(port),
       mode: { kind: 'builtin' },
+      // Fast banner retries keep the delivery-failure tests quick.
+      escalationRetryDelaysMs: [5, 5, 5],
+      ...options,
     });
   }
 
@@ -508,8 +325,9 @@ describe('SignalBotDaemon', () => {
   async function withDaemon(
     body: (daemon: SignalBotDaemon) => Promise<void>,
     configOverrides?: Partial<ResolvedSignalConfig>,
+    options?: Partial<SignalBotDaemonOptions>,
   ): Promise<void> {
-    const daemon = createDaemon(configOverrides);
+    const daemon = createDaemon(configOverrides, options);
     const startPromise = daemon.start();
     // Wait for the "online" message to be sent (daemon is ready)
     await waitForMessages(mockApi, 1);
@@ -577,6 +395,11 @@ describe('SignalBotDaemon', () => {
       expect(messages.some((m) => m.includes('/new'))).toBe(true);
       expect(messages.some((m) => m.includes('/sessions'))).toBe(true);
       expect(messages.some((m) => m.includes('/switch'))).toBe(true);
+      expect(messages.some((m) => m.includes('approve <code>') && m.includes('details <code>'))).toBe(true);
+      const help = messages.find((m) => m.includes('Commands:'));
+      expect(help).toContain('/pending - list pending escalations');
+      expect(help).toContain('/show <code>');
+      expect(help).toContain('approve+ <code> - approve it and whitelist the pattern its banner shows');
     });
   });
 
@@ -606,6 +429,80 @@ describe('SignalBotDaemon', () => {
     await startPromise;
 
     expect(mockApi.messageTexts.some((m) => m.includes('shutting down'))).toBe(true);
+  });
+
+  it(
+    'keeps running when its connection drops: it reconnects, and only shutdown() ends run()',
+    { timeout: 30_000 },
+    async () => {
+      // IronCurtainDaemon treats a started transport as gone only when run()
+      // rejects, so cron escalations keep the Signal path while the connection
+      // is down (DAEMON.md, Escalation Handling; test/operator-docs.test.ts).
+      const daemon = createDaemon();
+      let ended = false;
+      const running = daemon.start().then(() => {
+        ended = true;
+      });
+      try {
+        await waitForMessages(mockApi, 1);
+        // signal-cli restarts: the bot reconnects and drains what it missed.
+        mockApi.queueForDrain(mockApi.envelope('+15559876543', '/help'));
+        mockApi.disconnectClients();
+        await waitForMessage(mockApi, (m) => m.includes('Commands:'), 20_000);
+        expect(ended).toBe(false);
+      } finally {
+        await daemon.shutdown();
+        await running;
+      }
+      expect(ended).toBe(true);
+    },
+  );
+
+  it('says on stderr why Signal did not start when the bridge image cannot be used', async () => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const daemon = new SignalBotDaemon({
+        config: createTestSignalConfig(port),
+        containerManager: {
+          ...createMockSignalContainerManager(port),
+          ensureRunning: () =>
+            Promise.reject(
+              new SignalImageError('SIGNAL_IMAGE_NOT_PINNED', 'Run "ironcurtain setup-signal --update-image"\u202e'),
+            ),
+        },
+        mode: { kind: 'builtin' },
+      });
+
+      await expect(daemon.connect()).rejects.toThrow('setup-signal --update-image');
+      expect(stderr).toHaveBeenCalledWith(
+        'Signal transport not started: Run "ironcurtain setup-signal --update-image"\\u202e\n',
+      );
+      expect(mockApi.sentMessages).toHaveLength(0);
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
+  it('rejects an unauthenticated receive upgrade and closes the client', async () => {
+    const client = createSignalBridgeClient(`https://127.0.0.1:${port}`, 'c'.repeat(64), {
+      ca: getSignalTestTlsIdentity().certPem,
+    });
+    const close = vi.spyOn(client, 'close');
+    const daemon = createDaemon(undefined, {
+      containerManager: {
+        ...createMockSignalContainerManager(port),
+        ensureRunning: async () => client,
+      },
+    });
+    await expect(daemon.connect()).rejects.toThrow('WebSocket connection failed');
+    expect(close).toHaveBeenCalledOnce();
+    expect(mockApi.sentMessages).toHaveLength(0);
+  });
+
+  it('does not reopen the run wait after shutdown during startup', async () => {
+    const daemon = createDaemon();
+    await daemon.shutdown();
+    await expect(daemon.run()).resolves.toBeUndefined();
   });
 
   // --- Identity verification ---
@@ -666,50 +563,1017 @@ describe('SignalBotDaemon', () => {
     });
   });
 
+  /** Number of logger.error calls so far whose message contains `text`. */
+  function errorsLogged(text: string): number {
+    return vi.mocked(logger.error).mock.calls.filter(([message]) => message.includes(text)).length;
+  }
+
+  it('rejects messages while signal-cli lists no identity for the recipient, without locking or caching', async () => {
+    mockApi.setIdentities([{ number: '+15550000000', fingerprint: 'someone-else' }]);
+    const before = errorsLogged('lists no identity key');
+
+    await withDaemon(async () => {
+      mockApi.simulateIncomingMessage('+15559876543', 'first attempt');
+      await waitFor(() => errorsLogged('lists no identity key') > before);
+      expect(mockApi.messageTexts.some((m) => m.includes('Started a new session'))).toBe(false);
+
+      // Not locked and nothing cached: once signal-cli lists the record, messages pass.
+      mockApi.setIdentities([{ number: '+15559876543', fingerprint: 'test-identity-key-abc123' }]);
+      mockApi.simulateIncomingMessage('+15559876543', 'second attempt');
+      await waitForMessage(mockApi, (m) => m.includes('Started a new session'));
+    });
+  });
+
+  it('verifies the newest identity record listed for the number', async () => {
+    mockApi.setIdentities([
+      { number: '+15559876543', fingerprint: 'old-key-of-the-recipient', added: '1700000000000' },
+      { number: '+15559876543', fingerprint: 'test-identity-key-abc123', added: '1700000005000' },
+    ]);
+
+    await withDaemon(async () => {
+      mockApi.simulateIncomingMessage('+15559876543', 'Hello agent');
+      await waitForMessage(mockApi, (m) => m.includes('Started a new session'));
+    });
+  });
+
+  it('locks when the newest record for the number carries another key, even after a matching one', async () => {
+    mockApi.setIdentities([
+      { number: '+15559876543', fingerprint: 'test-identity-key-abc123', added: '1700000000000' },
+      { number: '+15559876543', fingerprint: 'changed-key', added: '1700000005000' },
+    ]);
+    const before = errorsLogged('LOCKED');
+
+    await withDaemon(async () => {
+      mockApi.simulateIncomingMessage('+15559876543', 'should be rejected');
+      await waitFor(() => errorsLogged('LOCKED') > before);
+      expect(mockApi.messageTexts.some((m) => m.includes('Started a new session'))).toBe(false);
+    });
+  });
+
+  it('verifies the record of the stored account UUID, whatever else is listed for the number', async () => {
+    // Another identity for the same number is listed first and is newer: neither the
+    // first nor the newest record for the number is the one setup recorded.
+    mockApi.setIdentities([
+      { number: '+15559876543', uuid: 'another-identity', fingerprint: 'other-key', added: '1700000005000' },
+      {
+        number: '+15559876543',
+        uuid: 'aci-recipient',
+        fingerprint: 'test-identity-key-abc123',
+        added: '1700000000000',
+      },
+    ]);
+
+    await withDaemon(
+      async () => {
+        mockApi.simulateIncomingMessage('+15559876543', 'Hello agent', undefined, undefined, {
+          sourceUuid: 'aci-recipient',
+        });
+        await waitForMessage(mockApi, (m) => m.includes('Started a new session'));
+      },
+      { recipientUuid: 'aci-recipient' },
+    );
+  });
+
+  it('locks when a message from the number comes from another account than the recorded one', async () => {
+    mockApi.setIdentities([{ number: '+15559876543', uuid: 'aci-recipient', fingerprint: 'test-identity-key-abc123' }]);
+    const before = errorsLogged('not the recorded aci-recipient');
+
+    await withDaemon(
+      async () => {
+        // The number now belongs to another Signal account (SIM swap): the recorded
+        // account's record still carries the stored key, but the sender is someone else.
+        mockApi.simulateIncomingMessage('+15559876543', 'Hello agent', undefined, undefined, {
+          sourceUuid: 'attacker-aci',
+        });
+        await waitFor(() => errorsLogged('not the recorded aci-recipient') > before);
+        // Locked: the recorded account is refused too until re-trust.
+        mockApi.simulateIncomingMessage('+15559876543', 'Hello again', undefined, undefined, {
+          sourceUuid: 'aci-recipient',
+        });
+        await wait(50);
+        expect(mockApi.messageTexts.some((m) => m.includes('Started a new session'))).toBe(false);
+      },
+      { recipientUuid: 'aci-recipient' },
+    );
+  });
+
+  it('accepts messages from the recorded account and rejects, without locking, one that names no account', async () => {
+    mockApi.setIdentities([{ number: '+15559876543', uuid: 'aci-recipient', fingerprint: 'test-identity-key-abc123' }]);
+    const before = errorsLogged('names no sender account');
+
+    await withDaemon(
+      async () => {
+        mockApi.simulateIncomingMessage('+15559876543', 'Hello agent', undefined, undefined, {
+          sourceUuid: 'ACI-RECIPIENT',
+        });
+        await waitForMessage(mockApi, (m) => m.includes('Agent response text'));
+
+        // The record check verifies the recorded account, not the sender: a message
+        // that names no sender account cannot be tied to it, so it is refused.
+        mockApi.simulateIncomingMessage('+15559876543', 'unnamed sender');
+        await waitFor(() => errorsLogged('names no sender account') > before);
+        expect(createdMockSessions[0].session.sendMessage).toHaveBeenCalledTimes(1);
+
+        // Not locked: the recorded account is still accepted.
+        mockApi.simulateIncomingMessage('+15559876543', 'follow up', undefined, undefined, {
+          sourceUuid: 'aci-recipient',
+        });
+        await waitFor(() => mockApi.messageTexts.filter((m) => m.includes('Agent response text')).length >= 2);
+        expect(createdMockSessions[0].session.sendMessage).toHaveBeenCalledTimes(2);
+      },
+      { recipientUuid: 'aci-recipient' },
+    );
+  });
+
+  it('rejects an approval that names no sender account when the account is recorded', async () => {
+    mockApi.setIdentities([{ number: USER, uuid: 'aci-recipient', fingerprint: 'test-identity-key-abc123' }]);
+    const before = errorsLogged('names no sender account');
+
+    await withDaemon(
+      async (daemon) => {
+        mockApi.simulateIncomingMessage(USER, 'Hello agent', undefined, undefined, { sourceUuid: 'aci-recipient' });
+        await waitForMessage(mockApi, (m) => m.includes('Agent response text'));
+        const code = await surface(daemon, 1, 'esc-unnamed');
+
+        mockApi.simulateIncomingMessage(USER, `approve ${code}`);
+        await waitFor(() => errorsLogged('names no sender account') > before);
+        expect(createdMockSessions[0].session.resolveEscalation).not.toHaveBeenCalled();
+
+        mockApi.simulateIncomingMessage(USER, `approve ${code}`, undefined, undefined, { sourceUuid: 'aci-recipient' });
+        await waitForMessage(mockApi, (m) => m.includes(`Escalation ${code} approved`));
+      },
+      { recipientUuid: 'aci-recipient' },
+    );
+  });
+
+  describe('unlocking from config.json on disk', () => {
+    const savedHome = process.env.IRONCURTAIN_HOME;
+    let home: string;
+
+    beforeEach(() => {
+      home = mkdtempSync(resolve(tmpdir(), 'ironcurtain-signal-unlock-'));
+      process.env.IRONCURTAIN_HOME = home;
+    });
+
+    afterEach(() => {
+      if (savedHome === undefined) delete process.env.IRONCURTAIN_HOME;
+      else process.env.IRONCURTAIN_HOME = savedHome;
+      rmSync(home, { recursive: true, force: true });
+    });
+
+    /** Writes what `setup-signal --re-trust` would record. */
+    function writeTrust(recipientIdentityKey: string, recipientUuid: string): void {
+      writeFileSync(
+        resolve(home, 'config.json'),
+        JSON.stringify({
+          signal: {
+            botNumber: '+15551234567',
+            recipientNumber: USER,
+            recipientIdentityKey,
+            recipientUuid,
+            container: { port },
+          },
+        }),
+        { mode: 0o600 },
+      );
+    }
+
+    it('unlocks when a re-trust records another account UUID for the same key', async () => {
+      mockApi.setIdentities([{ number: USER, uuid: 'aci-2', fingerprint: 'test-identity-key-abc123' }]);
+      const locked = errorsLogged('LOCKED');
+
+      await withDaemon(
+        async () => {
+          mockApi.simulateIncomingMessage(USER, 'first', undefined, undefined, { sourceUuid: 'aci-2' });
+          await waitFor(() => errorsLogged('LOCKED') > locked);
+
+          writeTrust('test-identity-key-abc123', 'aci-2');
+          mockApi.simulateIncomingMessage(USER, 'Hello agent', undefined, undefined, { sourceUuid: 'aci-2' });
+          await waitForMessage(mockApi, (m) => m.includes('Agent response text'));
+        },
+        { recipientUuid: 'aci-1' },
+      );
+    });
+
+    it('checks the reloaded identity against signal-cli instead of a success cached before the lock', async () => {
+      mockApi.setIdentities([{ number: USER, uuid: 'aci-1', fingerprint: 'test-identity-key-abc123' }]);
+      const locked = errorsLogged('LOCKED');
+
+      await withDaemon(
+        async () => {
+          // A verified message caches the identity check for 5 minutes.
+          mockApi.simulateIncomingMessage(USER, 'Hello agent', undefined, undefined, { sourceUuid: 'aci-1' });
+          await waitForMessage(mockApi, (m) => m.includes('Agent response text'));
+
+          mockApi.simulateIncomingMessage(USER, 'from elsewhere', undefined, undefined, { sourceUuid: 'aci-2' });
+          await waitFor(() => errorsLogged('LOCKED') > locked);
+          const requests = mockApi.identityRequests;
+
+          // config.json now names aci-2 with a key other than the one signal-cli lists for it.
+          mockApi.setIdentities([
+            { number: null, uuid: 'aci-1', fingerprint: 'test-identity-key-abc123' },
+            { number: USER, uuid: 'aci-2', fingerprint: 'key-of-aci-2' },
+          ]);
+          writeTrust('not-the-key-of-aci-2', 'aci-2');
+          mockApi.simulateIncomingMessage(USER, 'after unlock', undefined, undefined, { sourceUuid: 'aci-2' });
+          await waitFor(() => errorsLogged('LOCKED') > locked + 1);
+
+          expect(mockApi.identityRequests).toBe(requests + 1);
+          expect(createdMockSessions[0].session.sendMessage).toHaveBeenCalledTimes(1);
+        },
+        { recipientUuid: 'aci-1' },
+      );
+    });
+  });
+
   // --- Escalation handling ---
 
-  it('handles escalation approve reply', async () => {
+  const USER = '+15559876543';
+
+  function escalationRequest(escalationId: string, overrides: Partial<EscalationRequest> = {}): EscalationRequest {
+    return {
+      escalationId,
+      serverName: 'filesystem',
+      toolName: 'write_file',
+      arguments: { path: `/tmp/${escalationId}.txt`, content: 'hello' },
+      reason: 'Write outside the sandbox',
+      ...overrides,
+    };
+  }
+
+  /** The reply code in the latest banner header sent for session `label`. */
+  function bannerCode(label: number): string {
+    const header = mockApi.messageTexts.filter((m) => m.includes(`ESCALATION [#${label}`)).at(-1);
+    const code = header?.match(/\] code ([A-Z0-9]{4})\n/)?.[1];
+    if (code === undefined) throw new Error(`no escalation banner for #${label}`);
+    return code;
+  }
+
+  /** Surfaces an escalation on session `label`, waits until its banner is delivered, returns its code. */
+  async function surface(
+    daemon: SignalBotDaemon,
+    label: number,
+    escalationId: string,
+    overrides: Partial<EscalationRequest> = {},
+  ): Promise<string> {
+    await daemon.surfaceEscalation(label, escalationRequest(escalationId, overrides));
+    return bannerCode(label);
+  }
+
+  /** A well-formed code that differs from `code`. */
+  function otherCode(code: string): string {
+    return code === 'WXYZ' ? 'ZYXW' : 'WXYZ';
+  }
+
+  /** Starts Signal sessions #1..#count and waits for #1's reply to its first message. */
+  async function startSessions(count: number): Promise<void> {
+    mockApi.simulateIncomingMessage(USER, 'Hello agent');
+    await waitForMessage(mockApi, (m) => m.includes('Agent response text'));
+    for (let started = 1; started < count; started += 1) {
+      mockApi.simulateIncomingMessage(USER, '/new');
+      await waitFor(() => mockApi.messageTexts.filter((m) => m.includes('Started a new session')).length > started);
+    }
+  }
+
+  function stubTransport(): Transport {
+    return { run: vi.fn().mockResolvedValue(undefined), close: vi.fn() };
+  }
+
+  /** Awaits the banner deliveries started through a spied `surfaceEscalation`. */
+  async function deliveries(spy: { mock: { results: Array<{ value: unknown }> } }): Promise<void> {
+    await Promise.all(spy.mock.results.map((result) => result.value));
+  }
+
+  it('approves only with the code shown in the banner', async () => {
     await withDaemon(async (daemon) => {
-      mockApi.simulateIncomingMessage('+15559876543', 'Hello agent');
-      await waitForMessage(mockApi, (m) => m.includes('Started a new session'));
+      await startSessions(1);
+      const code = await surface(daemon, 1, 'esc-123');
+      expect(code).toMatch(new RegExp(`^[${ESCALATION_CODE_ALPHABET}]{4}$`));
 
-      daemon.setPendingEscalation(1, 'esc-123');
-      mockApi.simulateIncomingMessage('+15559876543', 'approve');
-      await waitForMessage(mockApi, (m) => m.includes('approved'));
+      mockApi.simulateIncomingMessage(USER, `approve ${code.toLowerCase()}`);
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${code} approved`));
+      expect(createdMockSessions[0].session.resolveEscalation).toHaveBeenCalledWith('esc-123', 'approved', undefined);
 
-      expect(mockApi.messageTexts.some((m) => m.includes('approved'))).toBe(true);
+      // A repeated approval is refused rather than applied to anything else.
+      mockApi.simulateIncomingMessage(USER, `approve ${code}`);
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${code} (#1) was already approved`));
+      expect(createdMockSessions[0].session.resolveEscalation).toHaveBeenCalledTimes(1);
     });
   });
 
-  it('handles escalation deny reply', async () => {
+  it('denies the only pending escalation on a bare deny', async () => {
     await withDaemon(async (daemon) => {
-      mockApi.simulateIncomingMessage('+15559876543', 'Hello agent');
-      await waitForMessage(mockApi, (m) => m.includes('Started a new session'));
+      await startSessions(1);
+      const code = await surface(daemon, 1, 'esc-456');
 
-      daemon.setPendingEscalation(1, 'esc-456');
-      mockApi.simulateIncomingMessage('+15559876543', '/deny');
-      await waitForMessage(mockApi, (m) => m.includes('denied'));
-
-      expect(mockApi.messageTexts.some((m) => m.includes('denied'))).toBe(true);
+      mockApi.simulateIncomingMessage(USER, '/deny');
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${code} denied`));
+      expect(createdMockSessions[0].session.resolveEscalation).toHaveBeenCalledWith('esc-456', 'denied', undefined);
     });
   });
 
-  it('rejects concurrent escalation replies', async () => {
+  it('refuses a bare approve and approve #N and never forwards them to the agent', async () => {
     await withDaemon(async (daemon) => {
-      mockApi.simulateIncomingMessage('+15559876543', 'Hello agent');
-      await waitForMessage(mockApi, (m) => m.includes('Started a new session'));
+      await startSessions(1);
+      await surface(daemon, 1, 'esc-bare');
+      const session = createdMockSessions[0].session;
 
-      daemon.setPendingEscalation(1, 'esc-789');
+      mockApi.simulateIncomingMessage(USER, 'approve');
+      mockApi.simulateIncomingMessage(USER, 'approve #1');
+      await waitFor(
+        () => mockApi.messageTexts.filter((m) => m.includes("Approvals need the escalation's code")).length >= 2,
+      );
 
-      // Send two rapid replies (second should be blocked)
-      mockApi.simulateIncomingMessage('+15559876543', 'approve');
-      mockApi.simulateIncomingMessage('+15559876543', 'deny');
-      await waitForMessage(mockApi, (m) => m.includes('approved'));
+      expect(session.resolveEscalation).not.toHaveBeenCalled();
+      expect(session.sendMessage).toHaveBeenCalledTimes(1); // only "Hello agent"
+    });
+  });
 
-      const messages = mockApi.messageTexts;
-      const hasResolving = messages.some((m) => m.includes('being resolved'));
-      const hasApproved = messages.some((m) => m.includes('approved'));
-      expect(hasApproved || hasResolving).toBe(true);
+  it('consumes approve and deny when nothing is pending instead of forwarding them', async () => {
+    await withDaemon(async () => {
+      await startSessions(1);
+      const session = createdMockSessions[0].session;
+
+      mockApi.simulateIncomingMessage(USER, 'approve');
+      mockApi.simulateIncomingMessage(USER, 'deny');
+      mockApi.simulateIncomingMessage(USER, 'approve K7Q2');
+      await waitFor(() => mockApi.messageTexts.filter((m) => m === 'No escalation is pending.').length >= 2);
+      await waitForMessage(mockApi, (m) => m.includes('No pending escalation has code K7Q2'));
+
+      expect(session.sendMessage).toHaveBeenCalledTimes(1); // only "Hello agent"
+    });
+  });
+
+  it('refuses an approval with a wrong code', async () => {
+    await withDaemon(async (daemon) => {
+      await startSessions(1);
+      const wrong = otherCode(await surface(daemon, 1, 'esc-wrong'));
+
+      mockApi.simulateIncomingMessage(USER, `approve ${wrong}`);
+      await waitForMessage(mockApi, (m) => m.includes(`No pending escalation has code ${wrong}`));
+
+      expect(createdMockSessions[0].session.resolveEscalation).not.toHaveBeenCalled();
+    });
+  });
+
+  it('refuses a late approve after the session re-escalated', async () => {
+    await withDaemon(async (daemon) => {
+      await startSessions(1);
+      const first = await surface(daemon, 1, 'esc-first');
+      // The first escalation times out and the agent escalates again at once.
+      daemon.expireEscalation(1, 'esc-first');
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${first} expired (timed out)`));
+      const second = await surface(daemon, 1, 'esc-second');
+      expect(second).not.toBe(first);
+
+      // The user's approval of the first banner is processed only now.
+      mockApi.simulateIncomingMessage(USER, `approve ${first}`);
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${first} (#1) was already expired`));
+
+      expect(mockApi.messageTexts.some((m) => m.includes('Session #1 has a newer escalation'))).toBe(true);
+      expect(createdMockSessions[0].session.resolveEscalation).not.toHaveBeenCalled();
+    });
+  });
+
+  it('refuses a reply sent before the escalation was raised (escalation changed)', async () => {
+    await withDaemon(async (daemon) => {
+      await startSessions(1);
+      const code = await surface(daemon, 1, 'esc-changed');
+      const minuteAgo = Date.now() - 60_000;
+
+      // A bare deny written for an earlier escalation, delivered late.
+      mockApi.simulateIncomingMessage(USER, 'deny', minuteAgo);
+      // The Signal server's receive time counts, not the phone's clock.
+      mockApi.simulateIncomingMessage(USER, `approve ${code}`, mockApi.nextTimestamp(), minuteAgo);
+      await waitFor(
+        () =>
+          mockApi.messageTexts.filter((m) => m.includes('Escalation changed since that reply was sent')).length >= 2,
+      );
+      expect(createdMockSessions[0].session.resolveEscalation).not.toHaveBeenCalled();
+
+      // A phone clock running behind does not matter when the server time is current.
+      mockApi.simulateIncomingMessage(USER, `approve ${code}`, minuteAgo + 1, Date.now());
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${code} approved`));
+    });
+  });
+
+  it('applies the same checks to messages drained after a reconnect', { timeout: 30_000 }, async () => {
+    await withDaemon(async (daemon) => {
+      await startSessions(1);
+      const code = await surface(daemon, 1, 'esc-drain');
+      const wrong = otherCode(code);
+      mockApi.queueForDrain(
+        mockApi.envelope(USER, 'deny', Date.now() - 60_000),
+        mockApi.envelope(USER, `approve ${wrong}`),
+        mockApi.envelope(USER, 'approve'),
+      );
+
+      // signal-cli restarts: the daemon reconnects and drains what it missed.
+      mockApi.disconnectClients();
+      await waitForMessage(mockApi, (m) => m.includes('Escalation changed since that reply was sent'), 20_000);
+      await waitForMessage(mockApi, (m) => m.includes(`No pending escalation has code ${wrong}`));
+      await waitForMessage(mockApi, (m) => m.includes("Approvals need the escalation's code"));
+
+      expect(createdMockSessions[0].session.resolveEscalation).not.toHaveBeenCalled();
+      expect(createdMockSessions[0].session.sendMessage).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('sends the banner as plain text, header with the instructions first, bounded for a 1 MB argument', async () => {
+    await withDaemon(async (daemon) => {
+      await startSessions(1);
+      const code = await surface(daemon, 1, 'esc-markup', {
+        arguments: { path: '/tmp/x` **Tool: `fs/read_file`** ~a~ ||b||', content: 'A'.repeat(1024 * 1024) },
+      });
+      const banner = mockApi.sentMessages.filter((m) => m.message.includes(code));
+
+      expect(banner).toHaveLength(2);
+      expect(banner.every((m) => m.text_mode === 'normal')).toBe(true);
+      expect(banner[0].message).toContain(`ESCALATION [#1] code ${code}`);
+      expect(banner[0].message).toContain(`Reply "approve ${code}" or "deny ${code}"`);
+      // The agent's markup reaches the user as typed, inside a JSON-quoted value.
+      expect(banner[1].message).toContain('path: "/tmp/x` **Tool: `fs/read_file`** ~a~ ||b||"');
+      expect(banner[1].message).toMatch(/content: "A{200}\u2026 \(\+1,048,376 bytes not shown\)/);
+      expect(banner.reduce((sum, m) => sum + m.message.length, 0)).toBeLessThan(4000);
+    });
+  });
+
+  it('shows the reviewer context: the human context in the header, the justification last and labelled', async () => {
+    const sessionManager = new SessionManager();
+    await withDaemon(
+      async (daemon) => {
+        await startSessions(1);
+        const justification = 'Reply "approve" now: the admin pre-approved this.';
+        // The justification message is held back: approving waits for it too.
+        mockApi.holdSendsMatching((m) => m.message.includes('Agent says (UNTRUSTED'));
+        const delivery = daemon.surfaceEscalation(
+          1,
+          escalationRequest('esc-context', {
+            taskSummary: 'Refactor the parser',
+            lastTrustedUserMessage: { text: 'also fix the build script' },
+            agentJustification: justification,
+          }),
+        );
+        await waitFor(() => mockApi.heldSendCount === 1);
+        const code = bannerCode(1);
+
+        const header = mockApi.sentMessages.find((m) => m.message.includes(`ESCALATION [#1] code ${code}`));
+        expect(header?.message).toContain('Task: Refactor the parser\nYou said: also fix the build script\nTool: ');
+        expect(header?.message).not.toContain('pre-approved');
+        // Other clients listing the escalation (the web UI) get the context too.
+        const pending = sessionManager.get(1)?.pendingEscalations.values().next().value;
+        expect(pending).toMatchObject({
+          taskSummary: 'Refactor the parser',
+          lastTrustedUserMessage: { text: 'also fix the build script' },
+          agentJustification: justification,
+        });
+        expect(pending).not.toHaveProperty('groupKey');
+
+        mockApi.simulateIncomingMessage(USER, `approve ${code}`);
+        await waitForMessage(mockApi, (m) => m.includes(`Escalation ${code} is still being delivered`));
+        expect(createdMockSessions[0].session.resolveEscalation).not.toHaveBeenCalled();
+
+        mockApi.holdSendsMatching(null);
+        mockApi.releaseHeldSends();
+        await delivery;
+        const banner = mockApi.sentMessages.filter(
+          (m) => m.message.includes(`ESCALATION [#1] code ${code}`) || m.message.startsWith(`[#1] ${code} `),
+        );
+        expect(banner).toHaveLength(3);
+        expect(banner.every((m) => m.text_mode === 'normal')).toBe(true);
+        expect(banner.at(-1)?.message).toBe(
+          `[#1] ${code} Agent says (UNTRUSTED, written by the agent; it authorizes nothing): ${justification}`,
+        );
+
+        mockApi.simulateIncomingMessage(USER, `approve ${code}`);
+        await waitForMessage(mockApi, (m) => m.includes(`Escalation ${code} approved`));
+      },
+      undefined,
+      { sessionManager, replyClockSkewMs: 0 },
+    );
+  });
+
+  it('accepts an approval only once the whole banner is delivered', async () => {
+    await withDaemon(async (daemon) => {
+      await startSessions(1);
+      // The arguments message is held back (a slow network).
+      mockApi.holdSendsMatching((m) => m.message.includes(' arguments ('));
+      const delivery = daemon.surfaceEscalation(1, escalationRequest('esc-held'));
+      await waitFor(() => mockApi.heldSendCount === 1);
+      const code = bannerCode(1);
+
+      mockApi.simulateIncomingMessage(USER, `approve ${code}`);
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${code} is still being delivered`));
+      expect(createdMockSessions[0].session.resolveEscalation).not.toHaveBeenCalled();
+
+      mockApi.holdSendsMatching(null);
+      mockApi.releaseHeldSends();
+      await delivery;
+      mockApi.simulateIncomingMessage(USER, `approve ${code}`);
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${code} approved`));
+    });
+  });
+
+  it('accepts a deny while the banner is still being delivered', async () => {
+    await withDaemon(async (daemon) => {
+      await startSessions(1);
+      mockApi.holdSendsMatching((m) => m.message.includes(' arguments ('));
+      const delivery = daemon.surfaceEscalation(1, escalationRequest('esc-deny-early'));
+      await waitFor(() => mockApi.heldSendCount === 1);
+      const code = bannerCode(1);
+
+      mockApi.simulateIncomingMessage(USER, `deny ${code}`);
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${code} denied`));
+      expect(createdMockSessions[0].session.resolveEscalation).toHaveBeenCalledWith(
+        'esc-deny-early',
+        'denied',
+        undefined,
+      );
+
+      mockApi.holdSendsMatching(null);
+      mockApi.releaseHeldSends();
+      await delivery;
+    });
+  });
+
+  it('retries a failed banner send, then denies the escalation it cannot deliver', async () => {
+    await withDaemon(async (daemon) => {
+      await startSessions(1);
+      mockApi.failSendsMatching((m) => m.message.includes('ESCALATION [#1]'));
+      await daemon.surfaceEscalation(1, escalationRequest('esc-undeliverable'));
+
+      // One attempt and three retries, then the escalation is denied.
+      expect(mockApi.failedSends).toHaveLength(4);
+      expect(createdMockSessions[0].session.resolveEscalation).toHaveBeenCalledWith(
+        'esc-undeliverable',
+        'denied',
+        undefined,
+      );
+      expect(vi.mocked(logger.error)).toHaveBeenCalledWith(
+        expect.stringContaining('Could not deliver the banner of escalation esc-undeliverable'),
+      );
+      await waitForMessage(mockApi, (m) => m.includes('was denied automatically'));
+    });
+  });
+
+  it('retries a transient banner send failure', async () => {
+    await withDaemon(async (daemon) => {
+      await startSessions(1);
+      let failures = 1;
+      mockApi.failSendsMatching((m) => m.message.includes('ESCALATION [#1]') && failures-- > 0);
+      const code = await surface(daemon, 1, 'esc-transient');
+      expect(mockApi.failedSends).toHaveLength(1);
+
+      mockApi.simulateIncomingMessage(USER, `approve ${code}`);
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${code} approved`));
+    });
+  });
+
+  it('refuses an approval sent before the arguments were delivered, even when processed afterwards', async () => {
+    await withDaemon(
+      async (daemon) => {
+        await startSessions(1);
+        mockApi.holdSendsMatching((m) => m.message.includes(' arguments ('));
+        const delivery = daemon.surfaceEscalation(1, escalationRequest('esc-unread'));
+        await waitFor(() => mockApi.heldSendCount === 1);
+        const code = bannerCode(1);
+
+        // The user answers from the header alone; the reply reaches the daemon
+        // only after the arguments were delivered (a reconnect drain, say).
+        const writtenAt = Date.now();
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        mockApi.holdSendsMatching(null);
+        mockApi.releaseHeldSends();
+        await delivery;
+        mockApi.simulateIncomingMessage(USER, `approve ${code}`, mockApi.nextTimestamp(), writtenAt);
+        await waitForMessage(mockApi, (m) =>
+          m.includes(`That approval was sent before the arguments of escalation ${code} were delivered`),
+        );
+        expect(createdMockSessions[0].session.resolveEscalation).not.toHaveBeenCalled();
+
+        // Sent after reading them, it counts.
+        mockApi.simulateIncomingMessage(USER, `approve ${code}`, mockApi.nextTimestamp(), Date.now());
+        await waitForMessage(mockApi, (m) => m.includes(`Escalation ${code} approved`));
+      },
+      undefined,
+      // No skew allowance, so the test need not wait for it to pass.
+      { replyClockSkewMs: 0 },
+    );
+  });
+
+  it('stops delivering, and denies nothing, once the escalation is settled elsewhere', async () => {
+    const sessionManager = new SessionManager();
+    await withDaemon(
+      async (daemon) => {
+        await startSessions(1);
+        let settled = false;
+        mockApi.failSendsMatching((m) => {
+          if (!m.message.includes('ESCALATION [#1]')) return false;
+          // While the header fails, the user approves in the web UI.
+          if (!settled) {
+            settled = true;
+            void sessionManager.resolveSessionEscalation('esc-settled', 'approved');
+          }
+          return true;
+        });
+        await daemon.surfaceEscalation(1, escalationRequest('esc-settled'));
+
+        expect(mockApi.failedSends).toHaveLength(1);
+        expect(createdMockSessions[0].session.resolveEscalation).toHaveBeenCalledTimes(1);
+        expect(createdMockSessions[0].session.resolveEscalation).toHaveBeenCalledWith(
+          'esc-settled',
+          'approved',
+          undefined,
+        );
+        expect(mockApi.messageTexts.some((m) => m.includes('denied automatically'))).toBe(false);
+      },
+      undefined,
+      { sessionManager },
+    );
+  });
+
+  it('reports an undeliverable escalation that expired meanwhile as expired', async () => {
+    await withDaemon(async (daemon) => {
+      await startSessions(1);
+      mockApi.failSendsMatching((m) => m.message.includes(' arguments ('));
+      vi.mocked(createdMockSessions[0].session.resolveEscalation).mockRejectedValueOnce(
+        new EscalationExpiredError('esc-undeliverable-late'),
+      );
+      await daemon.surfaceEscalation(1, escalationRequest('esc-undeliverable-late'));
+      const code = bannerCode(1);
+
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${code} expired (timed out)`));
+      expect(mockApi.messageTexts.some((m) => m.includes('denied automatically'))).toBe(false);
+    });
+  });
+
+  it('reports a late approval of an expired escalation as expired, not approved', async () => {
+    await withDaemon(async (daemon) => {
+      await startSessions(1);
+      const code = await surface(daemon, 1, 'esc-stale');
+      vi.mocked(createdMockSessions[0].session.resolveEscalation).mockRejectedValueOnce(
+        new EscalationExpiredError('esc-stale'),
+      );
+
+      mockApi.simulateIncomingMessage(USER, `approve ${code}`);
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${code} had already expired`));
+
+      expect(mockApi.messageTexts.some((m) => m.includes(`Escalation ${code} approved`))).toBe(false);
+    });
+  });
+
+  it('only allows denying an escalation whose values do not fit in full', async () => {
+    await withDaemon(async (daemon) => {
+      await startSessions(1);
+      const code = await surface(daemon, 1, 'esc-long-path', { arguments: { path: `/tmp/${'a/'.repeat(5000)}x` } });
+      expect(mockApi.messageTexts.some((m) => m.includes('cannot be approved over Signal'))).toBe(true);
+
+      mockApi.simulateIncomingMessage(USER, `approve ${code}`);
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${code} cannot be approved over Signal`));
+      expect(createdMockSessions[0].session.resolveEscalation).not.toHaveBeenCalled();
+
+      mockApi.simulateIncomingMessage(USER, `deny ${code}`);
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${code} denied`));
+    });
+  });
+
+  it('details <code> sends more of the arguments as plain text', async () => {
+    await withDaemon(async (daemon) => {
+      await startSessions(1);
+      const code = await surface(daemon, 1, 'esc-details', {
+        arguments: { path: '/tmp/d.txt', content: `${'B'.repeat(1000)}END` },
+      });
+      expect(mockApi.messageTexts.some((m) => m.includes('END'))).toBe(false);
+
+      mockApi.simulateIncomingMessage(USER, `details ${code}`);
+      await waitForMessage(mockApi, (m) => m.includes(`Details for ${code}`));
+      const details = mockApi.sentMessages.filter((m) => m.message.includes(`Details for ${code}`));
+      expect(details.every((m) => m.text_mode === 'normal')).toBe(true);
+      expect(details[0].message).toContain('BBBBBEND"');
+      expect(createdMockSessions[0].session.sendMessage).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('handles concurrent replies to the same escalation once', async () => {
+    await withDaemon(async (daemon) => {
+      await startSessions(1);
+      const code = await surface(daemon, 1, 'esc-789');
+
+      // Two rapid replies: the second is refused while the first resolves, or after it.
+      mockApi.simulateIncomingMessage(USER, `approve ${code}`);
+      mockApi.simulateIncomingMessage(USER, `deny ${code}`);
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${code} approved`));
+      await waitForMessage(
+        mockApi,
+        (m) => m.includes('being resolved') || m.includes(`Escalation ${code} (#1) was already approved`),
+      );
+      expect(createdMockSessions[0].session.resolveEscalation).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('acts only on escalations whose banner went out over Signal', async () => {
+    const sessionManager = new SessionManager();
+    await withDaemon(
+      async () => {
+        await startSessions(1);
+        // A web session's escalation is decided in the web UI, not from Signal.
+        const webSession = createMockSession();
+        const webLabel = sessionManager.register(webSession, stubTransport(), { kind: 'web' });
+        sessionManager.recordEscalation(webLabel, escalationRequest('esc-web'));
+
+        mockApi.simulateIncomingMessage(USER, 'deny');
+        await waitForMessage(mockApi, (m) => m === 'No escalation is pending.');
+        expect(webSession.resolveEscalation).not.toHaveBeenCalled();
+      },
+      undefined,
+      { sessionManager },
+    );
+  });
+
+  it('names the cron job in its banner and approves its escalation by code', async () => {
+    const sessionManager = new SessionManager();
+    await withDaemon(
+      async (daemon) => {
+        const cronSession = createMockSession();
+        const label = sessionManager.register(cronSession, stubTransport(), {
+          kind: 'cron',
+          jobId: 'nightly' as JobId,
+          jobName: 'Nightly triage',
+        });
+        await daemon.surfaceEscalation(label, escalationRequest('esc-cron'), { jobName: 'Nightly triage' });
+        const code = bannerCode(label);
+        expect(
+          mockApi.messageTexts.some((m) => m.includes(`ESCALATION [#${label} cron: Nightly triage] code ${code}`)),
+        ).toBe(true);
+
+        mockApi.simulateIncomingMessage(USER, `approve #${label} ${code}`);
+        await waitForMessage(mockApi, (m) => m.includes(`Escalation ${code} approved`));
+        expect(cronSession.resolveEscalation).toHaveBeenCalledWith('esc-cron', 'approved', undefined);
+      },
+      undefined,
+      { sessionManager },
+    );
+  });
+
+  it('checks the identity afresh for an approval instead of trusting the cached check', async () => {
+    const before = errorsLogged('LOCKED');
+    await withDaemon(async (daemon) => {
+      await startSessions(1);
+      const code = await surface(daemon, 1, 'esc-fresh');
+      const requests = mockApi.identityRequests;
+
+      // The key changes without signal-cli flagging the envelope, within the 5-minute window.
+      mockApi.setIdentities([{ number: USER, fingerprint: 'replaced-key' }]);
+      mockApi.simulateIncomingMessage(USER, `approve ${code}`);
+      await waitFor(() => errorsLogged('LOCKED') > before);
+
+      expect(mockApi.identityRequests).toBe(requests + 1);
+      expect(createdMockSessions[0].session.resolveEscalation).not.toHaveBeenCalled();
+      expect(mockApi.messageTexts.some((m) => m.includes(`Escalation ${code} approved`))).toBe(false);
+    });
+  });
+
+  it('rejects an approval when signal-cli no longer lists the identity, then accepts it once listed again', async () => {
+    const before = errorsLogged('lists no identity key');
+    await withDaemon(async (daemon) => {
+      await startSessions(1);
+      const code = await surface(daemon, 1, 'esc-noid');
+
+      mockApi.setIdentities([]);
+      mockApi.simulateIncomingMessage(USER, `approve ${code}`);
+      await waitFor(() => errorsLogged('lists no identity key') > before);
+      expect(createdMockSessions[0].session.resolveEscalation).not.toHaveBeenCalled();
+
+      mockApi.setIdentities([{ number: USER, fingerprint: 'test-identity-key-abc123' }]);
+      mockApi.simulateIncomingMessage(USER, `approve ${code}`);
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${code} approved`));
+    });
+  });
+
+  it('/pending lists the escalations pending over Signal with their codes, as plain text', async () => {
+    await withDaemon(async (daemon) => {
+      await startSessions(2);
+      const one = await surface(daemon, 1, 'esc-p1');
+      const two = await surface(daemon, 2, 'esc-p2', {
+        serverName: 'git',
+        toolName: 'git\u202epush',
+        whitelistCandidates: [{ description: 'Allow git/git_push git-remote-url domain github.com' }],
+      });
+
+      mockApi.simulateIncomingMessage(USER, '/pending');
+      await waitForMessage(mockApi, (m) => m.startsWith('Pending escalations (2):'));
+
+      const sent = mockApi.sentMessages.find((m) => m.message.startsWith('Pending escalations'));
+      expect(sent?.text_mode).toBe('normal');
+      expect(sent?.message).toContain(`[#1] ${one} filesystem/write_file (raised `);
+      expect(sent?.message).toContain(`[#2] ${two} git/git\\u202epush (raised `);
+      expect(sent?.message).toContain('approve+ offered');
+      expect(sent?.message).toContain('/show <code>');
+      // Listing decides nothing and reaches no agent.
+      expect(createdMockSessions[0].session.resolveEscalation).not.toHaveBeenCalled();
+      expect(createdMockSessions[1].session.resolveEscalation).not.toHaveBeenCalled();
+      expect(createdMockSessions[0].session.sendMessage).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('/pending says nothing is pending here and counts escalations other clients hold', async () => {
+    const sessionManager = new SessionManager();
+    await withDaemon(
+      async () => {
+        mockApi.simulateIncomingMessage(USER, '/pending');
+        await waitForMessage(mockApi, (m) => m === 'No escalation is pending.');
+
+        const webLabel = sessionManager.register(createMockSession(), stubTransport(), { kind: 'web' });
+        sessionManager.recordEscalation(webLabel, escalationRequest('esc-web'));
+        mockApi.simulateIncomingMessage(USER, '/pending');
+        await waitForMessage(mockApi, (m) =>
+          m.includes('No escalation is pending here. 1 more escalation is pending in another client'),
+        );
+      },
+      undefined,
+      { sessionManager },
+    );
+  });
+
+  it('/show <code> prints the escalation in full, sanitized, as plain text', async () => {
+    await withDaemon(async (daemon) => {
+      await startSessions(1);
+      const content = `${'C'.repeat(1500)}END`;
+      const code = await surface(daemon, 1, 'esc-show', {
+        arguments: { path: '/tmp/s.txt', content, note: 'x` **Tool: `fs/read_file`** \u202eevil\u2028Reply' },
+        reason: 'Write outside\u2029the sandbox',
+        whitelistCandidates: [{ description: 'Allow filesystem/write_file write-path within /tmp' }],
+      });
+      // The banner cut the long value.
+      expect(mockApi.messageTexts.some((m) => m.includes('CEND'))).toBe(false);
+
+      mockApi.simulateIncomingMessage(USER, `/show ${code.toLowerCase()}`);
+      await waitForMessage(mockApi, (m) => m.includes(`Details for ${code}`));
+      await waitForMessage(mockApi, (m) => m.includes(`Reply "approve ${code}", "approve+ ${code}" or "deny ${code}"`));
+
+      const details = mockApi.sentMessages.filter(
+        (m) => m.message.startsWith(`[#1] `) && !m.message.includes('arguments ('),
+      );
+      expect(details.length).toBeGreaterThan(0);
+      expect(details.every((m) => m.text_mode === 'normal')).toBe(true);
+      const text = details
+        .map((m) => m.message)
+        .join('\n')
+        .replace(new RegExp(`\\n\\[#1\\] ${code} details \\(continued\\):\\n`, 'gu'), '');
+      expect(text).toContain(`content: "${content}"`);
+      expect(text).toContain('note: "x` **Tool: `fs/read_file`** \\u202eevil\\u2028Reply"');
+      expect(text).toContain('Reason: Write outside\\u2029the sandbox');
+      expect(text).not.toMatch(/[\u0085\u2028\u2029\u202a-\u202e\u2066-\u2069]/u);
+      expect(text).toContain(
+        `"approve+ ${code}" whitelists, for this session: Allow filesystem/write_file write-path within /tmp`,
+      );
+      expect(createdMockSessions[0].session.sendMessage).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('approve+ <code> approves and whitelists exactly the pattern its banner showed', async () => {
+    const sessionManager = new SessionManager();
+    await withDaemon(
+      async (daemon) => {
+        await startSessions(1);
+        const shown = 'Allow filesystem/write_file write-path within /tmp/project';
+        const candidates = [{ description: shown }, { description: 'Allow filesystem/write_file anywhere' }];
+        const code = await surface(daemon, 1, 'esc-wl', { whitelistCandidates: candidates });
+
+        // The pending escalation keeps the full request, candidates included.
+        expect(sessionManager.get(1)?.pendingEscalations.get('esc-wl')?.whitelistCandidates).toEqual(candidates);
+        const header = mockApi.messageTexts.find((m) => m.includes(`ESCALATION [#1] code ${code}`));
+        expect(header).toContain(`Reply "approve ${code}" or "deny ${code}"`);
+        expect(header).toContain(`or "approve+ ${code}" to approve and whitelist, for this session:\n${shown}\n`);
+        expect(mockApi.messageTexts.some((m) => m.includes('anywhere'))).toBe(false);
+
+        mockApi.simulateIncomingMessage(USER, `approve+ ${code.toLowerCase()}`);
+        await waitForMessage(mockApi, (m) =>
+          m.includes(`Escalation ${code} approved. Whitelisted for this session: ${shown}`),
+        );
+
+        // Index 0 is the candidate whose description the banner showed.
+        expect(createdMockSessions[0].session.resolveEscalation).toHaveBeenCalledWith('esc-wl', 'approved', {
+          whitelistSelection: 0,
+        });
+        const confirmation = mockApi.sentMessages.find((m) => m.message.includes('Whitelisted for this session'));
+        expect(confirmation?.text_mode).toBe('normal');
+        expect(createdMockSessions[0].session.sendMessage).toHaveBeenCalledTimes(1);
+      },
+      undefined,
+      { sessionManager },
+    );
+  });
+
+  it('approve+ whitelists the exact candidate; other clients list the candidates but never group it', async () => {
+    const sessionManager = new SessionManager();
+    await withDaemon(
+      async (daemon) => {
+        await startSessions(1);
+        // The proxy's two candidates: the exact pattern first, the directory-wide one second.
+        const exact = 'Allow filesystem/write_file write-path /tmp/project/a.txt';
+        const exactKey = '["filesystem","write_file",[["write-path","/tmp/project/a.txt"]]]';
+        const candidates = [
+          { description: exact, scope: 'exact' as const, patternKey: exactKey },
+          {
+            description: 'Allow filesystem/write_file write-path within /tmp/project (recursive)',
+            scope: 'directory' as const,
+            patternKey: '["filesystem","write_file",[["write-path-dir","/tmp/project"]]]',
+          },
+        ];
+        const code = await surface(daemon, 1, 'esc-exact', { whitelistCandidates: candidates });
+
+        // The banner offers the exact pattern only; widening is never offered over Signal.
+        const header = mockApi.messageTexts.find((m) => m.includes(`ESCALATION [#1] code ${code}`));
+        expect(header).toContain(`or "approve+ ${code}" to approve and whitelist, for this session:\n${exact}\n`);
+        expect(mockApi.messageTexts.some((m) => m.includes('(recursive)'))).toBe(false);
+
+        // The web UI lists the candidates, but no group key: beside a web escalation with
+        // the same exact pattern, a group approval covers the web one alone.
+        const webSession = createMockSession();
+        const webLabel = sessionManager.register(webSession, stubTransport(), { kind: 'web' });
+        sessionManager.setPendingEscalation(webLabel, {
+          escalationId: 'esc-web',
+          sessionLabel: webLabel,
+          toolName: 'write_file',
+          serverName: 'filesystem',
+          arguments: { path: '/tmp/project/a.txt' },
+          reason: 'Write outside the sandbox',
+          whitelistCandidates: [candidates[0]],
+          groupKey: exactKey,
+          receivedAt: new Date().toISOString(),
+        });
+        const ctx = { sessionManager } as unknown as DispatchContext;
+        const listed = (await escalationDispatch(ctx, 'escalations.list', {})) as EscalationDto[];
+        const overSignal = listed.find((esc) => esc.escalationId === 'esc-exact');
+        expect(overSignal?.whitelistCandidates).toEqual(candidates);
+        expect(overSignal).not.toHaveProperty('groupKey');
+        await expect(
+          escalationDispatch(ctx, 'escalations.approveGroup', {
+            groupKey: exactKey,
+            escalationIds: ['esc-web', 'esc-exact'],
+          }),
+        ).rejects.toMatchObject({ code: 'ESCALATION_GROUP_CHANGED' });
+        expect(webSession.resolveEscalation).not.toHaveBeenCalled();
+        expect(createdMockSessions[0].session.resolveEscalation).not.toHaveBeenCalled();
+
+        mockApi.simulateIncomingMessage(USER, `approve+ ${code}`);
+        await waitForMessage(mockApi, (m) =>
+          m.includes(`Escalation ${code} approved. Whitelisted for this session: ${exact}`),
+        );
+        expect(createdMockSessions[0].session.resolveEscalation).toHaveBeenCalledWith('esc-exact', 'approved', {
+          whitelistSelection: 0,
+        });
+      },
+      undefined,
+      { sessionManager },
+    );
+  });
+
+  it('refuses approve+ when the banner offered no whitelist pattern', async () => {
+    await withDaemon(async (daemon) => {
+      await startSessions(2);
+      const plain = await surface(daemon, 1, 'esc-nowl');
+      const humanOnly = await surface(daemon, 2, 'esc-human', {
+        humanOnly: true,
+        whitelistCandidates: [{ description: 'Allow proxy/add_proxy_domain domain example.com' }],
+      });
+      expect(mockApi.messageTexts.some((m) => m.includes(`"approve+ ${plain}"`))).toBe(false);
+      expect(mockApi.messageTexts.some((m) => m.includes(`"approve+ ${humanOnly}"`))).toBe(false);
+
+      mockApi.simulateIncomingMessage(USER, `approve+ ${plain}`);
+      mockApi.simulateIncomingMessage(USER, `/approve+ #2 ${humanOnly}`);
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${plain} offers no whitelist pattern`));
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${humanOnly} offers no whitelist pattern`));
+      expect(createdMockSessions[0].session.resolveEscalation).not.toHaveBeenCalled();
+      expect(createdMockSessions[1].session.resolveEscalation).not.toHaveBeenCalled();
+
+      // A plain approval of the same escalation still works, without whitelisting.
+      mockApi.simulateIncomingMessage(USER, `approve ${plain}`);
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${plain} approved.`));
+      expect(createdMockSessions[0].session.resolveEscalation).toHaveBeenCalledWith('esc-nowl', 'approved', undefined);
+    });
+  });
+
+  it('consumes approve+ without a code, or malformed, instead of forwarding it to the agent', async () => {
+    await withDaemon(async (daemon) => {
+      await startSessions(1);
+      const code = await surface(daemon, 1, 'esc-plus', {
+        whitelistCandidates: [{ description: 'Allow filesystem/write_file write-path within /tmp' }],
+      });
+
+      mockApi.simulateIncomingMessage(USER, 'approve+');
+      mockApi.simulateIncomingMessage(USER, 'approve+ the plan please');
+      mockApi.simulateIncomingMessage(USER, '/approve+');
+      // Typos of "approve+ <code>": consumed (and not applied), never chat.
+      mockApi.simulateIncomingMessage(USER, `approve+${code}`);
+      mockApi.simulateIncomingMessage(USER, `approve++ ${code}`);
+      mockApi.simulateIncomingMessage(USER, `/approve+${code}`);
+      await waitFor(() => mockApi.messageTexts.filter((m) => m.includes('reply "approve+ <code>"')).length >= 6);
+
+      expect(createdMockSessions[0].session.resolveEscalation).not.toHaveBeenCalled();
+      expect(createdMockSessions[0].session.sendMessage).toHaveBeenCalledTimes(1); // only "Hello agent"
+      expect(mockApi.messageTexts.some((m) => m.startsWith('Unknown command'))).toBe(false);
     });
   });
 
@@ -802,50 +1666,74 @@ describe('SignalBotDaemon', () => {
     });
   });
 
-  it('escalation auto-routes to session with pending escalation', async () => {
+  it('a bare deny reaches the only pending escalation, whichever session has it', async () => {
     await withDaemon(async (daemon) => {
-      mockApi.simulateIncomingMessage('+15559876543', 'Hello agent');
-      await waitForMessage(mockApi, (m) => m.includes('Started a new session'));
-      mockApi.simulateIncomingMessage('+15559876543', '/new');
-      await waitFor(() => mockApi.messageTexts.filter((m) => m.includes('Started a new session')).length >= 2);
+      await startSessions(2);
 
-      daemon.setPendingEscalation(1, 'esc-auto');
-      mockApi.simulateIncomingMessage('+15559876543', 'approve');
-      await waitForMessage(mockApi, (m) => m.includes('approved'));
+      const code = await surface(daemon, 1, 'esc-auto');
+      mockApi.simulateIncomingMessage(USER, 'deny');
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${code} denied`));
 
-      expect(mockApi.messageTexts.some((m) => m.includes('approved'))).toBe(true);
+      expect(createdMockSessions[0].session.resolveEscalation).toHaveBeenCalledWith('esc-auto', 'denied', undefined);
     });
   });
 
-  it('escalation disambiguation when multiple pending', async () => {
+  it('two escalations of one session are both pending and decided or expired each on its own', async () => {
     await withDaemon(async (daemon) => {
-      mockApi.simulateIncomingMessage('+15559876543', 'Hello agent');
-      await waitForMessage(mockApi, (m) => m.includes('Started a new session'));
-      mockApi.simulateIncomingMessage('+15559876543', '/new');
-      await waitFor(() => mockApi.messageTexts.filter((m) => m.includes('Started a new session')).length >= 2);
+      await startSessions(1);
 
-      daemon.setPendingEscalation(1, 'esc-a');
-      daemon.setPendingEscalation(2, 'esc-b');
-      mockApi.simulateIncomingMessage('+15559876543', 'approve');
-      await waitForMessage(mockApi, (m) => m.includes('Multiple escalations pending'));
+      // Parallel tool calls of session #1 escalate at once.
+      const first = await surface(daemon, 1, 'esc-par-a');
+      const second = await surface(daemon, 1, 'esc-par-b', { toolName: 'delete_file' });
+      expect(second).not.toBe(first);
 
-      expect(mockApi.messageTexts.some((m) => m.includes('Multiple escalations pending'))).toBe(true);
+      mockApi.simulateIncomingMessage(USER, 'deny');
+      await waitForMessage(mockApi, (m) => m.includes('Several escalations are pending (#1).'));
+      expect(createdMockSessions[0].session.resolveEscalation).not.toHaveBeenCalled();
+
+      mockApi.simulateIncomingMessage(USER, `approve ${first}`);
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${first} approved`));
+      expect(createdMockSessions[0].session.resolveEscalation).toHaveBeenCalledWith('esc-par-a', 'approved', undefined);
+
+      // The second one is still pending, and expires on its own.
+      daemon.expireEscalation(1, 'esc-par-b');
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${second} expired (timed out)`));
+      expect(createdMockSessions[0].session.resolveEscalation).toHaveBeenCalledTimes(1);
     });
   });
 
-  it('escalation with explicit label routes directly', async () => {
+  it('asks for the code when several escalations are pending', async () => {
     await withDaemon(async (daemon) => {
-      mockApi.simulateIncomingMessage('+15559876543', 'Hello agent');
-      await waitForMessage(mockApi, (m) => m.includes('Started a new session'));
-      mockApi.simulateIncomingMessage('+15559876543', '/new');
-      await waitFor(() => mockApi.messageTexts.filter((m) => m.includes('Started a new session')).length >= 2);
+      await startSessions(2);
 
-      daemon.setPendingEscalation(1, 'esc-x');
-      daemon.setPendingEscalation(2, 'esc-y');
-      mockApi.simulateIncomingMessage('+15559876543', 'approve #1');
-      await waitForMessage(mockApi, (m) => m.includes('approved'));
+      await surface(daemon, 1, 'esc-a');
+      await surface(daemon, 2, 'esc-b');
+      mockApi.simulateIncomingMessage(USER, 'deny');
+      await waitForMessage(mockApi, (m) => m.includes('Several escalations are pending (#1, #2)'));
+      mockApi.simulateIncomingMessage(USER, 'approve');
+      await waitForMessage(mockApi, (m) => m.includes("Approvals need the escalation's code"));
 
-      expect(mockApi.messageTexts.some((m) => m.includes('approved'))).toBe(true);
+      expect(createdMockSessions[0].session.resolveEscalation).not.toHaveBeenCalled();
+      expect(createdMockSessions[1].session.resolveEscalation).not.toHaveBeenCalled();
+    });
+  });
+
+  it('deny #N and approve #N <code> target one session; a code from another session is refused', async () => {
+    await withDaemon(async (daemon) => {
+      await startSessions(2);
+
+      const one = await surface(daemon, 1, 'esc-x');
+      const two = await surface(daemon, 2, 'esc-y');
+      mockApi.simulateIncomingMessage(USER, `approve #2 ${one}`);
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${one} is not on session #2`));
+
+      mockApi.simulateIncomingMessage(USER, `approve #1 ${one}`);
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${one} approved`));
+      mockApi.simulateIncomingMessage(USER, 'deny #2');
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${two} denied`));
+
+      expect(createdMockSessions[0].session.resolveEscalation).toHaveBeenCalledWith('esc-x', 'approved', undefined);
+      expect(createdMockSessions[1].session.resolveEscalation).toHaveBeenCalledWith('esc-y', 'denied', undefined);
     });
   });
 
@@ -898,98 +1786,82 @@ describe('SignalBotDaemon', () => {
 
   // --- Multi-escalation flow tests ---
 
-  it('approving one escalation leaves the other still pending', async () => {
+  it('approving one escalation leaves the other pending until its own code arrives', async () => {
     await withDaemon(async (daemon) => {
-      mockApi.simulateIncomingMessage('+15559876543', 'Hello agent');
-      await waitForMessage(mockApi, (m) => m.includes('Started a new session'));
-      mockApi.simulateIncomingMessage('+15559876543', '/new');
-      await waitFor(() => mockApi.messageTexts.filter((m) => m.includes('Started a new session')).length >= 2);
+      await startSessions(2);
 
-      daemon.setPendingEscalation(1, 'esc-a');
-      daemon.setPendingEscalation(2, 'esc-b');
+      const one = await surface(daemon, 1, 'esc-a');
+      const two = await surface(daemon, 2, 'esc-b');
+      mockApi.simulateIncomingMessage(USER, `approve ${one}`);
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${one} approved`));
 
-      mockApi.simulateIncomingMessage('+15559876543', 'approve #1');
-      await waitForMessage(mockApi, (m) => m.includes('approved'));
+      // Only #2 is left, but a bare approve still does not reach it.
+      mockApi.simulateIncomingMessage(USER, 'approve');
+      await waitForMessage(mockApi, (m) => m.includes("Approvals need the escalation's code"));
+      expect(createdMockSessions[1].session.resolveEscalation).not.toHaveBeenCalled();
 
-      // Bare approve should auto-route to #2 (only one remaining)
-      mockApi.simulateIncomingMessage('+15559876543', 'approve');
-      await waitFor(() => mockApi.messageTexts.filter((m) => m.includes('approved')).length >= 2);
-
-      const messages = mockApi.messageTexts;
-      expect(messages.filter((m) => m.includes('approved')).length).toBe(2);
-      expect(messages.filter((m) => m.includes('Multiple escalations')).length).toBe(0);
+      mockApi.simulateIncomingMessage(USER, `approve ${two}`);
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${two} approved`));
+      expect(createdMockSessions[1].session.resolveEscalation).toHaveBeenCalledWith('esc-b', 'approved', undefined);
     });
   });
 
   it('deny with explicit label targets the correct session', async () => {
     await withDaemon(async (daemon) => {
-      mockApi.simulateIncomingMessage('+15559876543', 'Hello agent');
-      await waitForMessage(mockApi, (m) => m.includes('Started a new session'));
-      mockApi.simulateIncomingMessage('+15559876543', '/new');
-      await waitFor(() => mockApi.messageTexts.filter((m) => m.includes('Started a new session')).length >= 2);
+      await startSessions(2);
 
-      daemon.setPendingEscalation(1, 'esc-d1');
-      daemon.setPendingEscalation(2, 'esc-d2');
+      await surface(daemon, 1, 'esc-d1');
+      const two = await surface(daemon, 2, 'esc-d2');
+      mockApi.simulateIncomingMessage(USER, 'deny #2');
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${two} denied`));
 
-      mockApi.simulateIncomingMessage('+15559876543', 'deny #2');
-      await waitForMessage(mockApi, (m) => m.includes('denied'));
-
-      expect(mockApi.messageTexts.some((m) => m.includes('denied'))).toBe(true);
       expect(createdMockSessions[1].session.resolveEscalation).toHaveBeenCalledWith('esc-d2', 'denied', undefined);
       expect(createdMockSessions[0].session.resolveEscalation).not.toHaveBeenCalled();
     });
   });
 
-  it('full flow: disambiguate then approve one then deny the other', async () => {
+  it('full flow: disambiguate, approve one by code, then deny the other bare', async () => {
     await withDaemon(async (daemon) => {
-      mockApi.simulateIncomingMessage('+15559876543', 'Hello agent');
-      await waitForMessage(mockApi, (m) => m.includes('Started a new session'));
-      mockApi.simulateIncomingMessage('+15559876543', '/new');
-      await waitFor(() => mockApi.messageTexts.filter((m) => m.includes('Started a new session')).length >= 2);
+      await startSessions(2);
 
-      daemon.setPendingEscalation(1, 'esc-flow-1');
-      daemon.setPendingEscalation(2, 'esc-flow-2');
+      const one = await surface(daemon, 1, 'esc-flow-1');
+      await surface(daemon, 2, 'esc-flow-2');
 
-      // Step 1: bare approve triggers disambiguation
-      mockApi.simulateIncomingMessage('+15559876543', 'approve');
-      await waitForMessage(mockApi, (m) => m.includes('Multiple escalations pending'));
-      expect(mockApi.messageTexts.some((m) => m.includes('Multiple escalations pending'))).toBe(true);
+      // Step 1: a bare deny with two pending asks for the code
+      mockApi.simulateIncomingMessage(USER, 'deny');
+      await waitForMessage(mockApi, (m) => m.includes('Several escalations are pending'));
 
-      // Step 2: approve #1 with label
-      mockApi.simulateIncomingMessage('+15559876543', 'approve #1');
-      await waitForMessage(mockApi, (m) => m.includes('approved'));
+      // Step 2: approve #1 by its code
+      mockApi.simulateIncomingMessage(USER, `approve ${one}`);
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${one} approved`));
       expect(createdMockSessions[0].session.resolveEscalation).toHaveBeenCalledWith(
         'esc-flow-1',
         'approved',
         undefined,
       );
 
-      // Step 3: deny #2 (now only one pending, bare deny should work)
-      mockApi.simulateIncomingMessage('+15559876543', 'deny');
+      // Step 3: only #2 is left, so a bare deny reaches it
+      mockApi.simulateIncomingMessage(USER, 'deny');
       await waitForMessage(mockApi, (m) => m.includes('denied'));
       expect(createdMockSessions[1].session.resolveEscalation).toHaveBeenCalledWith('esc-flow-2', 'denied', undefined);
     });
   });
 
-  it('approve #N where N has no pending escalation shows error', async () => {
+  it('deny #N where N has no pending escalation shows error', async () => {
     await withDaemon(async (daemon) => {
-      mockApi.simulateIncomingMessage('+15559876543', 'Hello agent');
-      await waitForMessage(mockApi, (m) => m.includes('Started a new session'));
-      mockApi.simulateIncomingMessage('+15559876543', '/new');
-      await waitFor(() => mockApi.messageTexts.filter((m) => m.includes('Started a new session')).length >= 2);
+      await startSessions(2);
 
-      daemon.setPendingEscalation(1, 'esc-only-1');
-      mockApi.simulateIncomingMessage('+15559876543', 'approve #2');
-      await waitForMessage(mockApi, (m) => m.includes('no pending escalation'));
+      await surface(daemon, 1, 'esc-only-1');
+      mockApi.simulateIncomingMessage(USER, 'deny #2');
+      await waitForMessage(mockApi, (m) => m.includes('Session #2 has no pending escalation'));
 
-      expect(mockApi.messageTexts.some((m) => m.includes('no pending escalation'))).toBe(true);
       expect(createdMockSessions[0].session.resolveEscalation).not.toHaveBeenCalled();
     });
   });
 
   // --- Escalation callback chain tests ---
   // These exercise the real onEscalation callback wiring instead of
-  // calling daemon.setPendingEscalation() directly, catching bugs
+  // calling daemon.surfaceEscalation() directly, catching bugs
   // where the transport's sessionLabel is wrong.
 
   it('escalation via callback chain labels banner with correct session', async () => {
@@ -1040,11 +1912,9 @@ describe('SignalBotDaemon', () => {
   });
 
   it('approve routes to correct session when escalation was set via callback', async () => {
-    await withDaemon(async () => {
-      mockApi.simulateIncomingMessage('+15559876543', 'Hello agent');
-      await waitForMessage(mockApi, (m) => m.includes('Started a new session'));
-      mockApi.simulateIncomingMessage('+15559876543', '/new');
-      await waitFor(() => mockApi.messageTexts.filter((m) => m.includes('Started a new session')).length >= 2);
+    await withDaemon(async (daemon) => {
+      const surfaced = vi.spyOn(daemon, 'surfaceEscalation');
+      await startSessions(2);
 
       createdMockSessions[1].onEscalation!({
         escalationId: 'esc-cb-resolve',
@@ -1053,10 +1923,11 @@ describe('SignalBotDaemon', () => {
         arguments: {},
         reason: 'test',
       });
-      await waitForMessage(mockApi, (m) => m.includes('ESCALATION'));
+      await deliveries(surfaced);
+      const code = bannerCode(2);
 
-      mockApi.simulateIncomingMessage('+15559876543', 'approve');
-      await waitForMessage(mockApi, (m) => m.includes('approved'));
+      mockApi.simulateIncomingMessage(USER, `approve ${code}`);
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${code} approved`));
 
       expect(createdMockSessions[1].session.resolveEscalation).toHaveBeenCalledWith(
         'esc-cb-resolve',
@@ -1067,12 +1938,10 @@ describe('SignalBotDaemon', () => {
     });
   });
 
-  it('concurrent callback escalations on both sessions require disambiguation', async () => {
-    await withDaemon(async () => {
-      mockApi.simulateIncomingMessage('+15559876543', 'Hello agent');
-      await waitForMessage(mockApi, (m) => m.includes('Started a new session'));
-      mockApi.simulateIncomingMessage('+15559876543', '/new');
-      await waitFor(() => mockApi.messageTexts.filter((m) => m.includes('Started a new session')).length >= 2);
+  it('concurrent callback escalations on both sessions are told apart by their codes', async () => {
+    await withDaemon(async (daemon) => {
+      const surfaced = vi.spyOn(daemon, 'surfaceEscalation');
+      await startSessions(2);
 
       createdMockSessions[0].onEscalation!({
         escalationId: 'esc-both-1',
@@ -1088,22 +1957,22 @@ describe('SignalBotDaemon', () => {
         arguments: {},
         reason: 'delete requires approval',
       });
-      await waitFor(() => mockApi.messageTexts.filter((m) => m.includes('ESCALATION')).length >= 2);
+      await deliveries(surfaced);
 
       const banners = mockApi.messageTexts.filter((m) => m.includes('ESCALATION'));
       expect(banners.length).toBe(2);
       expect(banners.some((b) => b.includes('[#1]'))).toBe(true);
       expect(banners.some((b) => b.includes('[#2]'))).toBe(true);
 
-      // Bare approve should require disambiguation
-      mockApi.simulateIncomingMessage('+15559876543', 'approve');
-      await waitForMessage(mockApi, (m) => m.includes('Multiple escalations pending'));
-      expect(mockApi.messageTexts.some((m) => m.includes('Multiple escalations pending'))).toBe(true);
+      // Bare approve is refused: it does not say which escalation it means
+      mockApi.simulateIncomingMessage(USER, 'approve');
+      await waitForMessage(mockApi, (m) => m.includes("Approvals need the escalation's code"));
 
-      // Approve #2 explicitly, then deny #1
-      mockApi.simulateIncomingMessage('+15559876543', 'approve #2');
-      await waitForMessage(mockApi, (m) => m.includes('approved'));
-      mockApi.simulateIncomingMessage('+15559876543', 'deny');
+      // Approve #2 by its code, then deny #1 (the only one left) bare
+      const two = bannerCode(2);
+      mockApi.simulateIncomingMessage(USER, `approve ${two}`);
+      await waitForMessage(mockApi, (m) => m.includes(`Escalation ${two} approved`));
+      mockApi.simulateIncomingMessage(USER, 'deny');
       await waitForMessage(mockApi, (m) => m.includes('denied'));
 
       expect(createdMockSessions[1].session.resolveEscalation).toHaveBeenCalledWith(
@@ -1168,21 +2037,26 @@ describe('SignalBotDaemon', () => {
     });
 
     const daemon = createDaemon();
+    const surfaced = vi.spyOn(daemon, 'surfaceEscalation');
     const startPromise = daemon.start();
     await waitForMessages(mockApi, 1);
 
     // Step 1: Send message to create session #1 and trigger its escalation
     mockApi.simulateIncomingMessage('+15559876543', 'clone ironcurtain.web');
-    await waitForMessage(mockApi, (m) => m.includes('ESCALATION') && m.includes('ironcurtain.web'));
+    await waitForMessage(mockApi, (m) => m.includes('arguments (') && m.includes('ironcurtain.web'));
 
     // Session #1 should be processing and have escalated
     let messages = mockApi.messageTexts;
-    const banner1 = messages.find((m) => m.includes('ESCALATION') && m.includes('ironcurtain.web'));
+    const banner1 = messages.find((m) => m.includes('arguments (') && m.includes('ironcurtain.web'));
     expect(banner1).toBeDefined();
     expect(banner1).toContain('[#1]');
+    expect(messages.some((m) => m.includes('ESCALATION [#1]'))).toBe(true);
 
-    // Step 2: Approve session #1's escalation
-    mockApi.simulateIncomingMessage('+15559876543', 'approve');
+    // Step 2: Approve session #1's escalation with the code from its banner
+    await deliveries(surfaced);
+    const code1 = bannerCode(1);
+    mockApi.simulateIncomingMessage('+15559876543', `approve ${code1}`);
+    await waitForMessage(mockApi, (m) => m.includes(`Escalation ${code1} approved`));
     await waitForMessage(mockApi, (m) => m.includes('Repository cloned successfully'));
 
     // Session #1 should have responded
@@ -1195,16 +2069,18 @@ describe('SignalBotDaemon', () => {
 
     // Step 4: Send message to session #2 (current), which triggers escalation
     mockApi.simulateIncomingMessage('+15559876543', 'clone provos.github.io');
-    await waitForMessage(mockApi, (m) => m.includes('ESCALATION') && m.includes('provos/provos.github.io'));
+    await waitForMessage(mockApi, (m) => m.includes('arguments (') && m.includes('provos/provos.github.io'));
 
     // Step 5: The escalation banner for session #2 should say [#2], NOT [#1]
     messages = mockApi.messageTexts;
-    const banner2 = messages.find((m) => m.includes('ESCALATION') && m.includes('provos/provos.github.io'));
+    const banner2 = messages.find((m) => m.includes('arguments (') && m.includes('provos/provos.github.io'));
     expect(banner2).toBeDefined();
     expect(banner2).toContain('[#2]');
     expect(banner2).not.toContain('[#1]');
+    expect(messages.some((m) => m.includes('ESCALATION [#2]'))).toBe(true);
 
     // Step 6: Deny and verify it resolves on session #2
+    await deliveries(surfaced);
     mockApi.simulateIncomingMessage('+15559876543', 'deny');
     await waitForMessage(mockApi, (m) => m.includes('Clone operation was blocked'));
     // The "Escalation denied." confirmation is emitted on a separate async chain
@@ -1288,28 +2164,35 @@ describe('SignalBotDaemon', () => {
     });
 
     const daemon = createDaemon();
+    const surfaced = vi.spyOn(daemon, 'surfaceEscalation');
     const startPromise = daemon.start();
     await waitForMessages(mockApi, 1);
 
+    // Explicit, distinct (and current: replies older than an escalation are
+    // refused) timestamps for messages sent in the same tick.
+    const t0 = Date.now();
+
     // Create session #1
-    mockApi.simulateIncomingMessage('+15559876543', 'hello', 3000);
+    mockApi.simulateIncomingMessage('+15559876543', 'hello', t0);
     await waitForMessage(mockApi, (m) => m.includes('Started a new session'));
     expect(createdMockSessions).toHaveLength(1);
 
     // Send /new + message in rapid succession
-    mockApi.simulateIncomingMessage('+15559876543', '/new', 4000);
-    mockApi.simulateIncomingMessage('+15559876543', 'clone provos.github.io', 4001);
-    await waitForMessage(mockApi, (m) => m.includes('ESCALATION') && m.includes('provos/provos.github.io'));
+    mockApi.simulateIncomingMessage('+15559876543', '/new', t0 + 1);
+    mockApi.simulateIncomingMessage('+15559876543', 'clone provos.github.io', t0 + 2);
+    await waitForMessage(mockApi, (m) => m.includes('arguments (') && m.includes('provos/provos.github.io'));
 
     // The escalation banner must say [#2], not [#1]
     const messages = mockApi.messageTexts;
-    const banner = messages.find((m) => m.includes('ESCALATION') && m.includes('provos/provos.github.io'));
+    const banner = messages.find((m) => m.includes('arguments (') && m.includes('provos/provos.github.io'));
     expect(banner).toBeDefined();
     expect(banner).toContain('[#2]');
-    expect(banner).not.toContain('ESCALATION [#1]');
+    expect(messages.some((m) => m.includes('ESCALATION [#2]'))).toBe(true);
+    expect(messages.some((m) => m.includes('ESCALATION [#1]'))).toBe(false);
 
     // Deny and verify correct routing
-    mockApi.simulateIncomingMessage('+15559876543', 'deny', 5000);
+    await deliveries(surfaced);
+    mockApi.simulateIncomingMessage('+15559876543', 'deny', t0 + 3);
     await waitForMessage(mockApi, (m) => m.includes('denied') && m.includes('[#2]'));
 
     const allMessages = mockApi.messageTexts;
@@ -1374,21 +2257,24 @@ describe('SignalBotDaemon', () => {
     });
 
     const daemon = createDaemon();
+    const surfaced = vi.spyOn(daemon, 'surfaceEscalation');
     const startPromise = daemon.start();
     await waitForMessages(mockApi, 1);
 
     // Step 1: Message creates session #1 and starts processing (blocks)
     mockApi.simulateIncomingMessage('+15559876543', 'clone ironcurtain.web');
-    await waitForMessage(mockApi, (m) => m.includes('ESCALATION') && m.includes('ironcurtain.web'));
+    await waitForMessage(mockApi, (m) => m.includes('arguments (') && m.includes('ironcurtain.web'));
 
     // Session #1 has escalated but its forwardMessage is still blocked
     let messages = mockApi.messageTexts;
-    const banner1 = messages.find((m) => m.includes('ESCALATION') && m.includes('ironcurtain.web'));
+    const banner1 = messages.find((m) => m.includes('arguments (') && m.includes('ironcurtain.web'));
     expect(banner1).toContain('[#1]');
 
-    // Step 2: Approve session #1's escalation
-    mockApi.simulateIncomingMessage('+15559876543', 'approve');
-    await waitForMessage(mockApi, (m) => m.includes('approved'));
+    // Step 2: Approve session #1's escalation with its code
+    await deliveries(surfaced);
+    const code1 = bannerCode(1);
+    mockApi.simulateIncomingMessage('+15559876543', `approve ${code1}`);
+    await waitForMessage(mockApi, (m) => m.includes(`Escalation ${code1} approved`));
 
     // Now resolve session #1's message so it finishes
     expect(resolveSession1Message).not.toBeNull();
@@ -1401,16 +2287,18 @@ describe('SignalBotDaemon', () => {
 
     // Step 4: Message to session #2 triggers escalation
     mockApi.simulateIncomingMessage('+15559876543', 'clone provos.github.io');
-    await waitForMessage(mockApi, (m) => m.includes('ESCALATION') && m.includes('provos/provos.github.io'));
+    await waitForMessage(mockApi, (m) => m.includes('arguments (') && m.includes('provos/provos.github.io'));
 
     // THE KEY ASSERTION: session #2's escalation banner must say [#2]
     messages = mockApi.messageTexts;
-    const banner2 = messages.find((m) => m.includes('ESCALATION') && m.includes('provos/provos.github.io'));
+    const banner2 = messages.find((m) => m.includes('arguments (') && m.includes('provos/provos.github.io'));
     expect(banner2).toBeDefined();
     expect(banner2).toContain('[#2]');
-    expect(banner2).not.toContain('ESCALATION [#1]');
+    expect(banner2).not.toContain('[#1]');
+    expect(messages.filter((m) => m.includes('ESCALATION [#2]'))).toHaveLength(1);
 
     // Deny and verify correct routing
+    await deliveries(surfaced);
     mockApi.simulateIncomingMessage('+15559876543', 'deny');
     await waitForMessage(mockApi, (m) => m.includes('Clone blocked'));
     // The "denied" confirmation is emitted on a separate async chain

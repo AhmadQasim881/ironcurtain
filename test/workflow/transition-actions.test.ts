@@ -415,7 +415,7 @@ describe('transition actions: resetVisitCounts', () => {
 
 describe('human gate transition actions: resetVisitCounts', () => {
   /**
-   * Mirrors the vuln-discovery shape: a bounded agent loop escalates to
+   * A bounded agent loop escalates to
    * a human gate on cap-reached; APPROVE routes back into the loop and
    * carries a resetVisitCounts action so the loop does not immediately
    * re-escalate. Also asserts the hardcoded gate actions (storeHumanPrompt,

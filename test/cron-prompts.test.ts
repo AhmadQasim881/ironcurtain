@@ -34,6 +34,13 @@ describe('buildCronSystemPromptAugmentation', () => {
     expect(prompt).toContain('last-run.md');
   });
 
+  it('tells the agent where the previous run summary went', () => {
+    // The daemon moves last-run.md to previous-run.md before every run.
+    const prompt = buildCronSystemPromptAugmentation(baseContext);
+    expect(prompt).toContain('**previous-run.md**');
+    expect(prompt).toContain('moved here before this run started');
+  });
+
   it('instructs the agent about headless behavior', () => {
     const prompt = buildCronSystemPromptAugmentation(baseContext);
     expect(prompt).toContain('Headless Behavior');

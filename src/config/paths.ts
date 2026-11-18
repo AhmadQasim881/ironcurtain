@@ -1,10 +1,10 @@
-import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, resolve } from 'node:path';
+import { dirname, isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { BundleId } from '../session/types.js';
 import { JOB_ID_PATTERN } from '../types/slug.js';
+import { hashConstitutionText } from './constitution-hash.js';
 
 /**
  * Short slug length used in file/directory names that must fit under
@@ -36,11 +36,37 @@ function toBundleSlug(bundleId: BundleId | string): string {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /**
+ * Resolves an `IRONCURTAIN_HOME` value to the home directory.
+ *
+ * Unset or empty means the default `~/.ironcurtain` (an empty value is treated
+ * like XDG treats an empty base directory, never as "the current directory").
+ * A relative value is rejected: it would resolve against each process's own
+ * working directory, so a daemon and a CLI started in different directories
+ * would disagree on config, sockets and policy, and a value such as `~/ic`
+ * (unexpanded by a quoting shell) would silently land inside a project.
+ *
+ * @throws Error when the value is relative.
+ */
+export function resolveIronCurtainHome(value: string | undefined): string {
+  if (value === undefined || value === '') return resolve(homedir(), '.ironcurtain');
+  if (!isAbsolute(value)) {
+    throw new Error(
+      `IRONCURTAIN_HOME must be an absolute path, got ${JSON.stringify(value)}. ` +
+        'Use a full path such as /home/me/.ironcurtain, or unset it to use ~/.ironcurtain.',
+    );
+  }
+  return resolve(value);
+}
+
+/**
  * Returns the IronCurtain home directory.
- * Defaults to ~/.ironcurtain, overridable via IRONCURTAIN_HOME env var.
+ * Defaults to ~/.ironcurtain, overridable via the IRONCURTAIN_HOME env var
+ * (which must be absolute; see {@link resolveIronCurtainHome}). Read from the
+ * real process environment only: the trusted-env loader never lets a .env
+ * file set it.
  */
 export function getIronCurtainHome(): string {
-  return resolve(process.env.IRONCURTAIN_HOME ?? resolve(homedir(), '.ironcurtain'));
+  return resolveIronCurtainHome(process.env.IRONCURTAIN_HOME);
 }
 
 /**
@@ -48,6 +74,29 @@ export function getIronCurtainHome(): string {
  */
 export function getSessionsDir(): string {
   return resolve(getIronCurtainHome(), 'sessions');
+}
+
+/**
+ * Returns the host-side approval history: {home}/approval-history.jsonl
+ *
+ * One line per escalation a human approved (the generalized pattern only,
+ * never raw arguments), plus the decisions taken on the constitution
+ * amendments proposed from them. It lives outside every session sandbox,
+ * workspace and escalation directory, so no agent can write it. See
+ * `src/audit/approval-history.ts`.
+ */
+export function getApprovalHistoryPath(): string {
+  return resolve(getIronCurtainHome(), 'approval-history.jsonl');
+}
+
+/**
+ * Returns the host-global audit directory: {home}/audit/
+ *
+ * Holds the persona policy-mutation log and its chain head
+ * (`src/persona/policy-mutation-audit.ts`). Created with mode 0700.
+ */
+export function getAuditDir(): string {
+  return resolve(getIronCurtainHome(), 'audit');
 }
 
 /** Returns the private host-global statistics directory. */
@@ -88,6 +137,16 @@ function assertPathSafeSlug(kind: string, value: string): void {
 export const SESSION_LOG_FILENAME = 'session.log';
 export const SESSION_METADATA_FILENAME = 'session-metadata.json';
 export const SESSION_STATE_FILENAME = 'session-state.json';
+
+/**
+ * Artifacts of a session directory. `messages.jsonl` holds a builtin
+ * session's saved conversation (src/session/conversation-store.ts).
+ * `resume.lock` is the claim of the one process running a session
+ * (src/session/session-lock.ts); builtin, batch container and PTY sessions
+ * all take it, so they exclude each other.
+ */
+export const SESSION_MESSAGES_FILENAME = 'messages.jsonl';
+export const SESSION_LOCK_FILENAME = 'resume.lock';
 
 /**
  * Validates a workflow state slug of the form `{stateId}.{visitCount}`
@@ -292,6 +351,16 @@ export function getBaseUserConstitutionPath(): string {
 }
 
 /**
+ * Returns the user's MCP server configuration: {home}/mcp-servers.json.
+ * It adds servers to the package-bundled `mcp-servers.json` and may adjust
+ * a few documented fields of the built-in ones (see
+ * `mcp-servers-overlay.ts`). `home` defaults to {@link getIronCurtainHome}.
+ */
+export function getUserMcpServersPath(home: string = getIronCurtainHome()): string {
+  return resolve(home, 'mcp-servers.json');
+}
+
+/**
  * Returns the user-local generated artifacts directory: {home}/generated/
  * Pipeline commands write here; runtime reads from here first, falling back
  * to the package-bundled defaults in dist/config/generated/.
@@ -336,6 +405,23 @@ export function loadUserConstitutionText(): string {
 }
 
 /**
+ * Text the server pre-filter judges server relevance against when the default
+ * constitution is compiled (no `--constitution` override).
+ *
+ * The bundled base constitution holds only universal principles, so the
+ * pre-filter normally sees just the user constitution. A user base override
+ * (`~/.ironcurtain/constitution.md`) replaces that base with arbitrary text,
+ * which may grant server-specific permissions, so when it exists the
+ * pre-filter gets the full combined text the compiler gets. Otherwise a server
+ * permitted only by the override would be skipped and receive no rules.
+ *
+ * @param combinedConstitutionText the text from {@link loadConstitutionText}
+ */
+export function loadPrefilterConstitutionText(combinedConstitutionText: string): string {
+  return existsSync(getUserConstitutionBasePath()) ? combinedConstitutionText : loadUserConstitutionText();
+}
+
+/**
  * Loads the combined constitution text (base + optional user constitution).
  * If ~/.ironcurtain/constitution.md exists, it replaces the package-bundled base.
  * The user extension file (~/.ironcurtain/constitution-user.md), when present,
@@ -359,11 +445,11 @@ export function loadConstitutionText(packageBasePath: string): string {
 }
 
 /**
- * Loads the combined constitution and returns its SHA-256 hex digest.
+ * Loads the combined constitution and returns its SHA-256 hex digest, the
+ * value a compile of that text records as `constitutionHash`.
  */
 export function computeConstitutionHash(basePath: string): string {
-  const text = loadConstitutionText(basePath);
-  return createHash('sha256').update(text).digest('hex');
+  return hashConstitutionText(loadConstitutionText(basePath));
 }
 
 /**
@@ -441,6 +527,41 @@ export function getDaemonSocketPath(): string {
 }
 
 /**
+ * Returns the daemon singleton lock path: {home}/daemon.lock
+ *
+ * The running daemon holds this lock (see src/daemon/daemon-lock.ts), so a
+ * second daemon on the same home refuses to start. CLI job commands that run
+ * locally because no daemon answered hold it too.
+ */
+export function getDaemonLockPath(): string {
+  return resolve(getIronCurtainHome(), 'daemon.lock');
+}
+
+/**
+ * Returns the Signal transport lock path: {home}/signal.lock
+ *
+ * Held by the one process that runs the Signal transport for this home
+ * (`ironcurtain bot`, or the daemon unless `--no-signal`; see
+ * src/signal/signal-lock.ts), so a second one never attaches to the same
+ * signal-cli container and its messages.
+ */
+export function getSignalLockPath(): string {
+  return resolve(getIronCurtainHome(), 'signal.lock');
+}
+
+/**
+ * Returns the prune lock path: {home}/prune.lock
+ *
+ * Held by whoever removes old sessions, workflow runs, run records and
+ * dependency caches (`ironcurtain prune`, or the daemon with
+ * `retention.autoPrune`), so two prunes never run at once. See
+ * src/maintenance/prune.ts.
+ */
+export function getPruneLockPath(): string {
+  return resolve(getIronCurtainHome(), 'prune.lock');
+}
+
+/**
  * Returns the web UI state file path: {home}/web-ui.json
  *
  * The daemon writes connection info (port + auth token) here on startup
@@ -503,6 +624,62 @@ export function getJobRunsDir(jobId: string): string {
   return resolve(getJobDir(jobId), 'runs');
 }
 
+/**
+ * Returns the daemon-owned bare mirror of a job's `gitRepo`:
+ * {home}/jobs/{jobId}/repo.git/
+ *
+ * Host git fetches into this mirror and rebuilds the workspace's `.git`
+ * from it (see src/cron/git-sync.ts). It lies outside the workspace, so it
+ * is never mounted into a container and is a protected path for Code Mode
+ * policy evaluation: the agent can never write the git directory host git
+ * runs against.
+ */
+export function getJobRepoMirrorDir(jobId: string): string {
+  return resolve(getJobDir(jobId), 'repo.git');
+}
+
+// ---------------------------------------------------------------------------
+// Task-scope policy paths (`--task-scoped`)
+// ---------------------------------------------------------------------------
+
+/** Name of the task-scope policy cache directory in the IronCurtain home. */
+export const TASK_POLICIES_DIRNAME = 'task-policies';
+
+/**
+ * Returns the task-scope policy cache: {home}/task-policies/
+ *
+ * Each entry is one compiled task scope, named by its cache key (see
+ * `src/config/task-scope-policy.ts`). The directory lies inside the
+ * IronCurtain home, so it is a protected path for every agent, and each
+ * published entry `{home}/task-policies/{key}/` is one of the policy
+ * directories `validatePolicyDir()` accepts (the `.compile-*` staging
+ * directories beside them are not).
+ */
+export function getTaskPoliciesDir(): string {
+  return resolve(getIronCurtainHome(), TASK_POLICIES_DIRNAME);
+}
+
+/** Cache keys are SHA-256 hex digests; nothing else may name an entry. */
+const TASK_SCOPE_KEY_PATTERN = /^[0-9a-f]{64}$/;
+
+/** True when `key` can name a task scope: a SHA-256 hex digest. */
+export function isTaskScopeKey(key: string): boolean {
+  return TASK_SCOPE_KEY_PATTERN.test(key);
+}
+
+/**
+ * Returns the directory of one compiled task scope:
+ * {home}/task-policies/{key}/
+ *
+ * @throws Error when `key` is not a SHA-256 hex digest.
+ */
+export function getTaskPolicyDir(key: string): string {
+  if (!isTaskScopeKey(key)) {
+    throw new Error(`Invalid task-scope key: ${key}`);
+  }
+  return resolve(getTaskPoliciesDir(), key);
+}
+
 // ---------------------------------------------------------------------------
 // Workflow run paths
 // ---------------------------------------------------------------------------
@@ -512,6 +689,20 @@ export function getJobRunsDir(jobId: string): string {
  */
 export function getWorkflowRunsDir(): string {
   return resolve(getIronCurtainHome(), 'workflow-runs');
+}
+
+/**
+ * Returns the directory holding the cross-process workspace locks of running
+ * workflows and cron job runs: {home}/workflow-workspace-locks/
+ *
+ * Deliberately outside `workflow-runs/`: every subdirectory there is a run,
+ * and the locks must be shared by orchestrators on different base
+ * directories (a daemon and a `workflow resume-standalone <dir>`) and by the
+ * daemon's cron runs, any of which may point at the same workspace. See
+ * src/workflow/run-lock.ts.
+ */
+export function getWorkflowWorkspaceLocksDir(): string {
+  return resolve(getIronCurtainHome(), 'workflow-workspace-locks');
 }
 
 /**

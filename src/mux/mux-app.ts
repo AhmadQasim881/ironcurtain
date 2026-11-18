@@ -7,17 +7,20 @@
 
 /* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment */
 
+import { performance } from 'node:perf_hooks';
 import { createPtyBridge } from '../pty/pty-bridge.js';
 import { resolveIroncurtainBin } from '../pty/resolve-ironcurtain-bin.js';
 import { createMuxInputHandler, SCROLL_LINES, type MuxInputHandler } from './mux-input-handler.js';
 import { createMuxEscalationManager, type MuxEscalationManager } from './mux-escalation-manager.js';
 import { createMuxRenderer, type MuxRenderer } from './mux-renderer.js';
+import { navigateFocus } from './escalation-picker-state.js';
 import { writeTrustedUserContext } from '../escalation/trusted-input.js';
 import { createPasteInterceptor, type PasteInterceptor } from './paste-interceptor.js';
 import type { MuxTab, MuxAction } from './types.js';
 import { validateWorkspacePath } from '../session/workspace-validation.js';
 import { scanResumableSessions } from '../pty/session-scanner.js';
 import { scanPersonas } from './persona-scanner.js';
+import { parseNewCommandArgs } from './new-command-args.js';
 import type { ProviderProfileSnapshot } from './provider-profile-snapshot.js';
 import ora from 'ora';
 import chalk from 'chalk';
@@ -64,8 +67,16 @@ export function createMuxApp(options: MuxAppOptions): MuxApp {
 
   const tabs: MuxTab[] = [];
   let activeTabIndex = 0;
+  /**
+   * Task text from a `/new --task-scoped <task>` whose picker is still open:
+   * the session the picker spawns is task-scoped. Cleared by that spawn and
+   * by cancelling the picker.
+   */
+  let pendingTaskScope: string | undefined;
   let nextTabNumber = 1;
   let running = false;
+  // Monotonic: a wall-clock step must neither skip nor stretch the arming delay.
+  const clock = (): number => performance.now();
 
   // Components (initialized in start())
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -101,6 +112,8 @@ export function createMuxApp(options: MuxAppOptions): MuxApp {
     agentOverride?: string;
     persona?: string;
     providerProfileName?: string;
+    /** Task text for `--task-scoped` (the child compiles the scope). */
+    taskScope?: string;
   }): Promise<MuxTab> {
     const { columns } = process.stdout;
     const ptyRows = renderer.layout.ptyViewportRows;
@@ -120,8 +133,13 @@ export function createMuxApp(options: MuxAppOptions): MuxApp {
       providerProfileName: opts?.providerProfileName,
       model: options.model,
       captureTraces: options.captureTraces,
+      ...(opts?.taskScope !== undefined ? { taskScope: opts.taskScope } : {}),
       muxId: options.muxId,
       muxPid: options.muxPid,
+      // The mux re-renders cells, so the host terminal never sees a query
+      // from the agent: the headless terminal answers it (cursor position,
+      // device attributes) or the agent waits for a reply that never comes.
+      answerTerminalQueries: true,
     });
 
     const tab: MuxTab = {
@@ -203,30 +221,94 @@ export function createMuxApp(options: MuxAppOptions): MuxApp {
     renderer.showMessage(message);
   }
 
+  /**
+   * Shows multi-line output in the dismissible message panel. The footer
+   * flash holds one line only (anything more scrolls the alternate screen),
+   * so a result with several lines opens the panel instead; while another
+   * overlay is open, or when a single line is all there is, the flash is used.
+   */
+  function showLines(title: string, lines: readonly string[]): void {
+    const mode = inputHandler.mode;
+    if (lines.length <= 1 || (mode !== 'pty' && mode !== 'command')) {
+      showMessage(lines.join('\n'));
+      return;
+    }
+    logger.info(`${title}: ${lines.join(' | ')}`);
+    inputHandler.enterMessagePanel(title, lines, mode);
+    renderer.fullRedraw();
+  }
+
+  /** Bulk resolve results are one line per escalation; more than one goes to the panel. */
+  function showResolveResult(message: string): void {
+    showLines('Escalations resolved', message.split('\n'));
+  }
+
   function baseMode(): 'pty' | 'command' {
     return inputHandler.mode === 'command' ? 'command' : 'pty';
   }
 
+  /** Moves the picker's focus one tab; a different escalation re-arms it (see escalation-picker-state.ts). */
   function navigateEscalationTab(direction: 'next' | 'prev'): void {
     const eps = inputHandler.escalationPickerState;
     if (!eps) return;
+    const target = navigateFocus(escalationManager.pendingRefs(), eps.focusedDisplayNumber, direction);
+    if (target) inputHandler.focusEscalation(target);
+  }
 
-    const sortedNums = escalationManager.sortedDisplayNumbers();
-    if (sortedNums.length === 0) return;
-
-    const currentIdx = sortedNums.indexOf(eps.focusedDisplayNumber);
-    let newIdx: number;
-
-    if (currentIdx === -1) {
-      // Focused escalation was resolved/expired -- snap to first
-      newIdx = 0;
-    } else if (direction === 'next') {
-      newIdx = (currentIdx + 1) % sortedNums.length;
-    } else {
-      newIdx = (currentIdx - 1 + sortedNums.length) % sortedNums.length;
+  /**
+   * `/approve all` and `/approve+ all`: opens the confirmation screen that
+   * lists every pending escalation. Nothing is approved here; `y` on that
+   * screen approves exactly the listed set (escalation-approve-reviewed).
+   */
+  function openApproveAllConfirmation(whitelist: boolean): void {
+    const pending = escalationManager.pendingRefs();
+    if (pending.length === 0) {
+      showMessage('No pending escalations');
+      return;
     }
+    const approvable = pending.filter(
+      (ref) => escalationManager.state.pendingEscalations.get(ref.displayNumber)?.request.humanOnly !== true,
+    );
+    if (approvable.length === 0) {
+      const numbers = pending.map((ref) => `#${ref.displayNumber}`).join(', ');
+      showMessage(`Nothing to approve in bulk: ${numbers} must be approved one at a time (/approve N)`);
+      return;
+    }
+    inputHandler.enterBulkApproveConfirm(pending, whitelist, baseMode());
+    renderer.fullRedraw();
+  }
 
-    eps.focusedDisplayNumber = sortedNums[newIdx];
+  /**
+   * `/approve group N` and `/approve+ group N`: opens the confirmation screen
+   * listing every pending escalation that shares #N's whitelist pattern
+   * (escalation/escalation-groups.ts). Nothing is approved here; `y` on that
+   * screen approves exactly the listed members, and only while they are
+   * still exactly the group.
+   */
+  function openApproveGroupConfirmation(displayNumber: number, whitelist: boolean): void {
+    const command = whitelist ? '/approve+' : '/approve';
+    if (!escalationManager.state.pendingEscalations.has(displayNumber)) {
+      showMessage(`No pending escalation #${displayNumber}`);
+      return;
+    }
+    const group = escalationManager.groupOf(displayNumber);
+    if (!group) {
+      showMessage(
+        `Escalation #${displayNumber} is not in a group (no whitelist pattern, or human-only): use ${command} ${displayNumber}`,
+      );
+      return;
+    }
+    if (group.members.length < 2) {
+      showMessage(
+        `No other pending escalation shares the pattern of #${displayNumber}: use ${command} ${displayNumber}`,
+      );
+      return;
+    }
+    inputHandler.enterBulkApproveConfirm(group.members, whitelist, baseMode(), {
+      key: group.key,
+      description: group.description,
+    });
+    renderer.fullRedraw();
   }
 
   async function handleAction(action: MuxAction): Promise<void> {
@@ -297,22 +379,29 @@ export function createMuxApp(options: MuxAppOptions): MuxApp {
             break;
           }
         }
+        // A `/new --task-scoped <task>` that opened this picker scopes the
+        // session it spawns; the task is consumed by this one spawn.
+        const taskScope = pendingTaskScope;
+        pendingTaskScope = undefined;
         const tab = await spawnSession({
           workspacePath: validatedPath,
           persona: action.persona,
           providerProfileName: action.providerProfileName,
+          ...(taskScope !== undefined ? { taskScope } : {}),
         });
         activeTabIndex = tabs.length - 1;
         const personaPrefix = action.persona ? `persona "${action.persona}" ` : '';
+        const scopePrefix = taskScope !== undefined ? 'task-scoped ' : '';
         const profileSuffix = action.providerProfileName ? ` [${action.providerProfileName}]` : '';
         const suffix = validatedPath ? ` in ${validatedPath}` : '';
-        showMessage(`Spawned ${personaPrefix}session #${tab.number}${suffix}${profileSuffix}`);
+        showMessage(`Spawned ${scopePrefix}${personaPrefix}session #${tab.number}${suffix}${profileSuffix}`);
         inputHandler.exitPickerMode();
         renderer.fullRedraw();
         break;
       }
 
       case 'picker-cancel':
+        pendingTaskScope = undefined;
         renderer.fullRedraw();
         break;
 
@@ -328,9 +417,13 @@ export function createMuxApp(options: MuxAppOptions): MuxApp {
       }
 
       case 'persona-spawn': {
-        const personaTab = await spawnSession({ persona: action.persona });
+        const personaTab = await spawnSession({
+          persona: action.persona,
+          ...(action.taskScope !== undefined ? { taskScope: action.taskScope } : {}),
+        });
         activeTabIndex = tabs.length - 1;
-        showMessage(`Spawned persona "${action.persona}" as tab #${personaTab.number}`);
+        const scopePrefix = action.taskScope !== undefined ? 'task-scoped ' : '';
+        showMessage(`Spawned ${scopePrefix}persona "${action.persona}" as tab #${personaTab.number}`);
         renderer.fullRedraw();
         break;
       }
@@ -340,20 +433,19 @@ export function createMuxApp(options: MuxAppOptions): MuxApp {
         break;
 
       case 'escalation-open': {
-        if (escalationManager.pendingCount === 0) {
+        // Ctrl-E is the only way into the picker: an arrival never opens it.
+        const pending = escalationManager.pendingRefs();
+        if (pending.length === 0) {
           showMessage('No pending escalations');
           break;
         }
-        const sortedNums = escalationManager.sortedDisplayNumbers();
-        inputHandler.enterEscalationPickerMode(sortedNums[0], baseMode());
+        inputHandler.enterEscalationPickerMode(pending[0], baseMode());
         renderer.fullRedraw();
         break;
       }
 
       case 'escalation-dismiss': {
-        const sortedNums = escalationManager.sortedDisplayNumbers();
-        const highestPending = sortedNums.length > 0 ? sortedNums[sortedNums.length - 1] : 0;
-        inputHandler.dismissEscalationPicker(highestPending, action.targetMode);
+        inputHandler.dismissEscalationPicker(action.targetMode);
         renderer.fullRedraw();
         break;
       }
@@ -365,19 +457,50 @@ export function createMuxApp(options: MuxAppOptions): MuxApp {
       }
 
       case 'escalation-resolve': {
-        const message = escalationManager.resolve(action.displayNumber, action.decision, action.whitelist);
+        // Bound to the request the picker showed: the manager refuses the
+        // decision when another one is pending under that number.
+        const message = escalationManager.resolve(action.displayNumber, action.decision, {
+          whitelist: action.whitelist,
+          escalationId: action.escalationId,
+        });
         showMessage(message);
         // onChange callback (fired synchronously by resolve) handles focus adjustment,
-        // auto-close, and redraws — no additional redraw needed here.
+        // re-arming, auto-close, and redraws — no additional redraw needed here.
         break;
       }
 
-      case 'escalation-resolve-all': {
-        const message = escalationManager.resolveAll(action.decision, action.whitelist);
-        showMessage(message);
-        // onChange callback handles auto-close and redraws.
+      case 'escalation-deny-all': {
+        const message = escalationManager.denyAll();
+        // onChange (fired synchronously by resolve) has already auto-closed the
+        // picker, so the per-escalation results can open the message panel.
+        showResolveResult(message);
         break;
       }
+
+      case 'escalation-approve-reviewed': {
+        // Close the screen first: the results may open the message panel.
+        inputHandler.exitBulkApproveConfirm();
+        // The manager approves only if the pending set (or, for a group, the
+        // group's members) is still exactly the one the screen listed.
+        const message =
+          action.groupKey !== undefined
+            ? escalationManager.approveGroup(action.reviewed, action.groupKey, { whitelist: action.whitelist })
+            : escalationManager.approveAll(action.reviewed, { whitelist: action.whitelist });
+        renderer.fullRedraw();
+        showResolveResult(message);
+        break;
+      }
+
+      case 'escalation-approve-all-cancel':
+        inputHandler.exitBulkApproveConfirm();
+        renderer.fullRedraw();
+        showMessage('Approve all cancelled: nothing was approved');
+        break;
+
+      case 'message-panel-dismiss':
+        inputHandler.exitMessagePanel();
+        renderer.fullRedraw();
+        break;
 
       case 'scroll-up':
       case 'scroll-down': {
@@ -407,28 +530,78 @@ export function createMuxApp(options: MuxAppOptions): MuxApp {
         const decision = baseCommand === 'approve' ? 'approved' : 'denied';
         const arg = args[0];
         if (!arg) {
-          showMessage(`Usage: /${command} <number> or /${command} all`);
+          showMessage(
+            decision === 'approved'
+              ? `Usage: /${command} <number>, /${command} all or /${command} group <number>`
+              : `Usage: /${command} <number> or /${command} all`,
+          );
           break;
         }
-        let message: string;
-        if (arg === 'all') {
-          message = escalationManager.resolveAll(decision, withWhitelist);
-        } else {
-          const num = parseInt(arg, 10);
-          if (isNaN(num)) {
-            showMessage('Invalid escalation number');
+        if (arg === 'group' && decision === 'approved') {
+          // Group approval only through the screen that lists every member.
+          // A missing number parses as NaN.
+          const groupNumber = args.length > 1 ? parseInt(args[1], 10) : NaN;
+          if (isNaN(groupNumber)) {
+            showMessage(`Usage: /${command} group <number>`);
             break;
           }
-          message = escalationManager.resolve(num, decision, withWhitelist);
+          openApproveGroupConfirmation(groupNumber, withWhitelist);
+          break;
         }
-        showMessage(message);
+        if (arg === 'all') {
+          if (decision === 'approved') {
+            // Bulk approval only through the screen that lists every item.
+            openApproveAllConfirmation(withWhitelist);
+            break;
+          }
+          const message = escalationManager.denyAll();
+          renderer.redrawTabBar();
+          renderer.redrawCommandArea();
+          showResolveResult(message);
+          break;
+        }
+        const num = parseInt(arg, 10);
+        if (isNaN(num)) {
+          showMessage('Invalid escalation number');
+          break;
+        }
+        showMessage(escalationManager.resolve(num, decision, { whitelist: withWhitelist ? 'exact' : false }));
+        renderer.redrawTabBar();
+        renderer.redrawCommandArea();
+        break;
+      }
+
+      case 'approve+dir': {
+        // Approve and whitelist the directory-wide pattern: an explicit
+        // choice, one escalation at a time (never in bulk). The manager
+        // refuses, resolving nothing, when the escalation offers none.
+        const arg = args[0];
+        if (!arg) {
+          showMessage('Usage: /approve+dir <number>');
+          break;
+        }
+        if (arg === 'all' || arg === 'group') {
+          showMessage('Directory-wide whitelisting is chosen one escalation at a time: /approve+dir <number>');
+          break;
+        }
+        const num = parseInt(arg, 10);
+        if (isNaN(num)) {
+          showMessage('Invalid escalation number');
+          break;
+        }
+        showMessage(escalationManager.resolve(num, 'approved', { whitelist: 'directory' }));
         renderer.redrawTabBar();
         renderer.redrawCommandArea();
         break;
       }
 
       case 'new': {
-        const personaArg = args[0];
+        const parsed = parseNewCommandArgs(args);
+        if ('error' in parsed) {
+          showMessage(parsed.error);
+          break;
+        }
+        const personaArg = parsed.persona;
         if (personaArg) {
           // Validate persona before spawning
           const personas = scanPersonas();
@@ -441,9 +614,26 @@ export function createMuxApp(options: MuxAppOptions): MuxApp {
             showMessage(`Persona "${personaArg}" is not compiled. Run: ironcurtain persona compile ${personaArg}`);
             break;
           }
-          void handleAction({ kind: 'persona-spawn', persona: personaArg });
+          if (match.stale) {
+            showMessage(
+              `Persona "${personaArg}" has a stale compiled policy (its constitution changed). ` +
+                `Run: ironcurtain persona compile ${personaArg}`,
+            );
+            break;
+          }
+          if (match.invalidOverrides !== undefined) {
+            showMessage(match.invalidOverrides);
+            break;
+          }
+          void handleAction({
+            kind: 'persona-spawn',
+            persona: personaArg,
+            ...(parsed.taskScope !== undefined ? { taskScope: parsed.taskScope } : {}),
+          });
           break;
         }
+        // Held until the picker spawns (or is cancelled).
+        pendingTaskScope = parsed.taskScope;
         const personas = scanPersonas();
         inputHandler.enterPickerMode(personas, [...providerProfiles]);
         renderer.fullRedraw();
@@ -500,10 +690,16 @@ export function createMuxApp(options: MuxAppOptions): MuxApp {
       }
 
       case 'sessions': {
-        const sessionInfo = [...escalationManager.state.sessions.values()]
-          .map((s) => `  [${s.displayNumber}] ${s.registration.sessionId.substring(0, 8)} ${s.registration.label}`)
-          .join('\n');
-        showMessage(sessionInfo || 'No active sessions');
+        const sessionLines = [...escalationManager.state.sessions.values()].map(
+          (s) => `[${s.displayNumber}] ${s.registration.sessionId.substring(0, 8)} ${s.registration.label}`,
+        );
+        if (sessionLines.length === 0) {
+          showMessage('No active sessions');
+          break;
+        }
+        // One line per session: the message panel, not the one-row flash.
+        inputHandler.enterMessagePanel('Sessions', sessionLines, baseMode());
+        renderer.fullRedraw();
         break;
       }
 
@@ -532,6 +728,7 @@ export function createMuxApp(options: MuxAppOptions): MuxApp {
       if (process.platform === 'darwin') {
         process.stdout.write('\x1b[?1007l');
       }
+      process.stdout.write('\x1b[?7h'); // restore autowrap
       term.grabInput(false);
       term.hideCursor(false);
       term.fullscreen(false);
@@ -596,6 +793,12 @@ export function createMuxApp(options: MuxAppOptions): MuxApp {
 
       term.fullscreen(true);
       term.hideCursor(true);
+      // Autowrap off while fullscreen (DECAWM reset): a write that reaches the
+      // last column of the bottom row would otherwise wrap and scroll the
+      // alternate screen, shifting every region. The renderer also cuts its
+      // text to the width; this is the guard for anything it misses. Restored
+      // on shutdown and at exit.
+      process.stdout.write('\x1b[?7l');
 
       if (process.platform === 'darwin') {
         // On macOS, avoid X11 mouse tracking -- it prevents native text selection
@@ -608,7 +811,17 @@ export function createMuxApp(options: MuxAppOptions): MuxApp {
         term.grabInput({ mouse: 'button' });
       }
 
-      inputHandler = createMuxInputHandler({ initialMode: autoSpawn ? 'pty' : 'command' });
+      inputHandler = createMuxInputHandler({
+        initialMode: autoSpawn ? 'pty' : 'command',
+        // One monotonic clock for the arming delay, shared with the renderer.
+        now: clock,
+        // `a` and `w` approve only an escalation the picker has drawn in full
+        // for the arming delay, and `y` on the approve-all screen only a list
+        // that has been on screen completely; the renderer is created below,
+        // before any key can arrive.
+        displayedEscalation: () => renderer.displayedEscalation,
+        displayedBulkApproval: () => renderer.displayedBulkApproval,
+      });
 
       pasteInterceptor = createPasteInterceptor((text) => {
         if (!running) return;
@@ -636,10 +849,13 @@ export function createMuxApp(options: MuxAppOptions): MuxApp {
         getPersonaPickerState: () => inputHandler.personaPickerState,
         getProviderPickerState: () => inputHandler.providerPickerState,
         getEscalationPickerState: () => inputHandler.escalationPickerState,
+        getBulkApproveState: () => inputHandler.bulkApproveState,
+        getMessagePanelState: () => inputHandler.messagePanelState,
         getScrollOffset: () => {
           const active = getActiveTab();
           return active?.scrollOffset ?? null;
         },
+        now: clock,
       });
 
       term.on('key', (key: string, _matches: unknown, data: { code?: Buffer | number }) => {
@@ -675,62 +891,21 @@ export function createMuxApp(options: MuxAppOptions): MuxApp {
       });
 
       escalationManager.onChange(() => {
-        const pendingCount = escalationManager.pendingCount;
-        const mode = inputHandler.mode;
-
-        // Auto-close: picker is open but nothing left
-        if (mode === 'escalation-picker' && pendingCount === 0) {
-          inputHandler.exitEscalationPickerMode();
+        // The transition rules live in escalation-picker-state.ts
+        // (reconcileEscalationUi): an arrival never takes the keyboard -- the
+        // manager rings the bell, the tab bar and footer show the badge and
+        // the footer banner, and Ctrl-E opens the picker. An open picker
+        // closes when nothing is left and re-arms when its focus snaps to
+        // another escalation; the approve-all screen closes when its set
+        // changes.
+        const transition = inputHandler.reconcileEscalations(escalationManager.pendingRefs());
+        if (transition.outcome === 'picker-closed' || transition.outcome === 'bulk-cancelled') {
           renderer.fullRedraw();
-          return;
+        } else {
+          renderer.redrawTabBar();
+          renderer.redrawCommandArea();
         }
-
-        // Auto-open: new escalation arrived, picker not already open
-        if (pendingCount > 0 && mode !== 'escalation-picker') {
-          const sortedNums = escalationManager.sortedDisplayNumbers();
-          const highestPending = sortedNums[sortedNums.length - 1];
-
-          // Only auto-open if the user hasn't dismissed, OR if a genuinely new
-          // escalation arrived (higher display number than when they dismissed).
-          const shouldAutoOpen =
-            !inputHandler.escalationDismissed || highestPending > inputHandler.escalationDismissedAtNumber;
-
-          if (shouldAutoOpen) {
-            const previousMode = baseMode();
-
-            // If user is in another picker, cancel it first
-            if (mode === 'picker') {
-              inputHandler.exitPickerMode();
-            } else if (mode === 'resume-picker') {
-              inputHandler.exitResumePickerMode();
-            } else if (mode === 'persona-picker') {
-              inputHandler.exitPersonaPickerMode();
-            } else if (mode === 'provider-picker') {
-              inputHandler.exitProviderPickerMode();
-            }
-
-            inputHandler.enterEscalationPickerMode(highestPending, previousMode);
-            renderer.fullRedraw();
-            // BEL is already emitted by the escalation manager's onEscalation handler.
-            return;
-          }
-        }
-
-        // Live update while picker is open: re-validate focused tab
-        if (mode === 'escalation-picker') {
-          const eps = inputHandler.escalationPickerState;
-          if (eps && !escalationManager.state.pendingEscalations.has(eps.focusedDisplayNumber)) {
-            // Focused escalation was resolved or expired -- snap to nearest
-            const sortedNums = escalationManager.sortedDisplayNumbers();
-            if (sortedNums.length > 0) {
-              eps.focusedDisplayNumber = sortedNums[0];
-            }
-            // If sortedNums is empty, auto-close above will handle it on next tick
-          }
-        }
-
-        renderer.redrawTabBar();
-        renderer.redrawCommandArea();
+        if (transition.message) showMessage(transition.message);
       });
 
       escalationManager.startRegistryPolling();
@@ -764,6 +939,7 @@ export function createMuxApp(options: MuxAppOptions): MuxApp {
           if (process.platform === 'darwin') {
             process.stdout.write('\x1b[?1007l');
           }
+          process.stdout.write('\x1b[?7h'); // restore autowrap
           term.grabInput(false);
         }
       });

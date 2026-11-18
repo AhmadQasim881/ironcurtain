@@ -111,7 +111,7 @@ interface ExchangeRecord {
   provider: 'anthropic' | 'openai' | 'unknown';
   method: string;                // 'POST'
   host: string;                  // 'api.anthropic.com'
-  path: string;                  // '/v1/messages?beta=true'
+  path: string;                  // '/v1/messages?beta=true'; credential query values appear as <redacted>
   requestStartedAt: number;      // epoch ms
   requestFinishedAt: number;
   responseFinishedAt: number;
@@ -167,7 +167,7 @@ type ManifestEntry =
   | { schemaVersion: 1; event: 'session-end';   seq; sessionId; persona?; fsmState?; ts;
       exchanges: number;        // record count, computed at write-time
       bytesWritten: number;
-      abortedExchanges: number; // exchanges lost to an upstream truncation
+      abortedExchanges: number; // exchanges lost to an upstream truncation or a capture limit
       poisoned: boolean;        // true ⇒ discard the whole session downstream
       poisonReason?: 'reassembly-failure' | 'disk-error' | 'queue-overflow'
                    | 'infrastructure-teardown' | 'unsupported-encoding' | 'unknown';
@@ -269,13 +269,27 @@ complete `(input → output)` SFT pair:
 
 - **gzip / deflate / br are auto-decompressed** on the capture branch so
   `bodyUtf8` is what the SDK observed; the original `content-encoding` is kept as
-  metadata. `zstd` is not supported by Node's `zlib` → such a session is poisoned
-  (`unsupported-encoding`).
+  metadata. Other response encodings (`zstd`, ...) are not decoded for capture →
+  such a session is poisoned (`unsupported-encoding`). Request bodies are kept as
+  sent: a compressed request body is stored in `bodyBase64` with its
+  `contentEncoding`.
 - **Credentials are redacted** at write time — `authorization`, `x-api-key`,
-  `proxy-authorization`, `cookie`, `set-cookie` are replaced with `<redacted>`
-  (see `redactHeaders` in `trajectory-types.ts`). Capture also reads the
-  agent-facing request *before* the fake→real key swap, so a real provider key
-  never reaches the snapshot regardless.
+  `x-goog-api-key`, `api-key`, `anthropic-api-key`, `proxy-authorization`,
+  `cookie`, `cookie2` and `set-cookie` are replaced with `<redacted>` (see
+  `redactHeaders` in `trajectory-types.ts`), and so is the value of a credential
+  query parameter (`key`, `api_key`, `access_token`, ...) in the recorded `path`.
+  Capture also reads the agent-facing request *before* the fake→real key swap,
+  so a real provider key never reaches the snapshot regardless.
+- **The request is the agent's request.** The record holds the request body as
+  the agent sent it, before the proxy's request sanitizers removed hosted tools
+  (provider web search or fetch tools and the like), so tools the proxy stripped
+  still appear in captured request bodies even though the provider never saw
+  them.
+- **Bounded.** The request tee of a streamed exchange is capped at the
+  provider's request limit (32 MiB, 50 MiB for OpenAI and Codex); past it the
+  request is still forwarded, but that exchange is dropped from the capture and
+  counted in `session-end.abortedExchanges`. Responses are bounded the same way
+  (see "The binary session model").
 
 **Not captured:**
 
@@ -355,6 +369,15 @@ session in the bundle rather than dropping individual records — see
 `trajectory-capture.ts`, `HIGH_WATERMARK`), `unsupported-encoding` (zstd), and
 `infrastructure-teardown` (a synthetic `session-end` emitted by `close()` for a
 session whose orchestrator `finally` didn't run — e.g. SIGINT).
+
+**Capture limits are not poison either.** An exchange that exceeds a capture
+limit — SSE framing over 128 MiB per stream, 32 MiB per line or event, or 400,000
+events; a decoder's size, expansion or backlog limit; a verbatim body over
+128 MiB; the request tee limit above — is dropped on its own and counted in
+`abortedExchanges`, with the log line `exchange dropped (capture-limit)`. Only
+parser faults, corrupt or unsupported encodings and writer failures poison a
+session. Captured `usage` and `stop_reason` are read at their protocol position,
+so nested keys of the same name inside content cannot hijack them.
 
 **An upstream transport truncation is not one of them.** When a stream ends
 before its terminal event (`message_stop` / `[DONE]` / `response.completed`)

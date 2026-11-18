@@ -50,6 +50,14 @@ describe('evolve workflow manifest', () => {
         researcher: { prompt: string; transitions: Array<{ to: string }> };
         analyzer: { prompt: string; transitions: Array<{ to: string }> };
         analysis_record: { transitions: Array<{ to: string; when?: { verdict?: string } }> };
+        workers: { transitions: Array<{ to: string; when?: { verdict?: string } }> };
+        stop_check: {
+          type: string;
+          container: boolean;
+          resultFile: string;
+          run: string[][];
+          transitions: Array<{ to: string; when?: { verdict?: string } }>;
+        };
         preflight_review: {
           type: string;
           present: string[];
@@ -104,7 +112,33 @@ describe('evolve workflow manifest', () => {
     expect(raw.states.analyzer.prompt).toContain('{laneDir}/result.json');
     expect(raw.states.analyzer.prompt).toContain('{laneDir}/analysis.md');
     expect(raw.states.analyzer.prompt).not.toContain('/workspace/.evolve_runs/main/current/result.json');
-    expect(raw.states.analysis_record.transitions.find((t) => t.when?.verdict === 'recorded')?.to).toBe('orchestrator');
+    // A recorded round (fan-out batch or the in-place recovery round) goes to the
+    // deterministic stop check, never straight back to the orchestrator agent:
+    // the round budget is enforced by the bridge, not by an LLM verdict.
+    expect(raw.states.analysis_record.transitions.find((t) => t.when?.verdict === 'recorded')?.to).toBe('stop_check');
+    expect(raw.states.workers.transitions.find((t) => t.when?.verdict === 'recorded')?.to).toBe('stop_check');
+    expect(raw.states.stop_check).toMatchObject({
+      type: 'deterministic',
+      container: true,
+      resultFile: '.evolve_runs/main/current/stop_check.json',
+    });
+    expect(raw.states.stop_check.run).toEqual([
+      [
+        '/opt/workflow-venv/bin/python',
+        '/workflow-scripts/evolve_result.py',
+        'stop_check',
+        '--run-dir',
+        '/workspace/.evolve_runs/main',
+        '--result-file',
+        '/workspace/.evolve_runs/main/current/stop_check.json',
+      ],
+    ]);
+    expect(raw.states.stop_check.transitions).toEqual([
+      { to: 'final_summary', when: { verdict: 'stop' } },
+      { to: 'orchestrator', when: { verdict: 'continue' } },
+      { to: 'failed', when: { verdict: 'result_file_error' } },
+      { to: 'failed' },
+    ]);
     expect(raw.states.preflight_review).toMatchObject({
       type: 'human_gate',
       acceptedEvents: ['APPROVE', 'FORCE_REVISION', 'ABORT'],
@@ -1598,6 +1632,124 @@ describe('evolve_result.py bridge', () => {
     expect(signals).toMatchObject({ done_rounds: 3, max_rounds: 3, stop_reason: 'max_rounds' });
     // The barrier write is over ALL nodes, not the stale value.
     expect(signals.stop_reason).not.toBe('stale');
+  });
+
+  // ---------------------------------------------------------------------------
+  // stop_check: the deterministic round-boundary verdict the workflow routes on
+  // (WFE-14). The orchestrator agent is never asked whether to stop.
+  // ---------------------------------------------------------------------------
+
+  it('stop_check emits stop once max_rounds is reached, recomputing over the durable nodes', () => {
+    const scriptsDir = writeHarness({});
+    const runDir = resolve(tmpDir, 'stop-check-max-rounds');
+    writeStopRunSpec(runDir, { criterion: 'eval_score >= 99', maxRounds: 2, patience: 5 });
+    writeNodes(runDir, [1, 2], 1);
+    mkdirSync(resolve(runDir, 'current'), { recursive: true });
+    // A stale canonical file claiming "no stop" must not decide the verdict.
+    writeFileSync(resolve(runDir, 'current', 'stop_signals.json'), '{"stop_reason":null}\n');
+
+    const { status, result } = runBridge(scriptsDir, ['stop_check', '--run-dir', runDir]);
+
+    expect(status).toBe(0);
+    expect(result).toMatchObject({
+      verdict: 'stop',
+      passed: true,
+      payload: { stop_reason: 'max_rounds', done_rounds: 2, max_rounds: 2 },
+    });
+    // The canonical file the agents read is rewritten with the same decision.
+    expect(readStopSignals(runDir)).toMatchObject({ stop_reason: 'max_rounds', done_rounds: 2 });
+  });
+
+  it('stop_check emits stop for target_met and patience, continue while no stop condition holds', () => {
+    const scriptsDir = writeHarness({});
+    const target = resolve(tmpDir, 'stop-check-target');
+    writeStopRunSpec(target, { criterion: 'eval_score >= 3', maxRounds: 10, patience: 5 });
+    writeNodes(target, [1, 3], 1);
+    expect(runBridge(scriptsDir, ['stop_check', '--run-dir', target]).result).toMatchObject({
+      verdict: 'stop',
+      payload: { stop_reason: 'target_met' },
+    });
+
+    const patience = resolve(tmpDir, 'stop-check-patience');
+    writeStopRunSpec(patience, { criterion: 'eval_score >= 99', maxRounds: 10, patience: 2 });
+    writeNodes(patience, [2, 2, 2], 1);
+    expect(runBridge(scriptsDir, ['stop_check', '--run-dir', patience]).result).toMatchObject({
+      verdict: 'stop',
+      payload: { stop_reason: 'patience' },
+    });
+
+    const running = resolve(tmpDir, 'stop-check-continue');
+    writeStopRunSpec(running, { criterion: 'eval_score >= 99', maxRounds: 10, patience: 5 });
+    writeNodes(running, [1, 2], 1);
+    expect(runBridge(scriptsDir, ['stop_check', '--run-dir', running]).result).toMatchObject({
+      verdict: 'continue',
+      passed: true,
+      payload: { stop_reason: null, done_rounds: 2 },
+    });
+  });
+
+  it('stop_check fails (non-zero, no verdict) when the node database cannot be read', () => {
+    const scriptsDir = writeHarness({});
+    const runDir = resolve(tmpDir, 'stop-check-corrupt');
+    writeStopRunSpec(runDir, { criterion: 'eval_score >= 99', maxRounds: 2, patience: 5 });
+    mkdirSync(resolve(runDir, 'database_data'), { recursive: true });
+    writeFileSync(resolve(runDir, 'database_data', 'nodes.json'), '{not json');
+    const resultFile = resolve(tmpDir, 'corrupt-result.json');
+
+    const completed = spawnSync(
+      PYTHON,
+      [resolve(scriptsDir, 'evolve_result.py'), 'stop_check', '--run-dir', runDir, '--result-file', resultFile],
+      { encoding: 'utf-8' },
+    );
+
+    // The workflow routes a failed command to `failed`: an undecidable stop
+    // never continues the search.
+    expect(completed.status).not.toBe(0);
+    expect(existsSync(resultFile)).toBe(false);
+  });
+
+  it('stop_check fails closed when the run spec carries no positive round budget', () => {
+    // _compute_stop_signals reads a missing spec or budget as "no round limit",
+    // so without this check a deleted or zeroed budget would keep the search
+    // going until the visit backstop.
+    const scriptsDir = writeHarness({});
+    const cases: Array<{ label: string; spec?: Record<string, unknown> }> = [
+      { label: 'missing' },
+      {
+        label: 'no-budget',
+        spec: { evaluation: { core_score: 'eval_score', success_criteria: ['eval_score >= 99'] } },
+      },
+      { label: 'zero', spec: { budget: { max_rounds: 0, patience: 5 } } },
+      { label: 'non-integer', spec: { budget: { max_rounds: 'many', patience: 5 } } },
+    ];
+    for (const { label, spec } of cases) {
+      const runDir = resolve(tmpDir, `stop-check-budget-${label}`);
+      writeNodes(runDir, [1, 2], 1);
+      if (spec) writeFileSync(resolve(runDir, 'run_spec.yaml'), JSON.stringify(spec) + '\n');
+      const resultFile = resolve(tmpDir, `stop-check-budget-${label}.json`);
+
+      const completed = spawnSync(
+        PYTHON,
+        [resolve(scriptsDir, 'evolve_result.py'), 'stop_check', '--run-dir', runDir, '--result-file', resultFile],
+        { encoding: 'utf-8' },
+      );
+
+      expect(completed.status, label).not.toBe(0);
+      expect(completed.stderr, label).toContain('the round budget cannot be enforced');
+      expect(existsSync(resultFile), label).toBe(false);
+    }
+
+    // A string count is still a count (run specs are YAML).
+    const quoted = resolve(tmpDir, 'stop-check-budget-quoted');
+    writeNodes(quoted, [1, 2], 1);
+    writeFileSync(
+      resolve(quoted, 'run_spec.yaml'),
+      JSON.stringify({ budget: { max_rounds: '2', patience: 5 } }) + '\n',
+    );
+    expect(runBridge(scriptsDir, ['stop_check', '--run-dir', quoted]).result).toMatchObject({
+      verdict: 'stop',
+      payload: { stop_reason: 'max_rounds', max_rounds: 2 },
+    });
   });
 
   // ---------------------------------------------------------------------------

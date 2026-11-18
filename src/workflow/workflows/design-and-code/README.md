@@ -19,7 +19,7 @@ The workflow drives a Docker-isolated `claude-code` agent through distinct roles
 | 2 | `design` | Architect — module structure, interfaces, typed signatures | `.workflow/spec/spec.md` |
 | — | `design_review` | **Human gate** — approve, request a revision, or abort | — |
 | 3 | `implement` | Engineer — writes the code and unit tests, runs them | `src/`, tests |
-| 4 | `review` | Reviewer — checks correctness, edge cases, quality, coverage | `.workflow/reviews/review.md` |
+| 4 | `review` | Reviewer (read-only) — checks correctness, edge cases, quality, coverage | `.workflow/reviews/review.md` |
 
 ## Human gates
 
@@ -32,17 +32,17 @@ At each gate the presented artifact (`plan` or `spec`) is shown for inspection. 
 
 ## The coder–critic loop
 
-After implementation, the **reviewer** judges the code against the spec:
+After implementation, the **reviewer** judges the code against the spec. It runs with a **read-only workspace** (`workspaceAccess: read-only`): `/workspace` is mounted read-only and the policy engine denies every change outside `.workflow/reviews/`, whatever the persona allows, so a reviewer misled by the code it reads cannot change that code. It writes its review through the filesystem tool.
 
 - **`approved`** → the workflow completes (`done`).
 - **`rejected`** → control returns to `implement` with the review feedback, and the cycle repeats.
 
-The loop is bounded by `maxRounds` (**3**). If the reviewer is still rejecting when the limit is reached, the workflow raises an **escalation gate** so a human can approve as-is, force another revision, or abort — it never loops forever.
+The loop is bounded by `maxRounds` (**3**). If the reviewer is still rejecting when the limit is reached, the workflow raises an **escalation gate** so a human can approve as-is, force another revision, or abort — it never loops forever. Revisions requested at the plan and design gates do not use up these rounds: approving the plan or the design resets that phase's visit count.
 
 ## At a glance
 
 - **Mode:** Docker (`claude-code` agent, `--network=none`)
-- **Persona:** `global` for every agent state
+- **Persona:** `global` for every agent state; `review` is read-only (it can write only `.workflow/reviews/`)
 - **Max rounds:** 3 (implement ⇄ review)
 - **Artifacts:** `plan`, `spec`, `reviews` — all under `.workflow/`
 - **Terminal states:** `done` (success) · `aborted` (stopped at a gate)

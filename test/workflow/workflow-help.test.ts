@@ -26,7 +26,7 @@ describe('workflow help', () => {
     expect(help).toContain('status');
     expect(help).toContain('Print one status snapshot and exit; use for stateless polling');
     expect(help).toContain(
-      'Subscribe and exit at the next gate or terminal (not ordinary transitions); use for automation',
+      'Subscribe and exit at the next gate, tool-call escalation or terminal (not ordinary transitions); use for automation',
     );
     expect(help).toContain('Continuously stream transitions/events; does not exit after one');
     expect(help).toContain('Max seconds to await; timeout exits while the workflow keeps running');

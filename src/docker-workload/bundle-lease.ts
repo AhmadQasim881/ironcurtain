@@ -13,10 +13,22 @@ import {
   runtimeIdentitySchema,
   timestampSchema,
 } from '../zod-helpers.js';
-import { acquireProcessLock, ProcessLockBusyError } from './process-lock.js';
-import { resourceWatchdogPolicySchema } from '../docker/resource-watchdog.js';
+import {
+  acquireProcessLock,
+  getProcessStartIdentity,
+  getSelfProcessStartIdentity,
+  ProcessLockBusyError,
+} from './process-lock.js';
+import { RESOURCE_WATCHDOG_POLICY_SCHEMA_VERSION, resourceWatchdogPolicySchema } from '../docker/resource-watchdog.js';
+import { boundIncidentDetail } from './incident-detail.js';
 
-export const DOCKER_WORKLOAD_LEASE_SCHEMA_VERSION = 2;
+/**
+ * Version 3 binds the coordinator to its OS process-start identity, so a fresh
+ * reconciler can tell a live coordinator whose heartbeat only looks stale (host
+ * sleep, a clock step) from a dead one or a reused PID. Versions 1 and 2 stay
+ * readable and are never upgraded in place.
+ */
+export const DOCKER_WORKLOAD_LEASE_SCHEMA_VERSION = 3;
 export const MAX_DOCKER_WORKLOAD_LEASE_BYTES = 1024 * 1024;
 
 const absolutePathSchema = z
@@ -28,6 +40,9 @@ const absolutePathSchema = z
   });
 const labelKeySchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/u);
 
+/** Default label whose value, the lease generation, marks every outer resource the lease owns. */
+export const DOCKER_WORKLOAD_OWNERSHIP_LABEL_KEY = 'com.ironcurtain.docker-workload.generation';
+
 /**
  * Bounds for the separation between the two cleanup inventories. The lease owns
  * this rule: it stores the value, enforces it on close, and exports both halves
@@ -35,6 +50,26 @@ const labelKeySchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/u);
  */
 export const cleanupInventoryGapMsSchema = z.number().int().min(100).max(60_000);
 export const outerResourceKindSchema = z.enum(['container', 'network', 'volume']);
+
+const allocatedBytesSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+
+/**
+ * The runtime-owned host file holding an outer container's writable storage
+ * (an Apple VM's rootfs image), pinned by path and inode when the container is
+ * observed. The watchdog charges the bundle for allocation above
+ * `baselineAllocatedBytes`, recorded when the lease activates so the trusted
+ * bootstrap is not billed; it is null until then.
+ */
+const outerResourceStorageSchema = z
+  .object({
+    kind: z.literal('host-file'),
+    path: absolutePathSchema,
+    device: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    inode: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    boundAt: timestampSchema,
+    baselineAllocatedBytes: allocatedBytesSchema.nullable(),
+  })
+  .strict();
 
 const outerResourceSchema = z
   .object({
@@ -47,6 +82,7 @@ const outerResourceSchema = z
     requestedAt: timestampSchema,
     observedId: runtimeIdentitySchema.nullable(),
     observedAt: timestampSchema.nullable(),
+    storage: outerResourceStorageSchema.optional(),
     removal: z
       .object({
         proof: z.enum(['immutable-id-absent', 'requested-name-absent']),
@@ -58,6 +94,9 @@ const outerResourceSchema = z
   })
   .strict()
   .superRefine((resource, context) => {
+    if (resource.storage !== undefined && (resource.kind !== 'container' || resource.observedId === null)) {
+      context.addIssue({ code: 'custom', message: 'only an observed container may bind runtime storage' });
+    }
     if ((resource.observedId === null) !== (resource.observedAt === null)) {
       context.addIssue({ code: 'custom', message: 'resource observation ID/time must be recorded together' });
     }
@@ -75,6 +114,21 @@ const outerResourceSchema = z
     }
   });
 
+/** OS process-start identity: Linux boot ID plus start ticks, or the macOS `ps` start time. */
+const processStartIdentitySchema = z
+  .string()
+  .min(1)
+  .max(256)
+  .regex(/^[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?$/u);
+const legacyCoordinatorSchema = z
+  .object({
+    pid: z.number().int().positive(),
+    startedAt: timestampSchema,
+    heartbeatAt: timestampSchema,
+  })
+  .strict();
+const coordinatorSchema = legacyCoordinatorSchema.extend({ processIdentity: processStartIdentitySchema }).strict();
+
 const leaseBaseSchema = z
   .object({
     leaseId: identifierSchema,
@@ -90,15 +144,24 @@ const leaseBaseSchema = z
         bundleRuntimeRoot: absolutePathSchema.optional(),
         runtimeRoot: absolutePathSchema,
         apiRoot: absolutePathSchema,
+        /**
+         * Reserved for the IronCurtain-in-IronCurtain slice, which is not
+         * scheduled (docs/designs/ironcurtain-in-ironcurtain-hermetic-slice.md,
+         * "Implementation status"). Admission records `<stateRoot>/exchange`
+         * and cleanup removes it, but nothing mounts it into a container.
+         *
+         * It stays required in every schema version, and admission keeps
+         * writing it. `paths` is strict and every lease ever written carries
+         * the field; reconciliation parses every lease directory, closed ones
+         * included, and fences all nested-Docker admission on one it cannot
+         * read; and a detached supervisor from an older release keeps
+         * rereading its lease while newer code updates it. Dropping or
+         * renaming the field therefore needs a lease schema version bump. An
+         * implementation would add a ledgered exchange volume rather than
+         * mount this host directory.
+         */
         exchangeRoot: absolutePathSchema,
         stagingRoot: absolutePathSchema,
-      })
-      .strict(),
-    coordinator: z
-      .object({
-        pid: z.number().int().positive(),
-        startedAt: timestampSchema,
-        heartbeatAt: timestampSchema,
       })
       .strict(),
     cleanupInventoryGapMs: cleanupInventoryGapMsSchema,
@@ -127,26 +190,55 @@ const legacyLeaseBindingsSchema = z
 const leaseBindingsSchema = z.object({ watchdogPolicy: resourceWatchdogPolicySchema }).strict();
 const leaseSchema = z
   .discriminatedUnion('schemaVersion', [
-    leaseBaseSchema.extend({ schemaVersion: z.literal(1), bindings: legacyLeaseBindingsSchema }),
+    leaseBaseSchema.extend({
+      schemaVersion: z.literal(1),
+      coordinator: legacyCoordinatorSchema,
+      bindings: legacyLeaseBindingsSchema,
+    }),
+    leaseBaseSchema.extend({
+      schemaVersion: z.literal(2),
+      coordinator: legacyCoordinatorSchema,
+      bindings: leaseBindingsSchema,
+      dockerEndpoint: dockerEndpointSchema.optional(),
+    }),
     leaseBaseSchema.extend({
       schemaVersion: z.literal(DOCKER_WORKLOAD_LEASE_SCHEMA_VERSION),
+      coordinator: coordinatorSchema,
       bindings: leaseBindingsSchema,
       dockerEndpoint: dockerEndpointSchema.optional(),
     }),
   ])
   .superRefine((lease, context) => {
-    if (lease.schemaVersion === 2 && (lease.runtimeKind === 'docker') !== (lease.dockerEndpoint !== undefined)) {
+    if (lease.schemaVersion !== 1 && (lease.runtimeKind === 'docker') !== (lease.dockerEndpoint !== undefined)) {
       context.addIssue({
         code: 'custom',
         message: 'new Docker leases require exactly one captured Docker endpoint; Apple leases must not have one',
       });
     }
     if (
-      lease.schemaVersion === 2 &&
+      lease.schemaVersion !== 1 &&
       (lease.bindings.watchdogPolicy.targetRoot !== lease.paths.stateRoot ||
         lease.bindings.watchdogPolicy.cleanupInventoryGapMs !== lease.cleanupInventoryGapMs)
     ) {
       context.addIssue({ code: 'custom', message: 'lease watchdog policy must match state root and cleanup interval' });
+    }
+    if (
+      lease.schemaVersion !== 1 &&
+      lease.bindings.watchdogPolicy.schemaVersion === RESOURCE_WATCHDOG_POLICY_SCHEMA_VERSION &&
+      lease.bindings.watchdogPolicy.runtimeKind !== lease.runtimeKind
+    ) {
+      context.addIssue({ code: 'custom', message: 'lease watchdog policy must measure the lease runtime' });
+    }
+    if (lease.resources.some((resource) => resource.storage !== undefined && lease.runtimeKind !== 'apple-container')) {
+      context.addIssue({ code: 'custom', message: 'only Apple container leases bind runtime-owned storage files' });
+    }
+    if (
+      lease.status === 'active' &&
+      lease.resources.some(
+        (resource) => resource.storage !== undefined && resource.storage.baselineAllocatedBytes === null,
+      )
+    ) {
+      context.addIssue({ code: 'custom', message: 'an active lease requires a storage baseline for every bound file' });
     }
     const requestIds = lease.resources.map((resource) => resource.requestId);
     const requestedNames = lease.resources.map((resource) => `${resource.kind}:${resource.requestedName}`);
@@ -223,6 +315,8 @@ export interface CreateDockerWorkloadLeaseOptions {
   readonly bindings: z.infer<typeof leaseBindingsSchema>;
   readonly cleanupInventoryGapMs: number;
   readonly coordinatorPid?: number;
+  /** Start identity of `coordinatorPid`; read from the host process table when omitted. */
+  readonly coordinatorProcessIdentity?: string;
   readonly now?: Date;
 }
 
@@ -240,6 +334,13 @@ export function createDockerWorkloadLease(
 ): DockerWorkloadLease {
   assertCanonicalLeasePath(path);
   const now = (options.now ?? new Date()).toISOString();
+  const coordinatorPid = options.coordinatorPid ?? process.pid;
+  const processIdentity =
+    options.coordinatorProcessIdentity ??
+    (coordinatorPid === process.pid ? getSelfProcessStartIdentity() : getProcessStartIdentity(coordinatorPid));
+  if (processIdentity === undefined) {
+    throw new Error('Docker-workload lease requires the coordinator process start identity');
+  }
   const lease = leaseSchema.parse({
     schemaVersion: DOCKER_WORKLOAD_LEASE_SCHEMA_VERSION,
     leaseId: options.leaseId,
@@ -252,7 +353,8 @@ export function createDockerWorkloadLease(
     paths: options.paths,
     bindings: leaseBindingsSchema.parse(options.bindings),
     coordinator: {
-      pid: options.coordinatorPid ?? process.pid,
+      pid: coordinatorPid,
+      processIdentity,
       startedAt: now,
       heartbeatAt: now,
     },
@@ -359,16 +461,63 @@ function isQualificationObserver(
   return lease.runtimeKind === 'docker' && resource.kind === 'container' && resource.role === 'qualification-observer';
 }
 
-export function activateDockerWorkloadLease(path: string, generation: string, now = new Date()): DockerWorkloadLease {
+/** Pin one observed container's runtime-owned storage file before the container can run untrusted work. */
+export function bindDockerWorkloadOuterResourceStorage(
+  path: string,
+  generation: string,
+  requestId: string,
+  storage: { readonly kind: 'host-file'; readonly path: string; readonly device: number; readonly inode: number },
+  now = new Date(),
+): DockerWorkloadLease {
+  return updateLease(path, generation, now, (lease) => {
+    if (lease.status !== 'admitting') throw new Error('runtime storage may be bound only during admission');
+    const resource = requiredResource(lease, requestId);
+    if (resource.observedId === null) throw new Error(`outer resource is not observed yet: ${requestId}`);
+    if (resource.storage !== undefined) throw new Error(`outer resource storage was already bound: ${requestId}`);
+    resource.storage = {
+      kind: storage.kind,
+      path: storage.path,
+      device: storage.device,
+      inode: storage.inode,
+      boundAt: now.toISOString(),
+      baselineAllocatedBytes: null,
+    };
+  });
+}
+
+/**
+ * Admitting → active. `storageBaselines` carries, per request ID, the allocated
+ * bytes of every bound storage file at this instant: growth above them is what
+ * the watchdog charges to the released bundle.
+ */
+export function activateDockerWorkloadLease(
+  path: string,
+  generation: string,
+  now = new Date(),
+  storageBaselines: ReadonlyMap<string, number> = new Map(),
+): DockerWorkloadLease {
   return updateLease(path, generation, now, (lease) => {
     if (lease.status !== 'admitting') throw new Error('only an admitting Docker-workload lease may become active');
     if (lease.resources.length === 0 || lease.resources.some((resource) => resource.observedId === null)) {
       throw new Error('Docker-workload lease cannot activate before every requested outer resource is observed');
     }
+    const bound = lease.resources.filter((resource) => resource.storage !== undefined);
+    if (bound.length !== storageBaselines.size || bound.some((resource) => !storageBaselines.has(resource.requestId))) {
+      throw new Error('Docker-workload lease activation requires a baseline for exactly every bound storage file');
+    }
+    for (const resource of bound) {
+      const baseline = allocatedBytesSchema.parse(storageBaselines.get(resource.requestId));
+      if (resource.storage !== undefined) resource.storage.baselineAllocatedBytes = baseline;
+    }
     lease.status = 'active';
   });
 }
 
+/**
+ * The coordinator's progress marker. Only the coordinator writes it; observers
+ * judge liveness by when they see it change, not by comparing its wall-clock
+ * value with their own (and never by `sequence`, which every writer bumps).
+ */
 export function heartbeatDockerWorkloadLease(path: string, generation: string, now = new Date()): DockerWorkloadLease {
   return updateLease(path, generation, now, (lease) => {
     if (lease.status !== 'admitting' && lease.status !== 'active') {
@@ -445,6 +594,12 @@ export function closeDockerWorkloadLease(
   });
 }
 
+/**
+ * Record the lease's first incident. The detail is bounded here, at the one
+ * choke point every writer uses, so an over-long error message (an inventory
+ * failure embeds its whole argv) can never fail the lease schema and leave the
+ * incident unrecorded.
+ */
 export function recordDockerWorkloadLeaseIncident(
   path: string,
   generation: string,
@@ -455,7 +610,11 @@ export function recordDockerWorkloadLeaseIncident(
     if (lease.status === 'closed') throw new Error('cannot record incident for closed Docker-workload lease');
     if (lease.incident !== null) throw new Error('Docker-workload lease already has incident history');
     lease.status = 'incident';
-    lease.incident = { ...incident, recordedAt: now.toISOString() };
+    lease.incident = {
+      code: incident.code,
+      detail: boundIncidentDetail(incident.detail),
+      recordedAt: now.toISOString(),
+    };
   });
 }
 

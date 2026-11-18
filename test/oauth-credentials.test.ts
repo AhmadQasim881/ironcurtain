@@ -1,8 +1,19 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import {
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  lstatSync,
+  symlinkSync,
+} from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir, platform, homedir } from 'node:os';
 import type { IronCurtainConfig } from '../src/config/types.js';
+import { testUserConfig } from './helpers/user-config.js';
 import {
   parseCredentialsJson,
   parseAnthropicCredentialsJson,
@@ -55,33 +66,15 @@ function makeConfig(overrides?: Partial<IronCurtainConfig['userConfig']>): IronC
     constitutionPath: '/tmp/constitution.md',
     agentModelId: 'anthropic:claude-sonnet-4-6',
     escalationTimeoutSeconds: 300,
-    userConfig: {
-      agentModelId: 'anthropic:claude-sonnet-4-6',
-      policyModelId: 'anthropic:claude-sonnet-4-6',
-      anthropicApiKey: '',
-      googleApiKey: '',
-      openaiApiKey: '',
-      escalationTimeoutSeconds: 300,
-      resourceBudget: {
-        maxTotalTokens: 1_000_000,
-        maxSteps: 200,
-        maxSessionSeconds: 1800,
-        maxEstimatedCostUsd: 5.0,
-        warnThresholdPercent: 80,
-      },
+    userConfig: testUserConfig({
       autoCompact: {
         enabled: true,
         thresholdTokens: 160_000,
         keepRecentMessages: 10,
         summaryModelId: 'anthropic:claude-haiku-4-5',
       },
-      autoApprove: { enabled: false, modelId: 'anthropic:claude-haiku-4-5' },
-      auditRedaction: { enabled: true },
-      webSearch: { provider: null, brave: null, tavily: null, serpapi: null },
-      serverCredentials: {},
-      signal: null,
       ...overrides,
-    },
+    }),
   };
 }
 
@@ -520,7 +513,20 @@ describe('detectAuthMethod', () => {
       expect(result.credentials.accessToken).toBe('sk-ant-oat01-refreshed');
       expect(result.filePath).toBe(filePath);
     }
-    expect(saveToFile).toHaveBeenCalledWith(refreshed, filePath);
+    expect(saveToFile).toHaveBeenCalledWith(refreshed, filePath, { refreshedFrom: 'sk-ant-ort01-expired' });
+  });
+
+  it('uses the credentials the write-back kept when the host stored newer ones meanwhile', async () => {
+    const filePath = '/home/user/.claude/.credentials.json';
+    const hostCreds = validCreds({ accessToken: 'sk-ant-oat01-host-newer', refreshToken: 'sk-ant-ort01-host' });
+    const sources = makeSources({
+      loadFromFilesWithSource: () => [{ credentials: expiredCreds(), filePath }],
+      refreshToken: async () => validCreds({ accessToken: 'sk-ant-oat01-ours' }),
+      saveToFile: vi.fn(() => hostCreds),
+    });
+
+    const result = await detectAuthMethod(makeConfig(), sources);
+    expect(result).toMatchObject({ kind: 'oauth', source: 'file', filePath, credentials: hostCreds });
   });
 
   it('does not let an expired legacy file shadow a valid Anthropic CLI file', async () => {
@@ -567,7 +573,7 @@ describe('detectAuthMethod', () => {
       expect(result.credentials.accessToken).toBe('sk-ant-oat01-cli-refreshed');
       expect(result.filePath).toBe(cliPath);
     }
-    expect(saveToFile).toHaveBeenCalledWith(refreshed, cliPath);
+    expect(saveToFile).toHaveBeenCalledWith(refreshed, cliPath, { refreshedFrom: 'sk-ant-ort01-cli-good' });
   });
 
   it('refreshes CLI-store credentials with their own client kind', async () => {
@@ -701,7 +707,7 @@ describe('detectAuthMethod', () => {
       expect(result.credentials.accessToken).toBe('sk-ant-oat01-refreshed');
       expect(result.source).toBe('file');
     }
-    expect(saveFn).toHaveBeenCalledWith(refreshed, undefined);
+    expect(saveFn).toHaveBeenCalledWith(refreshed, undefined, { refreshedFrom: 'sk-ant-ort01-expired' });
   });
 
   it('refreshes expired Keychain credentials and returns keychainServiceName', async () => {
@@ -1248,6 +1254,110 @@ describe('saveOAuthCredentials', () => {
     expect(saved.claudeAiOauth).toBeUndefined();
   });
 
+  it('never clobbers a newer token the host stored while the refresh was in flight', () => {
+    const filePath = resolve(tmpDir, '.credentials.json');
+    // We refreshed from rt-0; meanwhile the host rotated it to host-rt and rewrote the file.
+    const hostFile = `${JSON.stringify({
+      claudeAiOauth: {
+        accessToken: 'host-at',
+        refreshToken: 'host-rt',
+        expiresAt: Date.now() + 8 * 3_600_000,
+        scopes: ['user:inference'],
+      },
+      mcpOAuth: { server: { token: 'keep' } },
+    })}\n`;
+    writeFileSync(filePath, hostFile, { mode: 0o600 });
+
+    const ours = validCreds({ accessToken: 'ours-at', refreshToken: 'ours-rt', expiresAt: Date.now() + 3_600_000 });
+    const result = saveOAuthCredentials(ours, filePath, { refreshedFrom: 'rt-0' });
+
+    expect(readFileSync(filePath, 'utf-8')).toBe(hostFile);
+    expect(result).toMatchObject({ accessToken: 'host-at', refreshToken: 'host-rt' });
+  });
+
+  it('replaces a stored token that still holds the refresh token our grant rotated away, even if it lasts longer', () => {
+    const filePath = resolve(tmpDir, '.credentials.json');
+    writeFileSync(
+      filePath,
+      JSON.stringify({
+        claudeAiOauth: { accessToken: 'old-at', refreshToken: 'rt-0', expiresAt: Date.now() + 8 * 3_600_000 },
+      }),
+    );
+
+    const ours = validCreds({ accessToken: 'ours-at', refreshToken: 'rt-1', expiresAt: Date.now() + 3_600_000 });
+    expect(saveOAuthCredentials(ours, filePath, { refreshedFrom: 'rt-0' })).toEqual(ours);
+    expect(JSON.parse(readFileSync(filePath, 'utf-8')).claudeAiOauth.refreshToken).toBe('rt-1');
+  });
+
+  it('never clobbers a newer token in the Anthropic CLI store (whole seconds)', () => {
+    const filePath = resolve(tmpDir, 'default.json');
+    const later = { ...VALID_ANTHROPIC_CLI_CREDENTIALS, expires_at: Math.floor(Date.now() / 1000) + 7_200 };
+    const hostFile = JSON.stringify(later);
+    writeFileSync(filePath, hostFile);
+
+    // Neither refresh rotated the refresh token; the stored access token simply lasts longer.
+    const ours = validCreds({ accessToken: 'ours-at', refreshToken: later.refresh_token });
+    const result = saveOAuthCredentials(ours, filePath, { refreshedFrom: later.refresh_token });
+
+    expect(readFileSync(filePath, 'utf-8')).toBe(hostFile);
+    expect(result).toMatchObject({ accessToken: later.access_token, clientKind: 'anthropic-cli' });
+  });
+
+  it('keeps a still-valid token that replaced the refresh token we refreshed from (host rotation or re-login)', () => {
+    const filePath = resolve(tmpDir, '.credentials.json');
+    const hostFile = JSON.stringify({
+      claudeAiOauth: { accessToken: 'relogin-at', refreshToken: 'relogin-rt', expiresAt: Date.now() + 30 * 60_000 },
+    });
+    writeFileSync(filePath, hostFile);
+
+    const ours = validCreds({ accessToken: 'ours-at', refreshToken: 'ours-rt', expiresAt: Date.now() + 3_600_000 });
+    expect(saveOAuthCredentials(ours, filePath, { refreshedFrom: 'old-rt' })).toMatchObject({
+      accessToken: 'relogin-at',
+    });
+    expect(readFileSync(filePath, 'utf-8')).toBe(hostFile);
+  });
+
+  it('replaces the token it refreshed from atomically and owner-only under umask 002', () => {
+    const filePath = resolve(tmpDir, '.credentials.json');
+    writeFileSync(
+      filePath,
+      JSON.stringify({ claudeAiOauth: { accessToken: 'old', refreshToken: 'rt-0', expiresAt: Date.now() - 1_000 } }),
+      { mode: 0o644 },
+    );
+    const ours = validCreds({ accessToken: 'new-at', refreshToken: 'rt-1' });
+
+    const previousUmask = process.umask(0o002);
+    let result: OAuthCredentials;
+    try {
+      result = saveOAuthCredentials(ours, filePath, { refreshedFrom: 'rt-0' });
+    } finally {
+      process.umask(previousUmask);
+    }
+
+    expect(result).toEqual(ours);
+    expect(JSON.parse(readFileSync(filePath, 'utf-8')).claudeAiOauth).toMatchObject({
+      accessToken: 'new-at',
+      refreshToken: 'rt-1',
+    });
+    expect(statSync(filePath).mode & 0o777).toBe(0o600);
+    expect(readdirSync(tmpDir)).toEqual(['.credentials.json']);
+  });
+
+  it('keeps a dotfile-managed (symlinked) credentials file a symlink', () => {
+    const dotfiles = resolve(tmpDir, 'dotfiles');
+    mkdirSync(dotfiles);
+    const real = resolve(dotfiles, 'claude-credentials.json');
+    writeFileSync(real, JSON.stringify(VALID_CREDENTIALS));
+    const link = resolve(tmpDir, '.credentials.json');
+    symlinkSync(real, link);
+
+    saveOAuthCredentials(validCreds({ accessToken: 'new-at', expiresAt: Date.now() + 7_200_000 }), link);
+
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(JSON.parse(readFileSync(real, 'utf-8')).claudeAiOauth.accessToken).toBe('new-at');
+    expect(statSync(real).mode & 0o777).toBe(0o600);
+  });
+
   it('writes the Anthropic CLI format when the CLI store file vanished before save', () => {
     // The origin file can be deleted or rotated by the Anthropic CLI between
     // detection and refresh write-back; the path must decide the format.
@@ -1315,5 +1425,41 @@ describe('saveCodexOAuthCredentials', () => {
     expect(saved.tokens?.refresh_token).toBe('new-refresh');
     expect(saved.tokens?.id_token).toBe('old-id-token');
     expect(saved.tokens?.account_id).toBe('acct_123');
+    expect(statSync(filePath).mode & 0o777).toBe(0o600);
+  });
+
+  it('never clobbers Codex tokens that expire later (JWT exp) than the refreshed ones', () => {
+    const filePath = resolve(tmpDir, 'auth.json');
+    const hostFile = JSON.stringify({
+      auth_mode: 'chatgpt',
+      tokens: { access_token: unsignedJwt({ exp: 4_102_444_800 }), refresh_token: 'host-refresh' },
+    });
+    writeFileSync(filePath, hostFile);
+
+    const result = saveCodexOAuthCredentials(
+      { accessToken: unsignedJwt({ exp: 4_102_441_200 }), refreshToken: 'host-refresh', expiresAt: 4_102_441_200_000 },
+      filePath,
+      { refreshedFrom: 'host-refresh' },
+    );
+
+    expect(readFileSync(filePath, 'utf-8')).toBe(hostFile);
+    expect(result.refreshToken).toBe('host-refresh');
+  });
+
+  it('replaces Codex tokens whose expiry it cannot read', () => {
+    const filePath = resolve(tmpDir, 'auth.json');
+    writeFileSync(
+      filePath,
+      JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: 'opaque', refresh_token: 'old-refresh' } }),
+    );
+
+    saveCodexOAuthCredentials(
+      { accessToken: unsignedJwt({ exp: 4_102_444_800 }), refreshToken: 'new-refresh', expiresAt: 4_102_444_800_000 },
+      filePath,
+      { refreshedFrom: 'old-refresh' },
+    );
+
+    const saved = JSON.parse(readFileSync(filePath, 'utf-8')) as { tokens: Record<string, unknown> };
+    expect(saved.tokens.refresh_token).toBe('new-refresh');
   });
 });

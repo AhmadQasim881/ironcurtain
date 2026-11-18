@@ -18,7 +18,7 @@ import { createContainerRuntime } from '../docker/container-runtime.js';
 
 import { randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import {
   getBundleRuntimeRootForHome,
   getDockerWorkloadLeaseDir,
@@ -29,14 +29,20 @@ import {
 } from '../config/paths.js';
 import type { ContainerRuntime } from '../docker/types.js';
 import type { ContainerRuntimeKind } from '../docker/container-runtime.js';
-import type { LoadedResourceWatchdogPolicy } from '../docker/resource-watchdog.js';
+import {
+  RESOURCE_WATCHDOG_POLICY_SCHEMA_VERSION,
+  type LoadedResourceWatchdogPolicy,
+} from '../docker/resource-watchdog.js';
+import { lateObservationGapMs, PeerProgressTracker, resolveMonotonicClock } from '../docker/peer-liveness.js';
 import type { ResolvedDockerWorkloadConfig } from './config.js';
 // Type-only: daemon observations are deliberately field-compatible with the
 // lifecycle evidence payloads, and a type import adds no runtime edge.
 import type { PrivateDockerBootstrapObservation, PrivateDockerDaemonReadiness } from './private-docker.js';
 import {
   activateDockerWorkloadLease,
+  bindDockerWorkloadOuterResourceStorage,
   createDockerWorkloadLease,
+  DOCKER_WORKLOAD_OWNERSHIP_LABEL_KEY,
   heartbeatDockerWorkloadLease,
   loadDockerWorkloadLease,
   observeDockerWorkloadOuterResource,
@@ -44,9 +50,11 @@ import {
   returnDockerWorkloadLeaseRecoveryToIncident,
   requestDockerWorkloadOuterResource,
   type DockerWorkloadCleanupProof,
+  type DockerWorkloadLease,
   type DockerWorkloadOuterResource,
 } from './bundle-lease.js';
 import type { DockerWorkloadRevocationResult } from './bundle-revocation.js';
+import { assertExactTargetIdentity } from './bundle-cleanup.js';
 import {
   DockerWorkloadCleanupPreconditionError,
   isDockerWorkloadLifecycleClaimBusy,
@@ -55,6 +63,7 @@ import {
   withDockerWorkloadLifecycleClaim,
 } from './cleanup-ownership.js';
 import {
+  assertRuntimeWatchdogCoverage,
   DOCKER_WORKLOAD_HEARTBEAT_INTERVAL_MS,
   DOCKER_WORKLOAD_RECOVERY_BOUND_MS,
   DOCKER_WORKLOAD_STALE_HEARTBEAT_MS,
@@ -65,9 +74,11 @@ import {
 } from './watchdog-policy.js';
 import {
   assertResourceWatchdogSupervisorFresh,
+  assertResourceWatchdogSupervisorReady,
   launchDetachedResourceWatchdogSupervisor,
   loadResourceWatchdogSupervisorStatus,
   requestResourceWatchdogSupervisorStop,
+  RESOURCE_WATCHDOG_SUPERVISOR_STDERR_FILE,
   watchdogSupervisorPolicyBinding,
   type LaunchDetachedResourceWatchdogSupervisorOptions,
   type ResourceWatchdogSupervisorStatus,
@@ -78,9 +89,25 @@ import {
   type DockerWorkloadAuditSink,
   type ExpandedOuterCreate,
 } from './lifecycle-evidence.js';
-import { acquireProcessLock, ProcessLockBusyError, type ProcessIdentityResolver } from './process-lock.js';
+import { createDockerWorkloadEmergencyReserve, releaseDockerWorkloadEmergencyReserve } from './emergency-reserve.js';
+import {
+  acquireProcessLock,
+  getProcessStartIdentity,
+  getSelfProcessStartIdentity,
+  ProcessLockBusyError,
+  type ProcessIdentityResolver,
+  type ProcessLockHandle,
+} from './process-lock.js';
+import { boundIncidentDetail, incidentDetailFromError, preserveOriginalFailure } from './incident-detail.js';
+import {
+  createRegistryPullProvenanceSink,
+  REGISTRY_PULL_PROVENANCE_FILE,
+  type RegistryPullProvenanceSink,
+} from './pull-provenance.js';
+import type { RegistryPullProvenance } from '../docker/registry-egress-proxy.js';
+import * as logger from '../logger.js';
 
-export const DOCKER_WORKLOAD_OWNERSHIP_LABEL_KEY = 'com.ironcurtain.docker-workload.generation';
+export { DOCKER_WORKLOAD_OWNERSHIP_LABEL_KEY };
 
 const LEASE_FILE = 'lease.json';
 const POLICY_FILE = 'policy.json';
@@ -88,12 +115,69 @@ const STATUS_FILE = 'status.json';
 const STOP_REQUEST_FILE = 'stop.json';
 const EVIDENCE_DIR = 'evidence';
 const ADMISSION_LOCK_FILE = 'admission.lock';
-const STATE_SUBDIRS = ['daemon', 'api', 'exchange', 'staging'] as const;
+/**
+ * Host-only state created under the lease state root. Only `staging` has a
+ * consumer (the Apple selected-agent archive link). The lease still records
+ * the historical daemon/api paths and the reserved `exchangeRoot` (see
+ * bundle-lease.ts) so cleanup removes them if an older generation created
+ * them, but nothing mounts or writes them, so they are no longer created or
+ * measured. `exchangeRoot` belongs to the IronCurtain-in-IronCurtain slice,
+ * which is reserved and not scheduled
+ * (docs/designs/ironcurtain-in-ironcurtain-hermetic-slice.md).
+ */
+const STATE_SUBDIRS = ['staging'] as const;
 const SUPERVISOR_STOP_TIMEOUT_MS = 10_000;
 const SUPERVISOR_STOP_POLL_MS = 50;
 const HEARTBEAT_CLAIM_RETRY_MS = 50;
 const POST_CREATE_SAMPLE_POLL_MS = 50;
 const ADMISSION_LOCK_ACQUIRE_ATTEMPTS = 16;
+const ADMISSION_LOCK_POLL_MS = 200;
+const RECONCILE_LIVENESS_POLL_MS = 250;
+
+/**
+ * How long an admission waits for another process's admission critical
+ * section (fence detection and lease creation, a short synchronous step)
+ * before it gives up as busy.
+ */
+export const DOCKER_WORKLOAD_ADMISSION_WAIT_MS = 60_000;
+
+/**
+ * Appended to every fenced-admission refusal: how an operator inspects,
+ * retries, or retires an unresolved lease.
+ */
+export const DOCKER_WORKLOAD_FENCE_REMEDIATION =
+  'Inspect them with `ironcurtain docker-workload status`, retry their exact recovery with ' +
+  '`ironcurtain docker-workload reconcile` once the recorded container runtime is running, or remove what a ' +
+  "lease's generation label still owns and retire its record with `ironcurtain docker-workload clear <lease-id> --force`";
+
+/** Admission refused because unresolved leases fence it. `leaseIds` names them. */
+export class DockerWorkloadAdmissionFencedError extends Error {
+  readonly code = 'DOCKER_WORKLOAD_ADMISSION_FENCED';
+  readonly leaseIds: readonly string[];
+
+  constructor(fences: readonly { readonly leaseId: string; readonly detail: string }[]) {
+    super(
+      `refusing Docker-workload admission while unresolved leases block it: ${fences
+        .map((fence) => fence.detail)
+        .join(', ')}. ${DOCKER_WORKLOAD_FENCE_REMEDIATION}`,
+    );
+    this.name = 'DockerWorkloadAdmissionFencedError';
+    this.leaseIds = fences.map((fence) => fence.leaseId);
+  }
+}
+
+/** Another process held the admission critical section for the whole bounded wait. */
+export class DockerWorkloadAdmissionBusyError extends Error {
+  readonly code = 'DOCKER_WORKLOAD_ADMISSION_BUSY';
+  readonly ownerPid: number | undefined;
+
+  constructor(ownerPid: number | undefined, waitedMs: number, cause: unknown) {
+    const owner = ownerPid === undefined ? '' : ` (owner pid ${ownerPid})`;
+    super(`Docker-workload admission is busy${owner} after waiting ${Math.round(waitedMs / 1000)}s`, { cause });
+    this.name = 'DockerWorkloadAdmissionBusyError';
+    this.ownerPid = ownerPid;
+  }
+}
 
 export type DockerWorkloadRuntimeKind = ContainerRuntimeKind;
 export type OuterResourceKind = DockerWorkloadOuterResource['kind'];
@@ -116,6 +200,13 @@ export type OuterResourceRole =
 export interface OuterResourceRegistration {
   readonly labels: Readonly<Record<string, string>>;
   observed(immutableId: string, expanded?: ExpandedOuterCreate): void;
+  /**
+   * After `observed`, pin the runtime-owned file that holds this container's
+   * writable storage when the watchdog policy measures it (an Apple VM's rootfs
+   * image). A no-op for everything else. Fails closed: a container whose
+   * storage cannot be bound must not run.
+   */
+  bindStorage(): Promise<void>;
 }
 
 export interface OuterResourceRequest {
@@ -155,7 +246,7 @@ export interface WatchdogSupervisorController {
   readStatus(statusPath: string): ResourceWatchdogSupervisorStatus | undefined;
   requestStop(
     stopRequestPath: string,
-    lease: { readonly leaseId: string; readonly generation: string; readonly schemaVersion: 1 | 2 },
+    lease: Pick<DockerWorkloadLease, 'leaseId' | 'generation' | 'schemaVersion'>,
     cleanup: DockerWorkloadCleanupProof,
     now: Date,
   ): void;
@@ -175,16 +266,33 @@ export interface DockerWorkloadAdmissionOptions {
   readonly generation?: string;
   readonly ownershipLabelKey?: string;
   readonly auditSink?: DockerWorkloadAuditSink;
+  /** Wall clock for persisted lease, status, and audit timestamps. */
   readonly clock?: () => Date;
+  /**
+   * Observer-local monotonic clock for liveness and in-process deadlines.
+   * Defaults to `performance.now()`, or to `clock` when only that is injected.
+   */
+  readonly monotonicClock?: () => number;
   readonly sleep?: (milliseconds: number) => Promise<void>;
   readonly pidAlive?: (pid: number) => boolean;
-  /** Test seam for cross-process lock identity; production reads the host process table. */
+  /** Test seam for process-start identity (locks and coordinator liveness); production reads the process table. */
   readonly processIdentityForPid?: ProcessIdentityResolver;
-  /** Resolve the runtime recorded by an older lease when backend selection changed. */
-  readonly runtimeForKind?: (kind: DockerWorkloadRuntimeKind, endpoint?: DockerEndpoint) => ContainerRuntime;
+  /**
+   * Resolve the runtime recorded by an older lease when backend selection
+   * changed. `undefined` means that runtime is unavailable: the lease is
+   * fenced, never inventoried through a different runtime.
+   */
+  readonly runtimeForKind?: (
+    kind: DockerWorkloadRuntimeKind,
+    endpoint?: DockerEndpoint,
+  ) => ContainerRuntime | undefined;
   readonly supervisor?: WatchdogSupervisorController;
   /** Off for tests that must not leave a real host heartbeat interval running. */
   readonly startHeartbeat?: boolean;
+  /** Bounded wait for another process's admission critical section; defaults to {@link DOCKER_WORKLOAD_ADMISSION_WAIT_MS}. */
+  readonly admissionWaitMs?: number;
+  /** Progress notice, naming the holder, while admission waits for another process; defaults to the logger. */
+  readonly onAdmissionWait?: (message: string) => void;
 }
 
 export interface ReconcileDockerWorkloadOptions {
@@ -192,14 +300,24 @@ export interface ReconcileDockerWorkloadOptions {
   readonly runtimeKind: DockerWorkloadRuntimeKind;
   readonly auditSink?: DockerWorkloadAuditSink;
   readonly clock?: () => Date;
+  /** Observer-local monotonic clock; defaults to `performance.now()`, or to `clock` when only that is injected. */
+  readonly monotonicClock?: () => number;
   readonly sleep?: (milliseconds: number) => Promise<void>;
   readonly pidAlive?: (pid: number) => boolean;
-  /** Test seam for cross-process lock identity; production reads the host process table. */
+  /** Test seam for process-start identity (locks and coordinator liveness); production reads the process table. */
   readonly processIdentityForPid?: ProcessIdentityResolver;
-  /** Resolve the runtime recorded by an older lease when backend selection changed. */
-  readonly runtimeForKind?: (kind: DockerWorkloadRuntimeKind, endpoint?: DockerEndpoint) => ContainerRuntime;
+  /**
+   * Resolve the runtime recorded by an older lease when backend selection
+   * changed. `undefined` means that runtime is unavailable: the lease is
+   * fenced, never inventoried through a different runtime.
+   */
+  readonly runtimeForKind?: (
+    kind: DockerWorkloadRuntimeKind,
+    endpoint?: DockerEndpoint,
+  ) => ContainerRuntime | undefined;
   readonly supervisor?: WatchdogSupervisorController;
   readonly recoveryBoundMs?: number;
+  /** Missed-heartbeat bound; also the window a live coordinator is watched for before recovery. */
   readonly staleHeartbeatMs?: number;
 }
 
@@ -212,9 +330,44 @@ export interface ReconcileDockerWorkloadResult {
   readonly fenced: readonly string[];
 }
 
-interface ReconcileDockerWorkloadHeldResult extends ReconcileDockerWorkloadResult {
+export interface ReconcileDockerWorkloadHeldResult extends ReconcileDockerWorkloadResult {
   /** Current-pass reasons, used only to make admission failures actionable. */
-  readonly fenceDetails: readonly string[];
+  readonly fences: readonly { readonly leaseId: string; readonly detail: string }[];
+}
+
+/**
+ * Where one lease stands, judged from a single snapshot without waiting,
+ * recovering, or writing anything:
+ *
+ * - `closed`: cleanup is proven; nothing to do.
+ * - `live`: a fresh, live coordinator owns it (and, once active, a fresh bound
+ *   watchdog supervisor).
+ * - `settling`: the coordinator heartbeat is recent but the lease is not
+ *   provably live (a coordinator that just died, or a starting supervisor);
+ *   it fences until the stale bound passes.
+ * - `stale`: its coordinator is gone or silent; exact recovery is due.
+ * - `incident`: cleanup could not be proven; exact recovery is retried.
+ * - `unreadable`: a lease marker exists but cannot be parsed or trusted.
+ */
+export type DockerWorkloadLeaseState = 'closed' | 'live' | 'settling' | 'stale' | 'incident' | 'unreadable';
+
+export interface DockerWorkloadLeaseSummary {
+  readonly leaseId: string;
+  readonly leasePath: string;
+  readonly state: DockerWorkloadLeaseState;
+  /** True when the lease refuses new nested-Docker admission. */
+  readonly fencesAdmission: boolean;
+  readonly detail: string;
+  /** The validated record; absent when it is unreadable. */
+  readonly lease?: DockerWorkloadLease;
+}
+
+export interface InspectDockerWorkloadLeasesOptions {
+  readonly clock?: () => Date;
+  readonly pidAlive?: (pid: number) => boolean;
+  readonly processIdentityForPid?: ProcessIdentityResolver;
+  readonly supervisor?: WatchdogSupervisorController;
+  readonly staleHeartbeatMs?: number;
 }
 
 /** Cleanup is proven, but mandatory post-close audit publication failed. */
@@ -233,50 +386,108 @@ export interface DockerWorkloadTeardownResult {
 }
 
 /**
- * Reconcile every nonclosed lease under a cross-process lock, then admit one new
- * bundle: create its state-root subtree, render the frozen watchdog policy, and
- * durably create the host-only lease. No outer resource is created and the
- * watchdog is not yet attested — those are handle methods driven by the caller
- * in §8.2 order.
+ * Reconcile every nonclosed lease, then admit one new bundle: create its
+ * state-root subtree, render the frozen watchdog policy, and durably create the
+ * host-only lease. No outer resource is created and the watchdog is not yet
+ * attested — those are handle methods driven by the caller in §8.2 order.
+ *
+ * Recovery runs under per-lease lifecycle claims before the global critical
+ * section; that section (an in-process queue, then the cross-process admission
+ * lock, waited for up to `admissionWaitMs`) covers only fence detection and
+ * lease creation. A lease still unresolved at that point refuses admission
+ * with a {@link DockerWorkloadAdmissionFencedError} naming it.
  */
 export async function admitDockerWorkloadBundle(
   options: DockerWorkloadAdmissionOptions,
 ): Promise<DockerWorkloadBundleHandle> {
   if (options.runtimeKind === 'docker') dockerEndpointSchema.parse(options.runtime.dockerEndpoint);
   const clock = options.clock ?? defaultClock;
+  const monotonicClock = resolveLifecycleMonotonicClock(options);
   const sleep = options.sleep ?? defaultSleep;
   const pidAlive = options.pidAlive ?? defaultPidAlive;
   const supervisor = options.supervisor ?? defaultSupervisorController;
+  const root = getDockerWorkloadRoot();
+  const reconcileOptions: ReconcileDockerWorkloadOptions = {
+    ...options,
+    clock,
+    monotonicClock,
+    sleep,
+    pidAlive,
+    supervisor,
+  };
+
+  // Exact recovery of stale and incident leases runs first and outside the
+  // global critical section: every lease is recovered under its own
+  // lifecycle claim, and a recovery another admission (or the watchdog)
+  // already owns is waited for, bounded, rather than reported as busy.
+  const recovery = await reconcileHeld(reconcileOptions, true);
+  const recoveryDetails = new Map(recovery.fences.map((fence) => [fence.leaseId, fence.detail]));
+
+  return withDockerWorkloadAdmissionLock(
+    root,
+    {
+      processIdentityForPid: options.processIdentityForPid,
+      monotonicClock,
+      sleep,
+      waitMs: options.admissionWaitMs ?? DOCKER_WORKLOAD_ADMISSION_WAIT_MS,
+      onWait: options.onAdmissionWait ?? ((message) => logger.info(message)),
+    },
+    () => {
+      // The critical section covers only fence detection and lease creation.
+      // A lease that is still unresolved now (its recovery failed, another
+      // process's recovery of it outlasted the wait, or it went stale since)
+      // fences this admission: a new lease is never created beside it.
+      const fences = inspectDockerWorkloadLeases(reconcileOptions)
+        .filter((summary) => summary.fencesAdmission)
+        .map((summary) => ({
+          leaseId: summary.leaseId,
+          detail: recoveryDetails.get(summary.leaseId) ?? `${summary.leaseId} (${summary.detail})`,
+        }));
+      if (fences.length > 0) throw new DockerWorkloadAdmissionFencedError(fences);
+      return Promise.resolve(createAdmittedBundle(options, { clock, monotonicClock, sleep, supervisor }));
+    },
+  );
+}
+
+function createAdmittedBundle(
+  options: DockerWorkloadAdmissionOptions,
+  resolved: {
+    readonly clock: () => Date;
+    readonly monotonicClock: () => number;
+    readonly sleep: (milliseconds: number) => Promise<void>;
+    readonly supervisor: WatchdogSupervisorController;
+  },
+): DockerWorkloadBundleHandle {
+  const { clock, monotonicClock, sleep, supervisor } = resolved;
   const leaseId = options.leaseId ?? `dw-${randomUUID()}`;
   const generation = options.generation ?? `gen-${randomUUID()}`;
   const ownershipLabelKey = options.ownershipLabelKey ?? DOCKER_WORKLOAD_OWNERSHIP_LABEL_KEY;
-  const root = getDockerWorkloadRoot();
 
-  return withDockerWorkloadAdmissionLock(root, options.processIdentityForPid, async () => {
-    const reconciliation = await reconcileHeld({ ...options, clock, sleep, pidAlive, supervisor });
-    if (reconciliation.fenced.length > 0) {
-      throw new Error(
-        `refusing Docker-workload admission while unresolved leases block it: ${reconciliation.fenceDetails.join(
-          ', ',
-        )}`,
-      );
-    }
+  // Validate the packaged policy, including real storage coverage for this
+  // runtime, before creating lease-specific state. A broken or incomplete
+  // install must fail without accumulating empty lease/state directories on
+  // every retry.
+  const template = loadFrozenWatchdogPolicyTemplate(options.watchdogPolicyTemplatePath);
+  assertRuntimeWatchdogCoverage(template, options.runtimeKind);
+  const leaseDir = getDockerWorkloadLeaseDir(leaseId);
+  const stateRoot = getDockerWorkloadStateRoot(leaseId);
+  createStateRootSubtree(stateRoot);
+  mkdirSync(leaseDir, { recursive: true, mode: 0o700 });
+  const evidenceDir = join(leaseDir, EVIDENCE_DIR);
+  mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
 
-    // Validate the packaged policy before creating lease-specific state. A
-    // broken or incomplete install must fail without accumulating empty
-    // lease/state directories on every retry.
-    const template = loadFrozenWatchdogPolicyTemplate(options.watchdogPolicyTemplatePath);
-    const leaseDir = getDockerWorkloadLeaseDir(leaseId);
-    const stateRoot = getDockerWorkloadStateRoot(leaseId);
-    createStateRootSubtree(stateRoot);
-    mkdirSync(leaseDir, { recursive: true, mode: 0o700 });
-    const evidenceDir = join(leaseDir, EVIDENCE_DIR);
-    mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
+  const policyPath = join(leaseDir, POLICY_FILE);
+  const loadedPolicy = renderWatchdogPolicy(template, options.runtimeKind, stateRoot, policyPath);
 
-    const policyPath = join(leaseDir, POLICY_FILE);
-    const loadedPolicy = renderWatchdogPolicy(template, stateRoot, policyPath);
-
-    const leasePath = join(leaseDir, LEASE_FILE);
+  const leasePath = join(leaseDir, LEASE_FILE);
+  const coordinatorProcessIdentity = getSelfProcessStartIdentity(options.processIdentityForPid);
+  if (coordinatorProcessIdentity === undefined) {
+    throw new Error('could not determine the coordinator process start identity for the Docker-workload lease');
+  }
+  // Held until cleanup, which frees it before its first durable write. The
+  // lease that follows is what lets any cleanup find it again.
+  createDockerWorkloadEmergencyReserve(leaseDir);
+  try {
     createDockerWorkloadLease(leasePath, {
       leaseId,
       bundleId: options.bundleId,
@@ -287,52 +498,202 @@ export async function admitDockerWorkloadBundle(
       bindings: { watchdogPolicy: loadedPolicy.policy },
       cleanupInventoryGapMs: loadedPolicy.policy.cleanupInventoryGapMs,
       coordinatorPid: process.pid,
+      coordinatorProcessIdentity,
       now: clock(),
     });
+  } catch (error) {
+    releaseDockerWorkloadEmergencyReserve(leaseDir);
+    throw error;
+  }
 
-    emitAudit(options.auditSink, leaseId, generation, clock().toISOString(), {
-      kind: 'admission-decision',
-      decision: 'admitting',
-      bundleId: options.bundleId,
-      runtimeKind: options.runtimeKind,
-      configuration: options.configuration,
-      watchdogPolicy: loadedPolicy.policy,
-      detail: 'reconciled outstanding leases and created a fresh admitting lease',
-    });
+  emitAudit(options.auditSink, leaseId, generation, clock().toISOString(), {
+    kind: 'admission-decision',
+    decision: 'admitting',
+    bundleId: options.bundleId,
+    runtimeKind: options.runtimeKind,
+    configuration: options.configuration,
+    watchdogPolicy: loadedPolicy.policy,
+    detail: 'reconciled outstanding leases and created a fresh admitting lease',
+  });
 
-    return new DockerWorkloadBundleHandle({
-      runtime: options.runtime,
-      runtimeKind: options.runtimeKind,
-      bundleId: options.bundleId,
-      leaseId,
-      generation,
-      leasePath,
-      policyPath,
-      statusPath: join(leaseDir, STATUS_FILE),
-      stopRequestPath: join(leaseDir, STOP_REQUEST_FILE),
-      loadedPolicy,
-      ownershipLabelKey,
-      supervisorEntrypointPath: options.watchdogSupervisorEntrypointPath,
-      auditSink: options.auditSink,
-      clock,
-      sleep,
-      supervisor,
-      startHeartbeat: options.startHeartbeat ?? true,
-      processIdentityForPid: options.processIdentityForPid,
-    });
+  return new DockerWorkloadBundleHandle({
+    runtime: options.runtime,
+    runtimeKind: options.runtimeKind,
+    bundleId: options.bundleId,
+    leaseId,
+    generation,
+    leasePath,
+    policyPath,
+    statusPath: join(leaseDir, STATUS_FILE),
+    stopRequestPath: join(leaseDir, STOP_REQUEST_FILE),
+    loadedPolicy,
+    ownershipLabelKey,
+    supervisorEntrypointPath: options.watchdogSupervisorEntrypointPath,
+    auditSink: options.auditSink,
+    clock,
+    monotonicClock,
+    sleep,
+    supervisor,
+    startHeartbeat: options.startHeartbeat ?? true,
+    processIdentityForPid: options.processIdentityForPid,
   });
 }
 
-/** Reconcile every nonclosed lease under the cross-process admission lock. */
+/**
+ * One bounded pass of exact recovery over every nonclosed lease. Each lease is
+ * recovered under its own lifecycle claim, so the pass takes no global lock
+ * and concurrent passes or admissions never collide on one; a lease whose
+ * lifecycle another owner holds right now is reported fenced, not waited for.
+ */
 export async function reconcileDockerWorkloadLeases(
   options: ReconcileDockerWorkloadOptions,
 ): Promise<ReconcileDockerWorkloadResult> {
-  const { reconciled, preserved, fenced } = await withDockerWorkloadAdmissionLock(
-    getDockerWorkloadRoot(),
-    options.processIdentityForPid,
-    () => reconcileHeld(options),
-  );
+  const { reconciled, preserved, fenced } = await reconcileHeld(options, false);
   return { reconciled, preserved, fenced };
+}
+
+/**
+ * Judge every lease from one snapshot: no wait, no recovery, no write. The
+ * admission critical section uses it for fence detection, and the operator
+ * status command and `doctor` use it to report what blocks admission.
+ */
+export function inspectDockerWorkloadLeases(
+  options: InspectDockerWorkloadLeasesOptions = {},
+): readonly DockerWorkloadLeaseSummary[] {
+  const context: LeaseSnapshotContext = {
+    now: (options.clock ?? defaultClock)(),
+    pidAlive: options.pidAlive ?? defaultPidAlive,
+    identityForPid: options.processIdentityForPid ?? getProcessStartIdentity,
+    supervisor: options.supervisor ?? defaultSupervisorController,
+    staleHeartbeatMs: options.staleHeartbeatMs ?? DOCKER_WORKLOAD_STALE_HEARTBEAT_MS,
+  };
+  const leasesRoot = getDockerWorkloadLeasesRoot();
+  const summaries: DockerWorkloadLeaseSummary[] = [];
+  for (const leaseId of listLeaseIds(leasesRoot)) {
+    const leaseDir = join(leasesRoot, leaseId);
+    const leasePath = join(leaseDir, LEASE_FILE);
+    let lease: DockerWorkloadLease;
+    try {
+      lease = loadDockerWorkloadLease(leasePath);
+    } catch (error) {
+      if (pathEntryExistsWithoutFollowing(leasePath)) {
+        summaries.push({
+          leaseId,
+          leasePath,
+          state: 'unreadable',
+          fencesAdmission: true,
+          detail: `lease record is unreadable; exact recovery cannot be proven: ${errorText(error)}`,
+        });
+      }
+      continue;
+    }
+    summaries.push({ leaseId, leasePath, lease, ...classifyLeaseSnapshot(lease, leaseDir, context) });
+  }
+  return summaries;
+}
+
+interface LeaseSnapshotContext {
+  readonly now: Date;
+  readonly pidAlive: (pid: number) => boolean;
+  readonly identityForPid: ProcessIdentityResolver;
+  readonly supervisor: WatchdogSupervisorController;
+  readonly staleHeartbeatMs: number;
+}
+
+function classifyLeaseSnapshot(
+  lease: DockerWorkloadLease,
+  leaseDir: string,
+  context: LeaseSnapshotContext,
+): Pick<DockerWorkloadLeaseSummary, 'state' | 'fencesAdmission' | 'detail'> {
+  if (lease.status === 'closed')
+    return { state: 'closed', fencesAdmission: false, detail: 'closed with cleanup proof' };
+  if (lease.incident !== null) {
+    const recovering = lease.status === 'revoking' ? 'exact recovery is running or was interrupted; ' : '';
+    return {
+      state: 'incident',
+      fencesAdmission: true,
+      detail: `${recovering}incident ${lease.incident.code} at ${lease.incident.recordedAt}: ${lease.incident.detail}`,
+    };
+  }
+  const heartbeatFresh = isHeartbeatAgeFresh(lease, context.now, context.staleHeartbeatMs);
+  const coordinatorLive = heartbeatFresh && isCoordinatorProcessAlive(lease, context.pidAlive, context.identityForPid);
+  if (isLeaseLive(lease, leaseDir, context.supervisor, coordinatorLive, context.now)) {
+    return { state: 'live', fencesAdmission: false, detail: `owned by coordinator pid ${lease.coordinator.pid}` };
+  }
+  if (heartbeatFresh) {
+    return { state: 'settling', fencesAdmission: true, detail: 'lifecycle is still owned or recently active' };
+  }
+  return { state: 'stale', fencesAdmission: true, detail: 'its coordinator is gone or silent; exact recovery is due' };
+}
+
+/**
+ * Run one bounded exact-recovery attempt for a single lease, exactly as a
+ * reconciliation pass would (live leases are preserved, recent ones fenced).
+ * The operator `clear` command tries this before anything label-based.
+ */
+export async function recoverDockerWorkloadLease(
+  leaseId: string,
+  options: ReconcileDockerWorkloadOptions,
+): Promise<ReconcileDockerWorkloadHeldResult> {
+  return reconcileHeld(options, false, [leaseId]);
+}
+
+/**
+ * The state-root identity guard every exact cleanup applies before it removes
+ * host state, for a caller outside that sequence (the operator `clear`):
+ * throws unless the lease's state root is absent or still the exact real
+ * directory its bound watchdog policy recorded. A symlink or a replaced
+ * directory there would otherwise redirect the removal of the state paths
+ * beneath it to whatever it points at.
+ */
+export function assertDockerWorkloadStateRootIdentity(lease: DockerWorkloadLease, leasePath: string): void {
+  if (!pathEntryExistsWithoutFollowing(lease.paths.stateRoot)) return;
+  const { policy } = loadLeaseWatchdogPolicy(lease, join(dirname(leasePath), POLICY_FILE));
+  assertExactTargetIdentity(lease, policy.targetDevice, policy.targetInode);
+}
+
+/**
+ * Why a lease record this process cannot read may still belong to a running
+ * coordinator, or undefined once it is quiescent. Such a record (a newer
+ * schema, a changed mode or form, corruption) carries no trustworthy
+ * liveness, so the operator `clear` refuses it while either signal remains:
+ * the record was rewritten within the stale bound (a live coordinator rewrites
+ * it with every heartbeat, whether or not this version can parse it; the same
+ * clock-step rule as heartbeat freshness applies), or the coordinator process
+ * the raw record still names is running (by PID and, when the record names
+ * one, its start identity; an unreadable process table cannot prove it gone).
+ */
+export function describeUnreadableDockerWorkloadLeaseActivity(
+  leasePath: string,
+  coordinator: { readonly pid: number; readonly processIdentity: string | undefined } | undefined,
+  options: InspectDockerWorkloadLeasesOptions = {},
+): string | undefined {
+  const staleHeartbeatMs = options.staleHeartbeatMs ?? DOCKER_WORKLOAD_STALE_HEARTBEAT_MS;
+  let modifiedAtMs: number;
+  try {
+    modifiedAtMs = lstatSync(leasePath).mtimeMs;
+  } catch {
+    return 'its record changed while it was being judged; retry';
+  }
+  const ageMs = (options.clock ?? defaultClock)().getTime() - modifiedAtMs;
+  if (ageMs > -DOCKER_WORKLOAD_HEARTBEAT_INTERVAL_MS && ageMs < staleHeartbeatMs) {
+    return (
+      `its record was rewritten within the last ${Math.round(staleHeartbeatMs / 1000)}s, so a running ` +
+      'coordinator may still own it; retry once it has been quiet that long'
+    );
+  }
+  if (coordinator === undefined || !(options.pidAlive ?? defaultPidAlive)(coordinator.pid)) return undefined;
+  if (coordinator.processIdentity !== undefined) {
+    let identity: string | undefined;
+    try {
+      identity = (options.processIdentityForPid ?? getProcessStartIdentity)(coordinator.pid);
+    } catch {
+      identity = coordinator.processIdentity;
+    }
+    // A different start identity is PID reuse: the recorded coordinator is gone.
+    if (identity !== coordinator.processIdentity) return undefined;
+  }
+  return `the coordinator process its record names (pid ${coordinator.pid}) is still running; end that session first`;
 }
 
 interface DockerWorkloadBundleHandleContext {
@@ -350,6 +711,7 @@ interface DockerWorkloadBundleHandleContext {
   readonly supervisorEntrypointPath: string;
   readonly auditSink: DockerWorkloadAuditSink | undefined;
   readonly clock: () => Date;
+  readonly monotonicClock: () => number;
   readonly sleep: (milliseconds: number) => Promise<void>;
   readonly supervisor: WatchdogSupervisorController;
   readonly startHeartbeat: boolean;
@@ -361,11 +723,14 @@ export class DockerWorkloadBundleHandle {
   private readonly context: DockerWorkloadBundleHandleContext;
   private rejecting = false;
   private supervisorPid: number | undefined;
+  /** When this coordinator saw the bound supervisor's status change, on its own monotonic clock. */
+  private supervisorProgress: PeerProgressTracker | undefined;
   private heartbeatTimer: NodeJS.Timeout | undefined;
   private heartbeatRefreshPromise: Promise<boolean> | undefined;
   private supervisorMonitorTimer: NodeJS.Timeout | undefined;
   private teardownPromise: Promise<DockerWorkloadTeardownResult> | undefined;
   private readonly localCreateOperations = new Set<symbol>();
+  private registryPullProvenance: RegistryPullProvenanceSink | undefined;
 
   constructor(context: DockerWorkloadBundleHandleContext) {
     this.context = context;
@@ -393,6 +758,25 @@ export class DockerWorkloadBundleHandle {
   get stagingRoot(): string {
     return loadDockerWorkloadLease(this.leasePath).paths.stagingRoot;
   }
+  /** This lease's append-only registry-pull provenance log, in its host-only evidence directory. */
+  get registryPullProvenancePath(): string {
+    return join(dirname(this.leasePath), EVIDENCE_DIR, REGISTRY_PULL_PROVENANCE_FILE);
+  }
+
+  /**
+   * Append one completed registry pull to this lease's durable provenance log.
+   * The digests are what the registry reported: audit provenance, never an
+   * attestation of the pulled bytes. The log outlives teardown, which deletes
+   * only the state root.
+   */
+  recordRegistryPull(record: RegistryPullProvenance): void {
+    this.registryPullProvenance ??= createRegistryPullProvenanceSink(this.registryPullProvenancePath, {
+      leaseId: this.leaseId,
+      generation: this.generation,
+      bundleId: this.context.bundleId,
+    });
+    this.registryPullProvenance.append(record, this.context.clock());
+  }
 
   /** Durably record the caller-selected runtime name BEFORE the caller creates it. */
   precommitOuterResource(request: OuterResourceRequest): OuterResourceRegistration {
@@ -409,6 +793,7 @@ export class DockerWorkloadBundleHandle {
       this.context.clock(),
     );
     const labels = { [this.context.ownershipLabelKey]: this.generation };
+    let observedId: string | undefined;
     return {
       labels,
       observed: (immutableId: string, expanded?: ExpandedOuterCreate): void => {
@@ -419,6 +804,7 @@ export class DockerWorkloadBundleHandle {
           immutableId,
           this.context.clock(),
         );
+        observedId = immutableId;
         this.emit({
           kind: 'outer-create',
           requestId,
@@ -429,7 +815,32 @@ export class DockerWorkloadBundleHandle {
           expanded: expanded ?? {},
         });
       },
+      bindStorage: async (): Promise<void> => {
+        if (kind !== 'container' || !this.measuresContainerStorage()) return;
+        if (observedId === undefined) throw new Error('outer container storage can be bound only after observation');
+        const describe = this.context.runtime.describeContainerStorage?.bind(this.context.runtime);
+        if (describe === undefined) {
+          throw new Error('the selected runtime cannot locate container storage for the observed-disk watchdog');
+        }
+        const storage = await describe(observedId);
+        bindDockerWorkloadOuterResourceStorage(
+          this.leasePath,
+          this.generation,
+          requestId,
+          storage,
+          this.context.clock(),
+        );
+      },
     };
+  }
+
+  /** Whether the frozen policy charges the bundle for runtime-owned container storage files. */
+  private measuresContainerStorage(): boolean {
+    const policy = this.loadedPolicy.policy;
+    return (
+      policy.schemaVersion === RESOURCE_WATCHDOG_POLICY_SCHEMA_VERSION &&
+      policy.stateClasses.some((stateClass) => stateClass.kind === 'apple-container-rootfs')
+    );
   }
 
   /**
@@ -488,9 +899,20 @@ export class DockerWorkloadBundleHandle {
       stopRequestPath: this.context.stopRequestPath,
       entrypointPath: this.context.supervisorEntrypointPath,
       startupTimeoutMs: DOCKER_WORKLOAD_WATCHDOG_STARTUP_TIMEOUT_MS,
+      // The lease directory owns the supervisor's bounded fatal-error log.
+      stderrLogPath: join(dirname(this.leasePath), RESOURCE_WATCHDOG_SUPERVISOR_STDERR_FILE),
     });
     this.supervisorPid = launched.pid;
-    this.assertSupervisorStatus(launched.status);
+    const policy = this.loadedPolicy.policy;
+    this.supervisorProgress = new PeerProgressTracker({
+      staleAfterMs: policy.staleAfterMs,
+      lateAfterMs: lateObservationGapMs(policy.staleAfterMs, policy.sampleIntervalMs, policy.sampleTimeoutMs),
+      monotonicNow: this.context.monotonicClock,
+      wallNow: () => this.context.clock().getTime(),
+    });
+    // The launch waited for this new process to publish `ready`, so its first
+    // observation is the start of the supervisor's first window.
+    this.assertSupervisorStatus(launched.status, 'gate');
     const firstSample = launched.status.lastSample;
     if (firstSample === null) throw new Error('watchdog attestation returned no first sample');
     this.emit({
@@ -537,23 +959,32 @@ export class DockerWorkloadBundleHandle {
     });
   }
 
-  /** Prove the watchdog supervisor is still fresh immediately before daemon/VM create. */
+  /**
+   * Prove the watchdog supervisor is still fresh immediately before daemon/VM
+   * create or activation: its status must have changed within the stale window
+   * of this coordinator's monotonic clock.
+   */
   assertWatchdogFresh(): void {
-    const status = this.context.supervisor.readStatus(this.context.statusPath);
-    if (status === undefined) throw new Error('watchdog supervisor status is missing');
-    this.assertSupervisorStatus(status);
+    this.assertSupervisorStatus(this.readSupervisorStatus(), 'gate');
   }
 
   /** One deterministic health-monitor iteration; the interval uses the same path. */
   async pollSupervisorHealth(): Promise<void> {
     if (this.rejecting || this.supervisorPid === undefined || this.localCreateOperations.size !== 0) return;
     try {
-      this.assertWatchdogFresh();
+      this.assertSupervisorStatus(this.readSupervisorStatus(), 'monitor');
     } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      this.emit({ kind: 'incident', code: 'watchdog-supervisor-unhealthy', detail });
+      // An audit failure must not skip the teardown this incident demands.
+      const auditFailures = this.tryEmitIncident('watchdog-supervisor-unhealthy', error);
       await this.teardown();
+      if (auditFailures.length !== 0) throw preserveOriginalFailure(error, auditFailures);
     }
+  }
+
+  private readSupervisorStatus(): ResourceWatchdogSupervisorStatus {
+    const status = this.context.supervisor.readStatus(this.context.statusPath);
+    if (status === undefined) throw new Error('watchdog supervisor status is missing');
+    return status;
   }
 
   private async reconfirmSupervisorAfterCreate(baselineSampleAt: number | undefined): Promise<void> {
@@ -567,14 +998,24 @@ export class DockerWorkloadBundleHandle {
       // A long valid create intentionally excludes sampling. Demand a newer
       // real sample before returning authority to the caller.
     }
-    const deadline = this.context.clock().getTime() + this.loadedPolicy.policy.staleAfterMs;
+    const deadline = this.context.monotonicClock() + this.loadedPolicy.policy.staleAfterMs;
     for (;;) {
       const status = this.context.supervisor.readStatus(this.context.statusPath);
-      if (status !== undefined && status.lastSample !== null && status.lastSample.sampledAtMs > baselineSampleAt) {
-        this.assertSupervisorStatus(status);
+      // Only the supervisor writes samples, so any different one is newer; a
+      // backward wall step must not make that newer sample look older. A
+      // sample that landed while this create waited for the lifecycle claim
+      // is newer than the baseline yet older than the create, so it must also
+      // pass the gate; until a sample does, keep waiting rather than failing
+      // a valid create. Binding, readiness, and liveness failures still throw.
+      if (
+        status !== undefined &&
+        status.lastSample !== null &&
+        status.lastSample.sampledAtMs !== baselineSampleAt &&
+        this.unprovenSupervisorProgressMs(status, 'gate') < this.loadedPolicy.policy.staleAfterMs
+      ) {
         return;
       }
-      if (this.context.clock().getTime() >= deadline) {
+      if (this.context.monotonicClock() >= deadline) {
         throw new Error('watchdog supervisor did not publish a fresh sample after outer create');
       }
       await this.context.sleep(POST_CREATE_SAMPLE_POLL_MS);
@@ -618,7 +1059,12 @@ export class DockerWorkloadBundleHandle {
         // one lifecycle owner before the caller attaches and releases the agent.
         this.assertWatchdogFresh();
         heartbeatDockerWorkloadLease(this.leasePath, this.generation, this.context.clock());
-        activateDockerWorkloadLease(this.leasePath, this.generation, this.context.clock());
+        activateDockerWorkloadLease(
+          this.leasePath,
+          this.generation,
+          this.context.clock(),
+          measureStorageBaselines(lease, this.measuresContainerStorage()),
+        );
         this.emit({ kind: 'lease-transition', from: 'admitting', to: 'active' });
         return Promise.resolve();
       },
@@ -681,12 +1127,12 @@ export class DockerWorkloadBundleHandle {
       cleanup,
       this.context.clock(),
     );
-    const deadline = this.context.clock().getTime() + SUPERVISOR_STOP_TIMEOUT_MS;
+    const deadline = this.context.monotonicClock() + SUPERVISOR_STOP_TIMEOUT_MS;
     for (;;) {
       const status = this.context.supervisor.readStatus(this.context.statusPath);
       if (status?.state === 'closed') return false;
       const supervisorGone = this.supervisorPid === undefined || !this.context.supervisor.isAlive(this.supervisorPid);
-      if (supervisorGone || this.context.clock().getTime() >= deadline) {
+      if (supervisorGone || this.context.monotonicClock() >= deadline) {
         this.emit({
           kind: 'incident',
           code: 'watchdog-supervisor-lost',
@@ -709,7 +1155,7 @@ export class DockerWorkloadBundleHandle {
   }
 
   private async retryCoordinatorHeartbeat(): Promise<boolean> {
-    const deadline = this.context.clock().getTime() + DOCKER_WORKLOAD_HEARTBEAT_INTERVAL_MS;
+    const deadline = this.context.monotonicClock() + DOCKER_WORKLOAD_HEARTBEAT_INTERVAL_MS;
     for (;;) {
       if (this.rejecting) return false;
       try {
@@ -728,7 +1174,7 @@ export class DockerWorkloadBundleHandle {
       } catch {
         // A concurrent short lease mutation gets the same bounded retry.
       }
-      if (this.context.clock().getTime() >= deadline) return false;
+      if (this.context.monotonicClock() >= deadline) return false;
       await this.context.sleep(HEARTBEAT_CLAIM_RETRY_MS);
     }
   }
@@ -737,29 +1183,48 @@ export class DockerWorkloadBundleHandle {
     if (!this.context.startHeartbeat || this.supervisorMonitorTimer !== undefined) return;
     this.supervisorMonitorTimer = setInterval(() => {
       void this.pollSupervisorHealth().catch((error: unknown) => {
-        this.emit({
-          kind: 'incident',
-          code: 'watchdog-monitor-teardown-failed',
-          detail: error instanceof Error ? error.message : String(error),
-        });
+        // Last resort inside a timer: a failed audit here has nowhere to go.
+        this.tryEmitIncident('watchdog-monitor-teardown-failed', error);
       });
     }, this.loadedPolicy.policy.sampleIntervalMs);
     this.supervisorMonitorTimer.unref();
   }
 
-  private assertSupervisorStatus(status: ResourceWatchdogSupervisorStatus): void {
-    assertResourceWatchdogSupervisorFresh(
-      status,
-      { leaseId: this.leaseId, generation: this.generation, policy: this.loadedPolicy.policy },
-      this.loadedPolicy.policy.staleAfterMs,
-      this.context.clock(),
-    );
-    if (this.supervisorPid === undefined || status.supervisorPid !== this.supervisorPid) {
+  /** Throw unless {@link unprovenSupervisorProgressMs} is within the stale window. */
+  private assertSupervisorStatus(status: ResourceWatchdogSupervisorStatus, mode: 'gate' | 'monitor'): void {
+    const unprovenForMs = this.unprovenSupervisorProgressMs(status, mode);
+    if (unprovenForMs >= this.loadedPolicy.policy.staleAfterMs) {
+      throw new Error(
+        `watchdog supervisor heartbeat is stale: no status change for ${unprovenForMs}ms of coordinator time`,
+      );
+    }
+  }
+
+  /**
+   * Bind the status to this lease, policy, and live supervisor process (any
+   * mismatch throws), then return for how long this coordinator has lacked
+   * evidence of supervisor progress, judged by when it saw `updatedAt` change
+   * on its own monotonic clock. A `'gate'` (pre-create, activation,
+   * post-create) counts from the last change it saw; its own lateness is never
+   * such evidence. The background `'monitor'` counts only time it actually
+   * watched: after its own late iteration (host sleep, a paused VM) the
+   * supervisor gets a fresh window instead of the blame.
+   */
+  private unprovenSupervisorProgressMs(status: ResourceWatchdogSupervisorStatus, mode: 'gate' | 'monitor'): number {
+    assertResourceWatchdogSupervisorReady(status, {
+      leaseId: this.leaseId,
+      generation: this.generation,
+      policy: this.loadedPolicy.policy,
+    });
+    const progress = this.supervisorProgress;
+    if (this.supervisorPid === undefined || progress === undefined || status.supervisorPid !== this.supervisorPid) {
       throw new Error('watchdog supervisor process ID binding mismatch');
     }
     if (!this.context.supervisor.isAlive(this.supervisorPid)) {
       throw new Error('watchdog supervisor process is not alive');
     }
+    const observation = progress.observe(status.updatedAt);
+    return mode === 'gate' ? observation.sinceChangeMs : observation.silentForMs;
   }
 
   private clearSupervisorMonitor(): void {
@@ -779,12 +1244,39 @@ export class DockerWorkloadBundleHandle {
   private emit(payload: DockerWorkloadAuditEventPayload): void {
     emitAudit(this.context.auditSink, this.leaseId, this.generation, this.context.clock().toISOString(), payload);
   }
+
+  /** Incident audit from a failure path: returns the audit failure instead of throwing it. */
+  private tryEmitIncident(code: string, error: unknown): readonly unknown[] {
+    return tryEmitIncidentAudit(
+      this.context.auditSink,
+      this.leaseId,
+      this.generation,
+      this.context.clock().toISOString(),
+      {
+        code,
+        detail: incidentDetailFromError(error),
+      },
+    );
+  }
 }
 
-async function reconcileHeld(options: ReconcileDockerWorkloadOptions): Promise<ReconcileDockerWorkloadHeldResult> {
+/**
+ * Exact recovery of every nonclosed lease (or only `onlyLeaseIds`). With
+ * `waitForRecoveryOwner`, a lease whose lifecycle claim another owner holds is
+ * waited for up to the recovery bound and then re-judged (an admission must
+ * not fail just because a concurrent one is recovering the same lease);
+ * otherwise it is reported fenced at once.
+ */
+async function reconcileHeld(
+  options: ReconcileDockerWorkloadOptions,
+  waitForRecoveryOwner: boolean,
+  onlyLeaseIds?: readonly string[],
+): Promise<ReconcileDockerWorkloadHeldResult> {
   const clock = options.clock ?? defaultClock;
+  const monotonicClock = resolveLifecycleMonotonicClock(options);
   const sleep = options.sleep ?? defaultSleep;
   const pidAlive = options.pidAlive ?? defaultPidAlive;
+  const identityForPid = options.processIdentityForPid ?? getProcessStartIdentity;
   const supervisor = options.supervisor ?? defaultSupervisorController;
   const recoveryBoundMs = options.recoveryBoundMs ?? DOCKER_WORKLOAD_RECOVERY_BOUND_MS;
   const staleHeartbeatMs = options.staleHeartbeatMs ?? DOCKER_WORKLOAD_STALE_HEARTBEAT_MS;
@@ -797,7 +1289,11 @@ async function reconcileHeld(options: ReconcileDockerWorkloadOptions): Promise<R
   const recordFence = (leaseId: string, detail: string): void => {
     fences.push({ leaseId, detail });
   };
-  for (const leaseId of listLeaseIds(leasesRoot)) {
+  const leaseIds =
+    onlyLeaseIds === undefined
+      ? listLeaseIds(leasesRoot)
+      : listLeaseIds(leasesRoot).filter((leaseId) => onlyLeaseIds.includes(leaseId));
+  for (const leaseId of leaseIds) {
     const leaseDir = join(leasesRoot, leaseId);
     const leasePath = join(leaseDir, LEASE_FILE);
     let lease;
@@ -814,11 +1310,34 @@ async function reconcileHeld(options: ReconcileDockerWorkloadOptions): Promise<R
       continue;
     }
     if (lease.status === 'closed') continue;
+    const coordinatorProcessAlive = isCoordinatorProcessAlive(lease, pidAlive, identityForPid);
+    let heartbeatFresh = isHeartbeatAgeFresh(lease, clock(), staleHeartbeatMs);
+    if (
+      lease.incident === null &&
+      !heartbeatFresh &&
+      coordinatorProcessAlive &&
+      (lease.status === 'admitting' || lease.status === 'active')
+    ) {
+      // A live coordinator whose heartbeat only looks stale may just have
+      // resumed from host sleep or seen a wall-clock step. That snapshot never
+      // destroys it: watch it for one bounded window of this process's own
+      // monotonic clock. Progress proves it alive; a whole silent window is
+      // the same bounded missed heartbeat that makes any coordinator stale.
+      const watched = await watchCoordinatorHeartbeat({
+        leasePath,
+        baseline: lease,
+        windowMs: staleHeartbeatMs,
+        monotonicClock,
+        sleep,
+        isLive: (current) => isLeaseLive(current, leaseDir, supervisor, true, clock()),
+      });
+      lease = watched.lease;
+      if (lease.status === 'closed') continue;
+      heartbeatFresh = watched.progressed;
+    }
     const recoveringIncident = lease.incident !== null;
-    const now = clock();
-    const heartbeatFresh = now.getTime() - Date.parse(lease.coordinator.heartbeatAt) < staleHeartbeatMs;
-    const coordinatorLive = heartbeatFresh && pidAlive(lease.coordinator.pid);
-    if (!recoveringIncident && isLeaseLive(lease, leaseDir, supervisor, coordinatorLive, now)) {
+    const coordinatorLive = heartbeatFresh && coordinatorProcessAlive;
+    if (!recoveringIncident && isLeaseLive(lease, leaseDir, supervisor, coordinatorLive, clock())) {
       preserved.push(leaseId);
       continue;
     }
@@ -839,7 +1358,7 @@ async function reconcileHeld(options: ReconcileDockerWorkloadOptions): Promise<R
         sleep,
         supervisor,
         recoveryBoundMs,
-        staleHeartbeatMs,
+        waitForOwner: waitForRecoveryOwner,
       });
       reconciled.push(leaseId);
     } catch (error) {
@@ -854,8 +1373,8 @@ async function reconcileHeld(options: ReconcileDockerWorkloadOptions): Promise<R
         recordFence(leaseId, `${leaseId} (${error instanceof Error ? error.message : String(error)})`);
         continue;
       }
-      fenceLease(leasePath, lease.leaseId, lease.generation, error, clock, options.auditSink);
-      recordFence(leaseId, describeFencedLease(leasePath, leaseId, error));
+      const auditFailures = fenceLease(leasePath, lease.leaseId, lease.generation, error, clock, options.auditSink);
+      recordFence(leaseId, describeFencedLease(leasePath, leaseId, error, auditFailures));
     }
   }
   if (postCloseAuditFailures.length === 1) throw postCloseAuditFailures[0];
@@ -869,7 +1388,7 @@ async function reconcileHeld(options: ReconcileDockerWorkloadOptions): Promise<R
     reconciled,
     preserved,
     fenced: fences.map((fence) => fence.leaseId),
-    fenceDetails: fences.map((fence) => fence.detail),
+    fences,
   };
 }
 
@@ -904,6 +1423,84 @@ function isLeaseLive(
   }
 }
 
+/**
+ * Whether the coordinator process recorded in the lease still exists. A v3
+ * lease also binds the process-start identity, so a reused PID reads as dead;
+ * older leases bind only the PID.
+ */
+function isCoordinatorProcessAlive(
+  lease: DockerWorkloadLease,
+  pidAlive: (pid: number) => boolean,
+  identityForPid: ProcessIdentityResolver,
+): boolean {
+  if (!pidAlive(lease.coordinator.pid)) return false;
+  if (lease.schemaVersion !== 3) return true;
+  let identity: string | undefined;
+  try {
+    identity = identityForPid(lease.coordinator.pid);
+  } catch {
+    // An unreadable process table cannot prove the coordinator dead.
+    return true;
+  }
+  return identity === lease.coordinator.processIdentity;
+}
+
+/**
+ * One-snapshot wall-clock freshness of the coordinator heartbeat. A heartbeat
+ * from further in the future than one heartbeat interval means the wall clock
+ * stepped back after it was written; its age is unknown, so it is not fresh
+ * evidence (it would otherwise fence a dead coordinator's lease for as long as
+ * the step). A smaller step reads as just written, which delays a dead
+ * coordinator's recovery by at most that interval.
+ */
+function isHeartbeatAgeFresh(lease: DockerWorkloadLease, now: Date, staleHeartbeatMs: number): boolean {
+  const ageMs = now.getTime() - Date.parse(lease.coordinator.heartbeatAt);
+  return ageMs > -DOCKER_WORKLOAD_HEARTBEAT_INTERVAL_MS && ageMs < staleHeartbeatMs;
+}
+
+/**
+ * Poll one lease for up to `windowMs` of observer-monotonic time. Returns as
+ * soon as the heartbeat has changed from `baseline` and the lease is live by
+ * `isLive`, or when the lease leaves admission/activity, or when the window
+ * ends. `progressed` reports whether the heartbeat changed at all.
+ */
+async function watchCoordinatorHeartbeat(context: {
+  readonly leasePath: string;
+  readonly baseline: DockerWorkloadLease;
+  readonly windowMs: number;
+  readonly monotonicClock: () => number;
+  readonly sleep: (milliseconds: number) => Promise<void>;
+  readonly isLive: (lease: DockerWorkloadLease) => boolean;
+}): Promise<{ readonly lease: DockerWorkloadLease; readonly progressed: boolean }> {
+  const deadline = context.monotonicClock() + context.windowMs;
+  let lease = context.baseline;
+  let progressed = false;
+  for (;;) {
+    await context.sleep(RECONCILE_LIVENESS_POLL_MS);
+    try {
+      lease = loadDockerWorkloadLease(context.leasePath);
+    } catch {
+      // Exact recovery re-reads the record and fences on what it finds.
+      return { lease, progressed };
+    }
+    if (lease.status !== 'admitting' && lease.status !== 'active') return { lease, progressed };
+    progressed ||= lease.coordinator.heartbeatAt !== context.baseline.coordinator.heartbeatAt;
+    if ((progressed && context.isLive(lease)) || context.monotonicClock() >= deadline) return { lease, progressed };
+  }
+}
+
+/** Monotonic clock for lifecycle code whose wall clock may be injected (see {@link resolveMonotonicClock}). */
+function resolveLifecycleMonotonicClock(options: {
+  readonly clock?: () => Date;
+  readonly monotonicClock?: () => number;
+}): () => number {
+  const injectedClock = options.clock;
+  return resolveMonotonicClock(
+    injectedClock === undefined ? undefined : () => injectedClock().getTime(),
+    options.monotonicClock,
+  );
+}
+
 async function recoverStaleLease(context: {
   readonly leaseDir: string;
   readonly leasePath: string;
@@ -913,10 +1510,11 @@ async function recoverStaleLease(context: {
   readonly sleep: (milliseconds: number) => Promise<void>;
   readonly supervisor: WatchdogSupervisorController;
   readonly recoveryBoundMs: number;
-  readonly staleHeartbeatMs: number;
+  /** Wait (bounded by `recoveryBoundMs`) for a lifecycle owner instead of failing busy at once. */
+  readonly waitForOwner: boolean;
 }): Promise<void> {
-  const { leaseDir, leasePath, lease, options, clock, sleep, supervisor, recoveryBoundMs } = context;
-  const endpoint = lease.schemaVersion === 2 ? lease.dockerEndpoint : undefined;
+  const { leaseDir, leasePath, lease, options, clock, sleep, supervisor, recoveryBoundMs, waitForOwner } = context;
+  const endpoint = lease.schemaVersion === 1 ? undefined : lease.dockerEndpoint;
   const runtime =
     lease.runtimeKind === options.runtimeKind &&
     (endpoint === undefined || endpoint.host === options.runtime.dockerEndpoint?.host)
@@ -942,7 +1540,7 @@ async function recoverStaleLease(context: {
     gapMs: loadedPolicy.policy.cleanupInventoryGapMs,
     clock,
     sleep,
-    waitForOwner: false,
+    waitForOwner,
     timeoutMs: recoveryBoundMs,
     processIdentityForPid: options.processIdentityForPid,
     revalidate: (claimedLease) => {
@@ -953,7 +1551,9 @@ async function recoverStaleLease(context: {
           `lease state ${claimedLease.status} no longer permits reconciliation cleanup`,
         );
       }
-      if (clock().getTime() - Date.parse(claimedLease.coordinator.heartbeatAt) < context.staleHeartbeatMs) {
+      // Staleness was judged on exactly this heartbeat value. Any change means
+      // its coordinator ran again, however the wall clock now compares.
+      if (claimedLease.coordinator.heartbeatAt !== lease.coordinator.heartbeatAt) {
         throw new DockerWorkloadCleanupPreconditionError('coordinator heartbeat refreshed before cleanup ownership');
       }
     },
@@ -1015,6 +1615,11 @@ async function recoverStaleLease(context: {
   }
 }
 
+/**
+ * Fence a lease whose recovery failed. Runs on a failure path, so it never
+ * throws: recording failures are returned and reported with the fence instead
+ * of replacing the recovery failure (the fenced lease still blocks admission).
+ */
 function fenceLease(
   leasePath: string,
   leaseId: string,
@@ -1022,8 +1627,8 @@ function fenceLease(
   error: unknown,
   clock: () => Date,
   auditSink: DockerWorkloadAuditSink | undefined,
-): void {
-  const detail = error instanceof Error ? error.message : String(error);
+): readonly unknown[] {
+  const detail = incidentDetailFromError(error);
   try {
     const current = loadDockerWorkloadLease(leasePath);
     if (current.incident !== null && current.status === 'revoking') {
@@ -1039,24 +1644,63 @@ function fenceLease(
   } catch {
     // Best effort: the audit incident below is the durable record.
   }
-  emitAudit(auditSink, leaseId, generation, clock().toISOString(), {
-    kind: 'incident',
+  return tryEmitIncidentAudit(auditSink, leaseId, generation, clock().toISOString(), {
     code: 'docker-workload-recovery-fenced',
     detail,
   });
 }
 
-function describeFencedLease(leasePath: string, leaseId: string, error: unknown): string {
-  const latest = error instanceof Error ? error.message : String(error);
+function describeFencedLease(
+  leasePath: string,
+  leaseId: string,
+  error: unknown,
+  auditFailures: readonly unknown[] = [],
+): string {
+  const latest = incidentDetailFromError(error);
+  const audit =
+    auditFailures.length === 0
+      ? ''
+      : `; incident audit publication failed: ${auditFailures.map((failure) => incidentDetailFromError(failure, 256)).join('; ')}`;
   try {
     const lease = loadDockerWorkloadLease(leasePath);
-    if (lease.incident === null) return `${leaseId} (latest recovery failure: ${latest})`;
-    return `${leaseId} (original incident ${lease.incident.code} at ${lease.incident.recordedAt}: ${lease.incident.detail}; latest recovery failure: ${latest})`;
+    if (lease.incident === null) return `${leaseId} (latest recovery failure: ${latest}${audit})`;
+    return `${leaseId} (original incident ${lease.incident.code} at ${lease.incident.recordedAt}: ${lease.incident.detail}; latest recovery failure: ${latest}${audit})`;
   } catch {
-    return `${leaseId} (lease record is unreadable; latest recovery failure: ${latest})`;
+    return `${leaseId} (lease record is unreadable; latest recovery failure: ${latest}${audit})`;
   }
 }
 
+/**
+ * Allocated bytes of every bound storage file right now: the activation
+ * baseline above which growth is charged to the released bundle. When the
+ * policy measures container storage, every live container must be bound, and
+ * a bound file must still be the pinned inode, or the agent is not released.
+ */
+function measureStorageBaselines(lease: DockerWorkloadLease, requireBinding: boolean): ReadonlyMap<string, number> {
+  const baselines = new Map<string, number>();
+  if (lease.status !== 'admitting') return baselines;
+  for (const resource of lease.resources) {
+    const storage = resource.storage;
+    if (storage === undefined) {
+      if (requireBinding && resource.kind === 'container' && resource.removal === null) {
+        throw new Error(`refusing activation: watchdog cannot measure the storage of ${resource.requestedName}`);
+      }
+      continue;
+    }
+    const stats = lstatSync(storage.path);
+    if (!stats.isFile() || stats.dev !== storage.device || stats.ino !== storage.inode) {
+      throw new Error(`bound container storage changed identity before activation: ${storage.path}`);
+    }
+    baselines.set(resource.requestId, stats.blocks * 512);
+  }
+  return baselines;
+}
+
+/**
+ * Admission keeps writing the reserved `exchangeRoot` (see bundle-lease.ts):
+ * every lease schema version requires it, and every release parses every lease
+ * directory. It records the path only; no `exchange` directory is created.
+ */
 function leasePathsFor(workspaceRoot: string, stateRoot: string, bundleId: string) {
   return {
     workspaceRoot,
@@ -1082,31 +1726,80 @@ function listLeaseIds(leasesRoot: string): readonly string[] {
     .sort();
 }
 
+interface AdmissionLockContext {
+  readonly processIdentityForPid: ProcessIdentityResolver | undefined;
+  readonly monotonicClock: () => number;
+  readonly sleep: (milliseconds: number) => Promise<void>;
+  readonly waitMs: number;
+  readonly onWait: (message: string) => void;
+}
+
+/** Per lock path, the tail of this process's admission queue. */
+const admissionQueues = new Map<string, Promise<void>>();
+
+/**
+ * Run `operation` inside the global admission critical section. Admissions
+ * in this process queue in order first: the process lock treats its own PID
+ * as a live owner, so without the queue a second same-process admission would
+ * be refused instead of waiting. The cross-process lock is then polled for up
+ * to `waitMs`, naming its holder once per holder.
+ */
 async function withDockerWorkloadAdmissionLock<T>(
   root: string,
-  processIdentityForPid: ProcessIdentityResolver | undefined,
+  context: AdmissionLockContext,
   operation: () => Promise<T>,
 ): Promise<T> {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   const lockPath = join(root, ADMISSION_LOCK_FILE);
-  let lock;
+  const previous = admissionQueues.get(lockPath) ?? Promise.resolve();
+  let endTurn: () => void = () => {};
+  const turn = new Promise<void>((resolveTurn) => {
+    endTurn = resolveTurn;
+  });
+  const tail = previous.then(() => turn);
+  admissionQueues.set(lockPath, tail);
+  await previous;
   try {
-    lock = acquireProcessLock(lockPath, {
-      attempts: ADMISSION_LOCK_ACQUIRE_ATTEMPTS,
-      processIdentityForPid,
-    });
-  } catch (error) {
-    if (error instanceof ProcessLockBusyError) {
-      const owner = error.ownerPid === undefined ? '' : ` (owner pid ${error.ownerPid})`;
-      throw new Error(`Docker-workload admission is busy${owner}`, { cause: error });
+    const lock = await acquireAdmissionLock(lockPath, context);
+    try {
+      return await operation();
+    } finally {
+      lock.release();
     }
-    throw error;
-  }
-  try {
-    return await operation();
   } finally {
-    lock.release();
+    endTurn();
+    if (admissionQueues.get(lockPath) === tail) admissionQueues.delete(lockPath);
   }
+}
+
+async function acquireAdmissionLock(lockPath: string, context: AdmissionLockContext): Promise<ProcessLockHandle> {
+  const deadline = context.monotonicClock() + context.waitMs;
+  let reportedHolder: string | undefined;
+  for (;;) {
+    try {
+      return acquireProcessLock(lockPath, {
+        attempts: ADMISSION_LOCK_ACQUIRE_ATTEMPTS,
+        processIdentityForPid: context.processIdentityForPid,
+      });
+    } catch (error) {
+      if (!(error instanceof ProcessLockBusyError)) throw error;
+      if (context.monotonicClock() >= deadline) {
+        throw new DockerWorkloadAdmissionBusyError(error.ownerPid, context.waitMs, error);
+      }
+      const holder = error.ownerPid === undefined ? 'another process' : `pid ${error.ownerPid}`;
+      if (holder !== reportedHolder) {
+        reportedHolder = holder;
+        context.onWait(
+          `Waiting for nested-Docker admission held by ${holder} (up to ${Math.round(context.waitMs / 1000)}s)`,
+        );
+      }
+      await context.sleep(ADMISSION_LOCK_POLL_MS);
+    }
+  }
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function pathEntryExistsWithoutFollowing(path: string): boolean {
@@ -1119,6 +1812,11 @@ function pathEntryExistsWithoutFollowing(path: string): boolean {
   }
 }
 
+/**
+ * The one lifecycle audit emitter. Incident details are bounded here, so no
+ * error message can exceed the audit schema and turn a recorded incident into
+ * a schema failure.
+ */
 function emitAudit(
   sink: DockerWorkloadAuditSink | undefined,
   leaseId: string,
@@ -1127,7 +1825,24 @@ function emitAudit(
   payload: DockerWorkloadAuditEventPayload,
 ): void {
   if (sink === undefined) return;
-  sink.emit({ at, leaseId, generation, ...payload });
+  const bounded = payload.kind === 'incident' ? { ...payload, detail: boundIncidentDetail(payload.detail) } : payload;
+  sink.emit({ at, leaseId, generation, ...bounded });
+}
+
+/** Emit an incident from a failure path; returns the audit failure instead of letting it replace the incident. */
+function tryEmitIncidentAudit(
+  sink: DockerWorkloadAuditSink | undefined,
+  leaseId: string,
+  generation: string,
+  at: string,
+  incident: { readonly code: string; readonly detail: string },
+): readonly unknown[] {
+  try {
+    emitAudit(sink, leaseId, generation, at, { kind: 'incident', ...incident });
+    return [];
+  } catch (error) {
+    return [error];
+  }
 }
 
 function defaultClock(): Date {

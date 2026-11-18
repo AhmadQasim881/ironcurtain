@@ -11,21 +11,31 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { resolve, dirname, extname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
-import type { Socket } from 'node:net';
+import { isIP, type Socket } from 'node:net';
 import { WebSocketServer, WebSocket as WsWebSocket } from 'ws';
 
-import type { SessionManager } from '../session/session-manager.js';
+import type { SessionEscalationEvent, SessionManager } from '../session/session-manager.js';
 import type { ControlRequestHandler } from '../daemon/control-socket.js';
 import type { SessionMode } from '../session/types.js';
 import type { TokenStreamBridge } from './token-stream-bridge.js';
 import { PtySessionManager } from './pty-session-manager.js';
 import { WebEventBus } from './web-event-bus.js';
-import { type RequestFrame, type ResponseFrame, type EventFrame, RpcError } from './web-ui-types.js';
+import { endManagedSession } from './web-session-teardown.js';
+import {
+  type RequestFrame,
+  type ResponseFrame,
+  type EventFrame,
+  type EscalationDto,
+  type WorkflowEscalationDto,
+  RpcError,
+} from './web-ui-types.js';
+import { escalationForWire } from './escalation-wire.js';
 import { dispatch, buildStatusDto, type WorkflowDispatchContext } from './json-rpc-dispatch.js';
 import type { WorkflowManager } from '../workflow/workflow-manager.js';
 import type { LlmStatisticsReader } from '../llm-metrics/query-service.js';
 import { wsDataToString } from './ws-utils.js';
 import { assignConnId } from './conn-registry.js';
+import { isBackpressured } from './ws-backpressure.js';
 import { personaCompileOrchestrator } from '../persona/persona-compile-orchestrator.js';
 import * as logger from '../logger.js';
 
@@ -47,7 +57,51 @@ const MIME_TYPES: Record<string, string> = {
 
 const MAX_STATISTICS_REQUESTS_PER_CLIENT = 2;
 const MAX_STATISTICS_REQUESTS_GLOBAL = 8;
+/**
+ * Upper bound on `bufferedAmount + frame` for a request response. A reply that
+ * would push the connection past it is replaced by a `RESPONSE_TOO_LARGE`
+ * error frame; the socket is never closed for it (closing would reject every
+ * pending request and drop the client's PTY and token-stream subscriptions).
+ */
 const MAX_WEBSOCKET_BUFFERED_BYTES = 8 * 1024 * 1024;
+/**
+ * Default cap on one serialized response frame. Every bulk method is bounded
+ * well below it (1 MiB file bodies, listing-only artifacts, 1 MiB message-log
+ * pages), so this is defense in depth against a method that escapes its own
+ * budget. Overridable per server for tests.
+ */
+const DEFAULT_MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+
+/** Vite's default dev-server port (`packages/web-ui/vite.config.ts`). */
+const DEFAULT_VITE_DEV_PORT = 5173;
+
+/** Bind hosts that mean "every interface"; see `isAllowedHostname`. */
+const WILDCARD_HOSTS = new Set(['0.0.0.0', '::', '[::]', '::0']);
+
+/**
+ * Origins of the Vite dev server for `--web-ui-dev`. The port follows
+ * `IRONCURTAIN_WEB_UI_PORT` exactly as `vite.config.ts` does (its
+ * `parsePort`), so pass that variable's value; anything that is not a valid
+ * port means the default.
+ */
+export function viteDevOrigins(portEnv: string | undefined): string[] {
+  const parsed = portEnv === undefined ? Number.NaN : Number(portEnv);
+  const port = Number.isInteger(parsed) && parsed >= 1 && parsed <= 65_535 ? parsed : DEFAULT_VITE_DEV_PORT;
+  return [`http://localhost:${port}`, `http://127.0.0.1:${port}`];
+}
+
+/** `host[:port]` as a browser or the CLI client sends it: a hostname, an IPv4 literal or a bracketed IPv6 literal. */
+const HOST_HEADER = /^(?:\[[0-9a-f:.]+\]|[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)(?::\d{1,5})?$/i;
+
+/**
+ * True for 127.0.0.0/8 and ::1, given a WHATWG URL hostname (brackets
+ * stripped): the URL parser has already turned every IPv4 spelling (`127.1`,
+ * `0x7f.1`) into a dotted quad and IPv6 into its compressed form. Rarer
+ * spellings of loopback (IPv4-mapped) fail closed.
+ */
+function isLoopbackAddress(address: string): boolean {
+  return address === '::1' || (isIP(address) === 4 && address.startsWith('127.'));
+}
 
 // ---------------------------------------------------------------------------
 // WebUiServer
@@ -60,8 +114,17 @@ export interface WebUiServerOptions {
   readonly sessionManager: SessionManager;
   readonly mode: SessionMode;
   readonly maxConcurrentWebSessions: number;
-  /** When true, skip Origin validation (for Vite dev server). */
+  /**
+   * When true, the Origin allowlist additionally accepts the Vite dev server
+   * (`devOrigins`). Host and Origin are still validated: dev mode never
+   * skips a check, it only adds the one origin the dev setup needs.
+   */
   readonly devMode?: boolean;
+  /**
+   * Origins accepted in dev mode besides the daemon's own. Defaults to
+   * `viteDevOrigins(undefined)`, i.e. localhost and 127.0.0.1 on port 5173.
+   */
+  readonly devOrigins?: readonly string[];
   /** Optional WorkflowManager for workflow RPC methods. */
   readonly workflowManager?: WorkflowManager;
   /**
@@ -87,12 +150,37 @@ export interface WebUiServerOptions {
   readonly daemonPid?: number;
   /** Existing daemon-owned statistics reader; no second HTTP/WS server is created. */
   readonly statisticsReader?: LlmStatisticsReader;
+  /**
+   * OS-sandbox warning for new PTY sessions (see
+   * `PtySessionManagerOptions.osSandboxNotice`). Omitted = no warning.
+   */
+  readonly osSandboxNotice?: () => string | undefined;
+  /**
+   * Grace period before turn-based web sessions are reaped once the last
+   * client disconnects. Defaults to {@link WebUiServer.ORPHAN_GRACE_MS};
+   * overridable for tests.
+   */
+  readonly orphanGraceMs?: number;
+  /**
+   * Largest serialized response frame (bytes) sent to a client; larger
+   * replies become `RESPONSE_TOO_LARGE` errors. Defaults to 8 MiB. Exposed so
+   * tests can exercise the cap without building a multi-megabyte payload.
+   */
+  readonly maxResponseBytes?: number;
 }
 
 export class WebUiServer {
   private httpServer: Server | null = null;
   private wss: InstanceType<typeof WebSocketServer> | null = null;
   private readonly clients = new Set<WsWebSocket>();
+  /**
+   * The connected clients whose handshake carried an Origin: browsers (every
+   * browser sends one on a WebSocket handshake; the CLI clients send none).
+   * Only these can show an escalation to a person, see {@link hasBrowserClient}.
+   */
+  private readonly browserClients = new Set<WsWebSocket>();
+  /** Unsubscribes the SessionManager escalation bridge (see start()). */
+  private unsubscribeSessionEscalations: (() => void) | null = null;
   private readonly authToken: string;
   private readonly options: WebUiServerOptions;
   private readonly eventBus = new WebEventBus();
@@ -109,10 +197,24 @@ export class WebUiServer {
   private activeStatisticsRequests = 0;
   private readonly staticRoot: string;
   private readonly staticCache = new Map<string, { content: Buffer; mime: string }>();
+  /** Lower-cased dev-mode origin allowlist (empty unless `devMode`). */
+  private readonly devOrigins: ReadonlySet<string>;
+  private readonly maxResponseBytes: number;
+  /**
+   * Clients that were skipped for at least one event frame because their send
+   * buffer was above the backpressure threshold. Each gets one
+   * `daemon.resync` frame before its next delivered event (the 10 s status
+   * broadcast guarantees there is one), so it refetches the state it missed.
+   */
+  private readonly clientsMissingEvents = new WeakSet<WsWebSocket>();
 
   constructor(options: WebUiServerOptions) {
     this.options = options;
+    this.maxResponseBytes = options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
     this.authToken = randomBytes(32).toString('base64url');
+    this.devOrigins = new Set(
+      options.devMode ? (options.devOrigins ?? viteDevOrigins(undefined)).map((origin) => origin.toLowerCase()) : [],
+    );
     const rawStaticRoot = resolveStaticAssetPath();
     try {
       this.staticRoot = realpathSync(rawStaticRoot);
@@ -129,6 +231,7 @@ export class WebUiServer {
       daemonId: options.daemonId ?? randomBytes(4).toString('hex'),
       daemonPid: options.daemonPid ?? process.pid,
       captureTracesDefault: options.captureTracesDefault ?? false,
+      osSandboxNotice: options.osSandboxNotice,
     });
 
     this.dispatchCtx = {
@@ -178,6 +281,41 @@ export class WebUiServer {
     this.dispatchCtx.tokenStreamBridge = bridge;
   }
 
+  /**
+   * Whether a browser is connected (an authenticated WebSocket client whose
+   * handshake carried an allowed Origin), i.e. whether a person can see and
+   * decide an escalation shown in the web UI right now. The daemon keeps a
+   * cron escalation pending for the web UI only then.
+   */
+  hasBrowserClient(): boolean {
+    return this.browserClients.size > 0;
+  }
+
+  /**
+   * Pushes the escalations of SessionManager sessions whose transport does
+   * not announce them itself (cron and Signal sessions; web sessions emit
+   * their own through WebSessionTransport) as `escalation.created`,
+   * `escalation.resolved` and `escalation.expired`, so they appear and
+   * disappear in every connected browser as they happen.
+   */
+  private bridgeSessionEscalation(event: SessionEscalationEvent): void {
+    if (event.managed.source.kind === 'web') return;
+    switch (event.kind) {
+      case 'pending':
+        this.eventBus.emit('escalation.created', { ...event.escalation, sessionSource: event.managed.source });
+        break;
+      case 'resolved':
+        this.eventBus.emit('escalation.resolved', { escalationId: event.escalationId, decision: event.decision });
+        break;
+      case 'expired':
+        this.eventBus.emit('escalation.expired', {
+          escalationId: event.escalationId,
+          sessionLabel: event.managed.label,
+        });
+        break;
+    }
+  }
+
   async start(): Promise<string> {
     const httpServer = createServer((req, res) => this.handleHttpRequest(req, res));
     const wss = new WebSocketServer({ noServer: true, maxPayload: 1_048_576 });
@@ -193,6 +331,11 @@ export class WebUiServer {
 
     this.httpServer = httpServer;
     this.wss = wss;
+
+    this.unsubscribeSessionEscalations?.();
+    this.unsubscribeSessionEscalations = this.options.sessionManager.subscribeEscalationEvents((event) =>
+      this.bridgeSessionEscalation(event),
+    );
 
     this.statusInterval = setInterval(() => {
       if (this.clients.size > 0) {
@@ -231,16 +374,23 @@ export class WebUiServer {
 
     this.cancelOrphanTimer();
 
+    this.unsubscribeSessionEscalations?.();
+    this.unsubscribeSessionEscalations = null;
+
     for (const client of this.clients) {
       client.close(1001, 'Server shutting down');
     }
     this.clients.clear();
+    this.browserClients.clear();
     this.aliveClients.clear();
     this.missedPings.clear();
 
+    // Full teardown (not a bare SessionManager.end) so session.ended still
+    // fires for the daemon's bridge bookkeeping; idempotent against an end
+    // already in flight for the same label.
     const webSessions = this.options.sessionManager.byKind('web');
     for (const managed of webSessions) {
-      await this.options.sessionManager.end(managed.label).catch((err: unknown) => {
+      await endManagedSession(this.dispatchCtx, managed.label, 'daemon_shutdown').catch((err: unknown) => {
         logger.warn(`[WebUI] Error ending web session #${managed.label}: ${String(err)}`);
       });
     }
@@ -279,14 +429,41 @@ export class WebUiServer {
    * Send an event frame to a specific set of clients (targeted delivery).
    * Used by TokenStreamBridge for per-subscription delivery without
    * modifying the generic broadcast() path.
+   *
+   * A client whose send buffer is above the backpressure threshold is skipped
+   * for this frame, so a stalled tab cannot grow the daemon's heap without
+   * bound. Because the skipped frame may have carried state (an escalation, a
+   * gate), the client is remembered and, once it has drained, receives a
+   * `daemon.resync` frame ahead of its next event: the UI then refetches its
+   * state as it does after a reconnect. Token-stream batches and PTY output
+   * apply the same threshold before calling here, with their own recovery
+   * (dropped display deltas; a PTY replay).
    */
   sendToSubscribers(clients: ReadonlySet<WsWebSocket>, event: string, payload: unknown): void {
-    const frame: EventFrame = { event, payload, seq: ++this.eventSeq };
+    let wirePayload = payload;
+    if (event === 'escalation.created') {
+      wirePayload = escalationForWire(payload as EscalationDto);
+    } else if (event === 'workflow.escalation_raised') {
+      const raised = payload as { workflowId: string; escalation: WorkflowEscalationDto };
+      wirePayload = { workflowId: raised.workflowId, escalation: escalationForWire(raised.escalation) };
+    }
+    const frame: EventFrame = { event, payload: wirePayload, seq: ++this.eventSeq };
     const data = JSON.stringify(frame);
     for (const client of clients) {
-      if (client.readyState === WsWebSocket.OPEN) {
-        client.send(data);
+      if (client.readyState !== WsWebSocket.OPEN) continue;
+      if (isBackpressured(client)) {
+        this.clientsMissingEvents.add(client);
+        continue;
       }
+      if (this.clientsMissingEvents.delete(client)) {
+        const resync: EventFrame = {
+          event: 'daemon.resync',
+          payload: { reason: 'backpressure' },
+          seq: ++this.eventSeq,
+        };
+        client.send(JSON.stringify(resync));
+      }
+      client.send(data);
     }
   }
 
@@ -314,13 +491,15 @@ export class WebUiServer {
 
   private removeClient(ws: WsWebSocket): void {
     this.clients.delete(ws);
+    this.browserClients.delete(ws);
     this.aliveClients.delete(ws);
     this.missedPings.delete(ws);
+    this.clientsMissingEvents.delete(ws);
   }
 
   // --- Orphan session cleanup ---
 
-  private static readonly ORPHAN_GRACE_MS = 60_000;
+  static readonly ORPHAN_GRACE_MS = 60_000;
 
   private startOrphanTimerIfNeeded(): void {
     if (this.orphanTimer) return;
@@ -329,11 +508,14 @@ export class WebUiServer {
     const webSessions = this.options.sessionManager.byKind('web');
     if (webSessions.length === 0) return;
 
-    logger.info(`[WebUI] No connected clients with ${webSessions.length} web session(s). Starting 60s orphan timer.`);
+    const graceMs = this.options.orphanGraceMs ?? WebUiServer.ORPHAN_GRACE_MS;
+    logger.info(
+      `[WebUI] No connected clients with ${webSessions.length} web session(s). Starting ${Math.round(graceMs / 1000)}s orphan timer.`,
+    );
     this.orphanTimer = setTimeout(() => {
       this.orphanTimer = null;
       this.cleanupOrphanedWebSessions();
-    }, WebUiServer.ORPHAN_GRACE_MS);
+    }, graceMs);
   }
 
   private cancelOrphanTimer(): void {
@@ -351,7 +533,10 @@ export class WebUiServer {
 
     logger.info(`[WebUI] Ending ${webSessions.length} orphaned web session(s).`);
     for (const managed of webSessions) {
-      this.options.sessionManager.end(managed.label).catch((err: unknown) => {
+      // Through the shared teardown so `session.ended` is emitted: the daemon
+      // drops its TokenStreamBridge label maps on that event, and a client that
+      // connects during the teardown window learns the row is gone.
+      endManagedSession(this.dispatchCtx, managed.label, 'orphaned').catch((err: unknown) => {
         logger.warn(`[WebUI] Error ending orphaned web session #${managed.label}: ${String(err)}`);
       });
     }
@@ -362,11 +547,27 @@ export class WebUiServer {
   private handleHttpRequest(req: IncomingMessage, res: ServerResponse): void {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
+    // The token-bearing URL must never leak through a Referer, and a page
+    // opened from this UI must not keep a handle on it (COOP).
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+    res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
     const connectSrc = this.options.devMode ? "'self' ws://127.0.0.1:* ws://localhost:*" : "'self'";
+    // `style-src 'unsafe-inline'` stays: xterm and Svelte transitions inject
+    // <style>. Agent markdown is kept from using it by lib/markdown.ts, and
+    // `form-action 'none'` closes the form-submission path that default-src
+    // does not govern. base-uri/frame-ancestors/object-src are belt and braces.
     res.setHeader(
       'Content-Security-Policy',
-      `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src ${connectSrc}`,
+      `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src ${connectSrc}; ` +
+        "form-action 'none'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'",
     );
+
+    if (!this.isAllowedHost(req)) {
+      res.writeHead(421);
+      res.end('Misdirected Request');
+      return;
+    }
 
     let url: URL;
     let pathname: string;
@@ -473,6 +674,12 @@ export class WebUiServer {
     head: Buffer,
     wss: InstanceType<typeof WebSocketServer>,
   ): void {
+    if (!this.isAllowedHost(req)) {
+      socket.write('HTTP/1.1 421 Misdirected Request\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
     let url: URL;
     try {
       url = new URL(req.url ?? '', `http://${req.headers.host ?? 'localhost'}`);
@@ -495,13 +702,14 @@ export class WebUiServer {
       return;
     }
 
-    if (!this.options.devMode) {
-      const origin = req.headers.origin;
-      if (origin && !this.isValidOrigin(origin)) {
-        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
-        socket.destroy();
-        return;
-      }
+    // Browsers always send Origin on a WebSocket handshake; a foreign one is
+    // a cross-site connection attempt even if the token leaked. A missing
+    // Origin is a non-browser client (the CLI daemon client) and is accepted.
+    const origin = req.headers.origin;
+    if (origin !== undefined && !this.isValidOrigin(origin)) {
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      socket.destroy();
+      return;
     }
 
     if (this.clients.size >= 10) {
@@ -512,6 +720,7 @@ export class WebUiServer {
 
     wss.handleUpgrade(req, socket, head, (ws) => {
       this.clients.add(ws);
+      if (origin !== undefined) this.browserClients.add(ws);
       this.aliveClients.add(ws);
       this.missedPings.delete(ws);
       // Assign a per-connection id so persona-mutation dispatch can build an
@@ -557,9 +766,55 @@ export class WebUiServer {
     return timingSafeEqual(expected, actual);
   }
 
+  /**
+   * Host-header allowlist (DNS-rebinding defence). A rebinding page makes the
+   * browser send the attacker's domain as Host; only the authorities a user
+   * can legitimately type for this server pass: `localhost`, a loopback
+   * address, the configured bind host or, for a wildcard bind, any IP
+   * literal (no DNS name can be rebound to an IP literal), each at the port
+   * this very connection arrived on. Missing or malformed Host fails closed.
+   */
+  private isAllowedHost(req: IncomingMessage): boolean {
+    const host = req.headers.host;
+    if (host === undefined || !HOST_HEADER.test(host)) return false;
+    let authority: URL;
+    try {
+      authority = new URL(`http://${host}`);
+    } catch {
+      return false;
+    }
+    return this.isAllowedAuthority(authority, req.socket.localPort ?? this.getPort());
+  }
+
+  private isAllowedAuthority(url: URL, listeningPort: number): boolean {
+    const port = url.port === '' ? 80 : Number(url.port);
+    return port === listeningPort && this.isAllowedHostname(url.hostname);
+  }
+
+  private isAllowedHostname(hostname: string): boolean {
+    const name = hostname.toLowerCase();
+    const bare = name.startsWith('[') && name.endsWith(']') ? name.slice(1, -1) : name;
+    if (name === 'localhost' || isLoopbackAddress(bare)) return true;
+    const bindHost = this.options.host.toLowerCase();
+    if (WILDCARD_HOSTS.has(bindHost)) return isIP(bare) !== 0;
+    return bare === bindHost || name === bindHost;
+  }
+
+  /**
+   * Origin allowlist for the WebSocket handshake: same scheme/authority rules
+   * as the Host check, plus the Vite dev server in dev mode. Exact-string
+   * matching on a normalized origin; `null` and anything unparsable fail.
+   */
   private isValidOrigin(origin: string): boolean {
-    const { host, port } = this.options;
-    return [`http://${host}:${port}`, `http://localhost:${port}`, `http://127.0.0.1:${port}`].includes(origin);
+    if (this.devOrigins.has(origin.toLowerCase())) return true;
+    let url: URL;
+    try {
+      url = new URL(origin);
+    } catch {
+      return false;
+    }
+    if (url.protocol !== 'http:' || url.origin !== origin) return false;
+    return this.isAllowedAuthority(url, this.getPort());
   }
 
   // --- JSON-RPC ---
@@ -627,11 +882,32 @@ export class WebUiServer {
     }
   }
 
+  /**
+   * Sends a response frame, replacing one that is too large for the response
+   * cap or for the connection's send buffer with a small `RESPONSE_TOO_LARGE`
+   * error for the same request id. The socket stays open either way: closing
+   * it would fail every other in-flight request and drop the client's PTY
+   * and token-stream subscriptions, which is what an agent filling a
+   * presented artifact with large files used to achieve.
+   */
   private sendResponse(client: WsWebSocket, response: ResponseFrame): void {
     if (client.readyState !== WsWebSocket.OPEN) return;
     const serialized = JSON.stringify(response);
-    if (client.bufferedAmount + Buffer.byteLength(serialized) > MAX_WEBSOCKET_BUFFERED_BYTES) {
-      client.close(1013, 'WebSocket response backpressure');
+    const size = Buffer.byteLength(serialized);
+    const overCap = size > this.maxResponseBytes;
+    const overBuffer = client.bufferedAmount + size > MAX_WEBSOCKET_BUFFERED_BYTES;
+    if (overCap || overBuffer) {
+      const message = overCap
+        ? `Response of ${size} bytes exceeds the ${this.maxResponseBytes}-byte limit`
+        : `Response of ${size} bytes does not fit the connection's send buffer (${client.bufferedAmount} bytes queued)`;
+      // The request id is client-chosen: quote and clip it for the log line.
+      logger.warn(`[WebUI] ${message} (request ${JSON.stringify(response.id.slice(0, 64))})`);
+      const fallback: ResponseFrame = {
+        id: response.id,
+        ok: false,
+        error: { code: 'RESPONSE_TOO_LARGE', message },
+      };
+      client.send(JSON.stringify(fallback));
       return;
     }
     client.send(serialized);

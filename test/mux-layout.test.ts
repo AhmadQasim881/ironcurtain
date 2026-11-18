@@ -46,6 +46,15 @@ describe('calculateLayout', () => {
     expect(layout.footerY).toBe(2);
   });
 
+  it('command mode: one more panel row per escalation offering a directory-wide pattern', () => {
+    // One escalation, both patterns: header, argument, reason and two pattern lines.
+    expect(calculateLayout(30, 'command', 1, 1, 1).escalationPanelRows).toBe(5);
+    expect(calculateLayout(30, 'command', 1).escalationPanelRows).toBe(4);
+    // Still capped by the panel maximum and the half-viewport overlay.
+    expect(calculateLayout(60, 'command', 3, 1, 3).escalationPanelRows).toBe(12);
+    expect(calculateLayout(24, 'command', 2, 1, 2).escalationPanelRows).toBe(8);
+  });
+
   it('overlay Y position is correct', () => {
     const layout = calculateLayout(30, 'command', 1);
     // ptyViewport: 27 rows (30 - 3)
@@ -111,5 +120,25 @@ describe('calculateLayout', () => {
     expect(isBottomPanelPicker('persona-picker')).toBe(true);
     expect(isBottomPanelPicker('pty')).toBe(false);
     expect(isBottomPanelPicker('command')).toBe(false);
+  });
+
+  it('the approve-all confirmation is a picker that floats over the full viewport', () => {
+    expect(isPickerMode('escalation-approve-all')).toBe(true);
+    expect(isBottomPanelPicker('escalation-approve-all')).toBe(false);
+    const layout = calculateLayout(24, 'escalation-approve-all', 3);
+    expect(layout.pickerRows).toBe(0);
+    expect(layout.overlayRows).toBe(0);
+  });
+});
+
+describe('message-panel mode', () => {
+  it('is a bottom-panel picker that claims half the viewport', () => {
+    expect(isPickerMode('message-panel')).toBe(true);
+    expect(isBottomPanelPicker('message-panel')).toBe(true);
+    const layout = calculateLayout(24, 'message-panel', 0);
+    expect(layout.ptyViewportRows).toBe(21);
+    expect(layout.pickerRows).toBe(10);
+    expect(layout.pickerY).toBe(1 + 21 - 10);
+    expect(layout.overlayRows).toBe(0);
   });
 });

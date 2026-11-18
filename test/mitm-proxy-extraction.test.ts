@@ -1,17 +1,18 @@
 /**
- * Tests for extractToolResults and extractFromJsonResponse in mitm-proxy.ts.
+ * Tests for extractToolResults (mitm-proxy.ts) and the token stream's
+ * non-streaming JSON extraction (sse-extractor.ts).
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { getTokenStreamBus, resetTokenStreamBus } from '../src/docker/token-stream-bus.js';
 import type { TokenStreamEvent } from '../src/docker/token-stream-types.js';
 import type { SessionId } from '../src/session/types.js';
+import { extractToolResults } from '../src/docker/mitm-proxy.js';
 import {
-  extractToolResults,
-  extractFromJsonResponse,
   createBoundedJsonResponseCapture,
   MAX_JSON_RESPONSE_CAPTURE_BYTES,
-} from '../src/docker/mitm-proxy.js';
+  tokenStreamEventsFromJson,
+} from '../src/docker/sse-extractor.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -249,16 +250,11 @@ describe('extractToolResults', () => {
 });
 
 // ---------------------------------------------------------------------------
-// extractFromJsonResponse
+// tokenStreamEventsFromJson
 // ---------------------------------------------------------------------------
 
-describe('extractFromJsonResponse', () => {
-  beforeEach(() => {
-    resetTokenStreamBus();
-  });
-
+describe('tokenStreamEventsFromJson', () => {
   it('extracts Anthropic JSON response (model + text + usage)', () => {
-    const { events } = collectEvents(SESSION_ID);
     const body = Buffer.from(
       JSON.stringify({
         model: 'claude-sonnet-4-20250514',
@@ -268,7 +264,7 @@ describe('extractFromJsonResponse', () => {
       }),
     );
 
-    extractFromJsonResponse(body, SESSION_ID);
+    const events = tokenStreamEventsFromJson(body);
 
     expect(events).toHaveLength(3);
 
@@ -288,7 +284,6 @@ describe('extractFromJsonResponse', () => {
   });
 
   it('extracts OpenAI JSON response format', () => {
-    const { events } = collectEvents(SESSION_ID);
     const body = Buffer.from(
       JSON.stringify({
         model: 'gpt-4',
@@ -297,7 +292,7 @@ describe('extractFromJsonResponse', () => {
       }),
     );
 
-    extractFromJsonResponse(body, SESSION_ID);
+    const events = tokenStreamEventsFromJson(body);
 
     const starts = eventsOfKind(events, 'message_start');
     expect(starts).toHaveLength(1);
@@ -314,13 +309,11 @@ describe('extractFromJsonResponse', () => {
   });
 
   it('handles invalid JSON gracefully', () => {
-    const { events } = collectEvents(SESSION_ID);
-    extractFromJsonResponse(Buffer.from('not json'), SESSION_ID);
+    const events = tokenStreamEventsFromJson(Buffer.from('not json'));
     expect(events).toHaveLength(0);
   });
 
   it('handles response without model', () => {
-    const { events } = collectEvents(SESSION_ID);
     const body = Buffer.from(
       JSON.stringify({
         content: [{ type: 'text', text: 'no model' }],
@@ -328,7 +321,7 @@ describe('extractFromJsonResponse', () => {
       }),
     );
 
-    extractFromJsonResponse(body, SESSION_ID);
+    const events = tokenStreamEventsFromJson(body);
 
     // No message_start since no model
     expect(eventsOfKind(events, 'message_start')).toHaveLength(0);
@@ -339,7 +332,6 @@ describe('extractFromJsonResponse', () => {
   });
 
   it('handles response without usage', () => {
-    const { events } = collectEvents(SESSION_ID);
     const body = Buffer.from(
       JSON.stringify({
         model: 'claude-sonnet-4-20250514',
@@ -347,7 +339,7 @@ describe('extractFromJsonResponse', () => {
       }),
     );
 
-    extractFromJsonResponse(body, SESSION_ID);
+    const events = tokenStreamEventsFromJson(body);
 
     const ends = eventsOfKind(events, 'message_end');
     expect(ends).toHaveLength(1);
@@ -356,7 +348,6 @@ describe('extractFromJsonResponse', () => {
   });
 
   it('extracts multiple content blocks', () => {
-    const { events } = collectEvents(SESSION_ID);
     const body = Buffer.from(
       JSON.stringify({
         model: 'claude-sonnet-4-20250514',
@@ -368,7 +359,7 @@ describe('extractFromJsonResponse', () => {
       }),
     );
 
-    extractFromJsonResponse(body, SESSION_ID);
+    const events = tokenStreamEventsFromJson(body);
 
     const deltas = eventsOfKind(events, 'text_delta');
     expect(deltas).toHaveLength(2);
@@ -377,7 +368,6 @@ describe('extractFromJsonResponse', () => {
   });
 
   it('defaults stop_reason to "stop" when missing', () => {
-    const { events } = collectEvents(SESSION_ID);
     const body = Buffer.from(
       JSON.stringify({
         content: [],
@@ -385,11 +375,36 @@ describe('extractFromJsonResponse', () => {
       }),
     );
 
-    extractFromJsonResponse(body, SESSION_ID);
+    const events = tokenStreamEventsFromJson(body);
 
     const ends = eventsOfKind(events, 'message_end');
     expect(ends).toHaveLength(1);
     expect(ends[0].stopReason).toBe('stop');
+  });
+
+  it("surfaces OpenRouter's authoritative usage.cost and cache reads on message_end", () => {
+    const body = Buffer.from(
+      JSON.stringify({
+        model: 'z-ai/glm-5.2',
+        choices: [{ message: { role: 'assistant', content: 'Hi' }, finish_reason: 'stop' }],
+        usage: {
+          prompt_tokens: 1024,
+          completion_tokens: 8,
+          prompt_tokens_details: { cached_tokens: 900 },
+          cost: 0.0042,
+        },
+      }),
+    );
+
+    const ends = eventsOfKind(tokenStreamEventsFromJson(body), 'message_end');
+
+    expect(ends).toEqual([
+      expect.objectContaining({ inputTokens: 1024, outputTokens: 8, costUsd: 0.0042, cachedTokens: 900 }),
+    ]);
+  });
+
+  it('extracts nothing from a JSON value that is not an object', () => {
+    expect(tokenStreamEventsFromJson(Buffer.from('[1,2,3]'))).toEqual([]);
   });
 });
 
